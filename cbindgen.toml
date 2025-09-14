@@ -1,0 +1,10 @@
+language = "C"
+sys_includes = ["netdb.h"]
+include_guard = "ARES_H"
+
+[export.rename]
+Channel = "ares_channel"
+ChannelData = "ares_channeldata"
+AresHostCallback = "ares_host_callback"
+HostEnt = "hostent"
+timeval = "struct timeval"
