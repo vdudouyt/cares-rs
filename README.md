@@ -1,3 +1,5 @@
+![build-and-test](https://github.com/vdudouyt/cares-rs/actions/workflows/cargo-test.yaml/badge.svg)
+
 ## Synopsis
 
 Build and run example.c:
