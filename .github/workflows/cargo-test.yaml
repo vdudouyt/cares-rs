@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout the repository
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Install Rust (via rustup)
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache Cargo dependencies for faster builds
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Build the project
+      - name: Build
+        run: cargo build
+
+      # Run tests
+      - name: Run tests
+        run: cargo test
