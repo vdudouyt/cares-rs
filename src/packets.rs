@@ -42,6 +42,7 @@ pub struct DnsQuery {
 }
 
 impl DnsQuery {
+    #[cfg(test)]
     pub fn new(domain: &str, qtype: u16, qclass: u16) -> DnsQuery {
         DnsQuery {
             name: domain.split(".").map(str::to_owned).collect(),
@@ -73,6 +74,7 @@ pub struct DnsLabel {
 }
 
 impl DnsLabel {
+    #[cfg(test)]
     pub fn new(name: &[&str], offset: Option<u16>) -> DnsLabel {
         DnsLabel { name: name.iter().map(ToString::to_string).collect(), offset }
     }

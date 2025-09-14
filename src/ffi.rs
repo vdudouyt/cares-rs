@@ -49,7 +49,7 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, _family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
     let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else {
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
+pub unsafe extern "C" fn ares_timeout(_channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
     // we do not have any retransmission support yet
     unsafe {
         (*tv).tv_sec = 3;
@@ -107,12 +107,12 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
     let channeldata = unsafe { &mut *channel };
     for task in &mut channeldata.tasks {
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), write_fds) } {
-            let len = task.sock.send_to(&task.writebuf, ("8.8.8.8", 53)).unwrap();
+            let _len = task.sock.send_to(&task.writebuf, ("8.8.8.8", 53)).unwrap();
             task.status = Status::Reading;
         }
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), read_fds) } {
             let mut buf = vec![0u8; 65_535];
-            let (len, src) = task.sock.recv_from(&mut buf).unwrap();
+            let (len, _src) = task.sock.recv_from(&mut buf).unwrap();
             task.status = Status::Completed;
 
             let mut cur = Cursor::new(&buf[0..len]);
@@ -127,7 +127,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
 
                 /* construct hostent */
                 let name = CString::new(name).unwrap();
-                let mut aliases_vec: Vec<*mut c_char> = vec![std::ptr::null_mut()];
+                let aliases_vec: Vec<*mut c_char> = vec![std::ptr::null_mut()];
                 let aliases: Box<[*mut c_char]> = aliases_vec.into_boxed_slice();
                 let addr_ptr = answer.data.as_ptr();
                 let addr_list = vec![ addr_ptr, std::ptr::null_mut() ];
@@ -140,8 +140,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     h_addr_list: addr_list.as_ptr() as *mut *mut c_char,
                 };
 
-                let addr_ptr = answer.data.as_ptr();
-                (task.callback)(task.arg, ARES_SUCCESS, 0, &mut hostent);
+                unsafe { (task.callback)(task.arg, ARES_SUCCESS, 0, &mut hostent) };
             }
         }
     }
