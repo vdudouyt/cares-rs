@@ -10,7 +10,6 @@ use crate::packets::*;
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
 pub const ARES_EFORMERR: i32 = 2;
-
 pub const ARES_LIB_INIT_ALL: i32 = 1;
 
 #[unsafe(no_mangle)]
@@ -36,6 +35,7 @@ pub struct ChannelData {
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     let channeldata = ChannelData { tasks: vec![] };
     let channel = Box::into_raw(Box::new(channeldata));
@@ -44,11 +44,13 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     unsafe { drop(Box::from_raw(channel)); }
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, _family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
@@ -74,6 +76,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
     let channeldata = unsafe { &mut *channel };
     unsafe { libc::FD_ZERO(write_fds) };
@@ -89,20 +92,22 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
         };
         if nfds < fd { nfds = fd + 1 }
     }
-    return nfds;
+    nfds
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_timeout(_channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
     // we do not have any retransmission support yet
     unsafe {
         (*tv).tv_sec = 3;
         (*tv).tv_usec = 0;
     };
-    return tv;
+    tv
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     let channeldata = unsafe { &mut *channel };
     for task in &mut channeldata.tasks {
@@ -130,7 +135,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 let aliases_vec: Vec<*mut c_char> = vec![std::ptr::null_mut()];
                 let aliases: Box<[*mut c_char]> = aliases_vec.into_boxed_slice();
                 let addr_ptr = answer.data.as_ptr();
-                let addr_list = vec![ addr_ptr, std::ptr::null_mut() ];
+                let addr_list = [ addr_ptr, std::ptr::null_mut() ];
 
                 let mut hostent = libc::hostent {
                     h_name: name.as_ptr() as *mut c_char,
