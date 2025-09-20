@@ -1,16 +1,15 @@
-use std::net::IpAddr;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ResolvConf {
-    pub nameservers: Vec<IpAddr>,
+pub struct SysConfig {
+    pub nameservers: Vec<String>,
     pub domain: Option<String>,
     pub search: Vec<String>,
-    pub options: Options,
+    pub options: SysConfigOptions,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Options {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SysConfigOptions {
     pub ndots: u32,
     pub attempts: u32,
     pub timeout_secs: u64,
@@ -20,19 +19,23 @@ pub struct Options {
     pub edns0: bool,
 }
 
+impl Default for SysConfigOptions {
+    fn default() -> Self {
+        SysConfigOptions { ndots: 0, attempts: 4, timeout_secs: 5, use_vc: false, rotate: false, inet6: false, edns0: false }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
-    InvalidIp(String),
     MissingValue { keyword: String },
     InvalidNumber { keyword: String, value: String },
 }
 
-impl FromStr for ResolvConf {
+impl FromStr for SysConfig {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let options = Options { timeout_secs: 5, attempts: 4, ..Options::default() };
-        let mut conf = ResolvConf { options, ..ResolvConf::default() };
+        let mut conf = SysConfig::default();
 
         for raw_line in s.lines() {
             let line = strip_comment(raw_line).trim();
@@ -46,8 +49,7 @@ impl FromStr for ResolvConf {
             match keyword {
                 "nameserver" => {
                     for tok in rest {
-                        let ip = tok.parse::<IpAddr>().map_err(|_| ParseError::InvalidIp(tok.into()))?;
-                        conf.nameservers.push(ip);
+                        conf.nameservers.push(tok.to_string());
                     }
                 }
                 "domain" => conf.domain = Some(arg1.to_string()),
@@ -66,7 +68,7 @@ fn strip_comment(line: &str) -> &str {
     line[..idx].trim()
 }
 
-fn parse_options_into(opts: &mut Options, src: &str) -> Result<(), ParseError> {
+fn parse_options_into(opts: &mut SysConfigOptions, src: &str) -> Result<(), ParseError> {
     for token in src.split_whitespace() {
         let (key, val) = token.split_once(['=', ':']).unwrap_or((token, ""));
 
@@ -99,7 +101,7 @@ mod tests {
     #[test]
     fn parse_minimal() {
         let input = "nameserver 1.1.1.1\n";
-        let conf: ResolvConf = input.parse().unwrap();
+        let conf: SysConfig = input.parse().unwrap();
         assert_eq!(conf.nameservers.len(), 1);
         assert_eq!(conf.domain, None);
         assert!(conf.search.is_empty());
@@ -117,7 +119,7 @@ mod tests {
             search corp.local example.org
             options ndots:2 attempts:4 timeout:3 rotate use-vc
         "#;
-        let conf: ResolvConf = input.parse().unwrap();
+        let conf: SysConfig = input.parse().unwrap();
         assert_eq!(conf.nameservers.len(), 3);
         assert_eq!(conf.search, vec!["corp.local", "example.org"]);
         assert_eq!(conf.options.ndots, 2);
@@ -130,24 +132,17 @@ mod tests {
     #[test]
     fn parse_options_variants() {
         let input = "options retrans=7 edns0 foo=bar baz:9 qux";
-        let conf: ResolvConf = input.parse().unwrap();
+        let conf: SysConfig = input.parse().unwrap();
         assert_eq!(conf.options.timeout_secs, 7);
         assert!(conf.options.edns0);
     }
 
     #[test]
-    fn invalid_ip_errors() {
-        let input = "nameserver not_an_ip";
-        let err = input.parse::<ResolvConf>().unwrap_err();
-        match err { ParseError::InvalidIp(_) => {}, _ => panic!("unexpected error: {:?}", err) }
-    }
-
-    #[test]
     fn missing_value_errors() {
         let input = "domain\nsearch\noptions ndots";
-        let err = input.parse::<ResolvConf>().unwrap_err();
+        let err = input.parse::<SysConfig>().unwrap_err();
         match err {
-            ParseError::MissingValue { .. } | ParseError::InvalidNumber { .. } => {},
+            ParseError::MissingValue { .. } => {},
             _ => panic!("unexpected error: {:?}", err),
         }
     }

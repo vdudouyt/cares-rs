@@ -6,6 +6,7 @@ use std::io::Cursor;
 use bytes::BytesMut;
 use rand::Rng;
 use crate::packets::*;
+use crate::sysconfig::SysConfig;
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -31,13 +32,20 @@ struct Task {
 }
 
 pub struct ChannelData {
+    config: SysConfig,
     tasks: Vec<Task>,
+}
+
+fn build_sysconfig() -> SysConfig {
+    let try_resolv_conf = || Some(std::fs::read_to_string("/etc/resolv.conf").ok()?.parse::<SysConfig>().ok()?);
+    try_resolv_conf().unwrap_or_else(|| SysConfig::default())
 }
 
 #[unsafe(no_mangle)]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
-    let channeldata = ChannelData { tasks: vec![] };
+    let config: SysConfig = build_sysconfig();
+    let channeldata = ChannelData { config, tasks: vec![] };
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -110,9 +118,10 @@ pub unsafe extern "C" fn ares_timeout(_channel: Channel, _maxtv: *mut libc::time
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     let channeldata = unsafe { &mut *channel };
+    let nameserver = channeldata.config.nameservers.first().map_or("127.0.0.1", |v| v);
     for task in &mut channeldata.tasks {
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), write_fds) } {
-            let _len = task.sock.send_to(&task.writebuf, ("8.8.8.8", 53)).unwrap();
+            let _len = task.sock.send_to(&task.writebuf, (nameserver.to_owned(), 53)).unwrap();
             task.status = Status::Reading;
         }
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), read_fds) } {
