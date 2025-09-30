@@ -7,6 +7,7 @@ use bytes::BytesMut;
 use rand::Rng;
 use crate::packets::*;
 use crate::sysconfig::SysConfig;
+use std::net::Ipv4Addr;
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -34,6 +35,13 @@ struct Task {
 pub struct ChannelData {
     config: SysConfig,
     tasks: Vec<Task>,
+}
+
+#[repr(C)]
+pub struct ares_addr_node {
+    pub next: *mut ares_addr_node,
+    pub family: c_int,
+    pub data: [u8; 16], // enough to hold IPv6
 }
 
 fn build_sysconfig() -> SysConfig {
@@ -159,4 +167,19 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
         }
     }
     channeldata.tasks.retain(|t| t.status != Status::Completed);
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) {
+    let channeldata = unsafe { &mut *channel };
+    channeldata.config.nameservers.clear();
+    while !head.is_null() {
+        if unsafe { (*head).family } == libc::AF_INET {
+            let node = unsafe { &(*head) };
+            let oct4: [u8; 4] = node.data[0..4].try_into().unwrap();
+            channeldata.config.nameservers.push(Ipv4Addr::from(oct4).to_string());
+        }
+        head = unsafe { (*head).next };
+    }
 }
