@@ -89,7 +89,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     channeldata.tasks.push(task);
 }
 
-type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
+pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 
 #[unsafe(no_mangle)]
 #[allow(clippy::missing_safety_doc)]

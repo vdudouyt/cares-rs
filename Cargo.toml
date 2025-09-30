@@ -8,5 +8,12 @@ bytes = "1.10.1"
 libc = "0.2.175"
 rand = "0.8.0"
 
+[dev-dependencies]
+libloading = "0.8.9"
+
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bench]]
+name = "req100k"
+harness = false
