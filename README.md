@@ -1,4 +1,4 @@
-![build-and-test](https://github.com/vdudouyt/cares-rs/actions/workflows/cargo-test.yaml/badge.svg)
+![build-and-test](https://github.com/vdudouyt/cares-rs/actions/workflows/cargo-test.yaml/badge.svg) ![build-and-test](https://github.com/vdudouyt/cares-rs/actions/workflows/benchmarks.yaml/badge.svg)
 
 ## Synopsis
 

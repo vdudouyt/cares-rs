@@ -1,0 +1,7 @@
+options {
+	directory "/var/cache/bind";
+	listen-on-v6 { any; };
+	recursion no;         // do not query upstream DNS
+	allow-query { any; }; // allow local queries
+	forwarders {};        // no forwarders
+};
