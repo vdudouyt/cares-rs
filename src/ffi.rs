@@ -19,6 +19,10 @@ pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
     ARES_SUCCESS
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn ares_library_cleanup() {
+}
+
 pub type Channel = *mut ChannelData;
 
 #[derive(PartialEq)]
