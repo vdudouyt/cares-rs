@@ -98,29 +98,30 @@ pub unsafe extern "C" fn ares_timeout(_channel: Channel, _maxtv: *mut libc::time
 }
 
 fn build_hostent(buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
+    let mut addr_list: Vec<*const u8> = vec![];
     for answer in &result.answers {
-        let mut name = answer.name.name.clone();
-        if let Some(offset) = answer.name.offset {
-            let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
-            name.append(&mut label.name);
-        }
-        let name = name.join(".");
-        /* construct hostent */
-        let name = CString::new(name).unwrap();
-        let aliases_vec: Vec<*mut c_char> = vec![std::ptr::null_mut()];
-        let aliases: Box<[*mut c_char]> = aliases_vec.into_boxed_slice();
-        let addr_ptr = answer.data.as_ptr();
-        let addr_list = [ addr_ptr, std::ptr::null_mut() ];
-
-        let mut hostent = libc::hostent {
-            h_name: name.as_ptr() as *mut c_char,
-            h_aliases: aliases.as_ptr() as *mut *mut c_char,
-            h_addrtype: libc::AF_INET,
-            h_length: answer.data.len() as c_int,
-            h_addr_list: addr_list.as_ptr() as *mut *mut c_char,
-        };
-        unsafe { (ffidata.callback)(ffidata.arg, ARES_SUCCESS, 0, &mut hostent) };
+        addr_list.push(answer.data.as_ptr());
     }
+    addr_list.push(std::ptr::null());
+
+    let Some(answer) = result.answers.first() else { return };
+    let mut name = answer.name.name.clone();
+    if let Some(offset) = answer.name.offset {
+        let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
+        name.append(&mut label.name);
+    }
+    let name = name.join(".");
+    let name = CString::new(name).unwrap();
+
+    let aliases: Vec<*mut c_char> = vec![std::ptr::null_mut()];
+    let mut hostent = libc::hostent {
+        h_name: name.as_ptr() as *mut c_char,
+        h_aliases: aliases.as_ptr() as *mut *mut c_char,
+        h_addrtype: libc::AF_INET,
+        h_length: answer.data.len() as c_int,
+        h_addr_list: addr_list.as_ptr() as *mut *mut c_char,
+    };
+    unsafe { (ffidata.callback)(ffidata.arg, ARES_SUCCESS, 0, &mut hostent) };
 }
 
 #[unsafe(no_mangle)]
