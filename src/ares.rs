@@ -61,6 +61,6 @@ pub struct Task<T> {
 }
 
 pub fn build_sysconfig() -> SysConfig {
-    let try_resolv_conf = || Some(std::fs::read_to_string("/etc/resolv.conf").ok()?.parse::<SysConfig>().ok()?);
-    try_resolv_conf().unwrap_or_else(|| SysConfig::default())
+    let try_resolv_conf = || std::fs::read_to_string("/etc/resolv.conf").ok()?.parse::<SysConfig>().ok();
+    try_resolv_conf().unwrap_or_else(SysConfig::default)
 }
