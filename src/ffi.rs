@@ -9,6 +9,9 @@ use std::net::Ipv4Addr;
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
 pub const ARES_EFORMERR: i32 = 2;
+pub const ARES_ESERVFAIL: i32 = 3;
+pub const ARES_ENOTFOUND: i32 = 4;
+
 pub const ARES_LIB_INIT_ALL: i32 = 1;
 
 #[unsafe(no_mangle)]
@@ -98,6 +101,15 @@ pub unsafe extern "C" fn ares_timeout(_channel: Channel, _maxtv: *mut libc::time
 }
 
 fn build_hostent(buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
+    let reply_code = result.flags & 0x0f;
+    if reply_code > 0 {
+        let status = match reply_code {
+            3 => ARES_ENOTFOUND,
+            _ => ARES_ESERVFAIL,
+        };
+        return unsafe { (ffidata.callback)(ffidata.arg, status, 0, std::ptr::null_mut()) };
+    }
+
     let mut addr_list: Vec<*const u8> = vec![];
     for answer in &result.answers {
         addr_list.push(answer.data.as_ptr());

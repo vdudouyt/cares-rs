@@ -29,6 +29,7 @@ impl<T> Ares<T> {
         };
         let request = DnsFrame {
             transaction_id: rand::thread_rng().r#gen::<u16>(),
+            flags: 0x100,
             queries: vec![query],
             answers: vec![],
         };

@@ -132,6 +132,7 @@ impl DnsAnswer {
 #[derive(Debug, PartialEq)]
 pub struct DnsFrame {
     pub transaction_id: u16,
+    pub flags: u16,
     pub queries: Vec<DnsQuery>,
     pub answers: Vec<DnsAnswer>,
     // pub authority_responses: Vec<DnsAuthorityResponse>
@@ -149,12 +150,12 @@ impl DnsFrame {
         for _ in 0..header.ancount {
             answers.push(DnsAnswer::parse(buf)?);
         }
-        Some(DnsFrame { transaction_id: header.transaction_id, queries, answers })
+        Some(DnsFrame { transaction_id: header.transaction_id, flags: header.flags, queries, answers })
     }
     pub fn write<B: BufMut>(&self, b: &mut B) {
         let header = DnsHeader {
             transaction_id: self.transaction_id,
-            flags: 0x100,
+            flags: self.flags,
             qdcount: self.queries.len() as u16,
             ancount: 0,
             nscount: 0,
@@ -264,6 +265,7 @@ mod tests {
         };
         let expected = DnsFrame {
             transaction_id: 0x8a70,
+            flags: 0x8180,
             queries: vec![query],
             answers: vec![answer],
         };
@@ -274,6 +276,7 @@ mod tests {
         let query = DnsQuery::new("google.com", 1, 1);
         let frame = DnsFrame {
             transaction_id: 0x8a70,
+            flags: 0x100,
             queries: vec![query],
             answers: vec![],
         };
