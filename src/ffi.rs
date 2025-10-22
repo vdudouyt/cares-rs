@@ -11,6 +11,7 @@ pub const ARES_ENODATA: i32 = 1;
 pub const ARES_EFORMERR: i32 = 2;
 pub const ARES_ESERVFAIL: i32 = 3;
 pub const ARES_ENOTFOUND: i32 = 4;
+pub const ARES_ETIMEOUT: i32 = 12;
 
 pub const ARES_LIB_INIT_ALL: i32 = 1;
 
@@ -91,11 +92,12 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
 
 #[unsafe(no_mangle)]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_timeout(_channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
-    // we do not have any retransmission support yet
+pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
+    let channeldata = unsafe { &mut *channel };
+    let max_wait_time = channeldata.ares.max_wait_time().as_millis();
     unsafe {
-        (*tv).tv_sec = 3;
-        (*tv).tv_usec = 0;
+        (*tv).tv_sec = (max_wait_time / 1000) as i64;
+        (*tv).tv_usec = 1000 * (max_wait_time % 1000) as i64;
     };
     tv
 }
@@ -140,6 +142,15 @@ fn build_hostent(buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     let channeldata = unsafe { &mut *channel };
+    for task in &mut channeldata.ares.tasks {
+        if task.is_expired() {
+            let ffidata = &task.userdata;
+            unsafe { (ffidata.callback)(ffidata.arg, ARES_ETIMEOUT, 0, std::ptr::null_mut()) };
+            task.status = Status::Completed;
+        }
+    }
+    channeldata.ares.remove_completed();
+
     let mut tasks = std::mem::take(&mut channeldata.ares.tasks);
     for task in &mut tasks {
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), write_fds) } {

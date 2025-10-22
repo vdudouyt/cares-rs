@@ -12,7 +12,7 @@ pub struct SysConfig {
 pub struct SysConfigOptions {
     pub ndots: u32,
     pub attempts: u32,
-    pub timeout_secs: u64,
+    pub timeout_secs: u32,
     pub use_vc: bool,
     pub rotate: bool,
     pub inet6: bool,

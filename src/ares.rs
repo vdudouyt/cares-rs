@@ -2,6 +2,7 @@ use std::net::UdpSocket;
 use bytes::BytesMut;
 use std::io::Cursor;
 use rand::Rng;
+use std::time::{ Instant, Duration };
 
 use crate::sysconfig::SysConfig;
 use crate::packets::*;
@@ -33,7 +34,8 @@ impl<T> Ares<T> {
             queries: vec![query],
             answers: vec![],
         };
-        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::new(), userdata };
+        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::new(), userdata, expires_at };
         request.write(&mut task.writebuf);
         self.tasks.push(task);
     }
@@ -50,6 +52,12 @@ impl<T> Ares<T> {
         let frame = DnsFrame::parse(&mut Cursor::new(&buf[0..len]))?;
         Some((buf, frame))
     }
+    pub fn max_wait_time(&self) -> Duration {
+        self.tasks.iter().map(Task::time_remaining).min().unwrap()
+    }
+    pub fn remove_completed(&mut self) {
+        self.tasks.retain(|task| !task.is_expired());
+    }
 }
 
 #[derive(PartialEq)]
@@ -60,6 +68,16 @@ pub struct Task<T> {
     pub sock: UdpSocket,
     pub writebuf: BytesMut,
     pub userdata: T,
+    pub expires_at: Instant,
+}
+
+impl<T> Task<T> {
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+    pub fn time_remaining(&self) -> Duration {
+        self.expires_at.saturating_duration_since(Instant::now())
+    }
 }
 
 pub fn build_sysconfig() -> SysConfig {
