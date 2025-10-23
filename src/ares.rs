@@ -13,6 +13,9 @@ pub struct Ares<T> {
     pub tasks: Vec<Task<T>>,
 }
 
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub enum Family { Ipv4, Ipv6 }
+
 impl<T> Ares<T> {
     pub fn new(config: SysConfig) -> Self {
         Ares { config, tasks: vec![] }
@@ -20,12 +23,16 @@ impl<T> Ares<T> {
     pub fn from_sysconfig() -> Self {
         Ares::new(build_sysconfig())
     }
-    pub fn gethostbyname(&mut self, hostname: &str, userdata: T) {
+    pub fn gethostbyname(&mut self, hostname: &str, family: Family, userdata: T) {
+        let qtype = match family {
+            Family::Ipv4 => 0x01, // A
+            Family::Ipv6 => 0x1c, // AAAA
+        };
         let sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
         let _ = sock.set_nonblocking(true);
         let query = DnsQuery {
             name: hostname.split(".").map(str::to_owned).collect(),
-            qtype: 1,
+            qtype,
             qclass: 1,
         };
         let request = DnsFrame {

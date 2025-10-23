@@ -3,7 +3,7 @@ use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
 use std::io::Cursor;
 use crate::packets::*;
-use crate::ares::{ Ares, Status };
+use crate::ares::{ Ares, Status, Family };
 use std::net::Ipv4Addr;
 
 pub const ARES_SUCCESS: i32 = 0;
@@ -61,11 +61,16 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 
 #[unsafe(no_mangle)]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, _family: c_int, callback: AresHostCallback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
+    let family = match family {
+        libc::AF_INET => Family::Ipv4,
+        libc::AF_INET6 => Family::Ipv6,
+        _ => panic!("unexpected family value: {}", family),
+    };
     let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
     let ffidata = FFIData { callback, arg };
-    channeldata.ares.gethostbyname(&hostname, ffidata);
+    channeldata.ares.gethostbyname(&hostname, family, ffidata);
 }
 
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
@@ -128,10 +133,15 @@ fn build_hostent(buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
     let name = CString::new(name).unwrap();
 
     let aliases: Vec<*mut c_char> = vec![std::ptr::null_mut()];
+    let h_addrtype = match answer.record_type {
+        0x01 => libc::AF_INET,
+        0x1c => libc::AF_INET6,
+        _ => panic!("Unexpected DNS record type in answer: {}", answer.record_type),
+    };
     let mut hostent = libc::hostent {
         h_name: name.as_ptr() as *mut c_char,
         h_aliases: aliases.as_ptr() as *mut *mut c_char,
-        h_addrtype: libc::AF_INET,
+        h_addrtype,
         h_length: answer.data.len() as c_int,
         h_addr_list: addr_list.as_ptr() as *mut *mut c_char,
     };
