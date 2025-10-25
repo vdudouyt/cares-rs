@@ -107,11 +107,13 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
 #[derive(Debug)]
 pub enum AresDataType {
     MxReply,
+    TxtReply,
 }
 
 #[repr(C)]
 pub union AresDataUnion {
     mxreply: std::mem::ManuallyDrop<AresMxReply>,
+    txtreply: std::mem::ManuallyDrop<AresTxtReply>,
 }
 
 #[repr(C)]
@@ -127,9 +129,25 @@ pub struct AresMxReply {
     priority: c_ushort,
 }
 
+#[repr(C)]
+pub struct AresTxtReply {
+    next: *mut AresTxtReply,
+    txt: *const c_char,
+    length: usize, // null termination excluded
+}
+
 impl Drop for AresMxReply {
     fn drop(&mut self) {
         drop(unsafe { CString::from_raw(self.host as *mut c_char) });
+        if !self.next.is_null() {
+            drop(unsafe { Box::from_raw(self.next) })
+        }
+    }
+}
+
+impl Drop for AresTxtReply {
+    fn drop(&mut self) {
+        drop(unsafe { CString::from_raw(self.txt as *mut c_char) });
         if !self.next.is_null() {
             drop(unsafe { Box::from_raw(self.next) })
         }
@@ -140,10 +158,12 @@ impl Drop for AresMxReply {
 pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
-    let mut res = Box::into_raw(Box::new(AresMxReply { next: std::ptr::null_mut(), host: std::ptr::null_mut(), priority: 0 }));
+    let mut head = Box::into_raw(Box::new(AresMxReply { next: std::ptr::null_mut(), host: std::ptr::null_mut(), priority: 0 }));
+    let mut res = head;
     for answer in &frame.answers {
         if !unsafe { (*res).host.is_null() } {
-            res = Box::into_raw(Box::new(AresMxReply { next: res, host: std::ptr::null_mut(), priority: 0 }));
+            (*res).next = Box::into_raw(Box::new(AresMxReply { next: res, host: std::ptr::null_mut(), priority: 0 }));
+            res = (*res).next;
         }
         let mxreply = MxReply::parse(&mut Cursor::new(&answer.data)).unwrap();
         let mut name = mxreply.label.name.clone();
@@ -159,11 +179,38 @@ pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: 
             (*res).priority = mxreply.priority;
         }
     }
-    let mx = unsafe { *Box::from_raw(res) };
+    let mx = unsafe { *Box::from_raw(head) };
     let data = AresDataUnion { mxreply: ManuallyDrop::new(mx) };
     let aresdata = AresData { data_type: AresDataType::MxReply, data };
     let aresdata = Box::into_raw(Box::new(aresdata));
     unsafe { *out = &mut *(*aresdata).data.mxreply };
+    ARES_SUCCESS
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
+    let mut head = Box::into_raw(Box::new(AresTxtReply { next: std::ptr::null_mut(), txt: std::ptr::null_mut(), length: 0 }));
+    let mut res = head;
+    for answer in &frame.answers {
+        if !unsafe { (*res).txt.is_null() } {
+            (*res).next = Box::into_raw(Box::new(AresTxtReply { next: std::ptr::null_mut(), txt: std::ptr::null_mut(), length: 0 }));
+            res = (*res).next;
+        }
+        let txtreply = TxtReply::parse(&mut Cursor::new(&answer.data)).unwrap();
+        let length = txtreply.txt.len();
+        let txt = CString::new(txtreply.txt).unwrap().into_raw();
+        unsafe {
+            (*res).txt = txt;
+            (*res).length = length;
+        }
+    }
+    let txt = unsafe { *Box::from_raw(head) };
+    let data = AresDataUnion { txtreply: ManuallyDrop::new(txt) };
+    let aresdata = AresData { data_type: AresDataType::TxtReply, data };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut *(*aresdata).data.txtreply };
     ARES_SUCCESS
 }
 
@@ -173,6 +220,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     let mut aresdata = unsafe { Box::from_raw(aresdata) };
     match aresdata.data_type {
         AresDataType::MxReply => unsafe { ManuallyDrop::drop(&mut aresdata.data.mxreply) },
+        AresDataType::TxtReply => unsafe { ManuallyDrop::drop(&mut aresdata.data.txtreply) },
     }
 }
 

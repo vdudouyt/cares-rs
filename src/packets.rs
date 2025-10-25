@@ -182,6 +182,21 @@ impl MxReply {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct TxtReply {
+    pub txt: String,
+    pub length: u8,
+}
+
+impl TxtReply {
+    pub fn parse<B: Buf>(buf: &mut B) -> Option<TxtReply> {
+        let length = buf.try_get_u8().ok()?;
+        let txt_slice = buf.copy_to_bytes(std::cmp::min(length as usize, buf.remaining()));
+        let txt = String::from_utf8_lossy(&txt_slice).to_string();
+        Some(TxtReply { txt, length })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +319,12 @@ mod tests {
         let mut cur = Cursor::new(&buf);
         let expected = MxReply { priority: 20, label: DnsLabel::new(&["smtpin2"], Some(0x0c)) };
         assert_eq!(MxReply::parse(&mut cur), Some(expected));
+    }
+    #[test]
+    fn test_parse_txt_response() {
+        let buf: Vec<u8> = b"\x04abcd".to_vec();
+        let mut cur = Cursor::new(&buf);
+        let expected = TxtReply { length: 4, txt: "abcd".to_string() };
+        assert_eq!(TxtReply::parse(&mut cur), Some(expected));
     }
 }
