@@ -1,10 +1,11 @@
-use std::os::raw::{ c_int, c_void, c_char };
+use std::os::raw::{ c_int, c_void, c_char, c_ushort };
 use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
 use std::io::Cursor;
 use crate::packets::*;
 use crate::ares::{ Ares, Status, Family };
 use std::net::Ipv4Addr;
+use std::mem::{ ManuallyDrop, offset_of };
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -31,8 +32,29 @@ pub struct ChannelData {
 }
 
 #[derive(Debug)]
+enum Callback {
+    AresHostCallback(AresHostCallback),
+    AresCallback(AresCallback),
+}
+
+impl Callback {
+    fn run(&self, buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
+        match self {
+            Self::AresHostCallback(callback) => run_ares_host_callback(buf, result, *callback, ffidata.arg),
+            Self::AresCallback(callback) => run_ares_callback(buf, result, *callback, ffidata.arg),
+        }
+    }
+    fn run_error(&self, status: i32, arg: *mut c_void) {
+        match self {
+            Self::AresHostCallback(callback) => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
+            Self::AresCallback(callback) => unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) },
+        }
+    }
+}
+
+#[derive(Debug)]
 struct FFIData {
-    callback: AresHostCallback,
+    callback: Callback,
     arg: *mut c_void,
 }
 
@@ -69,11 +91,93 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         _ => panic!("unexpected family value: {}", family),
     };
     let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
-    let ffidata = FFIData { callback, arg };
+    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg };
     channeldata.ares.gethostbyname(&hostname, family, ffidata);
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
+    let channeldata = unsafe { &mut *channel };
+    let name = unsafe { CStr::from_ptr(name).to_string_lossy() };
+    let ffidata = FFIData { callback: Callback::AresCallback(callback), arg };
+    channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub enum AresDataType {
+    MxReply,
+}
+
+#[repr(C)]
+pub union AresDataUnion {
+    mxreply: std::mem::ManuallyDrop<AresMxReply>,
+}
+
+#[repr(C)]
+struct AresData {
+    data_type: AresDataType,
+    data: AresDataUnion,
+}
+
+#[repr(C)]
+pub struct AresMxReply {
+    next: *mut AresMxReply,
+    host: *const c_char,
+    priority: c_ushort,
+}
+
+impl Drop for AresMxReply {
+    fn drop(&mut self) {
+        drop(unsafe { CString::from_raw(self.host as *mut c_char) });
+        if !self.next.is_null() {
+            drop(unsafe { Box::from_raw(self.next) })
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
+    let mut res = Box::into_raw(Box::new(AresMxReply { next: std::ptr::null_mut(), host: std::ptr::null_mut(), priority: 0 }));
+    for answer in &frame.answers {
+        if !unsafe { (*res).host.is_null() } {
+            res = Box::into_raw(Box::new(AresMxReply { next: res, host: std::ptr::null_mut(), priority: 0 }));
+        }
+        let mxreply = MxReply::parse(&mut Cursor::new(&answer.data)).unwrap();
+        let mut name = mxreply.label.name.clone();
+        if let Some(offset) = mxreply.label.offset {
+            let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
+            name.append(&mut label.name);
+        }
+        let name = name.join(".");
+        let name = CString::new(name).unwrap();
+        let raw_ptr = name.into_raw();
+        unsafe {
+            (*res).host = raw_ptr;
+            (*res).priority = mxreply.priority;
+        }
+    }
+    let mx = unsafe { *Box::from_raw(res) };
+    let data = AresDataUnion { mxreply: ManuallyDrop::new(mx) };
+    let aresdata = AresData { data_type: AresDataType::MxReply, data };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut *(*aresdata).data.mxreply };
+    ARES_SUCCESS
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
+    let aresdata = unsafe { dataptr.byte_sub(offset_of!(AresData, data)) as *mut AresData };
+    let mut aresdata = unsafe { Box::from_raw(aresdata) };
+    match aresdata.data_type {
+        AresDataType::MxReply => unsafe { ManuallyDrop::drop(&mut aresdata.data.mxreply) },
+    }
+}
+
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
+pub type AresCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int);
 
 #[unsafe(no_mangle)]
 #[allow(clippy::missing_safety_doc)]
@@ -107,14 +211,14 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timev
     tv
 }
 
-fn build_hostent(buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
+fn run_ares_host_callback(buf: Vec<u8>, result: DnsFrame, callback: AresHostCallback, arg: *mut c_void) {
     let reply_code = result.flags & 0x0f;
     if reply_code > 0 {
         let status = match reply_code {
             3 => ARES_ENOTFOUND,
             _ => ARES_ESERVFAIL,
         };
-        return unsafe { (ffidata.callback)(ffidata.arg, status, 0, std::ptr::null_mut()) };
+        return unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
     }
 
     let mut addr_list: Vec<*const u8> = vec![];
@@ -145,7 +249,11 @@ fn build_hostent(buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
         h_length: answer.data.len() as c_int,
         h_addr_list: addr_list.as_ptr() as *mut *mut c_char,
     };
-    unsafe { (ffidata.callback)(ffidata.arg, ARES_SUCCESS, 0, &mut hostent) };
+    unsafe { callback(arg, ARES_SUCCESS, 0, &mut hostent) };
+}
+
+fn run_ares_callback(buf: Vec<u8>, _result: DnsFrame, callback: AresCallback, arg: *mut c_void) {
+    unsafe { callback(arg, ARES_SUCCESS, 0, buf.as_ptr() as *mut u8, buf.len() as i32) };
 }
 
 #[unsafe(no_mangle)]
@@ -155,7 +263,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
     for task in &mut channeldata.ares.tasks {
         if task.is_expired() {
             let ffidata = &task.userdata;
-            unsafe { (ffidata.callback)(ffidata.arg, ARES_ETIMEOUT, 0, std::ptr::null_mut()) };
+            (ffidata.callback).run_error(ARES_ETIMEOUT, ffidata.arg);
             task.status = Status::Completed;
         }
     }
@@ -168,7 +276,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
         }
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), read_fds) } {
             if let Some((buf, frame)) = channeldata.ares.read_impl(task) {
-                build_hostent(buf, frame, &task.userdata);
+                (task.userdata.callback).run(buf, frame, &task.userdata);
             }
         }
     }

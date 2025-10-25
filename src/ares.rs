@@ -46,6 +46,25 @@ impl<T> Ares<T> {
         request.write(&mut task.writebuf);
         self.tasks.push(task);
     }
+    pub fn query(&mut self, name: &str, dnsclass: u16, dnstype: u16, userdata: T) {
+        let sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        let _ = sock.set_nonblocking(true);
+        let query = DnsQuery {
+            name: name.split(".").map(str::to_owned).collect(),
+            qtype: dnstype,
+            qclass: dnsclass,
+        };
+        let request = DnsFrame {
+            transaction_id: rand::thread_rng().r#gen::<u16>(),
+            flags: 0x100,
+            queries: vec![query],
+            answers: vec![],
+        };
+        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::new(), userdata, expires_at };
+        request.write(&mut task.writebuf);
+        self.tasks.push(task);
+    }
     pub fn write_impl(&mut self, task: &mut Task<T>) {
         let nameserver = self.config.nameservers.first().unwrap().as_str();
         let _len = task.sock.send_to(&task.writebuf, (nameserver, 53)).unwrap();

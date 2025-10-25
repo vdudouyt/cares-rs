@@ -168,6 +168,20 @@ impl DnsFrame {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct MxReply {
+    pub priority: u16,
+    pub label: DnsLabel,
+}
+
+impl MxReply {
+    pub fn parse<B: Buf>(buf: &mut B) -> Option<MxReply> {
+        let priority = buf.try_get_u16().ok()?;
+        let label = DnsLabel::parse(buf)?;
+        Some(MxReply { priority, label })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +297,12 @@ mod tests {
         let mut vec: Vec<u8> = vec![];
         frame.write(&mut vec);
         assert_eq!(&vec[..], b"\x8a\x70\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06\x67\x6f\x6f\x67\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01");
+    }
+    #[test]
+    fn test_parse_mx_response() {
+        let buf: Vec<u8> = b"\x00\x14\x07\x73\x6d\x74\x70\x69\x6e\x32\xc0\x0c".to_vec();
+        let mut cur = Cursor::new(&buf);
+        let expected = MxReply { priority: 20, label: DnsLabel::new(&["smtpin2"], Some(0x0c)) };
+        assert_eq!(MxReply::parse(&mut cur), Some(expected));
     }
 }
