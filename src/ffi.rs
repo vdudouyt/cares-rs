@@ -215,6 +215,63 @@ pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out:
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
+    println!("ares_parse_ns_reply: {:?}", frame);
+
+    let Some(answer) = frame.answers.first() else { return ARES_ENODATA };
+    let mut name = answer.name.name.clone();
+    if let Some(offset) = answer.name.offset {
+        let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
+        name.append(&mut label.name);
+    }
+    let name = name.join(".");
+    let name = CString::new(name).unwrap();
+
+    let mut aliases: Vec<*mut c_char> = vec![];
+    for answer in &frame.answers {
+        let mut label = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
+        println!("label = {:?}", label);
+        let mut name = label.name.clone();
+        if let Some(offset) = label.offset {
+            let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
+            name.append(&mut label.name);
+        }
+        let nameserver = name.join(".");
+        println!("nameserver = {}", nameserver);
+        let nameserver = CString::new(nameserver).unwrap();
+        aliases.push(nameserver.into_raw());
+    }
+    aliases.push(std::ptr::null_mut());
+    let aliases_ptr = libc::calloc(aliases.len() + 1, std::mem::size_of::<*mut c_char>()) as *mut *mut c_char;
+    std::ptr::copy_nonoverlapping(aliases.as_ptr(), aliases_ptr, aliases.len() + 1);
+
+    let addr_list: Vec<*mut c_char> = vec![std::ptr::null_mut()];
+    let addr_list_ptr = libc::calloc(addr_list.len() + 1, std::mem::size_of::<*mut c_char>()) as *mut *mut c_char;
+
+    let mut hostent = libc::hostent {
+        h_name: name.into_raw(),
+        h_aliases: aliases_ptr,
+        h_addrtype: 0,
+        h_length: answer.data.len() as c_int,
+        h_addr_list: addr_list_ptr,
+    };
+    let hostent = Box::into_raw(Box::new(hostent));
+    unsafe { *out = hostent };
+
+    ARES_SUCCESS
+}
+
+static ARES_ERROR: &[u8] = b"ares error\0";
+static ARES_ERROR_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(ARES_ERROR) };
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_strerror(code: c_int) -> *const i8 {
+    ARES_ERROR_CSTR.as_ptr()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     let aresdata = unsafe { dataptr.byte_sub(offset_of!(AresData, data)) as *mut AresData };
     let mut aresdata = unsafe { Box::from_raw(aresdata) };
@@ -222,6 +279,26 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
         AresDataType::MxReply => unsafe { ManuallyDrop::drop(&mut aresdata.data.mxreply) },
         AresDataType::TxtReply => unsafe { ManuallyDrop::drop(&mut aresdata.data.txtreply) },
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
+    let mut hostent = Box::from_raw(hostent);
+    CString::from_raw((*hostent).h_name);
+
+    let mut ptr: *mut *mut c_char = hostent.h_aliases;
+    while !(*ptr).is_null() {
+        CString::from_raw(*ptr);
+        ptr = ptr.add(1);
+    }
+    libc::free(hostent.h_aliases as *mut c_void);
+
+    let mut ptr: *mut *mut c_char = hostent.h_addr_list;
+    while !(*ptr).is_null() {
+        CString::from_raw(*ptr);
+        ptr = ptr.add(1);
+    }
+    libc::free(hostent.h_addr_list as *mut c_void);
 }
 
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
