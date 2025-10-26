@@ -4,8 +4,8 @@ use std::io::Cursor;
 use rand::Rng;
 use std::time::{ Instant, Duration };
 
-use crate::sysconfig::SysConfig;
-use crate::packets::*;
+use crate::core::sysconfig::SysConfig;
+use crate::core::packets::*;
 
 /* TODO: reconcile ChannelData here */
 pub struct Ares<T> {

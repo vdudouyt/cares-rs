@@ -2,10 +2,10 @@ use std::os::raw::{ c_int, c_void, c_char, c_ushort };
 use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
 use std::io::Cursor;
-use crate::packets::*;
-use crate::ares::{ Ares, Status, Family };
 use std::net::Ipv4Addr;
 use std::mem::{ ManuallyDrop, offset_of };
+use crate::core::packets::*;
+use crate::core::ares::{ Ares, Status, Family };
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -218,7 +218,6 @@ pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out:
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
-    println!("ares_parse_ns_reply: {:?}", frame);
 
     let Some(answer) = frame.answers.first() else { return ARES_ENODATA };
     let mut name = answer.name.name.clone();
@@ -232,14 +231,12 @@ pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: 
     let mut aliases: Vec<*mut c_char> = vec![];
     for answer in &frame.answers {
         let mut label = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-        println!("label = {:?}", label);
         let mut name = label.name.clone();
         if let Some(offset) = label.offset {
             let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
             name.append(&mut label.name);
         }
         let nameserver = name.join(".");
-        println!("nameserver = {}", nameserver);
         let nameserver = CString::new(nameserver).unwrap();
         aliases.push(nameserver.into_raw());
     }
