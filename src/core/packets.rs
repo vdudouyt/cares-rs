@@ -104,6 +104,14 @@ impl DnsLabel {
         buf.advance(bytes_read);
         Some(DnsLabel { name, offset })
     }
+    pub fn build_string(&self, main_buf: &[u8]) -> Option<String> {
+        let mut name = self.name.clone();
+        if let Some(offset) = self.offset {
+            let mut label = DnsLabel::parse(&mut Cursor::new(&main_buf[offset as usize..]))?;
+            name.append(&mut label.name);
+        }
+        Some(name.join("."))
+    }
 }
 
 #[derive(Debug, PartialEq)]

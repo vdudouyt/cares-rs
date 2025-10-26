@@ -166,13 +166,7 @@ pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: 
             res = (*res).next;
         }
         let mxreply = MxReply::parse(&mut Cursor::new(&answer.data)).unwrap();
-        let mut name = mxreply.label.name.clone();
-        if let Some(offset) = mxreply.label.offset {
-            let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
-            name.append(&mut label.name);
-        }
-        let name = name.join(".");
-        let name = CString::new(name).unwrap();
+        let name = mxreply.label.build_cstring(&buf).unwrap();
         let raw_ptr = name.into_raw();
         unsafe {
             (*res).host = raw_ptr;
@@ -214,30 +208,24 @@ pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out:
     ARES_SUCCESS
 }
 
+impl DnsLabel {
+    pub fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
+        Some(CString::new(self.build_string(main_buf)?).ok()?)
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
 
     let Some(answer) = frame.answers.first() else { return ARES_ENODATA };
-    let mut name = answer.name.name.clone();
-    if let Some(offset) = answer.name.offset {
-        let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
-        name.append(&mut label.name);
-    }
-    let name = name.join(".");
-    let name = CString::new(name).unwrap();
+    let name = answer.name.build_cstring(&buf).unwrap();
 
     let mut aliases: Vec<*mut c_char> = vec![];
     for answer in &frame.answers {
         let mut label = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-        let mut name = label.name.clone();
-        if let Some(offset) = label.offset {
-            let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
-            name.append(&mut label.name);
-        }
-        let nameserver = name.join(".");
-        let nameserver = CString::new(nameserver).unwrap();
+        let nameserver = label.build_cstring(&buf).unwrap();
         aliases.push(nameserver.into_raw());
     }
     aliases.push(std::ptr::null_mut());
@@ -350,13 +338,7 @@ fn run_ares_host_callback(buf: Vec<u8>, result: DnsFrame, callback: AresHostCall
     addr_list.push(std::ptr::null());
 
     let Some(answer) = result.answers.first() else { return };
-    let mut name = answer.name.name.clone();
-    if let Some(offset) = answer.name.offset {
-        let mut label = DnsLabel::parse(&mut Cursor::new(&buf[offset as usize..])).unwrap();
-        name.append(&mut label.name);
-    }
-    let name = name.join(".");
-    let name = CString::new(name).unwrap();
+    let name = answer.name.build_cstring(&buf).unwrap();
 
     let aliases: Vec<*mut c_char> = vec![std::ptr::null_mut()];
     let h_addrtype = match answer.record_type {
