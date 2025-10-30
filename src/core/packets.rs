@@ -182,8 +182,12 @@ pub struct MxReply {
     pub label: DnsLabel,
 }
 
-impl MxReply {
-    pub fn parse<B: Buf>(buf: &mut B) -> Option<MxReply> {
+pub trait Parser {
+    fn parse<B: Buf>(buf: &mut B) -> Option<Self> where Self: Sized;
+}
+
+impl Parser for MxReply {
+    fn parse<B: Buf>(buf: &mut B) -> Option<MxReply> {
         let priority = buf.try_get_u16().ok()?;
         let label = DnsLabel::parse(buf)?;
         Some(MxReply { priority, label })
@@ -196,8 +200,8 @@ pub struct TxtReply {
     pub length: u8,
 }
 
-impl TxtReply {
-    pub fn parse<B: Buf>(buf: &mut B) -> Option<TxtReply> {
+impl Parser for TxtReply {
+    fn parse<B: Buf>(buf: &mut B) -> Option<TxtReply> {
         let length = buf.try_get_u8().ok()?;
         let txt_slice = buf.copy_to_bytes(std::cmp::min(length as usize, buf.remaining()));
         let txt = String::from_utf8_lossy(&txt_slice).to_string();

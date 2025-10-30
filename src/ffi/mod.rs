@@ -1,3 +1,5 @@
+mod ares_data;
+
 use std::os::raw::{ c_int, c_void, c_char, c_ushort };
 use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
@@ -6,6 +8,7 @@ use std::net::Ipv4Addr;
 use std::mem::{ ManuallyDrop, offset_of };
 use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
+use crate::ffi::ares_data::IntoAresData;
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -111,18 +114,13 @@ pub enum AresDataType {
 }
 
 #[repr(C)]
-pub union AresDataUnion {
-    mxreply: std::mem::ManuallyDrop<AresMxReply>,
-    txtreply: std::mem::ManuallyDrop<AresTxtReply>,
-}
-
-#[repr(C)]
-struct AresData {
+struct AresData<T> {
     data_type: AresDataType,
-    data: AresDataUnion,
+    data: T,
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct AresMxReply {
     next: *mut AresMxReply,
     host: *const c_char,
@@ -154,58 +152,61 @@ impl Drop for AresTxtReply {
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
+trait FFILinkedList {
+    fn next(&mut self) -> &mut *mut Self;
+}
+
+impl FFILinkedList for AresMxReply {
+    fn next(&mut self) -> &mut *mut Self { &mut self.next }
+}
+
+impl FFILinkedList for AresTxtReply {
+    fn next(&mut self) -> &mut *mut Self { &mut self.next }
+}
+
+fn chain_leaves<T>(mut elts: Vec<T>) -> T where T: FFILinkedList {
+    let mut tail = elts.pop().unwrap();
+    while let Some(mut x) = elts.pop() /* O(1) */ {
+        *(x.next()) = Box::into_raw(Box::new(tail));
+        tail = x
+    }
+    tail
+}
+
+trait DataType {
+    fn datatype() -> AresDataType;
+}
+
+impl DataType for AresMxReply {
+    fn datatype() -> AresDataType { AresDataType::MxReply }
+}
+
+impl DataType for AresTxtReply {
+    fn datatype() -> AresDataType { AresDataType::TxtReply }
+}
+
+pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2) -> c_int
+where T1: Parser + IntoAresData<T2>, T2: FFILinkedList + DataType
+{
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
-    let mut head = Box::into_raw(Box::new(AresMxReply { next: std::ptr::null_mut(), host: std::ptr::null_mut(), priority: 0 }));
-    let mut res = head;
-    for answer in &frame.answers {
-        if !unsafe { (*res).host.is_null() } {
-            (*res).next = Box::into_raw(Box::new(AresMxReply { next: res, host: std::ptr::null_mut(), priority: 0 }));
-            res = (*res).next;
-        }
-        let mxreply = MxReply::parse(&mut Cursor::new(&answer.data)).unwrap();
-        let name = mxreply.label.build_cstring(&buf).unwrap();
-        let raw_ptr = name.into_raw();
-        unsafe {
-            (*res).host = raw_ptr;
-            (*res).priority = mxreply.priority;
-        }
-    }
-    let mx = unsafe { *Box::from_raw(head) };
-    let data = AresDataUnion { mxreply: ManuallyDrop::new(mx) };
-    let aresdata = AresData { data_type: AresDataType::MxReply, data };
+    let replies: Vec<T1> = frame.answers.into_iter().map(|x| T1::parse(&mut Cursor::new(&x.data)).unwrap()).collect();
+    let aresreplies: Vec<_> = replies.into_iter().map(|x| x.into_ares_data(&buf)).collect();
+    let reply = chain_leaves(aresreplies);
+    let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
     let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut *(*aresdata).data.mxreply };
+    unsafe { *out = &mut (*aresdata).data };
     ARES_SUCCESS
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
+    ares_parse_data::<MxReply, AresMxReply>(abuf, alen, out)
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
-    let mut head = Box::into_raw(Box::new(AresTxtReply { next: std::ptr::null_mut(), txt: std::ptr::null_mut(), length: 0 }));
-    let mut res = head;
-    for answer in &frame.answers {
-        if !unsafe { (*res).txt.is_null() } {
-            (*res).next = Box::into_raw(Box::new(AresTxtReply { next: std::ptr::null_mut(), txt: std::ptr::null_mut(), length: 0 }));
-            res = (*res).next;
-        }
-        let txtreply = TxtReply::parse(&mut Cursor::new(&answer.data)).unwrap();
-        let length = txtreply.txt.len();
-        let txt = CString::new(txtreply.txt).unwrap().into_raw();
-        unsafe {
-            (*res).txt = txt;
-            (*res).length = length;
-        }
-    }
-    let txt = unsafe { *Box::from_raw(head) };
-    let data = AresDataUnion { txtreply: ManuallyDrop::new(txt) };
-    let aresdata = AresData { data_type: AresDataType::TxtReply, data };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut *(*aresdata).data.txtreply };
-    ARES_SUCCESS
+    ares_parse_data::<TxtReply, AresTxtReply>(abuf, alen, out)
 }
 
 impl DnsLabel {
@@ -258,11 +259,10 @@ pub unsafe extern "C" fn ares_strerror(code: c_int) -> *const i8 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
-    let aresdata = unsafe { dataptr.byte_sub(offset_of!(AresData, data)) as *mut AresData };
-    let mut aresdata = unsafe { Box::from_raw(aresdata) };
-    match aresdata.data_type {
-        AresDataType::MxReply => unsafe { ManuallyDrop::drop(&mut aresdata.data.mxreply) },
-        AresDataType::TxtReply => unsafe { ManuallyDrop::drop(&mut aresdata.data.txtreply) },
+    let aresdata = unsafe { dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data)) as *mut AresData<*mut c_void> };
+    match (*aresdata).data_type {
+        AresDataType::MxReply => unsafe { Box::from_raw(aresdata as *mut AresData<AresMxReply>); },
+        AresDataType::TxtReply => unsafe { Box::from_raw(aresdata as *mut AresData<AresTxtReply>); },
     }
 }
 
@@ -399,5 +399,39 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
             channeldata.ares.config.nameservers.push(Ipv4Addr::from(oct4).to_string());
         }
         head = unsafe { (*head).next };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyNode {
+        next: *mut DummyNode,
+        num: u8,
+    }
+
+    impl DummyNode {
+        fn new(num: u8) -> DummyNode {
+            DummyNode { next: std::ptr::null_mut(), num }
+        }
+    }
+
+    impl FFILinkedList for DummyNode {
+        fn next(&mut self) -> &mut *mut Self { &mut self.next }
+    }
+
+    #[test]
+    fn test_chain_leaves() {
+        let vec = vec![DummyNode::new(1), DummyNode::new(2), DummyNode::new(3)];
+        unsafe {
+            let head = chain_leaves(vec);
+            assert_eq!(head.num, 1);
+            let head = &*(head.next);
+            assert_eq!(head.num, 2);
+            let head = &*(head.next);
+            assert_eq!(head.num, 3);
+            assert_eq!(head.next, std::ptr::null_mut());
+        }
     }
 }
