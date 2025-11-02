@@ -304,29 +304,10 @@ fn run_ares_host_callback(buf: Vec<u8>, result: DnsFrame, callback: AresHostCall
         return unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
     }
 
-    let mut addr_list: Vec<*const u8> = vec![];
-    for answer in &result.answers {
-        addr_list.push(answer.data.as_ptr());
-    }
-    addr_list.push(std::ptr::null());
-
-    let Some(answer) = result.answers.first() else { return };
-    let name = answer.name.build_cstring(&buf).unwrap();
-
-    let aliases: Vec<*mut c_char> = vec![std::ptr::null_mut()];
-    let h_addrtype = match answer.record_type {
-        0x01 => libc::AF_INET,
-        0x1c => libc::AF_INET6,
-        _ => panic!("Unexpected DNS record type in answer: {}", answer.record_type),
-    };
-    let mut hostent = libc::hostent {
-        h_name: name.as_ptr() as *mut c_char,
-        h_aliases: aliases.as_ptr() as *mut *mut c_char,
-        h_addrtype,
-        h_length: answer.data.len() as c_int,
-        h_addr_list: addr_list.as_ptr() as *mut *mut c_char,
-    };
-    unsafe { callback(arg, ARES_SUCCESS, 0, &mut hostent) };
+    let mut hostent = unsafe { parse_hostent(buf.as_ptr(), buf.len() as i32, HostentParseMode::Addrs).unwrap() };
+    let mut hostent = Box::into_raw(Box::new(hostent));
+    unsafe { callback(arg, ARES_SUCCESS, 0, &mut *hostent) };
+    unsafe { ares_free_hostent(hostent) };
 }
 
 fn run_ares_callback(buf: Vec<u8>, _result: DnsFrame, callback: AresCallback, arg: *mut c_void) {
