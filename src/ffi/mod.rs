@@ -1,6 +1,7 @@
 mod ares_data;
 mod ares_hostent;
 mod null_terminated;
+mod cstr;
 
 use std::os::raw::{ c_int, c_void, c_char, c_ushort };
 use std::os::fd::{ AsRawFd };
@@ -12,6 +13,7 @@ use crate::core::packets::*;
 use crate::ffi::ares_hostent::*;
 use crate::core::ares::{ Ares, Status, Family };
 use crate::ffi::ares_data::IntoAresData;
+use crate::cstr;
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -235,12 +237,9 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
     ARES_SUCCESS
 }
 
-static ARES_ERROR: &[u8] = b"ares error\0";
-static ARES_ERROR_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(ARES_ERROR) };
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ares_strerror(_code: c_int) -> *const i8 {
-    ARES_ERROR_CSTR.as_ptr()
+    cstr!("ares error")
 }
 
 #[unsafe(no_mangle)]
@@ -360,11 +359,9 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
 #[allow(clippy::missing_safety_doc)]
 pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
     let (major, minor, patch) = (1, 17, 1);
-    static VERSION_STR: &[u8] = b"1.17.1-rs\0";
-
     let v = (major << 16) | (minor << 8) | patch;
     if !version.is_null() { unsafe { *version = v } }
-    VERSION_STR.as_ptr() as *const c_char
+    cstr!("1.17.1-rs")
 }
 
 #[cfg(test)]
