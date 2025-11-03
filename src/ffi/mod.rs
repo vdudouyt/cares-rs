@@ -356,6 +356,17 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
     }
 }
 
+#[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
+pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
+    let (major, minor, patch) = (1, 17, 1);
+    static VERSION_STR: &[u8] = b"1.17.1-rs\0";
+
+    let v = (major << 16) | (minor << 8) | patch;
+    if !version.is_null() { unsafe { *version = v } }
+    VERSION_STR.as_ptr() as *const c_char
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
