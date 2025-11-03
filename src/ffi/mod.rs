@@ -2,6 +2,7 @@ mod ares_data;
 mod ares_hostent;
 mod null_terminated;
 mod cstr;
+mod error;
 
 use std::os::raw::{ c_int, c_void, c_char, c_ushort };
 use std::os::fd::{ AsRawFd };
@@ -10,8 +11,9 @@ use std::io::Cursor;
 use std::net::Ipv4Addr;
 use std::mem::offset_of;
 use crate::core::packets::*;
-use crate::ffi::ares_hostent::*;
 use crate::core::ares::{ Ares, Status, Family };
+use crate::ffi::ares_hostent::*;
+use crate::ffi::error::*;
 use crate::ffi::ares_data::IntoAresData;
 use crate::cstr;
 
@@ -235,11 +237,6 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
     let hostent = Box::into_raw(Box::new(hostent));
     unsafe { *out = hostent };
     ARES_SUCCESS
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ares_strerror(_code: c_int) -> *const i8 {
-    cstr!("ares error")
 }
 
 #[unsafe(no_mangle)]
