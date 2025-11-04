@@ -1,8 +1,9 @@
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SysConfig {
-    pub nameservers: Vec<String>,
+    pub nameservers: Vec<SocketAddr>,
     pub domain: Option<String>,
     pub search: Vec<String>,
     pub options: SysConfigOptions,
@@ -49,7 +50,7 @@ impl FromStr for SysConfig {
             match keyword {
                 "nameserver" => {
                     for tok in rest {
-                        conf.nameservers.push(tok.to_string());
+                        conf.nameservers.push(parse_ns_addr(tok).unwrap());
                     }
                 }
                 "domain" => conf.domain = Some(arg1.to_string()),
@@ -92,6 +93,18 @@ fn take_num_arg<T: FromStr>(keyword: &str, val: &str) -> Result<T, ParseError> {
         _ => val.parse().map_err(|_| ParseError::InvalidNumber { keyword: keyword.into(), value: val.into() }),
     }
     
+}
+
+pub fn parse_ns_addr(s: &str) -> Option<SocketAddr> {
+    if let Ok(sa) = SocketAddr::from_str(s) {
+        return Some(sa);
+    }
+
+    if let Ok(ip) = IpAddr::from_str(s) {
+        return Some(SocketAddr::from((ip, 53)));
+    }
+
+    None
 }
 
 #[cfg(test)]

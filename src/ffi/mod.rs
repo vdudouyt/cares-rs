@@ -8,10 +8,11 @@ use std::os::raw::{ c_int, c_void, c_char, c_ushort };
 use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
 use std::io::Cursor;
-use std::net::Ipv4Addr;
+use std::net::{ Ipv4Addr, SocketAddr };
 use std::mem::offset_of;
 use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
+use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::error::*;
 use crate::ffi::ares_data::IntoAresData;
@@ -354,10 +355,19 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
         if unsafe { (*head).family } == libc::AF_INET {
             let node = unsafe { &(*head) };
             let oct4: [u8; 4] = node.data[0..4].try_into().unwrap();
-            channeldata.ares.config.nameservers.push(Ipv4Addr::from(oct4).to_string());
+            channeldata.ares.config.nameservers.push(SocketAddr::from((Ipv4Addr::from(oct4), 53)));
         }
         head = unsafe { (*head).next };
     }
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
+    let channeldata = unsafe { &mut *channel };
+    let mut cursor = Cursor::new(CStr::from_ptr(servers).to_str().unwrap());
+    channeldata.ares.config.nameservers = servers_csv::parse_from_reader(&mut cursor).unwrap();
+    ARES_SUCCESS
 }
 
 #[unsafe(no_mangle)]

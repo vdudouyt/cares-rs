@@ -66,8 +66,8 @@ impl<T> Ares<T> {
         self.tasks.push(task);
     }
     pub fn write_impl(&mut self, task: &mut Task<T>) {
-        let nameserver = self.config.nameservers.first().unwrap().as_str();
-        let _len = task.sock.send_to(&task.writebuf, (nameserver, 53)).unwrap();
+        let ns_addr = self.config.nameservers.first().unwrap();
+        let _len = task.sock.send_to(&task.writebuf, ns_addr).unwrap();
         task.status = Status::Reading;
     }
     pub fn read_impl(&mut self, task: &mut Task<T>) -> Option<(Vec<u8>, DnsFrame)> {
