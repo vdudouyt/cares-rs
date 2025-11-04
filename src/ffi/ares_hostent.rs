@@ -4,7 +4,8 @@ use crate::ffi::null_terminated;
 use crate::core::packets::*;
 use crate::{ ARES_ENODATA, ARES_EFORMERR };
 
-pub enum HostentParseMode { Addrs, Aliases }
+#[derive(PartialEq)]
+pub enum HostentParseMode { Addrs, Addrs4, Addrs6, Aliases }
 
 pub unsafe fn parse_hostent(abuf: *const u8, alen: c_int, mode: HostentParseMode) -> Result<libc::hostent, i32> {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
@@ -22,7 +23,13 @@ pub unsafe fn parse_hostent(abuf: *const u8, alen: c_int, mode: HostentParseMode
     let mut aliases: Vec<*mut i8> = vec![];
     let mut addr_list: Vec<*mut i8> = vec![];
     match mode {
-        HostentParseMode::Addrs => for answer in &frame.answers {
+        HostentParseMode::Addrs | HostentParseMode::Addrs4 | HostentParseMode::Addrs6 => for answer in &frame.answers {
+            if mode == HostentParseMode::Addrs4 && h_addrtype != libc::AF_INET {
+                continue;
+            }
+            if mode == HostentParseMode::Addrs6 && h_addrtype != libc::AF_INET6 {
+                continue;
+            }
             let expected_length = match h_addrtype {
                 libc::AF_INET => 4,
                 libc::AF_INET6 => 16,

@@ -233,7 +233,15 @@ pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs).unwrap() };
+    let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs4).unwrap() };
+    let hostent = Box::into_raw(Box::new(hostent));
+    unsafe { *out = hostent };
+    ARES_SUCCESS
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
+    let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs6).unwrap() };
     let hostent = Box::into_raw(Box::new(hostent));
     unsafe { *out = hostent };
     ARES_SUCCESS
