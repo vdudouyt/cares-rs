@@ -14,7 +14,6 @@ use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
-use crate::ffi::error::*;
 use crate::ffi::ares_data::IntoAresData;
 use crate::{ cstr, offset_of };
 
@@ -250,12 +249,10 @@ pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
-    unsafe {
-        let aresdata = dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data)) as *mut AresData<*mut c_void>;
-        match (*aresdata).data_type {
-            AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
-            AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
-        }
+    let aresdata = dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data)) as *mut AresData<*mut c_void>;
+    match (*aresdata).data_type {
+        AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
+        AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
     }
 }
 
@@ -309,8 +306,8 @@ fn run_ares_host_callback(buf: Vec<u8>, result: DnsFrame, callback: AresHostCall
         return unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
     }
 
-    let mut hostent = unsafe { parse_hostent(buf.as_ptr(), buf.len() as i32, HostentParseMode::Addrs).unwrap() };
-    let mut hostent = Box::into_raw(Box::new(hostent));
+    let hostent = unsafe { parse_hostent(buf.as_ptr(), buf.len() as i32, HostentParseMode::Addrs).unwrap() };
+    let hostent = Box::into_raw(Box::new(hostent));
     unsafe { callback(arg, ARES_SUCCESS, 0, &mut *hostent) };
     unsafe { ares_free_hostent(hostent) };
 }
