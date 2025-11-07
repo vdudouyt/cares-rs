@@ -3,20 +3,20 @@ mod ares_hostent;
 mod null_terminated;
 mod cstr;
 mod error;
+mod offset_of;
 
 use std::os::raw::{ c_int, c_void, c_char, c_ushort };
 use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
 use std::io::Cursor;
 use std::net::{ Ipv4Addr, SocketAddr };
-use std::mem::offset_of;
 use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::error::*;
 use crate::ffi::ares_data::IntoAresData;
-use crate::cstr;
+use crate::{ cstr, offset_of };
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -27,12 +27,12 @@ pub const ARES_ETIMEOUT: i32 = 12;
 
 pub const ARES_LIB_INIT_ALL: i32 = 1;
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
     ARES_SUCCESS
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub extern "C" fn ares_library_cleanup() {
 }
 
@@ -76,7 +76,7 @@ pub struct ares_addr_node {
     pub data: [u8; 16], // enough to hold IPv6
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     let ares = Ares::from_sysconfig();
@@ -86,13 +86,13 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     ARES_SUCCESS
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     unsafe { drop(Box::from_raw(channel)); }
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
@@ -106,7 +106,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     channeldata.ares.gethostbyname(&hostname, family, ffidata);
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let name = unsafe { CStr::from_ptr(name).to_string_lossy() };
@@ -207,12 +207,12 @@ where T1: Parser + IntoAresData<T2>, T2: FFILinkedList + DataType
     ARES_SUCCESS
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
     unsafe { ares_parse_data::<MxReply, AresMxReply>(abuf, alen, out) }
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
     unsafe { ares_parse_data::<TxtReply, AresTxtReply>(abuf, alen, out) }
 }
@@ -224,7 +224,7 @@ impl DnsLabel {
 }
 
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Aliases).unwrap() };
     let hostent = Box::into_raw(Box::new(hostent));
@@ -232,7 +232,7 @@ pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: 
     ARES_SUCCESS
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs4).unwrap() };
     let hostent = Box::into_raw(Box::new(hostent));
@@ -240,7 +240,7 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
     ARES_SUCCESS
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs6).unwrap() };
     let hostent = Box::into_raw(Box::new(hostent));
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out
     ARES_SUCCESS
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     unsafe {
         let aresdata = dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data)) as *mut AresData<*mut c_void>;
@@ -259,7 +259,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     }
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
     unsafe { free_hostent(hostent) };
 }
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 pub type AresCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int);
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
     let channeldata = unsafe { &mut *channel };
@@ -287,7 +287,7 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
     nfds
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
     let channeldata = unsafe { &mut *channel };
@@ -319,7 +319,7 @@ fn run_ares_callback(buf: Vec<u8>, _result: DnsFrame, callback: AresCallback, ar
     unsafe { callback(arg, ARES_SUCCESS, 0, buf.as_ptr() as *mut u8, buf.len() as i32) };
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     let channeldata = unsafe { &mut *channel };
@@ -346,7 +346,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
     channeldata.ares.tasks = tasks;
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) {
     let channeldata = unsafe { &mut *channel };
@@ -361,7 +361,7 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
     }
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
     let channeldata = unsafe { &mut *channel };
@@ -370,7 +370,7 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
     ARES_SUCCESS
 }
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
     let (major, minor, patch) = (1, 17, 1);

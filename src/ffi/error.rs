@@ -27,7 +27,7 @@ pub const ARES_ECANCELLED: c_int = 24;
 pub const ARES_ESERVICE: c_int = 25;
 pub const ARES_ENOSERVER: c_int = 26;
 
-#[unsafe(no_mangle)]
+#[no_mangle]
 pub extern "C" fn ares_strerror(code: c_int) -> *const c_char {
     match code {
         ARES_SUCCESS => cstr!("Successful completion"),
