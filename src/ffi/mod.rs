@@ -1,5 +1,6 @@
 mod ares_data;
 mod ares_hostent;
+mod ares_options;
 mod cnullterminated;
 mod cstr;
 mod clinkedlist;
