@@ -1,4 +1,4 @@
-use std::net::UdpSocket;
+use std::net::{ UdpSocket, SocketAddr };
 use bytes::BytesMut;
 use std::io::Cursor;
 use rand::Rng;
@@ -11,6 +11,8 @@ use crate::core::packets::*;
 pub struct Ares<T> {
     pub config: SysConfig,
     pub tasks: Vec<Task<T>>,
+    pub default_udp_port: u16,
+    pub default_tcp_port: u16,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -18,7 +20,7 @@ pub enum Family { Ipv4, Ipv6 }
 
 impl<T> Ares<T> {
     pub fn new(config: SysConfig) -> Self {
-        Ares { config, tasks: vec![] }
+        Ares { config, tasks: vec![], default_udp_port: 53, default_tcp_port: 53 }
     }
     pub fn from_sysconfig() -> Self {
         Ares::new(build_sysconfig())
@@ -67,7 +69,8 @@ impl<T> Ares<T> {
     }
     pub fn write_impl(&mut self, task: &mut Task<T>) {
         let ns_addr = self.config.nameservers.first().unwrap();
-        let _len = task.sock.send_to(&task.writebuf, ns_addr).unwrap();
+        let socket_addr = SocketAddr::from((ns_addr.0, ns_addr.1.unwrap_or(self.default_udp_port)));
+        let _len = task.sock.send_to(&task.writebuf, socket_addr).unwrap();
         task.status = Status::Reading;
     }
     pub fn read_impl(&mut self, task: &mut Task<T>) -> Option<(Vec<u8>, DnsFrame)> {

@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SysConfig {
-    pub nameservers: Vec<SocketAddr>,
+    pub nameservers: Vec<(IpAddr, Option<u16>)>,
     pub domain: Option<String>,
     pub search: Vec<String>,
     pub options: SysConfigOptions,
@@ -95,13 +95,13 @@ fn take_num_arg<T: FromStr>(keyword: &str, val: &str) -> Result<T, ParseError> {
     
 }
 
-pub fn parse_ns_addr(s: &str) -> Option<SocketAddr> {
+pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
     if let Ok(sa) = SocketAddr::from_str(s) {
-        return Some(sa);
+        return Some((sa.ip(), Some(sa.port())));
     }
 
     if let Ok(ip) = IpAddr::from_str(s) {
-        return Some(SocketAddr::from((ip, 53)));
+        return Some((ip, None))
     }
 
     None

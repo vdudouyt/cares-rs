@@ -3,7 +3,7 @@
 
 use libc::{in_addr};
 use crate::ffi::Channel;
-use std::net::{ Ipv4Addr, SocketAddr };
+use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void};
 use crate::ffi::error::*;
 
@@ -137,9 +137,15 @@ pub unsafe extern "C" fn ares_init_options(channel: Channel, options: *const are
     if optmask & ARES_OPT_SERVERS != 0 && !options.servers.is_null() {
         let servers = unsafe { std::slice::from_raw_parts(options.servers, options.nservers as usize) };
         for server in servers {
-            let ip = Ipv4Addr::from(u32::from_be(server.s_addr));
-            channeldata.ares.config.nameservers.push(SocketAddr::from((ip, 53)));
+            let ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(server.s_addr)));
+            channeldata.ares.config.nameservers.push((ip, None));
         }
+    }
+    if optmask & ARES_OPT_UDP_PORT != 0 {
+        channeldata.ares.default_udp_port = options.udp_port;
+    }
+    if optmask & ARES_OPT_TCP_PORT != 0 {
+        channeldata.ares.default_tcp_port = options.tcp_port;
     }
     ARES_SUCCESS
 }
