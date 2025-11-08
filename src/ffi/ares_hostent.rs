@@ -1,6 +1,6 @@
 use std::ffi::{ c_void, c_int, CString };
 use std::io::Cursor;
-use crate::ffi::null_terminated;
+use crate::ffi::cnullterminated;
 use crate::core::packets::*;
 use crate::{ ARES_ENODATA, ARES_EFORMERR };
 
@@ -51,10 +51,10 @@ pub unsafe fn parse_hostent(abuf: *const u8, alen: c_int, mode: HostentParseMode
 
     let ret = libc::hostent {
         h_name: name.into_raw(),
-        h_aliases: unsafe { null_terminated::from_vec(aliases) },
+        h_aliases: unsafe { cnullterminated::from_vec(aliases) },
         h_addrtype,
         h_length: answer.data.len() as i32,
-        h_addr_list:  unsafe { null_terminated::from_vec(addr_list) },
+        h_addr_list:  unsafe { cnullterminated::from_vec(addr_list) },
     };
     Ok(ret)
 }
@@ -63,9 +63,9 @@ pub unsafe fn free_hostent(hostent: *mut libc::hostent) {
     unsafe {
         let hostent = Box::from_raw(hostent);
         drop(CString::from_raw(hostent.h_name));
-        let vec = null_terminated::into_vec(hostent.h_aliases);
+        let vec = cnullterminated::into_vec(hostent.h_aliases);
         for v in vec { drop(CString::from_raw(v)); }
-        let vec = null_terminated::into_vec(hostent.h_addr_list);
+        let vec = cnullterminated::into_vec(hostent.h_addr_list);
         for v in vec { libc::free(v as *mut c_void) }
     }
 }

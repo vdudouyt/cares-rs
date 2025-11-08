@@ -1,6 +1,6 @@
 mod ares_data;
 mod ares_hostent;
-mod null_terminated;
+mod cnullterminated;
 mod cstr;
 mod error;
 mod offset_of;
