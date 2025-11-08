@@ -2,6 +2,7 @@ mod ares_data;
 mod ares_hostent;
 mod cnullterminated;
 mod cstr;
+mod clinkedlist;
 mod error;
 mod offset_of;
 
@@ -15,6 +16,7 @@ use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::IntoAresData;
+use crate::ffi::clinkedlist::*;
 use crate::{ cstr, offset_of };
 
 pub const ARES_SUCCESS: i32 = 0;
@@ -159,25 +161,12 @@ impl Drop for AresTxtReply {
     }
 }
 
-pub trait FFILinkedList {
-    fn next(&mut self) -> &mut *mut Self;
-}
-
-impl FFILinkedList for AresMxReply {
+impl CLinkedList for AresMxReply {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
-impl FFILinkedList for AresTxtReply {
+impl CLinkedList for AresTxtReply {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
-}
-
-fn chain_leaves<T>(mut elts: Vec<T>) -> T where T: FFILinkedList {
-    let mut tail = elts.pop().unwrap();
-    while let Some(mut x) = elts.pop() /* O(1) */ {
-        *(x.next()) = Box::into_raw(Box::new(tail));
-        tail = x
-    }
-    tail
 }
 
 pub trait DataType {
@@ -193,13 +182,13 @@ impl DataType for AresTxtReply {
 }
 
 pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2) -> c_int
-where T1: Parser + IntoAresData<T2>, T2: FFILinkedList + DataType
+where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
 {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
     let replies: Vec<T1> = frame.answers.into_iter().map(|x| T1::parse(&mut Cursor::new(&x.data)).unwrap()).collect();
     let aresreplies: Vec<_> = replies.into_iter().map(|x| x.into_ares_data(&buf)).collect();
-    let reply = chain_leaves(aresreplies);
+    let reply = clinkedlist::chain_nodes(aresreplies);
     let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
     let aresdata = Box::into_raw(Box::new(aresdata));
     unsafe { *out = &mut (*aresdata).data };
@@ -383,35 +372,6 @@ pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct DummyNode {
-        next: *mut DummyNode,
-        num: u8,
-    }
-
-    impl DummyNode {
-        fn new(num: u8) -> DummyNode {
-            DummyNode { next: std::ptr::null_mut(), num }
-        }
-    }
-
-    impl FFILinkedList for DummyNode {
-        fn next(&mut self) -> &mut *mut Self { &mut self.next }
-    }
-
-    #[test]
-    fn test_chain_leaves() {
-        let vec = vec![DummyNode::new(1), DummyNode::new(2), DummyNode::new(3)];
-        unsafe {
-            let head = chain_leaves(vec);
-            assert_eq!(head.num, 1);
-            let head = &*(head.next);
-            assert_eq!(head.num, 2);
-            let head = &*(head.next);
-            assert_eq!(head.num, 3);
-            assert_eq!(head.next, std::ptr::null_mut());
-        }
-    }
 
     impl Default for AresMxReply {
         fn default() -> Self {
