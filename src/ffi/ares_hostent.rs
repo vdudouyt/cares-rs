@@ -51,10 +51,10 @@ pub unsafe fn parse_hostent(abuf: *const u8, alen: c_int, mode: HostentParseMode
 
     let ret = libc::hostent {
         h_name: name.into_raw(),
-        h_aliases: unsafe { null_terminated::from_vec(aliases, std::ptr::null_mut()) },
+        h_aliases: unsafe { null_terminated::from_vec(aliases) },
         h_addrtype,
         h_length: answer.data.len() as i32,
-        h_addr_list:  unsafe { null_terminated::from_vec(addr_list, std::ptr::null_mut()) },
+        h_addr_list:  unsafe { null_terminated::from_vec(addr_list) },
     };
     Ok(ret)
 }
@@ -63,9 +63,9 @@ pub unsafe fn free_hostent(hostent: *mut libc::hostent) {
     unsafe {
         let hostent = Box::from_raw(hostent);
         drop(CString::from_raw(hostent.h_name));
-        let vec = null_terminated::into_vec(hostent.h_aliases, std::ptr::null_mut());
+        let vec = null_terminated::into_vec(hostent.h_aliases);
         for v in vec { drop(CString::from_raw(v)); }
-        let vec = null_terminated::into_vec(hostent.h_addr_list, std::ptr::null_mut());
+        let vec = null_terminated::into_vec(hostent.h_addr_list);
         for v in vec { libc::free(v as *mut c_void) }
     }
 }
