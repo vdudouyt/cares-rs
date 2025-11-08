@@ -6,7 +6,7 @@ mod clinkedlist;
 mod error;
 mod offset_of;
 
-use std::os::raw::{ c_int, c_void, c_char, c_ushort };
+use std::ffi::{ c_int, c_void, c_char };
 use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
 use std::io::Cursor;
@@ -15,9 +15,9 @@ use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
-use crate::ffi::ares_data::IntoAresData;
+use crate::ffi::ares_data::*;
 use crate::ffi::clinkedlist::*;
-use crate::{ cstr, offset_of };
+use crate::cstr;
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -115,72 +115,6 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub enum AresDataType {
-    MxReply,
-    TxtReply,
-}
-
-#[repr(C)]
-struct AresData<T> {
-    data_type: AresDataType,
-    data: T,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct AresMxReply {
-    next: *mut AresMxReply,
-    host: *const c_char,
-    priority: c_ushort,
-}
-
-#[repr(C)]
-pub struct AresTxtReply {
-    next: *mut AresTxtReply,
-    txt: *const c_char,
-    length: usize, // null termination excluded
-}
-
-impl Drop for AresMxReply {
-    fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.host as *mut c_char) });
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
-    }
-}
-
-impl Drop for AresTxtReply {
-    fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.txt as *mut c_char) });
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
-    }
-}
-
-impl CLinkedList for AresMxReply {
-    fn next(&mut self) -> &mut *mut Self { &mut self.next }
-}
-
-impl CLinkedList for AresTxtReply {
-    fn next(&mut self) -> &mut *mut Self { &mut self.next }
-}
-
-pub trait DataType {
-    fn datatype() -> AresDataType;
-}
-
-impl DataType for AresMxReply {
-    fn datatype() -> AresDataType { AresDataType::MxReply }
-}
-
-impl DataType for AresTxtReply {
-    fn datatype() -> AresDataType { AresDataType::TxtReply }
-}
-
 pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2) -> c_int
 where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
 {
@@ -234,19 +168,6 @@ pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out
     let hostent = Box::into_raw(Box::new(hostent));
     unsafe { *out = hostent };
     ARES_SUCCESS
-}
-
-unsafe fn restore_original_ptr(dataptr: *mut c_void) -> *mut c_void {
-    dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
-    let aresdata = restore_original_ptr(dataptr) as *mut AresData<*mut c_void>;
-    match (*aresdata).data_type {
-        AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
-        AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
-    }
 }
 
 #[no_mangle]
@@ -368,36 +289,3 @@ pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
     if !version.is_null() { unsafe { *version = v } }
     cstr!("1.17.1-rs")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    impl Default for AresMxReply {
-        fn default() -> Self {
-            AresMxReply { next: std::ptr::null_mut(), host: CString::new("default").unwrap().into_raw(), priority: 1 }
-        }
-    }
-
-    impl Default for AresTxtReply {
-        fn default() -> Self {
-            AresTxtReply { next: std::ptr::null_mut(), txt: CString::new("default").unwrap().into_raw(), length: 0}
-        }
-    }
-
-    #[test]
-    fn test_restore_original_ptr() {
-        test_restore_original_ptr_impl::<AresMxReply>();
-        test_restore_original_ptr_impl::<AresTxtReply>();
-    }
-
-    fn test_restore_original_ptr_impl<T>() where T: Default + DataType {
-        let data = T::default();
-        let base: AresData<T> = AresData { data_type: T::datatype(), data };
-        let dataptr = std::ptr::addr_of!(base.data) as *mut c_void;
-        let restoredptr = unsafe { restore_original_ptr(dataptr) };
-        assert_eq!(std::ptr::addr_of!(base) as *mut c_void, restoredptr);
-    }
-}
-
-
