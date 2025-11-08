@@ -247,9 +247,13 @@ pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out
     ARES_SUCCESS
 }
 
+unsafe fn restore_original_ptr(dataptr: *mut c_void) -> *mut c_void {
+    dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
-    let aresdata = dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data)) as *mut AresData<*mut c_void>;
+    let aresdata = restore_original_ptr(dataptr) as *mut AresData<*mut c_void>;
     match (*aresdata).data_type {
         AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
         AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
@@ -407,6 +411,32 @@ mod tests {
             assert_eq!(head.num, 3);
             assert_eq!(head.next, std::ptr::null_mut());
         }
+    }
+
+    impl Default for AresMxReply {
+        fn default() -> Self {
+            AresMxReply { next: std::ptr::null_mut(), host: CString::new("default").unwrap().into_raw(), priority: 1 }
+        }
+    }
+
+    impl Default for AresTxtReply {
+        fn default() -> Self {
+            AresTxtReply { next: std::ptr::null_mut(), txt: CString::new("default").unwrap().into_raw(), length: 0}
+        }
+    }
+
+    #[test]
+    fn test_restore_original_ptr() {
+        test_restore_original_ptr_impl::<AresMxReply>();
+        test_restore_original_ptr_impl::<AresTxtReply>();
+    }
+
+    fn test_restore_original_ptr_impl<T>() where T: Default + DataType {
+        let data = T::default();
+        let base: AresData<T> = AresData { data_type: T::datatype(), data };
+        let dataptr = std::ptr::addr_of!(base.data) as *mut c_void;
+        let restoredptr = unsafe { restore_original_ptr(dataptr) };
+        assert_eq!(std::ptr::addr_of!(base) as *mut c_void, restoredptr);
     }
 }
 
