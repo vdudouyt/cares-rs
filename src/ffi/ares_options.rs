@@ -7,28 +7,18 @@ use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void};
 use crate::ffi::error::*;
 
-// ------- Opaque/alias types from c-ares headers -------
-
-// ares_socket_t is an int on POSIX-like platforms in c-ares.
 pub type ares_socket_t = c_int;
 
-// Forward decl for the opaque 'apattern' used only behind a pointer.
 #[repr(C)]
 pub struct apattern {
     _private: [u8; 0],
 }
 
-// In c-ares headers this is an enum; 0 == ARES_EVSYS_DEFAULT.
-// Expose as c_int to preserve ABI even if upstream adds variants.
 pub type ares_evsys_t = c_int;
 
-// The callback signature per docs:
-// void (*sock_state_cb)(void *data, ares_socket_t socket_fd, int readable, int writable);
 pub type ares_sock_state_cb =
     Option<extern "C" fn(data: *mut c_void, socket_fd: ares_socket_t, readable: c_int, writable: c_int)>;
 
-// Matches the struct shown in the ares_init docs:
-//   struct ares_server_failover_options { unsigned short retry_chance; size_t retry_delay; }
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ares_server_failover_options {
@@ -68,7 +58,6 @@ pub struct ares_options {
     pub server_failover_opts: ares_server_failover_options,
 }
 
-// A convenient zero/NULL initializer (mirrors C memset(0)).
 impl Default for ares_options {
     fn default() -> Self {
         Self {
