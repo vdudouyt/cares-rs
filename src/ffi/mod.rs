@@ -12,6 +12,7 @@ use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
 use std::io::Cursor;
 use std::net::IpAddr;
+use std::cmp::min;
 use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
@@ -26,8 +27,10 @@ pub const ARES_EFORMERR: i32 = 2;
 pub const ARES_ESERVFAIL: i32 = 3;
 pub const ARES_ENOTFOUND: i32 = 4;
 pub const ARES_ETIMEOUT: i32 = 12;
-
 pub const ARES_LIB_INIT_ALL: i32 = 1;
+
+#[allow(non_camel_case_types)]
+pub type ares_socket_t = c_int;
 
 #[no_mangle]
 pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
@@ -289,4 +292,25 @@ pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
     let v = (major << 16) | (minor << 8) | patch;
     if !version.is_null() { unsafe { *version = v } }
     cstr!("1.17.1-rs")
+}
+
+pub const ARES_GETSOCK_MAXNUM: usize = 16; // per c-ares headers
+pub const ARES_SOCKET_BAD: ares_socket_t = -1;
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
+    let channeldata = unsafe { &mut *channel };
+    let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
+
+    let mut mask: c_int = 0;
+    for i in 0..n {
+        let maybe_task = channeldata.ares.tasks.get(i);
+        std::ptr::write(socks.add(i), maybe_task.map(|x| x.sock.as_raw_fd()).unwrap_or(ARES_SOCKET_BAD));
+
+        if maybe_task.is_some() {
+            mask |= 1 << i; // No need to wait ARES_GETSOCK_WRITABLE for UDP sockets
+        }
+    }
+
+    mask
 }

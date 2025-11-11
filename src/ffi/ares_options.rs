@@ -6,8 +6,7 @@ use crate::ffi::Channel;
 use std::net::{ IpAddr, Ipv4Addr };
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void};
 use crate::ffi::error::*;
-
-pub type ares_socket_t = c_int;
+use crate::ares_socket_t;
 
 #[repr(C)]
 pub struct apattern {
