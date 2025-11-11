@@ -3,7 +3,7 @@
 
 use libc::{in_addr};
 use crate::ffi::Channel;
-use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
+use std::net::{ IpAddr, Ipv4Addr };
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void};
 use crate::ffi::error::*;
 

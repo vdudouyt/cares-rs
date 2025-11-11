@@ -11,7 +11,7 @@ use std::ffi::{ c_int, c_void, c_char };
 use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
 use std::io::Cursor;
-use std::net::{ IpAddr, Ipv4Addr, SocketAddr };
+use std::net::IpAddr;
 use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
