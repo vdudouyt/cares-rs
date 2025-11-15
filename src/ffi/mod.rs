@@ -276,6 +276,37 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
     }
 }
 
+fn ipv4_to_in_addr(ip: IpAddr) -> Option<AresAddrUnion> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let addr = u32::from_ne_bytes(v4.octets());
+            Some(AresAddrUnion { addr4: libc::in_addr { s_addr: addr } })
+        }
+        IpAddr::V6(_) => None,
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut AresAddrPortNode) -> c_int {
+    let channeldata = unsafe { &mut *channel };
+    let mut data: Vec<AresAddrPortNode> = vec![];
+    for srv in &channeldata.ares.config.nameservers {
+        data.push(AresAddrPortNode {
+            next: std::ptr::null_mut(),
+            family: libc::AF_INET,
+            addr: ipv4_to_in_addr(srv.0).unwrap(),
+            udp_port: srv.1.unwrap_or(channeldata.ares.default_udp_port) as c_int,
+            tcp_port: srv.1.unwrap_or(channeldata.ares.default_tcp_port) as c_int,
+        });
+    }
+    let data = clinkedlist::chain_nodes(data);
+    let aresdata: AresData<AresAddrPortNode> = AresData { data_type: AresAddrPortNode::datatype(), data };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut (*aresdata).data };
+    ARES_SUCCESS
+}
+
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {

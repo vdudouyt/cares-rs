@@ -1,4 +1,4 @@
-use std::ffi::{ CString, c_void, c_char, c_ushort };
+use std::ffi::{ CString, c_void, c_char, c_ushort, c_int };
 use crate::core::packets::{ TxtReply, MxReply };
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
@@ -33,6 +33,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     match (*aresdata).data_type {
         AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
         AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
+        AresDataType::AddrPortNode => drop(Box::from_raw(aresdata as *mut AresData<AresAddrPortNode>)),
     }
 }
 
@@ -41,6 +42,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
 pub enum AresDataType {
     MxReply,
     TxtReply,
+    AddrPortNode
 }
 
 #[repr(C)]
@@ -62,6 +64,23 @@ pub struct AresTxtReply {
     next: *mut AresTxtReply,
     pub txt: *const c_char,
     pub length: usize, // null termination excluded
+}
+
+// ares_addr_port_node
+
+#[repr(C)]
+pub union AresAddrUnion {
+    pub addr4: libc::in_addr,
+    pub addr6: libc::in6_addr,
+}
+
+#[repr(C)]
+pub struct AresAddrPortNode {
+    pub next: *mut AresAddrPortNode,
+    pub family: c_int,
+    pub addr: AresAddrUnion,
+    pub udp_port: c_int,
+    pub tcp_port: c_int,
 }
 
 impl Drop for AresMxReply {
@@ -90,6 +109,10 @@ impl CLinkedList for AresTxtReply {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
+impl CLinkedList for AresAddrPortNode {
+    fn next(&mut self) -> &mut *mut Self { &mut self.next }
+}
+
 pub trait DataType {
     fn datatype() -> AresDataType;
 }
@@ -100,6 +123,10 @@ impl DataType for AresMxReply {
 
 impl DataType for AresTxtReply {
     fn datatype() -> AresDataType { AresDataType::TxtReply }
+}
+
+impl DataType for AresAddrPortNode {
+    fn datatype() -> AresDataType { AresDataType::AddrPortNode }
 }
 
 #[cfg(test)]
