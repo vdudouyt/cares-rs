@@ -145,10 +145,18 @@ mod tests {
         }
     }
 
+    impl Default for AresAddrPortNode {
+        fn default() -> Self {
+            let addr = AresAddrUnion { addr4: libc::in_addr { s_addr: 0 } };
+            AresAddrPortNode { next: std::ptr::null_mut(), family: libc::AF_INET, addr, udp_port: 0, tcp_port: 0 }
+        }
+    }
+
     #[test]
     fn test_restore_original_ptr() {
         test_restore_original_ptr_impl::<AresMxReply>();
         test_restore_original_ptr_impl::<AresTxtReply>();
+        test_restore_original_ptr_impl::<AresAddrPortNode>();
     }
 
     fn test_restore_original_ptr_impl<T>() where T: Default + DataType {
