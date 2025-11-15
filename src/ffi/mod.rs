@@ -345,3 +345,8 @@ pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_
 
     mask
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
+    drop(CString::from_raw(s as *mut c_char));
+}
