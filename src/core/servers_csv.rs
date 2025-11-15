@@ -30,7 +30,7 @@ pub fn parse_servers_str(s: &str) -> Option<Vec<(IpAddr, Option<u16>)>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::IpAddr;
 
     fn addr(ip: &str) -> IpAddr {
         ip.parse().unwrap()
