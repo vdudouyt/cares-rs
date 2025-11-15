@@ -25,7 +25,7 @@ impl<T> Ares<T> {
     pub fn from_sysconfig() -> Self {
         Ares::new(build_sysconfig())
     }
-    pub fn gethostbyname(&mut self, hostname: &str, family: Family, userdata: T) {
+    pub fn gethostbyname(&mut self, hostname: &str, family: Family, userdata: T) -> &Task<T> {
         let qtype = match family {
             Family::Ipv4 => 0x01, // A
             Family::Ipv6 => 0x1c, // AAAA
@@ -47,6 +47,7 @@ impl<T> Ares<T> {
         let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::new(), userdata, expires_at };
         request.write(&mut task.writebuf);
         self.tasks.push(task);
+        self.tasks.last().unwrap()
     }
     pub fn query(&mut self, name: &str, dnsclass: u16, dnstype: u16, userdata: T) {
         let sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();

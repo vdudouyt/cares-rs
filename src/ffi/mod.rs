@@ -45,6 +45,8 @@ pub type Channel = *mut ChannelData;
 
 pub struct ChannelData {
     ares: Ares<FFIData>,
+    sock_create_callback: Option<AresSockCreateCallback>,
+    sock_create_callback_arg: *mut libc::c_void,
 }
 
 #[derive(Debug)]
@@ -85,7 +87,7 @@ pub struct ares_addr_node {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     let ares = Ares::from_sysconfig();
-    let channeldata = ChannelData { ares };
+    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut() };
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -108,7 +110,10 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     };
     let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg };
-    channeldata.ares.gethostbyname(&hostname, family, ffidata);
+    let newtask = channeldata.ares.gethostbyname(&hostname, family, ffidata);
+    if let Some(cb) = channeldata.sock_create_callback {
+        cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
+    }
 }
 
 #[no_mangle]
@@ -181,6 +186,7 @@ pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
 
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 pub type AresCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int);
+pub type AresSockCreateCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void);
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
@@ -349,4 +355,12 @@ pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
     drop(CString::from_raw(s as *mut c_char));
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: Option<AresSockCreateCallback>, arg: *mut c_void) {
+    let channeldata = unsafe { &mut *channel };
+    channeldata.sock_create_callback = callback;
+    channeldata.sock_create_callback_arg = arg;
 }
