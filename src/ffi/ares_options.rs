@@ -2,7 +2,8 @@
 #![allow(dead_code)]
 
 use libc::{in_addr};
-use crate::ffi::Channel;
+use crate::ffi::{ Channel, Ares };
+use crate::ChannelData;
 use std::net::{ IpAddr, Ipv4Addr };
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void};
 use crate::ffi::error::*;
@@ -118,9 +119,10 @@ pub const ARES_OPT_EVENT_THREAD   : c_int = 1 << 22;
 pub const ARES_OPT_SERVER_FAILOVER: c_int = 1 << 23;
 
 #[no_mangle]
-pub unsafe extern "C" fn ares_init_options(channel: Channel, options: *const ares_options, optmask: c_int) -> c_int {
-    let channeldata = unsafe { &mut *channel };
-    channeldata.ares.config.nameservers.clear();
+pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
+    let ares = Ares::from_sysconfig();
+    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut() };
+
     let options = unsafe { & *options };
     if optmask & ARES_OPT_SERVERS != 0 && !options.servers.is_null() {
         let servers = unsafe { std::slice::from_raw_parts(options.servers, options.nservers as usize) };
@@ -135,5 +137,7 @@ pub unsafe extern "C" fn ares_init_options(channel: Channel, options: *const are
     if optmask & ARES_OPT_TCP_PORT != 0 {
         channeldata.ares.default_tcp_port = options.tcp_port;
     }
+    let channel = Box::into_raw(Box::new(channeldata));
+    unsafe { *out_channel = channel };
     ARES_SUCCESS
 }
