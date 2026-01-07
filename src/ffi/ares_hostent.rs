@@ -66,6 +66,6 @@ pub unsafe fn free_hostent(hostent: *mut libc::hostent) {
         let vec = cnullterminated::into_vec(hostent.h_aliases);
         for v in vec { drop(CString::from_raw(v)); }
         let vec = cnullterminated::into_vec(hostent.h_addr_list);
-        for v in vec { libc::free(v as *mut c_void) }
+        for v in vec { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(v, hostent.h_length as usize))); }
     }
 }
