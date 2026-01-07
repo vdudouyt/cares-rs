@@ -7,34 +7,34 @@ use crate::{ ARES_ENODATA, ARES_EFORMERR };
 #[derive(PartialEq)]
 pub enum HostentParseMode { Addrs, Addrs4, Addrs6, Aliases }
 
+fn get_addr_type(record_type: u16) -> c_int {
+    match record_type {
+        0x01 => libc::AF_INET,
+        0x1c => libc::AF_INET6,
+        0x02 => 0x02,
+        _ => panic!("Unexpected DNS record type in answer: {record_type}"),
+    }
+}
+
 pub unsafe fn parse_hostent(abuf: *const u8, alen: c_int, mode: HostentParseMode) -> Result<libc::hostent, i32> {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
 
-    let Some(answer) = frame.answers.first() else { return Err(ARES_ENODATA) };
-    let name = answer.name.build_cstring(&buf).unwrap();
-    let h_addrtype = match answer.record_type {
-        0x01 => libc::AF_INET,
-        0x1c => libc::AF_INET6,
-        0x02 => 0x02,
-        _ => panic!("Unexpected DNS record type in answer: {}", answer.record_type),
+    let Some(first_answer) = frame.answers.first() else { return Err(ARES_ENODATA) };
+    let name = first_answer.name.build_cstring(&buf).unwrap();
+    let (expected_record_type, expected_length) = match mode {
+        HostentParseMode::Addrs4 => (0x01, 4),
+        HostentParseMode::Addrs6 => (0x1c, 16),
+        _ => (first_answer.record_type, first_answer.data.len()),
     };
 
     let mut aliases: Vec<*mut i8> = vec![];
     let mut addr_list: Vec<*mut i8> = vec![];
     match mode {
         HostentParseMode::Addrs | HostentParseMode::Addrs4 | HostentParseMode::Addrs6 => for answer in &frame.answers {
-            if mode == HostentParseMode::Addrs4 && h_addrtype != libc::AF_INET {
+            if answer.record_type != expected_record_type {
                 continue;
             }
-            if mode == HostentParseMode::Addrs6 && h_addrtype != libc::AF_INET6 {
-                continue;
-            }
-            let expected_length = match h_addrtype {
-                libc::AF_INET => 4,
-                libc::AF_INET6 => 16,
-                _ => return Err(ARES_EFORMERR),
-            };
             if answer.data.len() < expected_length {
                 return Err(ARES_EFORMERR);
             }
@@ -52,8 +52,8 @@ pub unsafe fn parse_hostent(abuf: *const u8, alen: c_int, mode: HostentParseMode
     let ret = libc::hostent {
         h_name: name.into_raw(),
         h_aliases: unsafe { cnullterminated::from_vec(aliases) },
-        h_addrtype,
-        h_length: answer.data.len() as i32,
+        h_addrtype: get_addr_type(expected_record_type),
+        h_length: expected_length as i32,
         h_addr_list:  unsafe { cnullterminated::from_vec(addr_list) },
     };
     Ok(ret)

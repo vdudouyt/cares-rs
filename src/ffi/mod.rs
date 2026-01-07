@@ -83,6 +83,12 @@ pub struct ares_addr_node {
     pub data: [u8; 16], // enough to hold IPv6
 }
 
+#[repr(C)]
+pub struct ares_addrttl {
+    pub ipaddr: [u8; 4], // ipv4
+    pub ttl: c_int,
+}
+
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
@@ -164,7 +170,7 @@ pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
+pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, naddrttls: *mut c_int) -> c_int {
     let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs4).unwrap() };
     let hostent = Box::into_raw(Box::new(hostent));
     unsafe { *out = hostent };
