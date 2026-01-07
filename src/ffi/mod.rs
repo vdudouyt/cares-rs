@@ -196,12 +196,13 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
         if answer.record_type != expected_record_type || answer.data.len() != expected_length {
             continue;
         }
-        println!("answer = {:?}", answer);
-        addr_list.push(Box::into_raw(answer.data.into_boxed_slice()) as *mut i8);
 
         if !addrttls.is_null() && (i as i32) < *naddrttls {
             (*(addrttls.add(i))).ttl = answer.ttl as i32;
+            unsafe { std::ptr::copy_nonoverlapping(answer.data.as_ptr(), (*(addrttls.add(i))).ipaddr.as_mut_ptr(), answer.data.len()) };
         }
+
+        addr_list.push(Box::into_raw(answer.data.into_boxed_slice()) as *mut i8);
         i += 1;
     }
 
