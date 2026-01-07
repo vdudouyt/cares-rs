@@ -35,7 +35,7 @@ pub unsafe fn parse_hostent(abuf: *const u8, alen: c_int, mode: HostentParseMode
                 libc::AF_INET6 => 16,
                 _ => return Err(ARES_EFORMERR),
             };
-            if answer.data.len() != expected_length {
+            if answer.data.len() < expected_length {
                 return Err(ARES_EFORMERR);
             }
             let dst = unsafe { libc::malloc(answer.data.len()) } as *mut u8;
