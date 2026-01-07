@@ -19,6 +19,7 @@ use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::*;
 use crate::ffi::clinkedlist::*;
+use crate::ffi::error::*;
 use crate::cstr;
 
 pub const ARES_SUCCESS: i32 = 0;
@@ -188,7 +189,9 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
     let addr_type = libc::AF_INET;
 
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
+    let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
+        return ARES_EBADRESP;
+    };
     let name = frame.answers.first().unwrap().name.build_cstring(&buf).unwrap();
     let mut addr_list: Vec<*mut i8> = vec![];
     let mut i = 0usize;
