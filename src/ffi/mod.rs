@@ -219,7 +219,9 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
     };
 
     let hostent_ptr = Box::into_raw(Box::new(hostent));
-    unsafe { *out = hostent_ptr };
+    if !out.is_null() {
+        *out = hostent_ptr;
+    }
     ARES_SUCCESS
 }
 
