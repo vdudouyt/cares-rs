@@ -191,6 +191,7 @@ fn buf_to_ip(buf: &[u8]) -> Result<IpAddr, &'static str> {
 }
 
 /* A safe counterpart matching libc::hostent as close as possible */
+#[derive(Debug)]
 struct HostEnt {
     name: CString,
     aliases: Vec<CString>,
@@ -261,7 +262,7 @@ impl HostEnt {
             h_aliases: unsafe { cnullterminated::from_vec(aliases) },
             h_addrtype: self.addrtype,
             h_length: self.length,
-            h_addr_list:  unsafe { cnullterminated::from_vec(addrlist) },
+            h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
         };
 
         Box::into_raw(Box::new(hostent))
@@ -270,57 +271,18 @@ impl HostEnt {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, naddrttls: *mut c_int) -> c_int {
-    let expected_record_type = RECORD_TYPE_A;
-    let expected_length = 4;
-    let addr_type = libc::AF_INET;
-
-    let error = |code: c_int| {
-        if !out.is_null() { *out = std::ptr::null_mut() }
-        if !naddrttls.is_null() { *naddrttls = 0 }
-        code
-    };
-
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
-        return error(ARES_EBADRESP);
-    };
-    let Some(first_answer) = frame.answers.first() else {
-        return error(ARES_ENODATA);
-    };
-    let name = first_answer.name.build_cstring(&buf).unwrap();
-    let mut addr_list: Vec<*mut i8> = vec![];
-    let mut i = 0usize;
-    for answer in frame.answers {
-        if answer.record_type != expected_record_type || answer.data.len() != expected_length {
-            continue;
+    match HostEnt::from_buf(buf, HostentParseMode::Addrs4) {
+        Ok(host) => {
+            if !out.is_null() { *out = host.into_raw() }
+            ARES_SUCCESS
         }
-
-        if !addrttls.is_null() && (i as i32) < *naddrttls {
-            (*(addrttls.add(i))).ttl = answer.ttl as i32;
-            unsafe { std::ptr::copy_nonoverlapping(answer.data.as_ptr(), (*(addrttls.add(i))).ipaddr.as_mut_ptr(), answer.data.len()) };
+        Err(err) => {
+            if !out.is_null() { *out = std::ptr::null_mut() }
+            if !naddrttls.is_null() { *naddrttls = 0 }
+            err
         }
-
-        addr_list.push(Box::into_raw(answer.data.into_boxed_slice()) as *mut i8);
-        i += 1;
     }
-
-    if !naddrttls.is_null() {
-        *naddrttls = i as i32;
-    }
-
-    let hostent = libc::hostent {
-        h_name: name.into_raw(),
-        h_aliases: unsafe { cnullterminated::from_vec(vec![]) },
-        h_addrtype: get_addr_type(expected_record_type),
-        h_length: expected_length as i32,
-        h_addr_list:  unsafe { cnullterminated::from_vec(addr_list) },
-    };
-
-    let hostent_ptr = Box::into_raw(Box::new(hostent));
-    if !out.is_null() {
-        *out = hostent_ptr;
-    }
-    ARES_SUCCESS
 }
 
 #[no_mangle]
