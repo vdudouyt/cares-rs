@@ -182,6 +182,92 @@ fn get_addr_type(record_type: u16) -> c_int {
     }
 }
 
+fn buf_to_ip(buf: &[u8]) -> Result<IpAddr, &'static str> {
+    match buf.len() {
+        4 => Ok(IpAddr::from(<[u8; 4]>::try_from(buf).unwrap())),
+        16 => Ok(IpAddr::from(<[u8; 16]>::try_from(buf).unwrap())),
+        _ => Err("invalid IP byte length"),
+    }
+}
+
+/* A safe counterpart matching libc::hostent as close as possible */
+struct HostEnt {
+    name: CString,
+    aliases: Vec<CString>,
+    addrtype: c_int,
+    length: c_int,
+    addrttls: Vec<(std::net::IpAddr, u16)>,
+    addrlist: Vec<IpAddr>,
+}
+
+fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {
+    let mut ret: Vec<*mut i8> = vec![];
+    for addr in addrlist {
+        let t = match addr {
+            IpAddr::V4(v4) => Box::new(v4.octets()) as Box<[u8]>,
+            IpAddr::V6(v6) => Box::new(v6.octets()) as Box<[u8]>,
+        };
+        if t.len() == length {
+            ret.push(Box::into_raw(t) as *mut i8);
+        }
+    }
+    ret
+}
+
+impl HostEnt {
+    pub fn from_buf(buf: &[u8], mode: HostentParseMode) -> Result<Self, c_int> {
+        let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
+            return Err(ARES_EBADRESP);
+        };
+        let Some(first_answer) = frame.answers.first() else {
+            return Err(ARES_ENODATA);
+        };
+        let (expected_record_type, expected_length) = match mode {
+            HostentParseMode::Addrs4 => (RECORD_TYPE_A, 4),
+            HostentParseMode::Addrs6 => (RECORD_TYPE_AAAA, 16),
+            _ => todo!(),
+        };
+        let name = first_answer.name.build_cstring(&buf).unwrap();
+        let mut addrttls: Vec<(std::net::IpAddr, u16)> = vec![];
+        let mut addrlist: Vec<std::net::IpAddr> = vec![];
+        for answer in frame.answers {
+            if answer.record_type != expected_record_type || answer.data.len() != expected_length {
+                continue;
+            }
+        
+            if let Ok(ip) = buf_to_ip(&answer.data) {
+                addrlist.push(ip);
+                addrttls.push((ip, answer.ttl as u16));
+            }
+        }
+        let hostent = Self {
+            name,
+            aliases: vec![],
+            addrtype: get_addr_type(expected_record_type),
+            addrttls: vec![],
+            length: expected_length as c_int,
+            addrlist
+        };
+        Ok(hostent)
+    }
+    fn parse_cname(answer: DnsAnswer) -> Self {
+        todo!()
+    }
+    unsafe fn into_raw(self) -> *mut libc::hostent {
+        let addrlist: Vec<*mut i8> = iplist_to_raw(&self.addrlist, self.length as usize);
+        let aliases: Vec<*mut i8> = self.aliases.into_iter().map(|t| t.into_raw()).collect();
+        let hostent = libc::hostent {
+            h_name: self.name.into_raw(),
+            h_aliases: unsafe { cnullterminated::from_vec(aliases) },
+            h_addrtype: self.addrtype,
+            h_length: self.length,
+            h_addr_list:  unsafe { cnullterminated::from_vec(addrlist) },
+        };
+
+        Box::into_raw(Box::new(hostent))
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, naddrttls: *mut c_int) -> c_int {
     let expected_record_type = RECORD_TYPE_A;
