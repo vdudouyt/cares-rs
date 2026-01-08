@@ -188,11 +188,20 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
     let expected_length = 4;
     let addr_type = libc::AF_INET;
 
+    let error = |code: c_int| {
+        if !out.is_null() { *out = std::ptr::null_mut() }
+        if !naddrttls.is_null() { *naddrttls = 0 }
+        code
+    };
+
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
-        return ARES_EBADRESP;
+        return error(ARES_EBADRESP);
     };
-    let name = frame.answers.first().unwrap().name.build_cstring(&buf).unwrap();
+    let Some(first_answer) = frame.answers.first() else {
+        return error(ARES_ENODATA);
+    };
+    let name = first_answer.name.build_cstring(&buf).unwrap();
     let mut addr_list: Vec<*mut i8> = vec![];
     let mut i = 0usize;
     for answer in frame.answers {
