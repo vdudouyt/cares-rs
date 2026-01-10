@@ -84,16 +84,36 @@ pub struct ares_addr_node {
     pub data: [u8; 16], // enough to hold IPv6
 }
 
+trait AddrTTL {
+    fn set_addr_ttl(&mut self, ip: &IpAddr, ttl: u32) -> Option<()>;
+}
+
 #[repr(C)]
 pub struct ares_addrttl {
     pub ipaddr: [u8; 4], // ipv4
     pub ttl: c_int,
 }
 
+impl AddrTTL for ares_addrttl {
+    fn set_addr_ttl(&mut self, ip: &IpAddr, ttl: u32) -> Option<()> {
+        let IpAddr::V4(ipv4) = ip else { return None };
+        (self.ipaddr, self.ttl) = (ipv4.octets(), ttl as c_int);
+        Some(())
+    }
+}
+
 #[repr(C)]
 pub struct ares_addr6ttl {
     pub ipaddr: [u8; 16], // ipv6
     pub ttl: c_int,
+}
+
+impl AddrTTL for ares_addr6ttl {
+    fn set_addr_ttl(&mut self, ip: &IpAddr, ttl: u32) -> Option<()> {
+        let IpAddr::V6(ipv6) = ip else { return None };
+        (self.ipaddr, self.ttl) = (ipv6.octets(), ttl as c_int);
+        Some(())
+    }
 }
 
 #[no_mangle]
@@ -292,46 +312,22 @@ impl HostEnt {
     }
 }
 
-unsafe fn fill_addrttls(host: &HostEnt, addrttls: *mut ares_addrttl, naddrttls: usize) -> usize {
+unsafe fn fill_addrttls<T: AddrTTL>(host: &HostEnt, addrttls: *mut T, naddrttls: usize) -> usize {
     let mut i = 0;
     for (ip, ttl) in host.addrttls.iter() {
         if i >= naddrttls {
             break;
         }
-        let IpAddr::V4(ipv4) = ip else {
-            continue;
-        };
-        if !addrttls.is_null() {
-            (*addrttls.add(i)).ipaddr = ipv4.octets();
-            (*addrttls.add(i)).ttl = *ttl as c_int;
+        if (*addrttls.add(i)).set_addr_ttl(&ip, *ttl).is_some() {
+            i += 1;
         }
-        i += 1;
     }
     i
 }
 
-unsafe fn fill_addr6ttls(host: &HostEnt, addrttls: *mut ares_addr6ttl, naddrttls: usize) -> usize {
-    let mut i = 0;
-    for (ip, ttl) in host.addrttls.iter() {
-        if i >= naddrttls {
-            break;
-        }
-        let IpAddr::V6(ipv6) = ip else {
-            continue;
-        };
-        if !addrttls.is_null() {
-            (*addrttls.add(i)).ipaddr = ipv6.octets();
-            (*addrttls.add(i)).ttl = *ttl as c_int;
-        }
-        i += 1;
-    }
-    i
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
+unsafe fn parse_reply<T: AddrTTL>(mode: HostentParseMode, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, HostentParseMode::Addrs4) {
+    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, mode) {
         Ok(host) => {
             let naddrttls = if !out_naddrttls.is_null() {
                 let naddrttls = std::cmp::max(*out_naddrttls, 0);
@@ -349,23 +345,13 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
+    parse_reply(HostentParseMode::Addrs4, abuf, alen, out, addrttls, out_naddrttls)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, HostentParseMode::Addrs6) {
-        Ok(host) => {
-            let naddrttls = if !out_naddrttls.is_null() {
-                let naddrttls = std::cmp::max(*out_naddrttls, 0);
-                fill_addr6ttls(&host, addrttls, naddrttls as usize)
-            } else {
-                0
-            };
-            (ARES_SUCCESS, host.into_raw(), naddrttls)
-        }
-        Err(err) => (err, std::ptr::null_mut(), 0)
-    };
-    if !out.is_null() { *out = host_ptr; }
-    if !out_naddrttls.is_null() { *out_naddrttls = naddrttls as i32; }
-    ret_code
+    parse_reply(HostentParseMode::Addrs6, abuf, alen, out, addrttls, out_naddrttls)
 }
 
 #[no_mangle]
