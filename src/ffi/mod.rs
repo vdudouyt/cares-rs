@@ -90,6 +90,12 @@ pub struct ares_addrttl {
     pub ttl: c_int,
 }
 
+#[repr(C)]
+pub struct ares_addr6ttl {
+    pub ipaddr: [u8; 16], // ipv6
+    pub ttl: c_int,
+}
+
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
@@ -304,6 +310,24 @@ unsafe fn fill_addrttls(host: &HostEnt, addrttls: *mut ares_addrttl, naddrttls: 
     i
 }
 
+unsafe fn fill_addr6ttls(host: &HostEnt, addrttls: *mut ares_addr6ttl, naddrttls: usize) -> usize {
+    let mut i = 0;
+    for (ip, ttl) in host.addrttls.iter() {
+        if i >= naddrttls {
+            break;
+        }
+        let IpAddr::V6(ipv6) = ip else {
+            continue;
+        };
+        if !addrttls.is_null() {
+            (*addrttls.add(i)).ipaddr = ipv6.octets();
+            (*addrttls.add(i)).ttl = *ttl as c_int;
+        }
+        i += 1;
+    }
+    i
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
@@ -325,11 +349,23 @@ pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs6).unwrap() };
-    let hostent = Box::into_raw(Box::new(hostent));
-    unsafe { *out = hostent };
-    ARES_SUCCESS
+pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, HostentParseMode::Addrs6) {
+        Ok(host) => {
+            let naddrttls = if !out_naddrttls.is_null() {
+                let naddrttls = std::cmp::max(*out_naddrttls, 0);
+                fill_addr6ttls(&host, addrttls, naddrttls as usize)
+            } else {
+                0
+            };
+            (ARES_SUCCESS, host.into_raw(), naddrttls)
+        }
+        Err(err) => (err, std::ptr::null_mut(), 0)
+    };
+    if !out.is_null() { *out = host_ptr; }
+    if !out_naddrttls.is_null() { *out_naddrttls = naddrttls as i32; }
+    ret_code
 }
 
 #[no_mangle]
