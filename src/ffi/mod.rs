@@ -221,9 +221,9 @@ impl HostEnt {
         let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
             return Err(ARES_EBADRESP);
         };
-        if frame.queries.len() == 0 {
+        let Some(query) = frame.queries.first() else {
             return Err(ARES_EBADRESP);
-        }
+        };
         let Some(first_answer) = frame.answers.first() else {
             return Err(ARES_ENODATA);
         };
@@ -232,7 +232,7 @@ impl HostEnt {
             HostentParseMode::Addrs6 => (RECORD_TYPE_AAAA, 16),
             _ => todo!(),
         };
-        let mut name = first_answer.name.build_cstring(&buf).unwrap();
+        let mut name = CString::new(query.name.join(".")).unwrap();
         let mut addrttls: Vec<(std::net::IpAddr, u32)> = vec![];
         let mut addrlist: Vec<std::net::IpAddr> = vec![];
         let mut aliases: Vec<CString> = vec![];
