@@ -221,6 +221,9 @@ impl HostEnt {
         let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
             return Err(ARES_EBADRESP);
         };
+        if frame.queries.len() == 0 {
+            return Err(ARES_EBADRESP);
+        }
         let Some(first_answer) = frame.answers.first() else {
             return Err(ARES_ENODATA);
         };
