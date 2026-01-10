@@ -224,9 +224,6 @@ impl HostEnt {
         let [ref query] = frame.queries[..] else {
             return Err(ARES_EBADRESP);
         };
-        let Some(first_answer) = frame.answers.first() else {
-            return Err(ARES_ENODATA);
-        };
         let (expected_record_type, expected_length) = match mode {
             HostentParseMode::Addrs4 => (RECORD_TYPE_A, 4),
             HostentParseMode::Addrs6 => (RECORD_TYPE_AAAA, 16),
@@ -260,6 +257,9 @@ impl HostEnt {
                 addrlist.push(ip);
                 addrttls.push((ip, answer.ttl));
             }
+        }
+        if addrlist.len() == 0 && aliases.len() == 0 {
+            return Err(ARES_ENODATA);
         }
         let hostent = Self {
             name,
