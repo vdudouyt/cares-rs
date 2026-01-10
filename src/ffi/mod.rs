@@ -229,16 +229,28 @@ impl HostEnt {
             HostentParseMode::Addrs6 => (RECORD_TYPE_AAAA, 16),
             _ => todo!(),
         };
-        let name = first_answer.name.build_cstring(&buf).unwrap();
+        let mut name = first_answer.name.build_cstring(&buf).unwrap();
         let mut addrttls: Vec<(std::net::IpAddr, u32)> = vec![];
         let mut addrlist: Vec<std::net::IpAddr> = vec![];
-        for answer in frame.answers {
+        let mut aliases: Vec<CString> = vec![];
+        let mut limit_ttl: Option<u32> = None;
+        for mut answer in frame.answers {
             if answer.record_type == RECORD_TYPE_CNAME {
-                return Ok(Self::parse_cname(buf, answer));
+                let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
+                let alias_of = alias_of.build_cstring(&buf).unwrap();
+                aliases.push(name);
+                name = alias_of;
+                limit_ttl = Some(answer.ttl);
             }
 
             if answer.record_type != expected_record_type || answer.data.len() != expected_length {
                 continue;
+            }
+
+            if let Some(limit_ttl) = limit_ttl {
+                if answer.ttl > limit_ttl {
+                    answer.ttl = limit_ttl;
+                }
             }
         
             if let Ok(ip) = buf_to_ip(&answer.data) {
@@ -248,26 +260,13 @@ impl HostEnt {
         }
         let hostent = Self {
             name,
-            aliases: vec![],
+            aliases,
             addrtype: get_addr_type(expected_record_type),
             addrttls,
             length: expected_length as c_int,
             addrlist
         };
         Ok(hostent)
-    }
-    fn parse_cname(buf: &[u8], answer: DnsAnswer) -> Self {
-        let name = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-        let name = name.build_cstring(&buf).unwrap();
-        let alias = answer.name.build_cstring(&buf).unwrap();
-        Self {
-            name,
-            aliases: vec![alias],
-            addrtype: RECORD_TYPE_CNAME as i32,
-            addrttls: vec![],
-            length: 0,
-            addrlist: vec![],
-        }
     }
     unsafe fn into_raw(self) -> *mut libc::hostent {
         let addrlist: Vec<*mut i8> = iplist_to_raw(&self.addrlist, self.length as usize);
