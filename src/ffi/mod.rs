@@ -171,6 +171,7 @@ pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: 
 }
 
 const RECORD_TYPE_A: u16 = 0x01;
+const RECORD_TYPE_CNAME: u16 = 0x05;
 const RECORD_TYPE_AAAA: u16 = 0x1c;
 
 fn get_addr_type(record_type: u16) -> c_int {
@@ -232,6 +233,10 @@ impl HostEnt {
         let mut addrttls: Vec<(std::net::IpAddr, u32)> = vec![];
         let mut addrlist: Vec<std::net::IpAddr> = vec![];
         for answer in frame.answers {
+            if answer.record_type == RECORD_TYPE_CNAME {
+                return Ok(Self::parse_cname(buf, answer));
+            }
+
             if answer.record_type != expected_record_type || answer.data.len() != expected_length {
                 continue;
             }
@@ -251,8 +256,18 @@ impl HostEnt {
         };
         Ok(hostent)
     }
-    fn parse_cname(answer: DnsAnswer) -> Self {
-        todo!()
+    fn parse_cname(buf: &[u8], answer: DnsAnswer) -> Self {
+        let name = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
+        let name = name.build_cstring(&buf).unwrap();
+        let alias = answer.name.build_cstring(&buf).unwrap();
+        Self {
+            name,
+            aliases: vec![alias],
+            addrtype: RECORD_TYPE_CNAME as i32,
+            addrttls: vec![],
+            length: 0,
+            addrlist: vec![],
+        }
     }
     unsafe fn into_raw(self) -> *mut libc::hostent {
         let addrlist: Vec<*mut i8> = iplist_to_raw(&self.addrlist, self.length as usize);
