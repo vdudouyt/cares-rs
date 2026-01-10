@@ -197,7 +197,7 @@ struct HostEnt {
     aliases: Vec<CString>,
     addrtype: c_int,
     length: c_int,
-    addrttls: Vec<(std::net::IpAddr, u16)>,
+    addrttls: Vec<(std::net::IpAddr, u32)>,
     addrlist: Vec<IpAddr>,
 }
 
@@ -229,7 +229,7 @@ impl HostEnt {
             _ => todo!(),
         };
         let name = first_answer.name.build_cstring(&buf).unwrap();
-        let mut addrttls: Vec<(std::net::IpAddr, u16)> = vec![];
+        let mut addrttls: Vec<(std::net::IpAddr, u32)> = vec![];
         let mut addrlist: Vec<std::net::IpAddr> = vec![];
         for answer in frame.answers {
             if answer.record_type != expected_record_type || answer.data.len() != expected_length {
@@ -238,14 +238,14 @@ impl HostEnt {
         
             if let Ok(ip) = buf_to_ip(&answer.data) {
                 addrlist.push(ip);
-                addrttls.push((ip, answer.ttl as u16));
+                addrttls.push((ip, answer.ttl));
             }
         }
         let hostent = Self {
             name,
             aliases: vec![],
             addrtype: get_addr_type(expected_record_type),
-            addrttls: vec![],
+            addrttls,
             length: expected_length as c_int,
             addrlist
         };
@@ -269,20 +269,42 @@ impl HostEnt {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, naddrttls: *mut c_int) -> c_int {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    match HostEnt::from_buf(buf, HostentParseMode::Addrs4) {
-        Ok(host) => {
-            if !out.is_null() { *out = host.into_raw() }
-            ARES_SUCCESS
+unsafe fn fill_addrttls(host: &HostEnt, addrttls: *mut ares_addrttl, naddrttls: usize) -> usize {
+    let mut i = 0;
+    for (ip, ttl) in host.addrttls.iter() {
+        if i >= naddrttls {
+            break;
         }
-        Err(err) => {
-            if !out.is_null() { *out = std::ptr::null_mut() }
-            if !naddrttls.is_null() { *naddrttls = 0 }
-            err
+        let IpAddr::V4(ipv4) = ip else {
+            continue;
+        };
+        if !addrttls.is_null() {
+            (*addrttls.add(i)).ipaddr = ipv4.octets();
+            (*addrttls.add(i)).ttl = *ttl as c_int;
         }
+        i += 1;
     }
+    i
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, HostentParseMode::Addrs4) {
+        Ok(host) => {
+            let naddrttls = if !out_naddrttls.is_null() {
+                let naddrttls = std::cmp::max(*out_naddrttls, 0);
+                fill_addrttls(&host, addrttls, naddrttls as usize)
+            } else {
+                0
+            };
+            (ARES_SUCCESS, host.into_raw(), naddrttls)
+        }
+        Err(err) => (err, std::ptr::null_mut(), 0)
+    };
+    if !out.is_null() { *out = host_ptr; }
+    if !out_naddrttls.is_null() { *out_naddrttls = naddrttls as i32; }
+    ret_code
 }
 
 #[no_mangle]
