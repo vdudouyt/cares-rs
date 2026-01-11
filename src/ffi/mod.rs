@@ -161,10 +161,38 @@ pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, o
 where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
 {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
-    let replies: Vec<T1> = frame.answers.into_iter().map(|x| T1::parse(&mut Cursor::new(&x.data)).unwrap()).collect();
+    let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return ARES_EBADRESP;
+    };
+    let [ref query] = frame.queries[..] else {
+        unsafe { *out = std::ptr::null_mut() };
+        return ARES_EBADRESP;
+    };
+    if frame.answers.len() == 0 {
+        return ARES_ENODATA;
+    }
+    let mut name = CString::new(query.name.join(".")).unwrap();
+
+    let mut replies: Vec<T1> = vec![];
+    let mut success = 0;
+    for answer in &frame.answers {
+        let Some(parsed) = T1::parse(&mut Cursor::new(&answer.data)) else {
+            continue;
+        };
+        success += 1;
+        if name != answer.name.build_cstring(&buf).unwrap() {
+            continue;
+        }
+        replies.push(parsed);
+    }
+
     let aresreplies: Vec<_> = replies.into_iter().map(|x| x.into_ares_data(&buf)).collect();
-    let reply = clinkedlist::chain_nodes(aresreplies);
+    let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return if success > 0 { ARES_SUCCESS } else { ARES_EBADRESP };
+    };
+
     let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
     let aresdata = Box::into_raw(Box::new(aresdata));
     unsafe { *out = &mut (*aresdata).data };
@@ -481,8 +509,11 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut
             tcp_port: srv.1.unwrap_or(channeldata.ares.default_tcp_port) as c_int,
         });
     }
-    let data = clinkedlist::chain_nodes(data);
-    let aresdata: AresData<AresAddrPortNode> = AresData { data_type: AresAddrPortNode::datatype(), data };
+    let Some(replies) = clinkedlist::chain_nodes(data) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return ARES_ENODATA;
+    };
+    let aresdata: AresData<AresAddrPortNode> = AresData { data_type: AresAddrPortNode::datatype(), data: replies };
     let aresdata = Box::into_raw(Box::new(aresdata));
     unsafe { *out = &mut (*aresdata).data };
     ARES_SUCCESS

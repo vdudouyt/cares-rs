@@ -2,13 +2,13 @@ pub trait CLinkedList {
     fn next(&mut self) -> &mut *mut Self;
 }
 
-pub fn chain_nodes<T>(mut elts: Vec<T>) -> T where T: CLinkedList {
-    let mut tail = elts.pop().unwrap();
+pub fn chain_nodes<T>(mut elts: Vec<T>) -> Option<T> where T: CLinkedList {
+    let mut tail = elts.pop()?;
     while let Some(mut x) = elts.pop() /* O(1) */ {
         *(x.next()) = Box::into_raw(Box::new(tail));
         tail = x
     }
-    tail
+    Some(tail)
 }
 
 #[cfg(test)]
