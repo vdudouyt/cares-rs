@@ -218,13 +218,18 @@ impl DnsLabel {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Aliases).unwrap() };
-    let hostent = Box::into_raw(Box::new(hostent));
-    unsafe { *out = hostent };
-    ARES_SUCCESS
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    match HostEnt::from_buf(buf, RECORD_TYPE_NS) {
+        Ok(hostent) => {
+            if !out.is_null() { *out = hostent.into_raw(); }
+            ARES_SUCCESS
+        },
+        Err(err) => err,
+    }
 }
 
 const RECORD_TYPE_A: u16 = 0x01;
+const RECORD_TYPE_NS: u16 = 0x02;
 const RECORD_TYPE_CNAME: u16 = 0x05;
 const RECORD_TYPE_AAAA: u16 = 0x1c;
 
@@ -271,17 +276,17 @@ fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {
 }
 
 impl HostEnt {
-    pub fn from_buf(buf: &[u8], mode: HostentParseMode) -> Result<Self, c_int> {
+    pub fn from_buf(buf: &[u8], expected_record_type: u16) -> Result<Self, c_int> {
         let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
             return Err(ARES_EBADRESP);
         };
         let [ref query] = frame.queries[..] else {
             return Err(ARES_EBADRESP);
         };
-        let (expected_record_type, expected_length) = match mode {
-            HostentParseMode::Addrs4 => (RECORD_TYPE_A, 4),
-            HostentParseMode::Addrs6 => (RECORD_TYPE_AAAA, 16),
-            _ => todo!(),
+        let expected_length = match expected_record_type {
+            RECORD_TYPE_A => 4,
+            RECORD_TYPE_AAAA => 16,
+            _ => 0,
         };
         let mut name = CString::new(query.name.join(".")).unwrap();
         let mut addrttls: Vec<(std::net::IpAddr, u32)> = vec![];
@@ -297,7 +302,7 @@ impl HostEnt {
                 limit_ttl = Some(answer.ttl);
             }
 
-            if answer.record_type != expected_record_type || answer.data.len() != expected_length {
+            if answer.record_type != expected_record_type {
                 continue;
             }
 
@@ -307,9 +312,18 @@ impl HostEnt {
                 }
             }
         
-            if let Ok(ip) = buf_to_ip(&answer.data) {
-                addrlist.push(ip);
-                addrttls.push((ip, answer.ttl));
+            if expected_length == 0 {
+                let alias = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
+                let alias = alias.build_cstring(&buf).unwrap();
+                aliases.push(alias);
+            } else {
+                if answer.data.len() != expected_length {
+                    continue;
+                }
+                if let Ok(ip) = buf_to_ip(&answer.data) {
+                    addrlist.push(ip);
+                    addrttls.push((ip, answer.ttl));
+                }
             }
         }
         if addrlist.len() == 0 && aliases.len() == 0 {
@@ -353,9 +367,9 @@ unsafe fn fill_addrttls<T: AddrTTL>(host: &HostEnt, addrttls: *mut T, naddrttls:
     i
 }
 
-unsafe fn parse_reply<T: AddrTTL>(mode: HostentParseMode, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int) -> c_int {
+unsafe fn parse_reply<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, mode) {
+    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, expected_record_type) {
         Ok(host) => {
             let naddrttls = if !out_naddrttls.is_null() {
                 let naddrttls = std::cmp::max(*out_naddrttls, 0);
@@ -374,12 +388,12 @@ unsafe fn parse_reply<T: AddrTTL>(mode: HostentParseMode, abuf: *const u8, alen:
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
-    parse_reply(HostentParseMode::Addrs4, abuf, alen, out, addrttls, out_naddrttls)
+    parse_reply(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
-    parse_reply(HostentParseMode::Addrs6, abuf, alen, out, addrttls, out_naddrttls)
+    parse_reply(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls)
 }
 
 #[no_mangle]
