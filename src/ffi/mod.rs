@@ -220,12 +220,10 @@ impl DnsLabel {
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     match HostEnt::from_buf(buf, RECORD_TYPE_NS) {
-        Ok(hostent) => {
-            if !out.is_null() { *out = hostent.into_raw(); }
-            ARES_SUCCESS
-        },
-        Err(err) => err,
+        Ok(hostent) => if !out.is_null() { *out = hostent.into_raw() },
+        Err(err) => return err,
     }
+    ARES_SUCCESS
 }
 
 const RECORD_TYPE_A: u16 = 0x01;
