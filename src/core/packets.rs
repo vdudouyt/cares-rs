@@ -195,6 +195,45 @@ impl Parser for MxReply {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct CaaReply {
+    pub critical: u32,
+    pub property: String,
+    pub plength: u64,
+    pub value: String,
+    pub length: u64,
+}
+
+impl Parser for CaaReply {
+    fn parse<B: Buf>(buf: &mut B) -> Option<CaaReply> {
+        let flags = buf.try_get_u8().ok()?;
+        let tag_len = buf.try_get_u8().ok()? as usize;
+
+        // property
+        let mut tag_bytes = vec![0u8; tag_len];
+        buf.try_copy_to_slice(&mut tag_bytes).ok()?;
+        let property = String::from_utf8(tag_bytes).ok()?;
+
+        // value
+        let val_len = buf.remaining();
+        let mut val_bytes = vec![0u8; val_len];
+        buf.try_copy_to_slice(&mut val_bytes).ok()?;
+        let value = String::from_utf8(val_bytes).ok()?;
+
+        if tag_len == 0 {
+            return None;
+        }
+
+        Some(CaaReply {
+            critical: flags as u32,
+            property,
+            plength: tag_len as u64,
+            value,
+            length: val_len as u64,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub struct TxtReply {
     pub txt: String,
     pub length: u8,

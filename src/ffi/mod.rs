@@ -209,6 +209,11 @@ pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out:
     unsafe { ares_parse_data::<TxtReply, AresTxtReply>(abuf, alen, out) }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn ares_parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
+    unsafe { ares_parse_data::<CaaReply, AresCaaReply>(abuf, alen, out) }
+}
+
 impl DnsLabel {
     pub fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
         Some(CString::new(self.build_string(main_buf)?).ok()?)

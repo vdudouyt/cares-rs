@@ -1,5 +1,5 @@
 use std::ffi::{ CString, c_void, c_char, c_ushort, c_int };
-use crate::core::packets::{ TxtReply, MxReply };
+use crate::core::packets::{ TxtReply, MxReply, CaaReply };
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
 
@@ -32,6 +32,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     let aresdata = restore_original_ptr(dataptr) as *mut AresData<*mut c_void>;
     match (*aresdata).data_type {
         AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
+        AresDataType::CaaReply => drop(Box::from_raw(aresdata as *mut AresData<AresCaaReply>)),
         AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
         AresDataType::AddrPortNode => drop(Box::from_raw(aresdata as *mut AresData<AresAddrPortNode>)),
     }
@@ -41,6 +42,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
 #[derive(Debug)]
 pub enum AresDataType {
     MxReply,
+    CaaReply,
     TxtReply,
     AddrPortNode
 }
@@ -64,6 +66,48 @@ pub struct AresTxtReply {
     next: *mut AresTxtReply,
     pub txt: *const c_char,
     pub length: usize, // null termination excluded
+}
+
+#[repr(C)]
+pub struct AresCaaReply {
+    next: *mut AresCaaReply,
+    critical: c_int,
+    property: *const c_char,
+    plength: usize,
+    value: *const c_char,
+    length: usize,
+}
+
+impl IntoAresData<AresCaaReply> for CaaReply {
+    fn into_ares_data(self, _main_buf: &[u8]) -> AresCaaReply {
+        // NOTE: plength/length in your Rust CaaReply are the byte lengths excluding NUL.
+        // For FFI, we store them as usize.
+        let plength = self.property.len();
+        let length = self.value.len();
+
+        let property = CString::new(self.property).unwrap().into_raw();
+        let value = CString::new(self.value).unwrap().into_raw();
+
+        AresCaaReply {
+            next: std::ptr::null_mut(),
+            critical: self.critical as c_int,
+            property,
+            plength,
+            value,
+            length,
+        }
+    }
+}
+
+impl Drop for AresCaaReply {
+    fn drop(&mut self) {
+        drop(unsafe { CString::from_raw(self.property as *mut c_char) });
+        drop(unsafe { CString::from_raw(self.value as *mut c_char) });
+
+        if !self.next.is_null() {
+            drop(unsafe { Box::from_raw(self.next) });
+        }
+    }
 }
 
 // ares_addr_port_node
@@ -105,6 +149,10 @@ impl CLinkedList for AresMxReply {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
+impl CLinkedList for AresCaaReply {
+    fn next(&mut self) -> &mut *mut Self { &mut self.next }
+}
+
 impl CLinkedList for AresTxtReply {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
@@ -119,6 +167,10 @@ pub trait DataType {
 
 impl DataType for AresMxReply {
     fn datatype() -> AresDataType { AresDataType::MxReply }
+}
+
+impl DataType for AresCaaReply {
+    fn datatype() -> AresDataType { AresDataType::CaaReply }
 }
 
 impl DataType for AresTxtReply {
