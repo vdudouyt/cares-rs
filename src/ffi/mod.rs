@@ -157,7 +157,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
 }
 
-pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2) -> c_int
+pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
 {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
@@ -177,6 +177,10 @@ where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
     let mut replies: Vec<T1> = vec![];
     let mut success = 0;
     for answer in &frame.answers {
+        if answer.record_type != expected_record_type {
+            success += 1;
+            continue;
+        }
         let Some(parsed) = T1::parse(&mut Cursor::new(&answer.data)) else {
             continue;
         };
@@ -201,17 +205,22 @@ where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
-    unsafe { ares_parse_data::<MxReply, AresMxReply>(abuf, alen, out) }
+    unsafe { ares_parse_data::<MxReply, AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
-    unsafe { ares_parse_data::<TxtReply, AresTxtReply>(abuf, alen, out) }
+    unsafe { ares_parse_data::<TxtReply, AresTxtReply>(abuf, alen, out, RECORD_TYPE_TXT) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
-    unsafe { ares_parse_data::<CaaReply, AresCaaReply>(abuf, alen, out) }
+    unsafe { ares_parse_data::<CaaReply, AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_parse_naptr_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresNaptrReply) -> c_int {
+    unsafe { ares_parse_data::<NaptrReply, AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
 }
 
 impl DnsLabel {
@@ -235,6 +244,10 @@ const RECORD_TYPE_A: u16 = 0x01;
 const RECORD_TYPE_NS: u16 = 0x02;
 const RECORD_TYPE_CNAME: u16 = 0x05;
 const RECORD_TYPE_AAAA: u16 = 0x1c;
+const RECORD_TYPE_MX: u16 = 0x0f;
+const RECORD_TYPE_TXT: u16 = 0x10;
+const RECORD_TYPE_CAA: u16 = 0x101;
+const RECORD_TYPE_NAPTR: u16 = 0x23;
 
 fn get_addr_type(record_type: u16) -> c_int {
     match record_type {

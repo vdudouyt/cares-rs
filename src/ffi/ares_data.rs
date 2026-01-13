@@ -1,5 +1,5 @@
 use std::ffi::{ CString, c_void, c_char, c_ushort, c_int };
-use crate::core::packets::{ TxtReply, MxReply, CaaReply };
+use crate::core::packets::{ TxtReply, MxReply, CaaReply, NaptrReply };
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
 
@@ -34,6 +34,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
         AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
         AresDataType::CaaReply => drop(Box::from_raw(aresdata as *mut AresData<AresCaaReply>)),
         AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
+        AresDataType::NaptrReply => drop(Box::from_raw(aresdata as *mut AresData<AresNaptrReply>)),
         AresDataType::AddrPortNode => drop(Box::from_raw(aresdata as *mut AresData<AresAddrPortNode>)),
     }
 }
@@ -44,6 +45,7 @@ pub enum AresDataType {
     MxReply,
     CaaReply,
     TxtReply,
+    NaptrReply,
     AddrPortNode
 }
 
@@ -157,6 +159,10 @@ impl CLinkedList for AresTxtReply {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
+impl CLinkedList for AresNaptrReply {
+    fn next(&mut self) -> &mut *mut Self { &mut self.next }
+}
+
 impl CLinkedList for AresAddrPortNode {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
@@ -177,8 +183,56 @@ impl DataType for AresTxtReply {
     fn datatype() -> AresDataType { AresDataType::TxtReply }
 }
 
+impl DataType for AresNaptrReply {
+    fn datatype() -> AresDataType { AresDataType::NaptrReply }
+}
+
 impl DataType for AresAddrPortNode {
     fn datatype() -> AresDataType { AresDataType::AddrPortNode }
+}
+
+#[repr(C)]
+pub struct AresNaptrReply {
+    next: *mut AresNaptrReply,
+    flags: *const c_char,
+    service: *const c_char,
+    regexp: *const c_char,
+    replacement: *const c_char,
+    order: u16,
+    preference: u16,
+}
+
+impl Drop for AresNaptrReply {
+    fn drop(&mut self) {
+        // Allocated via CString::into_raw() in into_ares_data()
+        drop(unsafe { CString::from_raw(self.flags as *mut c_char) });
+        drop(unsafe { CString::from_raw(self.service as *mut c_char) });
+        drop(unsafe { CString::from_raw(self.regexp as *mut c_char) });
+        drop(unsafe { CString::from_raw(self.replacement as *mut c_char) });
+
+        if !self.next.is_null() {
+            drop(unsafe { Box::from_raw(self.next) });
+        }
+    }
+}
+
+impl IntoAresData<AresNaptrReply> for NaptrReply {
+    fn into_ares_data(self, buf: &[u8]) -> AresNaptrReply {
+        let flags = CString::new(self.flags).unwrap().into_raw();
+        let service = CString::new(self.service).unwrap().into_raw();
+        let regexp = CString::new(self.regexp).unwrap().into_raw();
+        let replacement = CString::new(self.replacement).unwrap().into_raw();
+
+        AresNaptrReply {
+            next: std::ptr::null_mut(),
+            flags,
+            service,
+            regexp,
+            replacement,
+            order: self.order,
+            preference: self.preference,
+        }
+    }
 }
 
 #[cfg(test)]

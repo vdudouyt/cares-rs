@@ -248,6 +248,44 @@ impl Parser for TxtReply {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct NaptrReply {
+    pub order: u16,
+    pub preference: u16,
+    pub flags: String,
+    pub service: String,
+    pub regexp: String,
+    pub replacement: String,
+}
+
+fn parse_prefixed_string<B: Buf>(buf: &mut B) -> Option<String> {
+    let len = buf.try_get_u8().ok()? as usize;
+    let mut dst: Vec<u8> = vec![0; len as usize];
+    buf.try_copy_to_slice(&mut dst[..]).ok()?;
+    String::from_utf8(dst).ok()
+}
+
+impl Parser for NaptrReply {
+    fn parse<B: Buf>(buf: &mut B) -> Option<NaptrReply> {
+        let order = buf.try_get_u16().ok()?;
+        let preference = buf.try_get_u16().ok()?;
+        let flags = parse_prefixed_string(buf)?;
+        let service = parse_prefixed_string(buf)?;
+        let regexp = parse_prefixed_string(buf)?;
+        let replacement = parse_prefixed_string(buf)?;
+
+        let ret = NaptrReply {
+            order,
+            preference,
+            flags,
+            service,
+            regexp,
+            replacement,
+        };
+        Some(ret)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
