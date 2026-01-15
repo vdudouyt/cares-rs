@@ -233,7 +233,7 @@ impl DnsLabel {
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    match HostEnt::from_buf(buf, RECORD_TYPE_NS) {
+    match HostEnt::from_buf(buf, RECORD_TYPE_NS, 0) {
         Ok(hostent) => if !out.is_null() { *out = hostent.into_raw() },
         Err(err) => return err,
     }
@@ -243,6 +243,7 @@ pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: 
 const RECORD_TYPE_A: u16 = 0x01;
 const RECORD_TYPE_NS: u16 = 0x02;
 const RECORD_TYPE_CNAME: u16 = 0x05;
+const RECORD_TYPE_PTR: u16 = 0x0c;
 const RECORD_TYPE_AAAA: u16 = 0x1c;
 const RECORD_TYPE_MX: u16 = 0x0f;
 const RECORD_TYPE_TXT: u16 = 0x10;
@@ -254,6 +255,7 @@ fn get_addr_type(record_type: u16) -> c_int {
         0x01 => libc::AF_INET,
         0x1c => libc::AF_INET6,
         0x02 => 0x02,
+        0x0c => 0x0c,
         _ => panic!("Unexpected DNS record type in answer: {record_type}"),
     }
 }
@@ -292,17 +294,17 @@ fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {
 }
 
 impl HostEnt {
-    pub fn from_buf(buf: &[u8], expected_record_type: u16) -> Result<Self, c_int> {
+    pub fn from_buf(buf: &[u8], expected_record_type: u16, family: c_int) -> Result<Self, c_int> {
+        let expected_length = match family {
+            libc::AF_INET => 4,
+            libc::AF_INET6 => 16,
+            _ => 0,
+        };
         let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
             return Err(ARES_EBADRESP);
         };
         let [ref query] = frame.queries[..] else {
             return Err(ARES_EBADRESP);
-        };
-        let expected_length = match expected_record_type {
-            RECORD_TYPE_A => 4,
-            RECORD_TYPE_AAAA => 16,
-            _ => 0,
         };
         let mut name = CString::new(query.name.join(".")).unwrap();
         let mut addrttls: Vec<(std::net::IpAddr, u32)> = vec![];
@@ -312,10 +314,18 @@ impl HostEnt {
         for mut answer in frame.answers {
             if answer.record_type == RECORD_TYPE_CNAME {
                 let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
+                let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP)?;
+                if expected_record_type != RECORD_TYPE_PTR {
+                    aliases.push(name);
+                    name = alias_of;
+                    limit_ttl = Some(answer.ttl);
+                }
+            }
+
+            if answer.record_type == RECORD_TYPE_PTR {
+                let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
                 let alias_of = alias_of.build_cstring(&buf).unwrap();
-                aliases.push(name);
                 name = alias_of;
-                limit_ttl = Some(answer.ttl);
             }
 
             if answer.record_type != expected_record_type {
@@ -328,7 +338,7 @@ impl HostEnt {
                 }
             }
         
-            if expected_length == 0 {
+            if expected_length == 0 || expected_record_type == RECORD_TYPE_PTR {
                 let alias = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
                 let alias = alias.build_cstring(&buf).unwrap();
                 aliases.push(alias);
@@ -348,7 +358,7 @@ impl HostEnt {
         let hostent = Self {
             name,
             aliases,
-            addrtype: get_addr_type(expected_record_type),
+            addrtype: family,
             addrttls,
             length: expected_length as c_int,
             addrlist
@@ -383,9 +393,9 @@ unsafe fn fill_addrttls<T: AddrTTL>(host: &HostEnt, addrttls: *mut T, naddrttls:
     i
 }
 
-unsafe fn parse_reply<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int) -> c_int {
+unsafe fn parse_reply<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, expected_record_type) {
+    let (ret_code, host_ptr, naddrttls) = match HostEnt::from_buf(buf, expected_record_type, family) {
         Ok(host) => {
             let naddrttls = if !out_naddrttls.is_null() {
                 let naddrttls = std::cmp::max(*out_naddrttls, 0);
@@ -404,12 +414,28 @@ unsafe fn parse_reply<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, al
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
-    parse_reply(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls)
+    parse_reply(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
-    parse_reply(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls)
+    parse_reply(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let mut ret = match HostEnt::from_buf(buf, RECORD_TYPE_PTR, family) {
+        Ok(ret) => ret,
+        Err(err) => return err,
+    };
+    let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
+    let ip = buf_to_ip(ipbuf).unwrap();
+    ret.addrlist.push(ip);
+    ret.addrttls.push((ip, 0));
+    let host_ptr = ret.into_raw();
+    if !out.is_null() { *out = host_ptr; }
+    ARES_SUCCESS
 }
 
 #[no_mangle]

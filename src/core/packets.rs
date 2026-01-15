@@ -107,7 +107,8 @@ impl DnsLabel {
     pub fn build_string(&self, main_buf: &[u8]) -> Option<String> {
         let mut name = self.name.clone();
         if let Some(offset) = self.offset {
-            let mut label = DnsLabel::parse(&mut Cursor::new(&main_buf[offset as usize..]))?;
+            let slice = &main_buf.get(offset as usize..)?;
+            let mut label = DnsLabel::parse(&mut Cursor::new(slice))?;
             name.append(&mut label.name);
         }
         Some(name.join("."))
