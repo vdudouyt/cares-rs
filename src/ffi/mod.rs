@@ -177,6 +177,11 @@ where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
     let mut replies: Vec<T1> = vec![];
     let mut success = 0;
     for answer in &frame.answers {
+        if answer.record_type == RECORD_TYPE_CNAME {
+            let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
+            let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP).unwrap();
+            name = alias_of;
+        }
         if answer.record_type != expected_record_type {
             success += 1;
             continue;
@@ -223,6 +228,11 @@ pub unsafe extern "C" fn ares_parse_naptr_reply(abuf: *const u8, alen: c_int, ou
     unsafe { ares_parse_data::<NaptrReply, AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSrvReply) -> c_int {
+    unsafe { ares_parse_data::<SrvReply, AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
+}
+
 impl DnsLabel {
     pub fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
         Some(CString::new(self.build_string(main_buf)?).ok()?)
@@ -249,6 +259,7 @@ const RECORD_TYPE_AAAA: u16 = 0x1c;
 const RECORD_TYPE_MX: u16 = 0x0f;
 const RECORD_TYPE_TXT: u16 = 0x10;
 const RECORD_TYPE_CAA: u16 = 0x101;
+const RECORD_TYPE_SRV: u16 = 0x21;
 const RECORD_TYPE_NAPTR: u16 = 0x23;
 
 fn get_addr_type(record_type: u16) -> c_int {

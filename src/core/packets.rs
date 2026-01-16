@@ -321,6 +321,30 @@ impl Parser for SoaReply {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct SrvReply {
+    pub host: DnsLabel,
+    pub priority: u16,
+    pub weight: u16,
+    pub port: u16,
+}
+
+impl Parser for SrvReply {
+    fn parse<B: Buf>(buf: &mut B) -> Option<SrvReply> {
+        let priority = buf.try_get_u16().ok()?;
+        let weight = buf.try_get_u16().ok()?;
+        let port = buf.try_get_u16().ok()?;
+        let host = DnsLabel::parse(buf)?;
+
+        Some(SrvReply {
+            host,
+            priority,
+            weight,
+            port,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
