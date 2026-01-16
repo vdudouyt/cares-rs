@@ -34,7 +34,7 @@ mod tests {
     fn test_chain_leaves() {
         let vec = vec![DummyNode::new(1), DummyNode::new(2), DummyNode::new(3)];
         unsafe {
-            let head = chain_nodes(vec);
+            let head = chain_nodes(vec).unwrap();
             assert_eq!(head.num, 1);
             let head = &*(head.next);
             assert_eq!(head.num, 2);
