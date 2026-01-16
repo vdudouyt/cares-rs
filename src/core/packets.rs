@@ -287,6 +287,40 @@ impl Parser for NaptrReply {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct SoaReply {
+    pub nsname: DnsLabel,
+    pub hostmaster: DnsLabel,
+    pub serial: u32,
+    pub refresh: u32,
+    pub retry: u32,
+    pub expire: u32,
+    pub minttl: u32,
+}
+
+impl Parser for SoaReply {
+    fn parse<B: Buf>(buf: &mut B) -> Option<SoaReply> {
+        let nsname = DnsLabel::parse(buf)?;
+        let hostmaster = DnsLabel::parse(buf)?;
+
+        let serial = buf.try_get_u32().ok()?;
+        let refresh = buf.try_get_u32().ok()?;
+        let retry = buf.try_get_u32().ok()?;
+        let expire = buf.try_get_u32().ok()?;
+        let minttl = buf.try_get_u32().ok()?;
+
+        Some(SoaReply {
+            nsname,
+            hostmaster,
+            serial,
+            refresh,
+            retry,
+            expire,
+            minttl,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

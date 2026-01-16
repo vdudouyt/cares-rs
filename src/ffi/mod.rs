@@ -243,6 +243,7 @@ pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: 
 const RECORD_TYPE_A: u16 = 0x01;
 const RECORD_TYPE_NS: u16 = 0x02;
 const RECORD_TYPE_CNAME: u16 = 0x05;
+const RECORD_TYPE_SOA: u16 = 0x06;
 const RECORD_TYPE_PTR: u16 = 0x0c;
 const RECORD_TYPE_AAAA: u16 = 0x1c;
 const RECORD_TYPE_MX: u16 = 0x0f;
@@ -436,6 +437,36 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
     let host_ptr = ret.into_raw();
     if !out.is_null() { *out = host_ptr; }
     ARES_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
+        return ARES_EBADRESP;
+    };
+    let [ref query] = frame.queries[..] else {
+        unsafe { *out = std::ptr::null_mut() };
+        return ARES_EBADRESP;
+    };
+    if frame.answers.len() == 0 {
+        return ARES_EBADRESP;
+    }
+    for mut answer in frame.answers {
+        if answer.record_type == RECORD_TYPE_SOA {
+            let Some(soa) = SoaReply::parse(&mut Cursor::new(&answer.data)) else {
+                return ARES_EBADRESP;
+            };
+            if !out.is_null() {
+                let soa_reply = soa.into_ares_data(&answer.data);
+                let aresdata: AresData<AresSoaReply> = AresData { data_type: AresSoaReply::datatype(), data: soa_reply };
+                let aresdata = Box::into_raw(Box::new(aresdata));
+                unsafe { *out = &mut (*aresdata).data };
+            }
+            return ARES_SUCCESS;
+        }
+    }
+    return ARES_EBADRESP;
 }
 
 #[no_mangle]

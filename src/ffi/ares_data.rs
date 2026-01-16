@@ -1,5 +1,5 @@
-use std::ffi::{ CString, c_void, c_char, c_ushort, c_int };
-use crate::core::packets::{ TxtReply, MxReply, CaaReply, NaptrReply };
+use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint };
+use crate::core::packets::{ TxtReply, MxReply, CaaReply, NaptrReply, SoaReply };
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
 
@@ -35,6 +35,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
         AresDataType::CaaReply => drop(Box::from_raw(aresdata as *mut AresData<AresCaaReply>)),
         AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
         AresDataType::NaptrReply => drop(Box::from_raw(aresdata as *mut AresData<AresNaptrReply>)),
+        AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
         AresDataType::AddrPortNode => drop(Box::from_raw(aresdata as *mut AresData<AresAddrPortNode>)),
     }
 }
@@ -46,6 +47,7 @@ pub enum AresDataType {
     CaaReply,
     TxtReply,
     NaptrReply,
+    SoaReply,
     AddrPortNode
 }
 
@@ -108,6 +110,34 @@ impl Drop for AresCaaReply {
 
         if !self.next.is_null() {
             drop(unsafe { Box::from_raw(self.next) });
+        }
+    }
+}
+
+#[repr(C)]
+pub struct AresSoaReply {
+    nsname: *const c_char,
+    hostmaster: *const c_char,
+    serial: c_uint,
+    refresh: c_uint,
+    retry: c_uint,
+    expire: c_uint,
+    minttl: c_uint,
+}
+
+impl IntoAresData<AresSoaReply> for SoaReply {
+    fn into_ares_data(self, main_buf: &[u8]) -> AresSoaReply {
+        let nsname = self.nsname.build_cstring(main_buf).unwrap().into_raw();
+        let hostmaster = self.hostmaster.build_cstring(main_buf).unwrap().into_raw();
+
+        AresSoaReply {
+            nsname,
+            hostmaster,
+            serial: self.serial as c_uint,
+            refresh: self.refresh as c_uint,
+            retry: self.retry as c_uint,
+            expire: self.expire as c_uint,
+            minttl: self.minttl as c_uint,
         }
     }
 }
@@ -187,6 +217,10 @@ impl DataType for AresNaptrReply {
     fn datatype() -> AresDataType { AresDataType::NaptrReply }
 }
 
+impl DataType for AresSoaReply {
+    fn datatype() -> AresDataType { AresDataType::SoaReply }
+}
+
 impl DataType for AresAddrPortNode {
     fn datatype() -> AresDataType { AresDataType::AddrPortNode }
 }
@@ -204,7 +238,6 @@ pub struct AresNaptrReply {
 
 impl Drop for AresNaptrReply {
     fn drop(&mut self) {
-        // Allocated via CString::into_raw() in into_ares_data()
         drop(unsafe { CString::from_raw(self.flags as *mut c_char) });
         drop(unsafe { CString::from_raw(self.service as *mut c_char) });
         drop(unsafe { CString::from_raw(self.regexp as *mut c_char) });
@@ -213,6 +246,13 @@ impl Drop for AresNaptrReply {
         if !self.next.is_null() {
             drop(unsafe { Box::from_raw(self.next) });
         }
+    }
+}
+
+impl Drop for AresSoaReply {
+    fn drop(&mut self) {
+        drop(unsafe { CString::from_raw(self.nsname as *mut c_char) });
+        drop(unsafe { CString::from_raw(self.hostmaster as *mut c_char) });
     }
 }
 
@@ -251,6 +291,20 @@ mod tests {
         }
     }
 
+    impl Default for AresSoaReply {
+        fn default() -> Self {
+            AresSoaReply {
+                nsname: CString::new("").unwrap().into_raw(),
+                hostmaster: CString::new("").unwrap().into_raw(),
+                serial: 0,
+                refresh: 0,
+                retry: 0,
+                expire: 0,
+                minttl: 0,
+            }
+        }
+    }
+
     impl Default for AresAddrPortNode {
         fn default() -> Self {
             let addr = AresAddrUnion { addr4: libc::in_addr { s_addr: 0 } };
@@ -262,6 +316,7 @@ mod tests {
     fn test_restore_original_ptr() {
         test_restore_original_ptr_impl::<AresMxReply>();
         test_restore_original_ptr_impl::<AresTxtReply>();
+        test_restore_original_ptr_impl::<AresSoaReply>();
         test_restore_original_ptr_impl::<AresAddrPortNode>();
     }
 
