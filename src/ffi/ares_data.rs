@@ -1,5 +1,5 @@
 use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint, c_short };
-use crate::core::packets::{ TxtReply, MxReply, CaaReply, NaptrReply, SoaReply, SrvReply, UriReply };
+use crate::core::packets::{ TxtReply, TxtReplyExt, MxReply, CaaReply, NaptrReply, SoaReply, SrvReply, UriReply };
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
 
@@ -13,6 +13,15 @@ impl IntoAresData<AresTxtReply> for TxtReply {
         let length = bytes.len();
         let txt = Box::into_raw(bytes.into_boxed_slice());
         AresTxtReply { next: std::ptr::null_mut(), txt: txt as *const i8, length }
+    }
+}
+
+impl IntoAresData<AresTxtReplyExt> for TxtReplyExt {
+    fn into_ares_data(self, _main_buf: &[u8]) -> AresTxtReplyExt {
+        let bytes = self.txt.into_bytes();
+        let length = bytes.len();
+        let txt = Box::into_raw(bytes.into_boxed_slice());
+        AresTxtReplyExt { next: std::ptr::null_mut(), txt: txt as *const i8, length, record_start: self.record_start as c_char }
     }
 }
 
@@ -35,6 +44,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
         AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
         AresDataType::CaaReply => drop(Box::from_raw(aresdata as *mut AresData<AresCaaReply>)),
         AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
+        AresDataType::TxtReplyExt => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReplyExt>)),
         AresDataType::NaptrReply => drop(Box::from_raw(aresdata as *mut AresData<AresNaptrReply>)),
         AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
         AresDataType::SrvReply => drop(Box::from_raw(aresdata as *mut AresData<AresSrvReply>)),
@@ -49,6 +59,7 @@ pub enum AresDataType {
     MxReply,
     CaaReply,
     TxtReply,
+    TxtReplyExt,
     NaptrReply,
     SoaReply,
     SrvReply,
@@ -75,6 +86,14 @@ pub struct AresTxtReply {
     next: *mut AresTxtReply,
     pub txt: *const c_char,
     pub length: usize, // null termination excluded
+}
+
+#[repr(C)]
+pub struct AresTxtReplyExt {
+    next: *mut AresTxtReplyExt,
+    pub txt: *const c_char,
+    pub length: usize, // null termination excluded
+    pub record_start: c_char,
 }
 
 #[repr(C)]
@@ -182,6 +201,15 @@ impl Drop for AresTxtReply {
     }
 }
 
+impl Drop for AresTxtReplyExt {
+    fn drop(&mut self) {
+        drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length, self.length) });
+        if !self.next.is_null() {
+            drop(unsafe { Box::from_raw(self.next) })
+        }
+    }
+}
+
 impl Drop for AresSrvReply {
     fn drop(&mut self) {
         drop(unsafe { CString::from_raw(self.host as *mut c_char) });
@@ -200,6 +228,10 @@ impl CLinkedList for AresCaaReply {
 }
 
 impl CLinkedList for AresTxtReply {
+    fn next(&mut self) -> &mut *mut Self { &mut self.next }
+}
+
+impl CLinkedList for AresTxtReplyExt {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
@@ -233,6 +265,10 @@ impl DataType for AresCaaReply {
 
 impl DataType for AresTxtReply {
     fn datatype() -> AresDataType { AresDataType::TxtReply }
+}
+
+impl DataType for AresTxtReplyExt {
+    fn datatype() -> AresDataType { AresDataType::TxtReplyExt }
 }
 
 impl DataType for AresNaptrReply {

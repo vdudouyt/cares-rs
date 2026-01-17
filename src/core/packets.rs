@@ -253,6 +253,34 @@ impl Parser for TxtReply {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct TxtReplyExt {
+    pub txt: String,
+    pub length: usize,
+    pub record_start: bool,
+}
+
+impl Parser for Vec<TxtReplyExt> {
+    fn parse<B: Buf>(buf: &mut B) -> Option<Vec<TxtReplyExt>> {
+        let mut record_start = true;
+        let mut ret: Vec<TxtReplyExt> = vec![];
+        while buf.remaining() > 0 {
+            let txt = parse_prefixed_string(buf)?;
+            let length = txt.len();
+            ret.push(TxtReplyExt { txt, length, record_start });
+            record_start = false;
+        }
+        Some(ret)
+    }
+}
+
+impl<T: Parser> RRParser for T {
+    fn parse_rr(answer: &DnsAnswer) -> Option<T> {
+        let mut buf = Cursor::new(&answer.data);
+        T::parse(&mut buf)
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub struct NaptrReply {
     pub order: u16,
     pub preference: u16,

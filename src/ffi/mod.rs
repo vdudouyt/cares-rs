@@ -279,6 +279,26 @@ pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out:
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReplyExt) -> c_int {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let res = ParsedResponse::from_buf(buf).unwrap();
+
+    let (answers, parsed_count) = res.process_answers::<Vec<TxtReplyExt>>(&buf, RECORD_TYPE_TXT);
+    let answers: Vec<_> = answers.into_iter().flatten().collect();
+    let aresreplies: Vec<_> = answers.into_iter().map(|x| x.into_ares_data(&buf)).collect();
+
+    let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return if parsed_count > 0 { ARES_SUCCESS } else { ARES_EBADRESP };
+    };
+
+    let aresdata: AresData<AresTxtReplyExt> = AresData { data_type: AresTxtReplyExt::datatype(), data: reply };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut (*aresdata).data };
+    ARES_SUCCESS
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ares_parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
     unsafe { ares_parse_data::<CaaReply, AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
 }
