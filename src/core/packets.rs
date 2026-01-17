@@ -345,6 +345,42 @@ impl Parser for SrvReply {
     }
 }
 
+pub trait RRParser {
+    fn parse_rr(answer: &DnsAnswer) -> Option<Self> where Self: Sized;
+}
+
+#[derive(Debug, PartialEq)]
+pub struct UriReply {
+    pub priority: u16,
+    pub weight: u16,
+    pub uri: String,
+    pub ttl: u32,
+}
+
+impl RRParser for UriReply {
+    fn parse_rr(answer: &DnsAnswer) -> Option<UriReply> {
+        let mut buf = Cursor::new(&answer.data);
+        let priority = buf.try_get_u16().ok()?;
+        let weight = buf.try_get_u16().ok()?;
+
+        let uri_len = buf.remaining();
+        let mut uri_bytes = vec![0u8; uri_len];
+        buf.try_copy_to_slice(&mut uri_bytes).ok()?;
+        let uri = String::from_utf8(uri_bytes).ok()?;
+
+        if uri_len == 0 {
+            return None;
+        }
+
+        Some(UriReply {
+            priority,
+            weight,
+            uri,
+            ttl: answer.ttl
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

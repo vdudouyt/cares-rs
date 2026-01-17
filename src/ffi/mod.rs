@@ -157,6 +157,66 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
 }
 
+#[derive(Debug)]
+struct ParsedResponse {
+    pub transaction_id: u16,
+    pub query: DnsQuery,
+    pub answers: Vec<DnsAnswer>,
+}
+
+impl ParsedResponse {
+    pub unsafe fn from_raw(abuf: *const u8, alen: c_int) -> Result<Self, c_int> {
+        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        Self::from_buf(buf)
+    }
+
+    pub fn from_buf(buf: &[u8]) -> Result<Self, c_int> {
+        let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
+            return Err(ARES_EBADRESP);
+        };
+        if frame.queries.len() > 1 {
+            return Err(ARES_EBADRESP);
+        }
+        let Some(query) = frame.queries.into_iter().next() else {
+            return Err(ARES_EBADRESP);
+        };
+        if frame.answers.len() == 0 {
+            return Err(ARES_ENODATA);
+        }
+        Ok(Self {
+            transaction_id: frame.transaction_id,
+            query,
+            answers: frame.answers
+        })
+    }
+
+    pub fn process_answers<T: RRParser>(self, buf: &[u8], expected_record_type: u16) -> (Vec<T>, usize) {
+        let mut name = CString::new(self.query.name.join(".")).unwrap();
+        let mut parsed_answers: Vec<T> = vec![];
+        let mut success = 0;
+        for answer in &self.answers {
+            if answer.record_type == RECORD_TYPE_CNAME {
+                let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
+                let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP).unwrap();
+                name = alias_of;
+            }
+            if answer.record_type != expected_record_type {
+                success += 1;
+                continue;
+            }
+            let Some(parsed) = T::parse_rr(answer) else {
+                continue;
+            };
+            success += 1;
+            if name != answer.name.build_cstring(&buf).unwrap() {
+                continue;
+            }
+            parsed_answers.push(parsed);
+        }
+        (parsed_answers, success)
+    }
+}
+
 pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
 {
@@ -233,6 +293,38 @@ pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out:
     unsafe { ares_parse_data::<SrvReply, AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
 }
 
+fn ares_result(arg: Result<(), c_int>) -> c_int {
+    match arg {
+        Ok(_) => ARES_SUCCESS,
+        Err(err) => err,
+    }
+}
+
+unsafe fn parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> Result<(), c_int> {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let res = ParsedResponse::from_buf(buf)?;
+    let (answers, parsed_count) = res.process_answers::<UriReply>(&buf, RECORD_TYPE_URI);
+    if answers.len() == 0 {
+        unsafe { *out = std::ptr::null_mut() };
+        return if parsed_count > 0 { Ok(()) } else { Err(ARES_EBADRESP) };
+    }
+    let aresreplies: Vec<_> = answers.into_iter().map(|x| x.into_ares_data(&buf)).collect();
+
+    let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return Err(ARES_EBADRESP);
+    };
+    let aresdata: AresData<AresUriReply> = AresData { data_type: AresUriReply::datatype(), data: reply };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut (*aresdata).data };
+    Ok(())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> c_int {
+    ares_result(parse_uri_reply(abuf, alen, out))
+}
+
 impl DnsLabel {
     pub fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
         Some(CString::new(self.build_string(main_buf)?).ok()?)
@@ -261,6 +353,7 @@ const RECORD_TYPE_TXT: u16 = 0x10;
 const RECORD_TYPE_CAA: u16 = 0x101;
 const RECORD_TYPE_SRV: u16 = 0x21;
 const RECORD_TYPE_NAPTR: u16 = 0x23;
+const RECORD_TYPE_URI: u16 = 0x100;
 
 fn get_addr_type(record_type: u16) -> c_int {
     match record_type {

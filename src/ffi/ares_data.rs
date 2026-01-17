@@ -1,5 +1,5 @@
-use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint };
-use crate::core::packets::{ TxtReply, MxReply, CaaReply, NaptrReply, SoaReply, SrvReply };
+use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint, c_short };
+use crate::core::packets::{ TxtReply, MxReply, CaaReply, NaptrReply, SoaReply, SrvReply, UriReply };
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
 
@@ -37,6 +37,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
         AresDataType::NaptrReply => drop(Box::from_raw(aresdata as *mut AresData<AresNaptrReply>)),
         AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
         AresDataType::SrvReply => drop(Box::from_raw(aresdata as *mut AresData<AresSrvReply>)),
+        AresDataType::UriReply => drop(Box::from_raw(aresdata as *mut AresData<AresUriReply>)),
         AresDataType::AddrPortNode => drop(Box::from_raw(aresdata as *mut AresData<AresAddrPortNode>)),
     }
 }
@@ -50,6 +51,7 @@ pub enum AresDataType {
     NaptrReply,
     SoaReply,
     SrvReply,
+    UriReply,
     AddrPortNode
 }
 
@@ -208,6 +210,10 @@ impl CLinkedList for AresSrvReply {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
+impl CLinkedList for AresUriReply {
+    fn next(&mut self) -> &mut *mut Self { &mut self.next }
+}
+
 impl CLinkedList for AresAddrPortNode {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
@@ -238,6 +244,10 @@ impl DataType for AresSoaReply {
 
 impl DataType for AresSrvReply {
     fn datatype() -> AresDataType { AresDataType::SrvReply }
+}
+
+impl DataType for AresUriReply {
+    fn datatype() -> AresDataType { AresDataType::UriReply }
 }
 
 impl DataType for AresAddrPortNode {
@@ -272,6 +282,12 @@ impl Drop for AresSoaReply {
     fn drop(&mut self) {
         drop(unsafe { CString::from_raw(self.nsname as *mut c_char) });
         drop(unsafe { CString::from_raw(self.hostmaster as *mut c_char) });
+    }
+}
+
+impl Drop for AresUriReply {
+    fn drop(&mut self) {
+        drop(unsafe { CString::from_raw(self.uri as *mut c_char) });
     }
 }
 
@@ -311,6 +327,29 @@ impl IntoAresData<AresSrvReply> for SrvReply {
             priority: self.priority as c_ushort,
             weight: self.weight as c_ushort,
             port: self.port as c_ushort,
+        }
+    }
+}
+
+#[repr(C)]
+pub struct AresUriReply {
+    next: *mut AresUriReply,
+    priority: c_short,
+    weight: c_short,
+    uri: *const c_char,
+    ttl: c_int,
+}
+
+impl IntoAresData<AresUriReply> for UriReply {
+    fn into_ares_data(self, _main_buf: &[u8]) -> AresUriReply {
+        let uri = CString::new(self.uri).unwrap().into_raw();
+
+        AresUriReply {
+            next: std::ptr::null_mut(),
+            priority: self.priority as c_short,
+            weight: self.weight as c_short,
+            uri,
+            ttl: self.ttl as c_int
         }
     }
 }
