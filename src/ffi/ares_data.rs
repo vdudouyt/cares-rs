@@ -9,9 +9,10 @@ pub trait IntoAresData<T> {
 
 impl IntoAresData<AresTxtReply> for TxtReply {
     fn into_ares_data(self, _main_buf: &[u8]) -> AresTxtReply {
-        let length = self.txt.len();
-        let txt = CString::new(self.txt).unwrap().into_raw();
-        AresTxtReply { next: std::ptr::null_mut(), txt, length }
+        let bytes = self.txt.into_bytes();
+        let length = bytes.len();
+        let txt = Box::into_raw(bytes.into_boxed_slice());
+        AresTxtReply { next: std::ptr::null_mut(), txt: txt as *const i8, length }
     }
 }
 
@@ -174,7 +175,7 @@ impl Drop for AresMxReply {
 
 impl Drop for AresTxtReply {
     fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.txt as *mut c_char) });
+        drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length, self.length) });
         if !self.next.is_null() {
             drop(unsafe { Box::from_raw(self.next) })
         }

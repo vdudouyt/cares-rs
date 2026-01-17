@@ -237,14 +237,17 @@ impl Parser for CaaReply {
 #[derive(Debug, PartialEq)]
 pub struct TxtReply {
     pub txt: String,
-    pub length: u8,
+    pub length: usize,
 }
 
 impl Parser for TxtReply {
     fn parse<B: Buf>(buf: &mut B) -> Option<TxtReply> {
-        let length = buf.try_get_u8().ok()?;
-        let txt_slice = buf.copy_to_bytes(std::cmp::min(length as usize, buf.remaining()));
-        let txt = String::from_utf8_lossy(&txt_slice).to_string();
+        let mut txt: Vec<String> = vec![];
+        while buf.remaining() > 0 {
+            txt.push(parse_prefixed_string(buf)?);
+        }
+        let txt = txt.join("");
+        let length = txt.len();
         Some(TxtReply { txt, length })
     }
 }
