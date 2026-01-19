@@ -33,7 +33,7 @@ impl<T> Ares<T> {
         let sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
         let _ = sock.set_nonblocking(true);
         let query = DnsQuery {
-            name: hostname.split(".").map(str::to_owned).collect(),
+            name: hostname.split(".").filter(|t| t.len() > 0).map(str::to_owned).collect(),
             qtype,
             qclass: 1,
         };
