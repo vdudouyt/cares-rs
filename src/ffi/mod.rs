@@ -285,65 +285,14 @@ impl ParsedResponse {
     }
 }
 
-pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
-where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
-{
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
-        unsafe { *out = std::ptr::null_mut() };
-        return ARES_EBADRESP;
-    };
-    let [ref query] = frame.queries[..] else {
-        unsafe { *out = std::ptr::null_mut() };
-        return ARES_EBADRESP;
-    };
-    if frame.answers.len() == 0 {
-        return ARES_ENODATA;
-    }
-    let mut name = CString::new(query.name.join(".")).unwrap();
-
-    let mut replies: Vec<T1> = vec![];
-    let mut success = 0;
-    for answer in &frame.answers {
-        if answer.record_type == RECORD_TYPE_CNAME {
-            let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-            let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP).unwrap();
-            name = alias_of;
-        }
-        if answer.record_type != expected_record_type {
-            success += 1;
-            continue;
-        }
-        let Some(parsed) = T1::parse(&mut Cursor::new(&answer.data)) else {
-            continue;
-        };
-        success += 1;
-        if name != answer.name.build_cstring(&buf).unwrap() {
-            continue;
-        }
-        replies.push(parsed);
-    }
-
-    let aresreplies: Vec<_> = replies.into_iter().map(|x| x.into_ares_data(&buf)).collect();
-    let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
-        unsafe { *out = std::ptr::null_mut() };
-        return if success > 0 { ARES_SUCCESS } else { ARES_EBADRESP };
-    };
-
-    let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut (*aresdata).data };
-    ARES_SUCCESS
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
-    unsafe { ares_parse_data::<MxReply, AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
+    unsafe { parse_to_clinkedlist::<MxReply, AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
-    unsafe { ares_parse_data::<TxtReply, AresTxtReply>(abuf, alen, out, RECORD_TYPE_TXT) }
+    unsafe { parse_to_clinkedlist::<TxtReply, AresTxtReply>(abuf, alen, out, RECORD_TYPE_TXT) }
 }
 
 #[no_mangle]
@@ -368,19 +317,39 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
     ARES_SUCCESS
 }
 
+pub unsafe fn parse_to_clinkedlist<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
+where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType {
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let res = match ParsedResponse::from_buf(buf) {
+        Ok(res) => res,
+        Err(err) => return err,
+    };
+    let parsed_rrs = res.process_answers::<T1>(&buf, expected_record_type);
+    let aresreplies: Vec<_> = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(&buf)).collect();
+    let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return if parsed_rrs.success > 0 { ARES_SUCCESS } else { ARES_EBADRESP };
+    };
+
+    let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut (*aresdata).data };
+    ARES_SUCCESS
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
-    unsafe { ares_parse_data::<CaaReply, AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
+    unsafe { parse_to_clinkedlist::<CaaReply, AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_naptr_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresNaptrReply) -> c_int {
-    unsafe { ares_parse_data::<NaptrReply, AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
+    unsafe { parse_to_clinkedlist::<NaptrReply, AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSrvReply) -> c_int {
-    unsafe { ares_parse_data::<SrvReply, AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
+    unsafe { parse_to_clinkedlist::<SrvReply, AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
 }
 
 fn ares_result(arg: Result<(), c_int>) -> c_int {
