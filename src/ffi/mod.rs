@@ -532,7 +532,7 @@ unsafe fn fill_addrttls<T: AddrTTL>(host: &HostEnt, addrttls: *mut T, naddrttls:
     i
 }
 
-unsafe fn parse_reply<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
+unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let (ret_code, host_ptr, naddrttls) = match ParsedResponse::from_buf(buf) {
         Ok(res) => {
@@ -565,12 +565,12 @@ unsafe fn parse_reply<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, al
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
-    parse_reply(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET)
+    parse_to_hostent(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
-    parse_reply(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6)
+    parse_to_hostent(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6)
 }
 
 #[no_mangle]
