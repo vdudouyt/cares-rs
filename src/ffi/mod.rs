@@ -239,7 +239,7 @@ impl ParsedResponse {
         let mut success = 0;
         let mut aliases: Vec<CString> = vec![];
         let mut limit_ttl: Option<u32> = None;
-        for answer in &self.answers {
+        for mut answer in self.answers {
             if answer.record_type == RECORD_TYPE_CNAME {
                 let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
                 let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP).unwrap();
@@ -249,17 +249,36 @@ impl ParsedResponse {
                     limit_ttl = Some(answer.ttl);
                 }
             }
+
+            if answer.record_type == RECORD_TYPE_PTR {
+                let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
+                let alias_of = alias_of.build_cstring(&buf).unwrap();
+                name = alias_of;
+            }
+
             if answer.record_type != expected_record_type {
                 success += 1;
                 continue;
             }
-            let Some(parsed) = T::parse_rr(answer) else {
+
+            if expected_record_type == RECORD_TYPE_A || expected_record_type == RECORD_TYPE_AAAA {
+                if let Some(limit_ttl) = limit_ttl {
+                    if answer.ttl > limit_ttl {
+                        answer.ttl = limit_ttl;
+                    }
+                }
+            }
+
+            let Some(parsed) = T::parse_rr(&answer) else {
                 continue;
             };
             success += 1;
+            /*
             if name != answer.name.build_cstring(&buf).unwrap() {
+                println!("name != answer.name: {:?} != {:?}", name, answer.name);
                 continue;
             }
+            */
             items.push(parsed);
         }
         ParsedRRs { items, name, aliases, limit_ttl, success }
@@ -568,28 +587,33 @@ unsafe fn fill_addrttls<T: AddrTTL>(host: &HostEnt, addrttls: *mut T, naddrttls:
 
 unsafe fn parse_reply<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let res = ParsedResponse::from_buf(buf).unwrap();
-    let addr_records = res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_A);
-
-    let mut i: usize = 0;
-    if !out_naddrttls.is_null() && !addrttls.is_null() {
-        let naddrttls = std::cmp::max(*out_naddrttls, 0);
-        for record in addr_records.items.iter() {
-            if i >= (naddrttls as usize) {
-                break;
+    let (ret_code, host_ptr, naddrttls) = match ParsedResponse::from_buf(buf) {
+        Ok(res) => {
+            let addr_records = res.process_answers::<AddrRecord>(&buf, expected_record_type);
+            if addr_records.items.len() == 0 && addr_records.aliases.len() == 0 {
+                return ARES_ENODATA;
             }
-            if (*addrttls.add(i)).set_addr_ttl(&record.ip, record.ttl).is_some() {
-                i += 1;
-            }
-        }
-    }
-    if !out_naddrttls.is_null() {
-        *out_naddrttls = i as c_int;
-    }
 
-    let host_ptr = addr_records.into_raw_hostent(libc::AF_INET);
+            let mut i: usize = 0;
+            if !out_naddrttls.is_null() && !addrttls.is_null() {
+                let naddrttls = std::cmp::max(*out_naddrttls, 0);
+                for record in addr_records.items.iter() {
+                    if i >= (naddrttls as usize) {
+                        break;
+                    }
+                    if (*addrttls.add(i)).set_addr_ttl(&record.ip, record.ttl).is_some() {
+                        i += 1;
+                    }
+                }
+            }
+            (ARES_SUCCESS, addr_records.into_raw_hostent(family), i)
+        },
+        Err(err) => (err, std::ptr::null_mut(), 0),
+    };
+
     if !out.is_null() { *out = host_ptr; }
-    ARES_SUCCESS
+    if !out_naddrttls.is_null() { *out_naddrttls = naddrttls as i32; }
+    ret_code
 }
 
 #[no_mangle]
