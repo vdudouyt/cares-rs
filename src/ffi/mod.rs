@@ -318,7 +318,7 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
 }
 
 pub unsafe fn parse_to_clinkedlist<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
-where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType {
+where T1: RRParser + IntoAresData<T2>, T2: CLinkedList + DataType {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let res = match ParsedResponse::from_buf(buf) {
         Ok(res) => res,
@@ -359,31 +359,9 @@ fn ares_result(arg: Result<(), c_int>) -> c_int {
     }
 }
 
-unsafe fn parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> Result<(), c_int> {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let res = ParsedResponse::from_buf(buf)?;
-    let parsed_rrs = res.process_answers::<UriReply>(&buf, RECORD_TYPE_URI);
-    let answers = parsed_rrs.items;
-    let parsed_count = parsed_rrs.success;
-    if answers.len() == 0 {
-        unsafe { *out = std::ptr::null_mut() };
-        return if parsed_count > 0 { Ok(()) } else { Err(ARES_EBADRESP) };
-    }
-    let aresreplies: Vec<_> = answers.into_iter().map(|x| x.into_ares_data(&buf)).collect();
-
-    let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
-        unsafe { *out = std::ptr::null_mut() };
-        return Err(ARES_EBADRESP);
-    };
-    let aresdata: AresData<AresUriReply> = AresData { data_type: AresUriReply::datatype(), data: reply };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut (*aresdata).data };
-    Ok(())
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> c_int {
-    ares_result(parse_uri_reply(abuf, alen, out))
+    unsafe { parse_to_clinkedlist::<UriReply, AresUriReply>(abuf, alen, out, RECORD_TYPE_URI) }
 }
 
 impl DnsLabel {
