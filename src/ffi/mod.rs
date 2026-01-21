@@ -427,17 +427,6 @@ fn buf_to_ip(buf: &[u8]) -> Result<IpAddr, &'static str> {
     }
 }
 
-/* A safe counterpart matching libc::hostent as close as possible */
-#[derive(Debug)]
-struct HostEnt {
-    name: CString,
-    aliases: Vec<CString>,
-    addrtype: c_int,
-    length: c_int,
-    addrttls: Vec<(std::net::IpAddr, u32)>,
-    addrlist: Vec<IpAddr>,
-}
-
 fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {
     let mut ret: Vec<*mut i8> = vec![];
     for addr in addrlist {
@@ -450,88 +439,6 @@ fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {
         }
     }
     ret
-}
-
-impl HostEnt {
-    pub fn from_buf(buf: &[u8], expected_record_type: u16, family: c_int) -> Result<Self, c_int> {
-        let expected_length = match family {
-            libc::AF_INET => 4,
-            libc::AF_INET6 => 16,
-            _ => 0,
-        };
-        let parsed_response = ParsedResponse::from_buf(buf)?;
-        let mut name = CString::new(parsed_response.query.name.join(".")).unwrap();
-        let mut addrttls: Vec<(std::net::IpAddr, u32)> = vec![];
-        let mut addrlist: Vec<std::net::IpAddr> = vec![];
-        let mut aliases: Vec<CString> = vec![];
-        let mut limit_ttl: Option<u32> = None;
-        for mut answer in parsed_response.answers {
-            if answer.record_type == RECORD_TYPE_CNAME {
-                let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-                let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP)?;
-                if expected_record_type != RECORD_TYPE_PTR {
-                    aliases.push(name);
-                    name = alias_of;
-                    limit_ttl = Some(answer.ttl);
-                }
-            }
-
-            if answer.record_type == RECORD_TYPE_PTR {
-                let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-                let alias_of = alias_of.build_cstring(&buf).unwrap();
-                name = alias_of;
-            }
-
-            if answer.record_type != expected_record_type {
-                continue;
-            }
-
-            if let Some(limit_ttl) = limit_ttl {
-                if answer.ttl > limit_ttl {
-                    answer.ttl = limit_ttl;
-                }
-            }
-        
-            if expected_length == 0 || expected_record_type == RECORD_TYPE_PTR {
-                let alias = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-                let alias = alias.build_cstring(&buf).unwrap();
-                aliases.push(alias);
-            } else {
-                if answer.data.len() != expected_length {
-                    continue;
-                }
-                if let Ok(ip) = buf_to_ip(&answer.data) {
-                    addrlist.push(ip);
-                    addrttls.push((ip, answer.ttl));
-                }
-            }
-        }
-        if addrlist.len() == 0 && aliases.len() == 0 {
-            return Err(ARES_ENODATA);
-        }
-        let hostent = Self {
-            name,
-            aliases,
-            addrtype: family,
-            addrttls,
-            length: expected_length as c_int,
-            addrlist
-        };
-        Ok(hostent)
-    }
-    unsafe fn into_raw(self) -> *mut libc::hostent {
-        let addrlist: Vec<*mut i8> = iplist_to_raw(&self.addrlist, self.length as usize);
-        let aliases: Vec<*mut i8> = self.aliases.into_iter().map(|t| t.into_raw()).collect();
-        let hostent = libc::hostent {
-            h_name: self.name.into_raw(),
-            h_aliases: unsafe { cnullterminated::from_vec(aliases) },
-            h_addrtype: self.addrtype,
-            h_length: self.length,
-            h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
-        };
-
-        Box::into_raw(Box::new(hostent))
-    }
 }
 
 unsafe fn fill_addrttls<T: AddrTTL>(input: &Vec<AddrRecord>, addrttls: *mut T, naddrttls: usize) -> usize {
