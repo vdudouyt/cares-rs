@@ -528,51 +528,47 @@ impl HostEnt {
     }
 }
 
-unsafe fn fill_addrttls<T: AddrTTL>(host: &HostEnt, addrttls: *mut T, naddrttls: usize) -> usize {
+unsafe fn fill_addrttls<T: AddrTTL>(input: &Vec<AddrRecord>, addrttls: *mut T, naddrttls: usize) -> usize {
     let mut i = 0;
-    for (ip, ttl) in host.addrttls.iter() {
+    for addr_record in input.iter() {
         if i >= naddrttls {
             break;
         }
-        if (*addrttls.add(i)).set_addr_ttl(&ip, *ttl).is_some() {
+        if (*addrttls.add(i)).set_addr_ttl(&addr_record.ip, addr_record.ttl).is_some() {
             i += 1;
         }
     }
     i
 }
 
-unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let (ret_code, host_ptr, naddrttls) = match ParsedResponse::from_buf(buf) {
-        Ok(res) => {
-            let addr_records = match res.process_answers::<AddrRecord>(&buf, expected_record_type) {
-                Ok(res) => res,
-                Err(err) => return err,
-            };
-            if addr_records.items.len() == 0 && addr_records.aliases.len() == 0 {
-                return ARES_ENODATA;
-            }
-
-            let mut i: usize = 0;
-            if !out_naddrttls.is_null() && !addrttls.is_null() {
-                let naddrttls = std::cmp::max(*out_naddrttls, 0);
-                for record in addr_records.items.iter() {
-                    if i >= (naddrttls as usize) {
-                        break;
-                    }
-                    if (*addrttls.add(i)).set_addr_ttl(&record.ip, record.ttl).is_some() {
-                        i += 1;
-                    }
-                }
-            }
-            (ARES_SUCCESS, addr_records.into_raw_hostent(family), i)
-        },
-        Err(err) => (err, std::ptr::null_mut(), 0),
+unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, out_addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
+    let try_parse = || -> Result<ParsedRRs<AddrRecord>, c_int> {
+        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        let res = ParsedResponse::from_buf(buf)?;
+        let addr_records = res.process_answers::<AddrRecord>(&buf, expected_record_type)?;
+        if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
+            return Err(ARES_ENODATA);
+        }
+        Ok(addr_records)
     };
-
-    if !out.is_null() { *out = host_ptr; }
-    if !out_naddrttls.is_null() { *out_naddrttls = naddrttls as i32; }
-    ret_code
+    let on_success = |res: ParsedRRs<AddrRecord>| -> c_int {
+        if !out_addrttls.is_null() && !out_naddrttls.is_null() {
+            *out_naddrttls = fill_addrttls(&res.items, out_addrttls, *out_naddrttls as usize) as c_int;
+        }
+        if !out.is_null() {
+            *out = res.into_raw_hostent(family);
+        }
+        ARES_SUCCESS
+    };
+    let on_error = |status: c_int| -> c_int {
+        if !out.is_null() { *out = std::ptr::null_mut(); }
+        if !out_naddrttls.is_null() { *out_naddrttls = 0; }
+        status
+    };
+    match try_parse() {
+        Ok(res) => on_success(res),
+        Err(err) => on_error(err),
+    }
 }
 
 #[no_mangle]
