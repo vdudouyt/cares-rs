@@ -382,18 +382,7 @@ impl DnsLabel {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    ares_result((|| {
-        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let res = ParsedResponse::from_buf(buf)?;
-        let addr_records = res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_NS)?;
-        if addr_records.aliases.is_empty() {
-            return Err(ARES_ENODATA);
-        }
-        if !out.is_null() {
-            *out = addr_records.into_raw_hostent(libc::AF_INET);
-        }
-        Ok(())
-    })())
+    parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0)
 }
 
 const RECORD_TYPE_A: u16 = 0x01;
