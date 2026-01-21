@@ -233,7 +233,7 @@ impl ParsedResponse {
         })
     }
 
-    pub fn process_answers<T: RRParser>(self, buf: &[u8], expected_record_type: u16) -> ParsedRRs<T> {
+    pub fn process_answers<T: RRParser>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, c_int> {
         let mut name = CString::new(self.query.name.join(".")).unwrap();
         let mut items: Vec<T> = vec![];
         let mut success = 0;
@@ -242,7 +242,7 @@ impl ParsedResponse {
         for mut answer in self.answers {
             if answer.record_type == RECORD_TYPE_CNAME {
                 let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-                let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP).unwrap();
+                let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP)?;
                 if expected_record_type != RECORD_TYPE_PTR {
                     aliases.push(name);
                     name = alias_of;
@@ -250,14 +250,16 @@ impl ParsedResponse {
                 }
             }
 
+            if answer.record_type != expected_record_type {
+                success += 1;
+                continue;
+            }
+
             if answer.record_type == RECORD_TYPE_PTR {
                 let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
                 let alias_of = alias_of.build_cstring(&buf).unwrap();
                 name = alias_of;
-            }
-
-            if answer.record_type != expected_record_type {
-                success += 1;
+                aliases.push(name.clone());
                 continue;
             }
 
@@ -281,7 +283,7 @@ impl ParsedResponse {
             */
             items.push(parsed);
         }
-        ParsedRRs { items, name, aliases, limit_ttl, success }
+        Ok(ParsedRRs { items, name, aliases, limit_ttl, success })
     }
 }
 
@@ -300,7 +302,11 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let res = ParsedResponse::from_buf(buf).unwrap();
 
-    let parsed_rrs = res.process_answers::<Vec<TxtReplyExt>>(&buf, RECORD_TYPE_TXT);
+    let parsed_rrs = match res.process_answers::<Vec<TxtReplyExt>>(&buf, RECORD_TYPE_TXT) {
+        Ok(res) => res,
+        Err(err) => return err,
+    };
+
     let answers = parsed_rrs.items;
     let parsed_count = parsed_rrs.success;
     let answers: Vec<_> = answers.into_iter().flatten().collect();
@@ -324,7 +330,10 @@ where T1: RRParser + IntoAresData<T2>, T2: CLinkedList + DataType {
         Ok(res) => res,
         Err(err) => return err,
     };
-    let parsed_rrs = res.process_answers::<T1>(&buf, expected_record_type);
+    let parsed_rrs = match res.process_answers::<T1>(&buf, expected_record_type) {
+        Ok(res) => res,
+        Err(err) => return err,
+    };
     let aresreplies: Vec<_> = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(&buf)).collect();
     let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
         unsafe { *out = std::ptr::null_mut() };
@@ -536,7 +545,10 @@ unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let (ret_code, host_ptr, naddrttls) = match ParsedResponse::from_buf(buf) {
         Ok(res) => {
-            let addr_records = res.process_answers::<AddrRecord>(&buf, expected_record_type);
+            let addr_records = match res.process_answers::<AddrRecord>(&buf, expected_record_type) {
+                Ok(res) => res,
+                Err(err) => return err,
+            };
             if addr_records.items.len() == 0 && addr_records.aliases.len() == 0 {
                 return ARES_ENODATA;
             }
@@ -573,19 +585,33 @@ pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out
     parse_to_hostent(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6)
 }
 
+impl RRParser for CString {
+    fn parse_rr(answer: &DnsAnswer) -> Option<CString> {
+        let name = DnsLabel::parse(&mut Cursor::new(&answer.data))?;
+        Some(name.build_cstring(&answer.data)?)
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let mut ret = match HostEnt::from_buf(buf, RECORD_TYPE_PTR, family) {
-        Ok(ret) => ret,
+    let res = match ParsedResponse::from_buf(buf) {
+        Ok(res) => res,
         Err(err) => return err,
     };
+    let mut addr_records = match res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_PTR) {
+        Ok(res) => res,
+        Err(err) => return err,
+    };
+    if addr_records.aliases.len() == 0 {
+        return ARES_ENODATA;
+    }
     let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
-    let ip = buf_to_ip(ipbuf).unwrap();
-    ret.addrlist.push(ip);
-    ret.addrttls.push((ip, 0));
-    let host_ptr = ret.into_raw();
-    if !out.is_null() { *out = host_ptr; }
+    addr_records.items.push(AddrRecord { ip: buf_to_ip(ipbuf).unwrap(), ttl: 0 });
+    if !out.is_null() {
+        let host_ptr = addr_records.into_raw_hostent(family);
+        *out = host_ptr;
+    }
     ARES_SUCCESS
 }
 

@@ -412,6 +412,18 @@ impl RRParser for UriReply {
     }
 }
 
+#[derive(Debug)]
+pub struct PtrReply {
+    pub name: String,
+}
+
+impl RRParser for PtrReply {
+    fn parse_rr(answer: &DnsAnswer) -> Option<PtrReply> {
+        let name = DnsLabel::parse(&mut Cursor::new(&answer.data))?;
+        Some(PtrReply { name: name.build_string(&answer.data)? })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
