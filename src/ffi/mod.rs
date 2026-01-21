@@ -594,25 +594,22 @@ impl RRParser for CString {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let res = match ParsedResponse::from_buf(buf) {
-        Ok(res) => res,
-        Err(err) => return err,
-    };
-    let mut addr_records = match res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_PTR) {
-        Ok(res) => res,
-        Err(err) => return err,
-    };
-    if addr_records.aliases.len() == 0 {
-        return ARES_ENODATA;
-    }
-    let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
-    addr_records.items.push(AddrRecord { ip: buf_to_ip(ipbuf).unwrap(), ttl: 0 });
-    if !out.is_null() {
-        let host_ptr = addr_records.into_raw_hostent(family);
-        *out = host_ptr;
-    }
-    ARES_SUCCESS
+    ares_result((|| {
+        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        let res = ParsedResponse::from_buf(buf)?;
+        let mut addr_records = res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_PTR)?;
+        if addr_records.aliases.is_empty() {
+            return Err(ARES_ENODATA);
+        }
+        let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
+        let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
+        addr_records.items.push(AddrRecord { ip, ttl: 0 });
+        if !out.is_null() {
+            let host_ptr = addr_records.into_raw_hostent(family);
+            *out = host_ptr;
+        }
+        Ok(())
+    })())
 }
 
 #[no_mangle]
