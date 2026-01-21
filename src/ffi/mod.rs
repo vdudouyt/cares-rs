@@ -275,12 +275,6 @@ impl ParsedResponse {
                 continue;
             };
             success += 1;
-            /*
-            if name != answer.name.build_cstring(&buf).unwrap() {
-                println!("name != answer.name: {:?} != {:?}", name, answer.name);
-                continue;
-            }
-            */
             items.push(parsed);
         }
         Ok(ParsedRRs { items, name, aliases, limit_ttl, success })
