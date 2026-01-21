@@ -255,11 +255,11 @@ impl ParsedResponse {
                 continue;
             }
 
-            if answer.record_type == RECORD_TYPE_PTR {
+            if answer.record_type == RECORD_TYPE_PTR || answer.record_type == RECORD_TYPE_NS {
                 let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
                 let alias_of = alias_of.build_cstring(&buf).unwrap();
-                name = alias_of;
-                aliases.push(name.clone());
+                aliases.push(alias_of.clone());
+                if answer.record_type == RECORD_TYPE_PTR { name = alias_of; }
                 continue;
             }
 
@@ -382,12 +382,18 @@ impl DnsLabel {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    match HostEnt::from_buf(buf, RECORD_TYPE_NS, 0) {
-        Ok(hostent) => if !out.is_null() { *out = hostent.into_raw() },
-        Err(err) => return err,
-    }
-    ARES_SUCCESS
+    ares_result((|| {
+        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        let res = ParsedResponse::from_buf(buf)?;
+        let addr_records = res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_NS)?;
+        if addr_records.aliases.is_empty() {
+            return Err(ARES_ENODATA);
+        }
+        if !out.is_null() {
+            *out = addr_records.into_raw_hostent(libc::AF_INET);
+        }
+        Ok(())
+    })())
 }
 
 const RECORD_TYPE_A: u16 = 0x01;
