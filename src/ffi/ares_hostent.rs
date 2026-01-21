@@ -1,4 +1,4 @@
-use std::ffi::{ c_void, c_int, CString };
+use std::ffi::{ c_int, CString };
 use std::io::Cursor;
 use crate::ffi::cnullterminated;
 use crate::core::packets::*;

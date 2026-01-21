@@ -409,16 +409,6 @@ const RECORD_TYPE_SRV: u16 = 0x21;
 const RECORD_TYPE_NAPTR: u16 = 0x23;
 const RECORD_TYPE_URI: u16 = 0x100;
 
-fn get_addr_type(record_type: u16) -> c_int {
-    match record_type {
-        0x01 => libc::AF_INET,
-        0x1c => libc::AF_INET6,
-        0x02 => 0x02,
-        0x0c => 0x0c,
-        _ => panic!("Unexpected DNS record type in answer: {record_type}"),
-    }
-}
-
 fn buf_to_ip(buf: &[u8]) -> Result<IpAddr, &'static str> {
     match buf.len() {
         4 => Ok(IpAddr::from(<[u8; 4]>::try_from(buf).unwrap())),
