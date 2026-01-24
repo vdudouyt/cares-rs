@@ -202,11 +202,6 @@ impl ParsedRRs<AddrRecord> {
 }
 
 impl ParsedResponse {
-    pub unsafe fn from_raw(abuf: *const u8, alen: c_int) -> Result<Self, c_int> {
-        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        Self::from_buf(buf)
-    }
-
     pub fn from_buf(buf: &[u8]) -> Result<Self, c_int> {
         let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
             return Err(ARES_EBADRESP);

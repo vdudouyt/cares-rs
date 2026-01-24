@@ -1,6 +1,5 @@
 use std::net::{ UdpSocket, SocketAddr };
 use bytes::BytesMut;
-use std::io::Cursor;
 use rand::Rng;
 use std::time::{ Instant, Duration };
 
