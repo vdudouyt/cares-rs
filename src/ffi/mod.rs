@@ -313,7 +313,7 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
 
 pub unsafe fn parse_to_clinkedlist<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T1: RRParser + IntoAresData<T2>, T2: CLinkedList + DataType {
-    let res = (|| -> Result<*mut AresData<T2>, c_int> {
+    ares_fn_wrapper(out, || {
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let res = ParsedResponse::from_buf(buf)?;
         let parsed_rrs = res.process_answers::<T1>(&buf, expected_record_type)?;
@@ -323,10 +323,9 @@ where T1: RRParser + IntoAresData<T2>, T2: CLinkedList + DataType {
         };
 
         let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
-        Ok(Box::into_raw(Box::new(aresdata)))
-    })();
-    *out = if let Ok(aresdata_ptr) = res { &mut (*aresdata_ptr).data } else { std::ptr::null_mut() };
-    return if let Err(err) = res { err } else { ARES_SUCCESS };
+        let aresdata = Box::into_raw(Box::new(aresdata));
+        Ok(&mut (*aresdata).data)
+    })
 }
 
 #[no_mangle]
@@ -344,9 +343,17 @@ pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out:
     unsafe { parse_to_clinkedlist::<SrvReply, AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
 }
 
-fn ares_result(arg: Result<(), c_int>) -> c_int {
-    match arg {
-        Ok(_) => ARES_SUCCESS,
+unsafe fn ares_fn_wrapper<T, F>(out: *mut *mut T, f: F) -> c_int
+where F: FnOnce() -> Result<*mut T, c_int>
+{
+    if out.is_null() {
+        return ARES_ENOMEM;
+    }
+    match f() {
+        Ok(res) => {
+            unsafe { *out = res };
+            ARES_SUCCESS
+        },
         Err(err) => err,
     }
 }
@@ -465,7 +472,7 @@ impl RRParser for CString {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
-    ares_result((|| {
+    ares_fn_wrapper(out, || {
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let res = ParsedResponse::from_buf(buf)?;
         let mut addr_records = res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_PTR)?;
@@ -475,12 +482,8 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
         let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
         let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
         addr_records.items.push(AddrRecord { ip, ttl: 0 });
-        if !out.is_null() {
-            let host_ptr = addr_records.into_raw_hostent(family);
-            *out = host_ptr;
-        }
-        Ok(())
-    })())
+        Ok(addr_records.into_raw_hostent(family))
+    })
 }
 
 #[no_mangle]
