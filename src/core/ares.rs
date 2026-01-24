@@ -74,13 +74,11 @@ impl<T> Ares<T> {
         let _len = task.sock.send_to(&task.writebuf, socket_addr).unwrap();
         task.status = Status::Reading;
     }
-    pub fn read_impl(&mut self, task: &mut Task<T>) -> Option<(Vec<u8>, DnsFrame)> {
+    pub fn read_impl(&mut self, task: &mut Task<T>) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; 65_535];
         let (len, _src) = task.sock.recv_from(&mut buf).unwrap();
         task.status = Status::Completed;
-
-        let frame = DnsFrame::parse(&mut Cursor::new(&buf[0..len]))?;
-        Some((buf, frame))
+        Some(buf)
     }
     pub fn max_wait_time(&self) -> Duration {
         self.tasks.iter().map(Task::time_remaining).min().unwrap()

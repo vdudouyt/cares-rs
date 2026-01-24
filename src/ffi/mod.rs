@@ -57,16 +57,10 @@ enum Callback {
 }
 
 impl Callback {
-    fn run(&self, buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
+    fn run(&self, buf: Result<Vec<u8>, c_int>, ffidata: &FFIData) {
         match self {
-            Self::AresHostCallback(callback) => run_ares_host_callback(buf, result, *callback, ffidata.arg),
-            Self::AresCallback(callback) => run_ares_callback(buf, result, *callback, ffidata.arg),
-        }
-    }
-    fn run_error(&self, status: i32, arg: *mut c_void) {
-        match self {
-            Self::AresHostCallback(callback) => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
-            Self::AresCallback(callback) => unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) },
+            Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, ffidata.arg),
+            Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata.arg),
         }
     }
 }
@@ -216,6 +210,11 @@ impl ParsedResponse {
     pub fn from_buf(buf: &[u8]) -> Result<Self, c_int> {
         let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
             return Err(ARES_EBADRESP);
+        };
+        match frame.flags & 0x0f {
+            0 => {},
+            3 => return Err(ARES_ENOTFOUND),
+            _ => return Err(ARES_ESERVFAIL),
         };
         if frame.queries.len() > 1 {
             return Err(ARES_EBADRESP);
@@ -565,24 +564,30 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timev
     tv
 }
 
-fn run_ares_host_callback(buf: Vec<u8>, result: DnsFrame, callback: AresHostCallback, arg: *mut c_void) {
-    let reply_code = result.flags & 0x0f;
-    if reply_code > 0 {
-        let status = match reply_code {
-            3 => ARES_ENOTFOUND,
-            _ => ARES_ESERVFAIL,
-        };
-        return unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+fn run_ares_host_callback(res: Result<Vec<u8>, c_int>, callback: AresHostCallback, arg: *mut c_void) {
+    let res = (|| {
+        let buf = res?;
+        let res = ParsedResponse::from_buf(&buf)?;
+        let addr_records = res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_A)?;
+        if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
+            return Err(ARES_ENODATA);
+        }
+        Ok(unsafe { addr_records.into_raw_hostent(libc::AF_INET) })
+    })();
+    match res {
+        Ok(raw_hostent) => {
+            unsafe { callback(arg, ARES_SUCCESS, 0, &mut *raw_hostent) };
+            unsafe { ares_free_hostent(raw_hostent) };
+        },
+        Err(err) => unsafe { callback(arg, err, 0, std::ptr::null_mut()) },
     }
-
-    let hostent = unsafe { parse_hostent(buf.as_ptr(), buf.len() as i32, HostentParseMode::Addrs).unwrap() };
-    let hostent = Box::into_raw(Box::new(hostent));
-    unsafe { callback(arg, ARES_SUCCESS, 0, &mut *hostent) };
-    unsafe { ares_free_hostent(hostent) };
 }
 
-fn run_ares_callback(buf: Vec<u8>, _result: DnsFrame, callback: AresCallback, arg: *mut c_void) {
-    unsafe { callback(arg, ARES_SUCCESS, 0, buf.as_ptr() as *mut u8, buf.len() as i32) };
+fn run_ares_callback(res: Result<Vec<u8>, c_int>, callback: AresCallback, arg: *mut c_void) {
+    match res {
+        Ok(mut buf) => unsafe { callback(arg, ARES_SUCCESS, 0, buf.as_mut_ptr(), buf.len() as c_int) },
+        Err(err) => unsafe { callback(arg, err, 0, std::ptr::null_mut(), 0) },
+    }
 }
 
 #[no_mangle]
@@ -592,7 +597,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
     for task in &mut channeldata.ares.tasks {
         if task.is_expired() {
             let ffidata = &task.userdata;
-            (ffidata.callback).run_error(ARES_ETIMEOUT, ffidata.arg);
+            (ffidata.callback).run(Err(ARES_ETIMEOUT), &task.userdata);
             task.status = Status::Completed;
         }
     }
@@ -604,8 +609,8 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
             channeldata.ares.write_impl(task);
         }
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), read_fds) } {
-            if let Some((buf, frame)) = channeldata.ares.read_impl(task) {
-                (task.userdata.callback).run(buf, frame, &task.userdata);
+            if let Some(buf) = channeldata.ares.read_impl(task) {
+                (task.userdata.callback).run(Ok(buf), &task.userdata);
             }
         }
     }
