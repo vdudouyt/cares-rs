@@ -313,25 +313,20 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
 
 pub unsafe fn parse_to_clinkedlist<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T1: RRParser + IntoAresData<T2>, T2: CLinkedList + DataType {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let res = match ParsedResponse::from_buf(buf) {
-        Ok(res) => res,
-        Err(err) => return err,
-    };
-    let parsed_rrs = match res.process_answers::<T1>(&buf, expected_record_type) {
-        Ok(res) => res,
-        Err(err) => return err,
-    };
-    let aresreplies: Vec<_> = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(&buf)).collect();
-    let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
-        unsafe { *out = std::ptr::null_mut() };
-        return if parsed_rrs.success > 0 { ARES_SUCCESS } else { ARES_EBADRESP };
-    };
+    let res = (|| -> Result<*mut AresData<T2>, c_int> {
+        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        let res = ParsedResponse::from_buf(buf)?;
+        let parsed_rrs = res.process_answers::<T1>(&buf, expected_record_type)?;
+        let aresreplies: Vec<_> = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(&buf)).collect();
+        let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
+            return Err(if parsed_rrs.success > 0 { ARES_SUCCESS } else { ARES_EBADRESP });
+        };
 
-    let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut (*aresdata).data };
-    ARES_SUCCESS
+        let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
+        Ok(Box::into_raw(Box::new(aresdata)))
+    })();
+    *out = if let Ok(aresdata_ptr) = res { &mut (*aresdata_ptr).data } else { std::ptr::null_mut() };
+    return if let Err(err) = res { err } else { ARES_SUCCESS };
 }
 
 #[no_mangle]
