@@ -311,6 +311,30 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
     ARES_SUCCESS
 }
 
+unsafe fn parse_to_vec<T1, T2>(abuf: *const u8, alen: c_int, expected_record_type: u16) -> Result<Vec<T2>, c_int>
+where T1: RRParser + IntoAresData<T2>, T2: DataType
+{
+    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let res = ParsedResponse::from_buf(buf)?;
+    let parsed_rrs = res.process_answers::<T1>(&buf, expected_record_type)?;
+    Ok(parsed_rrs.items.into_iter().map(|x| x.into_ares_data(&buf)).collect())
+}
+
+pub unsafe fn parse_to_singleptr<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
+where T1: RRParser + IntoAresData<T2>, T2: DataType
+{
+    ares_fn_wrapper(out, || {
+        let aresreplies = parse_to_vec::<T1, T2>(abuf, alen, expected_record_type)?;
+        if aresreplies.len() > 1 {
+            return Err(ARES_EBADRESP);
+        }
+        let reply = aresreplies.into_iter().next().ok_or(ARES_ENODATA)?;
+        let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
+        let aresdata = Box::into_raw(Box::new(aresdata));
+        Ok(&mut (*aresdata).data)
+    })
+}
+
 pub unsafe fn parse_to_clinkedlist<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T1: RRParser + IntoAresData<T2>, T2: CLinkedList + DataType {
     ares_fn_wrapper(out, || {
@@ -488,32 +512,9 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
-        return ARES_EBADRESP;
-    };
-    let [ref query] = frame.queries[..] else {
-        unsafe { *out = std::ptr::null_mut() };
-        return ARES_EBADRESP;
-    };
-    if frame.answers.len() == 0 {
-        return ARES_EBADRESP;
-    }
-    for mut answer in frame.answers {
-        if answer.record_type == RECORD_TYPE_SOA {
-            let Some(soa) = SoaReply::parse(&mut Cursor::new(&answer.data)) else {
-                return ARES_EBADRESP;
-            };
-            if !out.is_null() {
-                let soa_reply = soa.into_ares_data(&answer.data);
-                let aresdata: AresData<AresSoaReply> = AresData { data_type: AresSoaReply::datatype(), data: soa_reply };
-                let aresdata = Box::into_raw(Box::new(aresdata));
-                unsafe { *out = &mut (*aresdata).data };
-            }
-            return ARES_SUCCESS;
-        }
-    }
-    return ARES_EBADRESP;
+    let ret = parse_to_singleptr::<SoaReply, AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA);
+    if ret == ARES_ENODATA { return ARES_EBADRESP; }
+    ret
 }
 
 #[no_mangle]
