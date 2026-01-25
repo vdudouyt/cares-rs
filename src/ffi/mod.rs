@@ -59,8 +59,8 @@ enum Callback {
 impl Callback {
     fn run(&self, buf: Result<Vec<u8>, c_int>, ffidata: &FFIData) {
         match self {
-            Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, ffidata.arg),
-            Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata.arg),
+            Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, ffidata),
+            Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata),
         }
     }
 }
@@ -69,6 +69,7 @@ impl Callback {
 struct FFIData {
     callback: Callback,
     arg: *mut c_void,
+    family: c_int,
 }
 
 #[repr(C)]
@@ -142,13 +143,13 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
+    let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
+    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family };
     let family = match family {
         libc::AF_INET => Family::Ipv4,
         libc::AF_INET6 => Family::Ipv6,
         _ => panic!("unexpected family value: {}", family),
     };
-    let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
-    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg };
     let newtask = channeldata.ares.gethostbyname(&hostname, family, ffidata);
     if let Some(cb) = channeldata.sock_create_callback {
         cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
@@ -159,7 +160,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let name = unsafe { CStr::from_ptr(name).to_string_lossy() };
-    let ffidata = FFIData { callback: Callback::AresCallback(callback), arg };
+    let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0 };
     channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
 }
 
@@ -558,29 +559,34 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timev
     tv
 }
 
-fn run_ares_host_callback(res: Result<Vec<u8>, c_int>, callback: AresHostCallback, arg: *mut c_void) {
+fn run_ares_host_callback(res: Result<Vec<u8>, c_int>, callback: AresHostCallback, ffidata: &FFIData) {
     let res = (|| {
+        let record_type = match ffidata.family {
+            libc::AF_INET => RECORD_TYPE_A,
+            libc::AF_INET6 => RECORD_TYPE_AAAA,
+            _ => panic!("unexpected family value: {}", ffidata.family),
+        };
         let buf = res?;
         let res = ParsedResponse::from_buf(&buf)?;
-        let addr_records = res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_A)?;
+        let addr_records = res.process_answers::<AddrRecord>(&buf, record_type)?;
         if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
             return Err(ARES_ENODATA);
         }
-        Ok(unsafe { addr_records.into_raw_hostent(libc::AF_INET) })
+        Ok(unsafe { addr_records.into_raw_hostent(ffidata.family) })
     })();
     match res {
         Ok(raw_hostent) => {
-            unsafe { callback(arg, ARES_SUCCESS, 0, &mut *raw_hostent) };
+            unsafe { callback(ffidata.arg, ARES_SUCCESS, 0, &mut *raw_hostent) };
             unsafe { ares_free_hostent(raw_hostent) };
         },
-        Err(err) => unsafe { callback(arg, err, 0, std::ptr::null_mut()) },
+        Err(err) => unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut()) },
     }
 }
 
-fn run_ares_callback(res: Result<Vec<u8>, c_int>, callback: AresCallback, arg: *mut c_void) {
+fn run_ares_callback(res: Result<Vec<u8>, c_int>, callback: AresCallback, ffidata: &FFIData) {
     match res {
-        Ok(mut buf) => unsafe { callback(arg, ARES_SUCCESS, 0, buf.as_mut_ptr(), buf.len() as c_int) },
-        Err(err) => unsafe { callback(arg, err, 0, std::ptr::null_mut(), 0) },
+        Ok(mut buf) => unsafe { callback(ffidata.arg, ARES_SUCCESS, 0, buf.as_mut_ptr(), buf.len() as c_int) },
+        Err(err) => unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut(), 0) },
     }
 }
 
