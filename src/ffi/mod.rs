@@ -22,6 +22,7 @@ use crate::ffi::ares_data::*;
 use crate::ffi::clinkedlist::*;
 use crate::ffi::error::*;
 use crate::cstr;
+pub use crate::ffi::ares_socket::{SocketFactory, AresSocketFunctions};
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
