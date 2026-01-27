@@ -9,12 +9,15 @@ use crate::{Channel, ARES_SOCKET_BAD};
 pub type ares_socket_t = c_int;
 pub type ares_ssize_t = isize;
 
+#[no_mangle]
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
-    todo!()
+    if funcs.is_null() { return }
+    let channeldata = unsafe { &mut *channel };
+    channeldata.ares.socket_factory = SocketFactory::new((*funcs).clone(), user_data);
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AresSocketFunctions {
     pub asocket: Option<unsafe extern "C" fn(domain: c_int, c_int, c_int, user_data: *mut c_void) -> ares_socket_t>,
     pub aclose: Option<unsafe extern "C" fn(fd: ares_socket_t, user_data: *mut c_void) -> c_int>,
