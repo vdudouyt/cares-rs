@@ -238,6 +238,21 @@ impl SocketFactory {
 
     fn asendv(&self, fd: ares_socket_t, bufs: &[&[u8]]) -> io::Result<usize> {
         let asendv = self.funcs.asendv.unwrap_or(default_asendv);
+
+        // Stack-allocate for small number of buffers (common case)
+        if bufs.len() <= 1 {
+            let mut iovecs: [iovec; 1] = unsafe { std::mem::zeroed() };
+            for (i, b) in bufs.iter().enumerate() {
+                iovecs[i] = iovec { iov_base: b.as_ptr() as *mut c_void, iov_len: b.len() };
+            }
+            let result = unsafe { asendv(fd, iovecs.as_ptr(), bufs.len() as c_int, self.user_data) };
+            if result == -1 {
+                return Err(Error::last_os_error());
+            }
+            return Ok(result as usize);
+        }
+
+        // Fallback to Vec for large number of buffers
         let iovecs: Vec<iovec> = bufs.iter().map(|b| iovec { iov_base: b.as_ptr() as *mut c_void, iov_len: b.len() }).collect();
         let result = unsafe { asendv(fd, iovecs.as_ptr(), iovecs.len() as c_int, self.user_data) };
         if result == -1 {
