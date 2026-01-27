@@ -1,7 +1,7 @@
 mod ares_data;
 mod ares_hostent;
 mod ares_options;
-mod ares_socket;
+pub mod ares_socket;
 mod cnullterminated;
 mod cstr;
 mod clinkedlist;

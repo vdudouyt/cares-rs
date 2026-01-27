@@ -114,13 +114,19 @@ pub struct SocketFactory {
     user_data: *mut c_void,
 }
 
+impl Default for SocketFactory {
+    fn default() -> Self {
+        SocketFactory { funcs: AresSocketFunctions::default(), user_data: std::ptr::null_mut() }
+    }
+}
+
 pub struct UdpSocket {
     fd: ares_socket_t,
     factory: Rc<SocketFactory>,
 }
 
 impl UdpSocket {
-    pub fn fd(&self) -> ares_socket_t {
+    pub fn as_raw_fd(&self) -> ares_socket_t {
         self.fd
     }
 
@@ -149,7 +155,7 @@ pub struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub fn fd(&self) -> ares_socket_t {
+    pub fn as_raw_fd(&self) -> ares_socket_t {
         self.fd
     }
 

@@ -2,13 +2,17 @@ use std::net::{ UdpSocket, SocketAddr };
 use bytes::BytesMut;
 use rand::Rng;
 use std::time::{ Instant, Duration };
+use std::rc::Rc;
 
 use crate::core::sysconfig::SysConfig;
 use crate::core::packets::*;
+use crate::ffi::SocketFactory;
+use crate::ffi::ares_socket;
 
 /* TODO: reconcile ChannelData here */
 pub struct Ares<T> {
     pub config: SysConfig,
+    pub socket_factory: Rc<SocketFactory>,
     pub tasks: Vec<Task<T>>,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
@@ -19,7 +23,13 @@ pub enum Family { Ipv4, Ipv6 }
 
 impl<T> Ares<T> {
     pub fn new(config: SysConfig) -> Self {
-        Ares { config, tasks: vec![], default_udp_port: 53, default_tcp_port: 53 }
+        Ares {
+            config,
+            socket_factory: Rc::new(SocketFactory::default()),
+            tasks: vec![],
+            default_udp_port: 53,
+            default_tcp_port: 53
+        }
     }
     pub fn from_sysconfig() -> Self {
         Ares::new(build_sysconfig())
@@ -29,8 +39,7 @@ impl<T> Ares<T> {
             Family::Ipv4 => 0x01, // A
             Family::Ipv6 => 0x1c, // AAAA
         };
-        let sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-        let _ = sock.set_nonblocking(true);
+        let sock = self.socket_factory.create_udp("0.0.0.0:0".parse().unwrap()).unwrap();
         let query = DnsQuery {
             name: hostname.split(".").filter(|t| t.len() > 0).map(str::to_owned).collect(),
             qtype,
@@ -49,8 +58,7 @@ impl<T> Ares<T> {
         self.tasks.last().unwrap()
     }
     pub fn query(&mut self, name: &str, dnsclass: u16, dnstype: u16, userdata: T) {
-        let sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-        let _ = sock.set_nonblocking(true);
+        let sock = self.socket_factory.create_udp("0.0.0.0:0".parse().unwrap()).unwrap();
         let query = DnsQuery {
             name: name.split(".").map(str::to_owned).collect(),
             qtype: dnstype,
@@ -70,12 +78,13 @@ impl<T> Ares<T> {
     pub fn write_impl(&mut self, task: &mut Task<T>) {
         let ns_addr = self.config.nameservers.first().unwrap();
         let socket_addr = SocketAddr::from((ns_addr.0, ns_addr.1.unwrap_or(self.default_udp_port)));
-        let _len = task.sock.send_to(&task.writebuf, socket_addr).unwrap();
+        task.sock.connect(socket_addr);
+        let _len = task.sock.send(&task.writebuf).unwrap();
         task.status = Status::Reading;
     }
     pub fn read_impl(&mut self, task: &mut Task<T>) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; 65_535];
-        let (len, _src) = task.sock.recv_from(&mut buf).unwrap();
+        let (len, _src) = task.sock.recv(&mut buf).unwrap();
         task.status = Status::Completed;
         Some(buf)
     }
@@ -92,7 +101,7 @@ pub enum Status { Writing, Reading, Completed }
 
 pub struct Task<T> {
     pub status: Status,
-    pub sock: UdpSocket,
+    pub sock: ares_socket::UdpSocket,
     pub writebuf: BytesMut,
     pub userdata: T,
     pub expires_at: Instant,
