@@ -72,6 +72,8 @@ struct FFIData {
     callback: Callback,
     arg: *mut c_void,
     family: c_int,
+    expected_record_type: c_int,
+    ip: Option<IpAddr>,
 }
 
 #[repr(C)]
@@ -146,7 +148,13 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
-    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family };
+    let expected_record_type = match family {
+        libc::AF_INET => RECORD_TYPE_A,
+        libc::AF_INET6 => RECORD_TYPE_AAAA,
+        _ => panic!("unexpected family value: {}", family),
+    };
+
+    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: expected_record_type as c_int, ip: None };
     let family = match family {
         libc::AF_INET => Family::Ipv4,
         libc::AF_INET6 => Family::Ipv6,
@@ -159,10 +167,23 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 }
 
 #[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
+    let channeldata = unsafe { &mut *channel };
+    let addrbuf = unsafe { std::slice::from_raw_parts(addr as *mut u8, addrlen as usize) };
+    let addr = buf_to_ip(addrbuf).unwrap();
+    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(addr) };
+    let newtask = channeldata.ares.gethostbyaddr(addr, ffidata);
+    if let Some(cb) = channeldata.sock_create_callback {
+        cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let name = unsafe { CStr::from_ptr(name).to_string_lossy() };
-    let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0 };
+    let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0, expected_record_type: 0, ip: None };
     channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
 }
 
@@ -402,18 +423,18 @@ pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: 
     parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0)
 }
 
-const RECORD_TYPE_A: u16 = 0x01;
-const RECORD_TYPE_NS: u16 = 0x02;
-const RECORD_TYPE_CNAME: u16 = 0x05;
-const RECORD_TYPE_SOA: u16 = 0x06;
-const RECORD_TYPE_PTR: u16 = 0x0c;
-const RECORD_TYPE_AAAA: u16 = 0x1c;
-const RECORD_TYPE_MX: u16 = 0x0f;
-const RECORD_TYPE_TXT: u16 = 0x10;
-const RECORD_TYPE_CAA: u16 = 0x101;
-const RECORD_TYPE_SRV: u16 = 0x21;
-const RECORD_TYPE_NAPTR: u16 = 0x23;
-const RECORD_TYPE_URI: u16 = 0x100;
+pub const RECORD_TYPE_A: u16 = 0x01;
+pub const RECORD_TYPE_NS: u16 = 0x02;
+pub const RECORD_TYPE_CNAME: u16 = 0x05;
+pub const RECORD_TYPE_SOA: u16 = 0x06;
+pub const RECORD_TYPE_PTR: u16 = 0x0c;
+pub const RECORD_TYPE_AAAA: u16 = 0x1c;
+pub const RECORD_TYPE_MX: u16 = 0x0f;
+pub const RECORD_TYPE_TXT: u16 = 0x10;
+pub const RECORD_TYPE_CAA: u16 = 0x101;
+pub const RECORD_TYPE_SRV: u16 = 0x21;
+pub const RECORD_TYPE_NAPTR: u16 = 0x23;
+pub const RECORD_TYPE_URI: u16 = 0x100;
 
 fn buf_to_ip(buf: &[u8]) -> Result<IpAddr, &'static str> {
     match buf.len() {
@@ -563,16 +584,14 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timev
 
 fn run_ares_host_callback(res: Result<Vec<u8>, c_int>, callback: AresHostCallback, ffidata: &FFIData) {
     let res = (|| {
-        let record_type = match ffidata.family {
-            libc::AF_INET => RECORD_TYPE_A,
-            libc::AF_INET6 => RECORD_TYPE_AAAA,
-            _ => panic!("unexpected family value: {}", ffidata.family),
-        };
         let buf = res?;
         let res = ParsedResponse::from_buf(&buf)?;
-        let addr_records = res.process_answers::<AddrRecord>(&buf, record_type)?;
+        let mut addr_records = res.process_answers::<AddrRecord>(&buf, ffidata.expected_record_type as u16)?;
         if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
             return Err(ARES_ENODATA);
+        }
+        if ffidata.expected_record_type as u16 == RECORD_TYPE_PTR {
+            addr_records.items.push(AddrRecord { ip: ffidata.ip.unwrap(), ttl: 0 });
         }
         Ok(unsafe { addr_records.into_raw_hostent(ffidata.family) })
     })();

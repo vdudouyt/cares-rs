@@ -1,4 +1,4 @@
-use std::net::{ UdpSocket, SocketAddr };
+use std::net::{ UdpSocket, SocketAddr, IpAddr };
 use bytes::BytesMut;
 use rand::Rng;
 use std::time::{ Instant, Duration };
@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::core::sysconfig::SysConfig;
 use crate::core::packets::*;
 use crate::ffi::SocketFactory;
-use crate::ffi::ares_socket;
+use crate::ffi::{ ares_socket, RECORD_TYPE_PTR };
 
 /* TODO: reconcile ChannelData here */
 pub struct Ares<T> {
@@ -57,6 +57,27 @@ impl<T> Ares<T> {
         self.tasks.push(task);
         self.tasks.last().unwrap()
     }
+    pub fn gethostbyaddr(&mut self, addr: IpAddr, userdata: T) -> &Task<T> {
+        let rhostname = rdns_name(addr);
+        //println!("rdns name: {}", rhostname);
+        let query = DnsQuery {
+            name: rhostname.split(".").filter(|t| t.len() > 0).map(str::to_owned).collect(),
+            qtype: RECORD_TYPE_PTR,
+            qclass: 1,
+        };
+        let request = DnsFrame {
+            transaction_id: rand::thread_rng().r#gen::<u16>(),
+            flags: 0x100,
+            queries: vec![query],
+            answers: vec![],
+        };
+        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let sock = self.socket_factory.create_udp("0.0.0.0:0".parse().unwrap()).unwrap();
+        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::new(), userdata, expires_at };
+        request.write(&mut task.writebuf);
+        self.tasks.push(task);
+        self.tasks.last().unwrap()
+    }
     pub fn query(&mut self, name: &str, dnsclass: u16, dnstype: u16, userdata: T) {
         let sock = self.socket_factory.create_udp("0.0.0.0:0".parse().unwrap()).unwrap();
         let query = DnsQuery {
@@ -93,6 +114,17 @@ impl<T> Ares<T> {
     }
     pub fn remove_completed(&mut self) {
         self.tasks.retain(|task| !task.is_expired());
+    }
+}
+
+fn rdns_name(ip: IpAddr) -> String {
+    match ip {
+        // decimal
+        IpAddr::V4(v4) => v4.octets().into_iter().rev().map(|b| b.to_string())
+            .collect::<Vec<_>>().join(".") + ".in-addr.arpa",
+        // hex (low nibble first)
+        IpAddr::V6(v6) => v6.octets().into_iter().flat_map(|b| [b >> 4, b & 0x0f]).map(|n| format!("{:x}", n))
+            .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(".") + ".ip6.arpa",
     }
 }
 
