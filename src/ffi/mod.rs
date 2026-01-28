@@ -169,6 +169,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
+    if channel.is_null() { return ARES_ENOTFOUND; }
     let channeldata = unsafe { &*channel };
     let name_str = unsafe { CStr::from_ptr(name).to_string_lossy() };
 
