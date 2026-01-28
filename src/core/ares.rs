@@ -5,6 +5,7 @@ use std::time::{ Instant, Duration };
 use std::rc::Rc;
 
 use crate::core::sysconfig::SysConfig;
+use crate::core::hostfile::Hosts;
 use crate::core::packets::*;
 use crate::ffi::SocketFactory;
 use crate::ffi::{ ares_socket, RECORD_TYPE_PTR };
@@ -14,6 +15,7 @@ pub struct Ares<T> {
     pub config: SysConfig,
     pub socket_factory: Rc<SocketFactory>,
     pub tasks: Vec<Task<T>>,
+    pub hosts: Hosts,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
 }
@@ -27,6 +29,7 @@ impl<T> Ares<T> {
             config,
             socket_factory: Rc::new(SocketFactory::default()),
             tasks: vec![],
+            hosts: Hosts::from_path("/etc/hosts").unwrap(),
             default_udp_port: 53,
             default_tcp_port: 53
         }

@@ -23,6 +23,7 @@ use crate::ffi::clinkedlist::*;
 use crate::ffi::error::*;
 use crate::cstr;
 pub use crate::ffi::ares_socket::{SocketFactory, AresSocketFunctions};
+use crate::core::hostfile::AddressFamily;
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -164,6 +165,61 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     if let Some(cb) = channeldata.sock_create_callback {
         cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
+    let channeldata = unsafe { &*channel };
+    let name_str = unsafe { CStr::from_ptr(name).to_string_lossy() };
+
+    // Convert C family constant to our Family enum
+    let family_filter = match family {
+        libc::AF_INET => AddressFamily::Ipv4,
+        libc::AF_INET6 => AddressFamily::Ipv6,
+        libc::AF_UNSPEC => AddressFamily::Any,
+        _ => {
+            unsafe { *host = std::ptr::null_mut() };
+            return ARES_ENOTFOUND;
+        }
+    };
+
+    // Lookup in the hosts file cache
+    let Some(lookup) = channeldata.ares.hosts.lookup(&name_str, family_filter) else {
+        unsafe { *host = std::ptr::null_mut() };
+        return ARES_ENOTFOUND;
+    };
+
+    if lookup.addrs.is_empty() {
+        unsafe { *host = std::ptr::null_mut() };
+        return ARES_ENOTFOUND;
+    }
+
+    // Determine h_addrtype and h_length from the first address
+    let (h_addrtype, h_length) = match lookup.addrs[0] {
+        IpAddr::V4(_) => (libc::AF_INET, 4),
+        IpAddr::V6(_) => (libc::AF_INET6, 16),
+    };
+
+    // Build address list
+    let addrlist: Vec<*mut i8> = iplist_to_raw(&lookup.addrs, h_length);
+
+    // Build aliases list
+    let aliases: Vec<*mut i8> = lookup
+        .aliases
+        .into_iter()
+        .map(|s| CString::new(s).unwrap().into_raw())
+        .collect();
+
+    let hostent = libc::hostent {
+        h_name: CString::new(lookup.canonical).unwrap().into_raw(),
+        h_aliases: unsafe { cnullterminated::from_vec(aliases) },
+        h_addrtype: h_addrtype,
+        h_length: h_length as c_int,
+        h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
+    };
+
+    unsafe { *host = Box::into_raw(Box::new(hostent)) };
+    ARES_SUCCESS
 }
 
 #[no_mangle]
