@@ -17,6 +17,7 @@ use std::cmp::min;
 use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
+use crate::core::services::{ Services, Protocol };
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::*;
 use crate::ffi::clinkedlist::*;
@@ -57,6 +58,7 @@ pub struct ChannelData {
 enum Callback {
     AresHostCallback(AresHostCallback),
     AresCallback(AresCallback),
+    AresNameinfoCallback(AresNameinfoCallback),
 }
 
 impl Callback {
@@ -64,6 +66,7 @@ impl Callback {
         match self {
             Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, ffidata),
             Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata),
+            Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, ffidata),
         }
     }
 }
@@ -75,6 +78,10 @@ struct FFIData {
     family: c_int,
     expected_record_type: c_int,
     ip: Option<IpAddr>,
+    // nameinfo-specific fields
+    nameinfo_flags: c_int,
+    port: u16,
+    scope_id: u32,
 }
 
 #[repr(C)]
@@ -155,7 +162,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         _ => panic!("unexpected family value: {}", family),
     };
 
-    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: expected_record_type as c_int, ip: None };
+    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: expected_record_type as c_int, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0 };
     let family = match family {
         libc::AF_INET => Family::Ipv4,
         libc::AF_INET6 => Family::Ipv6,
@@ -229,7 +236,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
     let channeldata = unsafe { &mut *channel };
     let addrbuf = unsafe { std::slice::from_raw_parts(addr as *mut u8, addrlen as usize) };
     let addr = buf_to_ip(addrbuf).unwrap();
-    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(addr) };
+    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(addr), nameinfo_flags: 0, port: 0, scope_id: 0 };
     let newtask = channeldata.ares.gethostbyaddr(addr, ffidata);
     if let Some(cb) = channeldata.sock_create_callback {
         cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
@@ -240,8 +247,176 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let name = unsafe { CStr::from_ptr(name).to_string_lossy() };
-    let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0, expected_record_type: 0, ip: None };
+    let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0 };
     channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
+}
+
+/// Looks up the node name and service name for a socket address.
+///
+/// This is the async equivalent of getnameinfo(3). It performs a reverse DNS lookup
+/// (PTR record) to get the hostname, and looks up the service name from /etc/services.
+///
+/// # Arguments
+/// * `channel` - The c-ares channel
+/// * `sa` - Pointer to a sockaddr structure (sockaddr_in or sockaddr_in6)
+/// * `salen` - Size of the sockaddr structure
+/// * `flags` - Flags controlling the lookup behavior (ARES_NI_*)
+/// * `callback` - Function to call with results
+/// * `arg` - User data passed to callback
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: AresNameinfoCallback, arg: *mut c_void) {
+    let channeldata = unsafe { &mut *channel };
+
+    // Extract IP address and port from sockaddr
+    let addr_info = match extract_addr_port(sa, salen) {
+        Ok(result) => result,
+        Err(status) => {
+            // Call callback with error
+            unsafe { callback(arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+            return;
+        }
+    };
+
+    // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
+    let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
+        flags | ARES_NI_LOOKUPHOST
+    } else {
+        flags
+    };
+
+    let want_host = (flags & ARES_NI_LOOKUPHOST) != 0;
+    let want_service = (flags & ARES_NI_LOOKUPSERVICE) != 0;
+
+    // If only service lookup requested (no host), return immediately
+    if want_service && !want_host {
+        let service = get_service_string(&channeldata.ares.services, addr_info.port, flags);
+        let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
+        unsafe { callback(arg, ARES_SUCCESS, 0, std::ptr::null_mut(), service_ptr) };
+        return;
+    }
+
+    // Host lookup requested
+    if want_host {
+        // Numeric host can be handled without DNS
+        if (flags & ARES_NI_NUMERICHOST) != 0 {
+            // ARES_NI_NUMERICHOST + ARES_NI_NAMEREQD is illegal (contradiction)
+            if (flags & ARES_NI_NAMEREQD) != 0 {
+                unsafe { callback(arg, ARES_EBADFLAGS, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+                return;
+            }
+
+            let node = CString::new(format_ip_with_scope(&addr_info.ip, addr_info.scope_id, flags)).unwrap();
+            let service = if want_service {
+                get_service_string(&channeldata.ares.services, addr_info.port, flags)
+            } else {
+                None
+            };
+            let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
+            unsafe { callback(arg, ARES_SUCCESS, 0, node.into_raw(), service_ptr) };
+            return;
+        }
+
+        // DNS lookup is necessary
+        let ffidata = FFIData {
+            callback: Callback::AresNameinfoCallback(callback),
+            arg,
+            family: addr_info.family,
+            expected_record_type: RECORD_TYPE_PTR as c_int,
+            ip: Some(addr_info.ip),
+            nameinfo_flags: flags,
+            port: addr_info.port,
+            scope_id: addr_info.scope_id,
+        };
+
+        // Start the PTR lookup
+        let newtask = channeldata.ares.gethostbyaddr(addr_info.ip, ffidata);
+        if let Some(cb) = channeldata.sock_create_callback {
+            cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
+        }
+    }
+}
+
+/// Format an IP address with scope ID for IPv6 (e.g., "fe80::1%0")
+fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: c_int) -> String {
+    match ip {
+        IpAddr::V6(_) => {
+            // Always append scope ID for IPv6, unless ARES_NI_NUMERICSCOPE is not set and scope is 0
+            // Actually, c-ares always appends %scope_id for IPv6 numeric addresses
+            if flags & ARES_NI_NUMERICSCOPE != 0 || scope_id != 0 {
+                format!("{}%{}", ip, scope_id)
+            } else {
+                // c-ares appends %0 even when scope_id is 0 for numeric IPv6
+                format!("{}%{}", ip, scope_id)
+            }
+        }
+        IpAddr::V4(_) => ip.to_string(),
+    }
+}
+
+/// Extracted address info from sockaddr
+struct AddrInfo {
+    ip: IpAddr,
+    port: u16,
+    family: c_int,
+    scope_id: u32, // Only meaningful for IPv6
+}
+
+/// Extract IP address and port from a sockaddr structure
+fn extract_addr_port(sa: *const libc::sockaddr, salen: libc::socklen_t) -> Result<AddrInfo, c_int> {
+    if sa.is_null() {
+        return Err(ARES_ENOMEM);
+    }
+
+    let family = unsafe { (*sa).sa_family as c_int };
+
+    match family {
+        libc::AF_INET => {
+            if (salen as usize) < std::mem::size_of::<libc::sockaddr_in>() {
+                return Err(ARES_ENOMEM);
+            }
+            let sa_in = sa as *const libc::sockaddr_in;
+            let addr_bytes = unsafe { (*sa_in).sin_addr.s_addr.to_ne_bytes() };
+            let ip = IpAddr::from(addr_bytes);
+            let port = unsafe { u16::from_be((*sa_in).sin_port) };
+            Ok(AddrInfo { ip, port, family: libc::AF_INET, scope_id: 0 })
+        }
+        libc::AF_INET6 => {
+            if (salen as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
+                return Err(ARES_ENOMEM);
+            }
+            let sa_in6 = sa as *const libc::sockaddr_in6;
+            let addr_bytes = unsafe { (*sa_in6).sin6_addr.s6_addr };
+            let ip = IpAddr::from(addr_bytes);
+            let port = unsafe { u16::from_be((*sa_in6).sin6_port) };
+            let scope_id = unsafe { (*sa_in6).sin6_scope_id };
+            Ok(AddrInfo { ip, port, family: libc::AF_INET6, scope_id })
+        }
+        _ => Err(ARES_ENOTIMP),
+    }
+}
+
+/// Get the service string based on flags
+fn get_service_string(services: &Services, port: u16, flags: c_int) -> Option<CString> {
+    if port == 0 {
+        return None;
+    }
+
+    if flags & ARES_NI_NUMERICSERV != 0 {
+        // Return numeric port
+        return Some(CString::new(port.to_string()).unwrap());
+    }
+
+    // Determine protocol preference based on flags
+    let prefer_udp = (flags & ARES_NI_DGRAM) != 0;
+    
+    // Try to look up the service name
+    if let Some(name) = services.lookup_any(port, prefer_udp) {
+        Some(CString::new(name).unwrap())
+    } else {
+        // Fall back to numeric port
+        Some(CString::new(port.to_string()).unwrap())
+    }
 }
 
 #[derive(Debug)]
@@ -606,6 +781,21 @@ pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 pub type AresCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int);
 pub type AresSockCreateCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void);
+pub type AresNameinfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, node: *mut c_char, service: *mut c_char);
+
+// ares_getnameinfo flags
+pub const ARES_NI_NOFQDN: c_int = 1 << 0;
+pub const ARES_NI_NUMERICHOST: c_int = 1 << 1;
+pub const ARES_NI_NAMEREQD: c_int = 1 << 2;
+pub const ARES_NI_NUMERICSERV: c_int = 1 << 3;
+pub const ARES_NI_DGRAM: c_int = 1 << 4;
+pub const ARES_NI_TCP: c_int = 0;
+pub const ARES_NI_UDP: c_int = ARES_NI_DGRAM;
+pub const ARES_NI_SCTP: c_int = 1 << 5;
+pub const ARES_NI_DCCP: c_int = 1 << 6;
+pub const ARES_NI_NUMERICSCOPE: c_int = 1 << 7;
+pub const ARES_NI_LOOKUPHOST: c_int = 1 << 8;
+pub const ARES_NI_LOOKUPSERVICE: c_int = 1 << 9;
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
@@ -666,6 +856,74 @@ fn run_ares_callback(res: Result<Vec<u8>, c_int>, callback: AresCallback, ffidat
         Ok(mut buf) => unsafe { callback(ffidata.arg, ARES_SUCCESS, 0, buf.as_mut_ptr(), buf.len() as c_int) },
         Err(err) => unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut(), 0) },
     }
+}
+
+fn run_ares_nameinfo_callback(res: Result<Vec<u8>, c_int>, callback: AresNameinfoCallback, ffidata: &FFIData) {
+    // We need access to the services database for service name lookup
+    // Since we don't have it here, we'll load it fresh (or could cache it globally)
+    let services = Services::default();
+    
+    // Determine if we want service lookup based on flags
+    let want_service = (ffidata.nameinfo_flags & ARES_NI_LOOKUPSERVICE) != 0;
+    
+    // Try to get hostname from PTR response
+    let hostname_result = (|| -> Result<CString, c_int> {
+        let buf = res?;
+        let parsed = ParsedResponse::from_buf(&buf)?;
+        let ptr_records = parsed.process_answers::<CString>(&buf, RECORD_TYPE_PTR)?;
+        
+        // Get the hostname from PTR response
+        if ptr_records.aliases.is_empty() {
+            return Err(ARES_ENOTFOUND);
+        }
+        
+        let mut name = ptr_records.name;
+        
+        // If ARES_NI_NOFQDN is set, strip the domain part
+        if ffidata.nameinfo_flags & ARES_NI_NOFQDN != 0 {
+            let name_str = name.to_string_lossy();
+            if let Some(dot_pos) = name_str.find('.') {
+                name = CString::new(&name_str[..dot_pos]).map_err(|_| ARES_EBADSTR)?;
+            }
+        }
+        
+        Ok(name)
+    })();
+    
+    // Handle the result
+    let (status, hostname) = match hostname_result {
+        Ok(name) => (ARES_SUCCESS, Some(name)),
+        Err(err) => {
+            // Only fall back to numeric IP on ARES_ENOTFOUND and when ARES_NI_NAMEREQD is not set
+            // For other errors (timeout, etc.), propagate the error
+            if err == ARES_ENOTFOUND && (ffidata.nameinfo_flags & ARES_NI_NAMEREQD) == 0 {
+                // Fall back to numeric IP (with scope_id for IPv6)
+                let ip_str = format_ip_with_scope(&ffidata.ip.unwrap(), ffidata.scope_id, ffidata.nameinfo_flags);
+                match CString::new(ip_str) {
+                    Ok(name) => (ARES_SUCCESS, Some(name)),
+                    Err(_) => {
+                        unsafe { callback(ffidata.arg, ARES_EBADSTR, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+                        return;
+                    }
+                }
+            } else {
+                // Propagate the error (ARES_ENOTFOUND if NAMEREQD was set, or timeout/other errors)
+                unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+                return;
+            }
+        }
+    };
+    
+    // Get the service name if requested
+    let service = if want_service {
+        get_service_string(&services, ffidata.port, ffidata.nameinfo_flags)
+    } else {
+        None
+    };
+    
+    let hostname_ptr = hostname.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
+    let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
+    unsafe { callback(ffidata.arg, status, 0, hostname_ptr, service_ptr) };
 }
 
 #[no_mangle]
