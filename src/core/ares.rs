@@ -1,6 +1,5 @@
 use std::net::{ SocketAddr, IpAddr, Ipv4Addr };
 use bytes::{ BytesMut, BufMut };
-use rand::Rng;
 use std::time::{ Instant, Duration };
 use std::rc::Rc;
 
@@ -69,7 +68,7 @@ impl<T> Ares<T> {
             Family::Ipv6 => 0x1c, // AAAA
         };
         let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
-        let transaction_id = rand::thread_rng().r#gen::<u16>();
+        let transaction_id = fastrand::u16(..);
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
         let mut writebuf = BytesMut::with_capacity(12 + hostname.len() + 2 + 4);
         write_dns_query_direct(&mut writebuf, hostname, qtype, transaction_id);
@@ -80,7 +79,7 @@ impl<T> Ares<T> {
     pub fn gethostbyaddr(&mut self, addr: IpAddr, userdata: T) -> &Task<T> {
         let rhostname = rdns_name(addr);
         let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
-        let transaction_id = rand::thread_rng().r#gen::<u16>();
+        let transaction_id = fastrand::u16(..);
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
         let mut writebuf = BytesMut::with_capacity(12 + rhostname.len() + 2 + 4);
         write_dns_query_direct(&mut writebuf, &rhostname, RECORD_TYPE_PTR, transaction_id);
@@ -96,7 +95,7 @@ impl<T> Ares<T> {
             qclass: dnsclass,
         };
         let request = DnsFrame {
-            transaction_id: rand::thread_rng().r#gen::<u16>(),
+            transaction_id: fastrand::u16(..),
             flags: 0x100,
             queries: vec![query],
             answers: vec![],
