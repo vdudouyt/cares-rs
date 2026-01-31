@@ -440,9 +440,19 @@ impl ParsedRRs<AddrRecord> {
             libc::AF_INET6 => 16,
             _ => 0,
         };
-        let iplist: Vec<_> = self.items.into_iter().map(|t| t.ip).collect();
-        let addrlist: Vec<*mut i8> = iplist_to_raw(&iplist, length);
-        let aliases: Vec<*mut i8> = self.aliases.into_iter().map(|t| t.into_raw()).collect();
+        let mut addrlist: Vec<*mut i8> = Vec::with_capacity(self.items.len());
+        for record in &self.items {
+            let raw: Box<[u8]> = match record.ip {
+                IpAddr::V4(v4) if length == 4 => Box::new(v4.octets()),
+                IpAddr::V6(v6) if length == 16 => Box::new(v6.octets()),
+                _ => continue,
+            };
+            addrlist.push(Box::into_raw(raw) as *mut i8);
+        }
+        let mut aliases: Vec<*mut i8> = Vec::with_capacity(self.aliases.len());
+        for a in self.aliases {
+            aliases.push(a.into_raw());
+        }
         let hostent = libc::hostent {
             h_name: self.name.into_raw(),
             h_aliases: unsafe { cnullterminated::from_vec(aliases) },
@@ -457,33 +467,45 @@ impl ParsedRRs<AddrRecord> {
 
 impl<'a> ParsedResponse<'a> {
     pub fn from_buf(buf: &'a [u8]) -> Result<Self, c_int> {
-        let Some(frame) = DnsFrame::parse(&mut SliceBuf::new(buf)) else {
+        let mut sbuf = SliceBuf::new(buf);
+        let Some(header) = DnsHeader::parse(&mut sbuf) else {
             return Err(ARES_EBADRESP);
         };
-        match frame.flags & 0x0f {
+        match header.flags & 0x0f {
             0 => {},
             3 => return Err(ARES_ENOTFOUND),
             _ => return Err(ARES_ESERVFAIL),
         };
-        if frame.queries.len() > 1 {
+        if header.qdcount != 1 {
             return Err(ARES_EBADRESP);
         }
-        let Some(query) = frame.queries.into_iter().next() else {
+        let Some(query) = DnsQuery::parse(&mut sbuf) else {
             return Err(ARES_EBADRESP);
         };
-        if frame.answers.is_empty() {
+        let answer_count = header.ancount as usize;
+        if answer_count == 0 {
+            return Err(ARES_ENODATA);
+        }
+        let mut answers = Vec::with_capacity(answer_count);
+        // Parse answer section (ancount), plus authority (nscount) and additional (arcount)
+        let total = answer_count + header.nscount as usize + header.arcount as usize;
+        for _ in 0..total {
+            let Some(answer) = DnsAnswer::parse(&mut sbuf) else { break };
+            answers.push(answer);
+        }
+        if answers.is_empty() {
             return Err(ARES_ENODATA);
         }
         Ok(Self {
-            transaction_id: frame.transaction_id,
+            transaction_id: header.transaction_id,
             query,
-            answers: frame.answers
+            answers,
         })
     }
 
     pub fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, c_int> {
         let mut name = CString::new(self.query.name.join(".")).unwrap();
-        let mut items: Vec<T> = vec![];
+        let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
         let mut success = 0;
         let mut aliases: Vec<CString> = vec![];
         let mut limit_ttl: Option<u32> = None;

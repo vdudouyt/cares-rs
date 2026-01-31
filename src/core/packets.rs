@@ -1,5 +1,12 @@
 use std::borrow::Cow;
+use arrayvec::ArrayVec;
 use bytes::BufMut;
+
+/// Max DNS label segments (e.g. "www.example.com" = 3 segments).
+/// DNS spec allows up to 127, but real names rarely exceed 8.
+const MAX_LABEL_PARTS: usize = 8;
+
+pub type LabelVec<'a> = ArrayVec<&'a str, MAX_LABEL_PARTS>;
 
 pub struct SliceBuf<'a> {
     data: &'a [u8],
@@ -10,7 +17,6 @@ impl<'a> SliceBuf<'a> {
     pub fn new(data: &'a [u8]) -> Self { Self { data, pos: 0 } }
     pub fn remaining(&self) -> usize { self.data.len() - self.pos }
     pub fn chunk(&self) -> &'a [u8] { &self.data[self.pos..] }
-    pub fn advance(&mut self, n: usize) { self.pos += n; }
 
     pub fn get_u8(&mut self) -> Option<u8> {
         let val = *self.data.get(self.pos)?;
@@ -83,7 +89,7 @@ impl DnsHeader {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct DnsQuery<'a> {
-    pub name: Vec<&'a str>,
+    pub name: LabelVec<'a>,
     pub qtype: u16,
     pub qclass: u16,
 }
@@ -92,7 +98,7 @@ impl<'a> DnsQuery<'a> {
     #[cfg(test)]
     pub fn new(domain: &'a str, qtype: u16, qclass: u16) -> DnsQuery<'a> {
         DnsQuery {
-            name: domain.split(".").collect(),
+            name: domain.split('.').collect(),
             qtype,
             qclass
         }
@@ -114,20 +120,22 @@ impl<'a> DnsQuery<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct DnsLabel<'a> {
-    pub name: Vec<&'a str>,
+    pub name: LabelVec<'a>,
     pub offset: Option<u16>,
 }
 
 impl<'a> DnsLabel<'a> {
     #[cfg(test)]
     pub fn new(name: &[&'a str], offset: Option<u16>) -> DnsLabel<'a> {
-        DnsLabel { name: name.to_vec(), offset }
+        let mut v = LabelVec::new();
+        for &s in name { v.push(s); }
+        DnsLabel { name: v, offset }
     }
     pub fn parse(buf: &mut SliceBuf<'a>) -> Option<DnsLabel<'a>> {
         let saved_pos = buf.pos;
-        let mut name: Vec<&'a str> = vec![];
+        let mut name = LabelVec::new();
         let mut offset: Option<u16> = None;
 
         loop {
@@ -149,14 +157,23 @@ impl<'a> DnsLabel<'a> {
         Some(DnsLabel { name, offset })
     }
     pub fn build_string(&self, main_buf: &[u8]) -> Option<String> {
-        let mut name = self.name.clone();
-        if let Some(offset) = self.offset {
-            let slice = main_buf.get(offset as usize..)?;
-            let mut sub_buf = SliceBuf::new(slice);
-            let label = DnsLabel::parse(&mut sub_buf)?;
-            name.extend(label.name);
+        if self.offset.is_none() {
+            return Some(self.name.join("."));
         }
-        Some(name.join("."))
+        let offset = self.offset.unwrap();
+        let slice = main_buf.get(offset as usize..)?;
+        let mut sub_buf = SliceBuf::new(slice);
+        let label = DnsLabel::parse(&mut sub_buf)?;
+        // Calculate capacity: self.name parts + label parts, with dots
+        let cap = self.name.iter().chain(label.name.iter())
+            .map(|s| s.len()).sum::<usize>()
+            + self.name.len() + label.name.len();
+        let mut result = String::with_capacity(cap);
+        for (i, part) in self.name.iter().chain(label.name.iter()).enumerate() {
+            if i > 0 { result.push('.'); }
+            result.push_str(part);
+        }
+        Some(result)
     }
 }
 
@@ -181,6 +198,8 @@ impl<'a> DnsAnswer<'a> {
     }
 }
 
+/// DnsFrame is kept for tests and general-purpose use.
+/// The hot parse path in ParsedResponse bypasses this.
 #[derive(Debug, PartialEq)]
 pub struct DnsFrame<'a> {
     pub transaction_id: u16,
@@ -192,8 +211,8 @@ pub struct DnsFrame<'a> {
 impl<'a> DnsFrame<'a> {
     pub fn parse(buf: &mut SliceBuf<'a>) -> Option<DnsFrame<'a>> {
         let header = DnsHeader::parse(buf)?;
-        let mut queries: Vec<DnsQuery<'a>> = vec![];
-        let mut answers: Vec<DnsAnswer<'a>> = vec![];
+        let mut queries: Vec<DnsQuery<'a>> = Vec::with_capacity(header.qdcount as usize);
+        let mut answers: Vec<DnsAnswer<'a>> = Vec::with_capacity(header.ancount as usize);
         for _ in 0..header.qdcount {
             queries.push(DnsQuery::parse(buf)?);
         }
@@ -277,17 +296,19 @@ pub struct TxtReply<'a> {
 
 impl<'a> Parser<'a> for TxtReply<'a> {
     fn parse(buf: &mut SliceBuf<'a>) -> Option<TxtReply<'a>> {
-        let mut segments: Vec<&'a str> = vec![];
-        while buf.remaining() > 0 {
-            segments.push(parse_prefixed_str(buf)?);
+        // Fast path: single TXT segment (most common)
+        let first = parse_prefixed_str(buf)?;
+        if buf.remaining() == 0 {
+            let length = first.len();
+            return Some(TxtReply { txt: Cow::Borrowed(first), length });
         }
-        let txt = if segments.len() == 1 {
-            Cow::Borrowed(segments[0])
-        } else {
-            Cow::Owned(segments.join(""))
-        };
-        let length = txt.len();
-        Some(TxtReply { txt, length })
+        // Multi-segment: must join
+        let mut joined = String::from(first);
+        while buf.remaining() > 0 {
+            joined.push_str(parse_prefixed_str(buf)?);
+        }
+        let length = joined.len();
+        Some(TxtReply { txt: Cow::Owned(joined), length })
     }
 }
 
