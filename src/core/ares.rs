@@ -1,5 +1,5 @@
-use std::net::{ UdpSocket, SocketAddr, IpAddr };
-use bytes::BytesMut;
+use std::net::{ SocketAddr, IpAddr, Ipv4Addr };
+use bytes::{ BytesMut, BufMut };
 use rand::Rng;
 use std::time::{ Instant, Duration };
 use std::rc::Rc;
@@ -11,13 +11,15 @@ use crate::core::packets::*;
 use crate::ffi::SocketFactory;
 use crate::ffi::{ ares_socket, RECORD_TYPE_PTR };
 
+const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+
 /* TODO: reconcile ChannelData here */
 pub struct Ares<T> {
     pub config: SysConfig,
     pub socket_factory: Rc<SocketFactory>,
     pub tasks: Vec<Task<T>>,
-    pub hosts: Hosts,
-    pub services: Services,
+    hosts: Option<Hosts>,
+    services: Option<Services>,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
 }
@@ -25,67 +27,75 @@ pub struct Ares<T> {
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum Family { Ipv4, Ipv6 }
 
+/// Write a DNS query directly to the buffer from a hostname string,
+/// avoiding intermediate Vec<String>, DnsQuery, and DnsFrame allocations.
+fn write_dns_query_direct(buf: &mut BytesMut, hostname: &str, qtype: u16, transaction_id: u16) {
+    // Header: 12 bytes
+    buf.put_u16(transaction_id);
+    buf.put_u16(0x0100); // flags: standard query, recursion desired
+    buf.put_u16(1);      // qdcount
+    buf.put_u16(0);      // ancount
+    buf.put_u16(0);      // nscount
+    buf.put_u16(0);      // arcount
+
+    // Question: labels
+    for label in hostname.split('.').filter(|t| !t.is_empty()) {
+        buf.put_u8(label.len() as u8);
+        buf.put_slice(label.as_bytes());
+    }
+    buf.put_u8(0); // root label
+    buf.put_u16(qtype);
+    buf.put_u16(1); // qclass: IN
+}
+
 impl<T> Ares<T> {
     pub fn new(config: SysConfig) -> Self {
         Ares {
             config,
             socket_factory: Rc::new(SocketFactory::default()),
             tasks: vec![],
-            hosts: Hosts::from_path("/etc/hosts").unwrap(),
-            services: Services::default(),
+            hosts: None,
+            services: None,
             default_udp_port: 53,
-            default_tcp_port: 53
+            default_tcp_port: 53,
         }
     }
     pub fn from_sysconfig() -> Self {
         Ares::new(build_sysconfig())
+    }
+    pub fn hosts(&mut self) -> &Hosts {
+        self.hosts.get_or_insert_with(|| Hosts::from_path("/etc/hosts").unwrap())
+    }
+    pub fn services(&mut self) -> &Services {
+        self.services.get_or_insert_with(Services::default)
     }
     pub fn gethostbyname(&mut self, hostname: &str, family: Family, userdata: T) -> &Task<T> {
         let qtype = match family {
             Family::Ipv4 => 0x01, // A
             Family::Ipv6 => 0x1c, // AAAA
         };
-        let sock = self.socket_factory.create_udp("0.0.0.0:0".parse().unwrap()).unwrap();
-        let query = DnsQuery {
-            name: hostname.split(".").filter(|t| t.len() > 0).map(str::to_owned).collect(),
-            qtype,
-            qclass: 1,
-        };
-        let request = DnsFrame {
-            transaction_id: rand::thread_rng().r#gen::<u16>(),
-            flags: 0x100,
-            queries: vec![query],
-            answers: vec![],
-        };
+        let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
+        let transaction_id = rand::thread_rng().r#gen::<u16>();
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
-        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::new(), userdata, expires_at };
-        request.write(&mut task.writebuf);
+        let mut writebuf = BytesMut::with_capacity(12 + hostname.len() + 2 + 4);
+        write_dns_query_direct(&mut writebuf, hostname, qtype, transaction_id);
+        let task = Task { status: Status::Writing, sock, writebuf, userdata, expires_at };
         self.tasks.push(task);
         self.tasks.last().unwrap()
     }
     pub fn gethostbyaddr(&mut self, addr: IpAddr, userdata: T) -> &Task<T> {
         let rhostname = rdns_name(addr);
-        //println!("rdns name: {}", rhostname);
-        let query = DnsQuery {
-            name: rhostname.split(".").filter(|t| t.len() > 0).map(str::to_owned).collect(),
-            qtype: RECORD_TYPE_PTR,
-            qclass: 1,
-        };
-        let request = DnsFrame {
-            transaction_id: rand::thread_rng().r#gen::<u16>(),
-            flags: 0x100,
-            queries: vec![query],
-            answers: vec![],
-        };
+        let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
+        let transaction_id = rand::thread_rng().r#gen::<u16>();
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
-        let sock = self.socket_factory.create_udp("0.0.0.0:0".parse().unwrap()).unwrap();
-        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::new(), userdata, expires_at };
-        request.write(&mut task.writebuf);
+        let mut writebuf = BytesMut::with_capacity(12 + rhostname.len() + 2 + 4);
+        write_dns_query_direct(&mut writebuf, &rhostname, RECORD_TYPE_PTR, transaction_id);
+        let task = Task { status: Status::Writing, sock, writebuf, userdata, expires_at };
         self.tasks.push(task);
         self.tasks.last().unwrap()
     }
     pub fn query(&mut self, name: &str, dnsclass: u16, dnstype: u16, userdata: T) {
-        let sock = self.socket_factory.create_udp("0.0.0.0:0".parse().unwrap()).unwrap();
+        let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
         let query = DnsQuery {
             name: name.split(".").map(str::to_owned).collect(),
             qtype: dnstype,
@@ -98,7 +108,7 @@ impl<T> Ares<T> {
             answers: vec![],
         };
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
-        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::new(), userdata, expires_at };
+        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::with_capacity(12 + name.len() + 2 + 4), userdata, expires_at };
         request.write(&mut task.writebuf);
         self.tasks.push(task);
     }
@@ -109,11 +119,10 @@ impl<T> Ares<T> {
         let _len = task.sock.send(&task.writebuf).unwrap();
         task.status = Status::Reading;
     }
-    pub fn read_impl(&mut self, task: &mut Task<T>) -> Option<Vec<u8>> {
-        let mut buf = vec![0u8; 65_535];
-        let (len, _src) = task.sock.recv(&mut buf).unwrap();
+    pub fn read_impl(task: &mut Task<T>, readbuf: &mut [u8]) -> Option<usize> {
+        let (len, _src) = task.sock.recv(readbuf).unwrap();
         task.status = Status::Completed;
-        Some(buf)
+        Some(len)
     }
     pub fn max_wait_time(&self) -> Duration {
         self.tasks.iter().map(Task::time_remaining).min().unwrap()
