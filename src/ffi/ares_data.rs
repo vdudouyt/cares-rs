@@ -7,25 +7,25 @@ pub trait IntoAresData<T> {
     fn into_ares_data(self, main_buf: &[u8]) -> T;
 }
 
-impl IntoAresData<AresTxtReply> for TxtReply {
+impl IntoAresData<AresTxtReply> for TxtReply<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> AresTxtReply {
-        let bytes = self.txt.into_bytes();
+        let bytes = self.txt.into_owned().into_bytes();
         let length = bytes.len();
         let txt = Box::into_raw(bytes.into_boxed_slice());
         AresTxtReply { next: std::ptr::null_mut(), txt: txt as *const i8, length }
     }
 }
 
-impl IntoAresData<AresTxtReplyExt> for TxtReplyExt {
+impl IntoAresData<AresTxtReplyExt> for TxtReplyExt<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> AresTxtReplyExt {
-        let bytes = self.txt.into_bytes();
+        let bytes = self.txt.as_bytes().to_vec();
         let length = bytes.len();
         let txt = Box::into_raw(bytes.into_boxed_slice());
         AresTxtReplyExt { next: std::ptr::null_mut(), txt: txt as *const i8, length, record_start: self.record_start as c_char }
     }
 }
 
-impl IntoAresData<AresMxReply> for MxReply {
+impl IntoAresData<AresMxReply> for MxReply<'_> {
     fn into_ares_data(self, main_buf: &[u8]) -> AresMxReply {
         let name = self.label.build_cstring(main_buf).unwrap();
         let raw_ptr = name.into_raw();
@@ -106,10 +106,8 @@ pub struct AresCaaReply {
     length: usize,
 }
 
-impl IntoAresData<AresCaaReply> for CaaReply {
+impl IntoAresData<AresCaaReply> for CaaReply<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> AresCaaReply {
-        // NOTE: plength/length in your Rust CaaReply are the byte lengths excluding NUL.
-        // For FFI, we store them as usize.
         let plength = self.property.len();
         let length = self.value.len();
 
@@ -149,7 +147,7 @@ pub struct AresSoaReply {
     minttl: c_uint,
 }
 
-impl IntoAresData<AresSoaReply> for SoaReply {
+impl IntoAresData<AresSoaReply> for SoaReply<'_> {
     fn into_ares_data(self, main_buf: &[u8]) -> AresSoaReply {
         let nsname = self.nsname.build_cstring(main_buf).unwrap().into_raw();
         let hostmaster = self.hostmaster.build_cstring(main_buf).unwrap().into_raw();
@@ -328,8 +326,8 @@ impl Drop for AresUriReply {
     }
 }
 
-impl IntoAresData<AresNaptrReply> for NaptrReply {
-    fn into_ares_data(self, buf: &[u8]) -> AresNaptrReply {
+impl IntoAresData<AresNaptrReply> for NaptrReply<'_> {
+    fn into_ares_data(self, _buf: &[u8]) -> AresNaptrReply {
         let flags = CString::new(self.flags).unwrap().into_raw();
         let service = CString::new(self.service).unwrap().into_raw();
         let regexp = CString::new(self.regexp).unwrap().into_raw();
@@ -356,7 +354,7 @@ pub struct AresSrvReply {
     port: c_ushort,
 }
 
-impl IntoAresData<AresSrvReply> for SrvReply {
+impl IntoAresData<AresSrvReply> for SrvReply<'_> {
     fn into_ares_data(self, main_buf: &[u8]) -> AresSrvReply {
         AresSrvReply {
             next: std::ptr::null_mut(),
@@ -377,7 +375,7 @@ pub struct AresUriReply {
     ttl: c_int,
 }
 
-impl IntoAresData<AresUriReply> for UriReply {
+impl IntoAresData<AresUriReply> for UriReply<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> AresUriReply {
         let uri = CString::new(self.uri).unwrap().into_raw();
 
@@ -444,5 +442,3 @@ mod tests {
         assert_eq!(std::ptr::addr_of!(base) as *mut c_void, restoredptr);
     }
 }
-
-

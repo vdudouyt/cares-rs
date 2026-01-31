@@ -11,13 +11,12 @@ mod offset_of;
 use std::ffi::{ c_int, c_void, c_char };
 use std::os::fd::{ AsRawFd };
 use std::ffi::{ CString, CStr };
-use std::io::Cursor;
 use std::net::IpAddr;
 use std::cmp::min;
 use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
-use crate::core::services::{ Services, Protocol };
+use crate::core::services::Services;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::*;
 use crate::ffi::clinkedlist::*;
@@ -25,6 +24,7 @@ use crate::ffi::error::*;
 use crate::cstr;
 pub use crate::ffi::ares_socket::{SocketFactory, AresSocketFunctions};
 use crate::core::hostfile::AddressFamily;
+use std::io::Cursor;
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -102,9 +102,9 @@ struct AddrRecord {
     ttl: u32,
 }
 
-impl RRParser for AddrRecord {
-    fn parse_rr(answer: &DnsAnswer) -> Option<Self> {
-        Some(Self { ip: buf_to_ip(&answer.data).ok()?, ttl: answer.ttl })
+impl RRParser<'_> for AddrRecord {
+    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<Self> {
+        Some(Self { ip: buf_to_ip(answer.data).ok()?, ttl: answer.ttl })
     }
 }
 
@@ -342,12 +342,9 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: c_int) -> String {
     match ip {
         IpAddr::V6(_) => {
-            // Always append scope ID for IPv6, unless ARES_NI_NUMERICSCOPE is not set and scope is 0
-            // Actually, c-ares always appends %scope_id for IPv6 numeric addresses
             if flags & ARES_NI_NUMERICSCOPE != 0 || scope_id != 0 {
                 format!("{}%{}", ip, scope_id)
             } else {
-                // c-ares appends %0 even when scope_id is 0 for numeric IPv6
                 format!("{}%{}", ip, scope_id)
             }
         }
@@ -410,7 +407,7 @@ fn get_service_string(services: &Services, port: u16, flags: c_int) -> Option<CS
 
     // Determine protocol preference based on flags
     let prefer_udp = (flags & ARES_NI_DGRAM) != 0;
-    
+
     // Try to look up the service name
     if let Some(name) = services.lookup_any(port, prefer_udp) {
         Some(CString::new(name).unwrap())
@@ -421,10 +418,10 @@ fn get_service_string(services: &Services, port: u16, flags: c_int) -> Option<CS
 }
 
 #[derive(Debug)]
-struct ParsedResponse {
+struct ParsedResponse<'a> {
     pub transaction_id: u16,
-    pub query: DnsQuery,
-    pub answers: Vec<DnsAnswer>,
+    pub query: DnsQuery<'a>,
+    pub answers: Vec<DnsAnswer<'a>>,
 }
 
 #[derive(Debug)]
@@ -458,9 +455,9 @@ impl ParsedRRs<AddrRecord> {
     }
 }
 
-impl ParsedResponse {
-    pub fn from_buf(buf: &[u8]) -> Result<Self, c_int> {
-        let Some(frame) = DnsFrame::parse(&mut Cursor::new(buf)) else {
+impl<'a> ParsedResponse<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, c_int> {
+        let Some(frame) = DnsFrame::parse(&mut SliceBuf::new(buf)) else {
             return Err(ARES_EBADRESP);
         };
         match frame.flags & 0x0f {
@@ -474,7 +471,7 @@ impl ParsedResponse {
         let Some(query) = frame.queries.into_iter().next() else {
             return Err(ARES_EBADRESP);
         };
-        if frame.answers.len() == 0 {
+        if frame.answers.is_empty() {
             return Err(ARES_ENODATA);
         }
         Ok(Self {
@@ -484,7 +481,7 @@ impl ParsedResponse {
         })
     }
 
-    pub fn process_answers<T: RRParser>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, c_int> {
+    pub fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, c_int> {
         let mut name = CString::new(self.query.name.join(".")).unwrap();
         let mut items: Vec<T> = vec![];
         let mut success = 0;
@@ -492,8 +489,9 @@ impl ParsedResponse {
         let mut limit_ttl: Option<u32> = None;
         for mut answer in self.answers {
             if answer.record_type == RECORD_TYPE_CNAME {
-                let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-                let alias_of = alias_of.build_cstring(&buf).ok_or(ARES_EBADRESP)?;
+                let mut cname_buf = SliceBuf::new(answer.data);
+                let alias_of = DnsLabel::parse(&mut cname_buf).unwrap();
+                let alias_of = alias_of.build_cstring(buf).ok_or(ARES_EBADRESP)?;
                 if expected_record_type != RECORD_TYPE_PTR {
                     aliases.push(name);
                     name = alias_of;
@@ -507,8 +505,9 @@ impl ParsedResponse {
             }
 
             if answer.record_type == RECORD_TYPE_PTR || answer.record_type == RECORD_TYPE_NS {
-                let alias_of = DnsLabel::parse(&mut Cursor::new(&answer.data)).unwrap();
-                let alias_of = alias_of.build_cstring(&buf).unwrap();
+                let mut ptr_buf = SliceBuf::new(answer.data);
+                let alias_of = DnsLabel::parse(&mut ptr_buf).unwrap();
+                let alias_of = alias_of.build_cstring(buf).unwrap();
                 aliases.push(alias_of.clone());
                 if answer.record_type == RECORD_TYPE_PTR { name = alias_of; }
                 continue;
@@ -534,12 +533,12 @@ impl ParsedResponse {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<MxReply, AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
+    unsafe { parse_to_clinkedlist::<AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<TxtReply, AresTxtReply>(abuf, alen, out, RECORD_TYPE_TXT) }
+    unsafe { parse_to_clinkedlist::<AresTxtReply>(abuf, alen, out, RECORD_TYPE_TXT) }
 }
 
 #[no_mangle]
@@ -547,7 +546,7 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let res = ParsedResponse::from_buf(buf).unwrap();
 
-    let parsed_rrs = match res.process_answers::<Vec<TxtReplyExt>>(&buf, RECORD_TYPE_TXT) {
+    let parsed_rrs = match res.process_answers::<Vec<TxtReplyExt>>(buf, RECORD_TYPE_TXT) {
         Ok(res) => res,
         Err(err) => return err,
     };
@@ -555,7 +554,7 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
     let answers = parsed_rrs.items;
     let parsed_count = parsed_rrs.success;
     let answers: Vec<_> = answers.into_iter().flatten().collect();
-    let aresreplies: Vec<_> = answers.into_iter().map(|x| x.into_ares_data(&buf)).collect();
+    let aresreplies: Vec<_> = answers.into_iter().map(|x| x.into_ares_data(buf)).collect();
 
     let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
         unsafe { *out = std::ptr::null_mut() };
@@ -568,20 +567,20 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
     ARES_SUCCESS
 }
 
-unsafe fn parse_to_vec<T1, T2>(abuf: *const u8, alen: c_int, expected_record_type: u16) -> Result<Vec<T2>, c_int>
-where T1: RRParser + IntoAresData<T2>, T2: DataType
+unsafe fn parse_to_vec<'a, T1, T2>(buf: &'a [u8], expected_record_type: u16) -> Result<Vec<T2>, c_int>
+where T1: RRParser<'a> + IntoAresData<T2>, T2: DataType
 {
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let res = ParsedResponse::from_buf(buf)?;
-    let parsed_rrs = res.process_answers::<T1>(&buf, expected_record_type)?;
-    Ok(parsed_rrs.items.into_iter().map(|x| x.into_ares_data(&buf)).collect())
+    let parsed_rrs = res.process_answers::<T1>(buf, expected_record_type)?;
+    Ok(parsed_rrs.items.into_iter().map(|x| x.into_ares_data(buf)).collect())
 }
 
-pub unsafe fn parse_to_singleptr<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
-where T1: RRParser + IntoAresData<T2>, T2: DataType
+unsafe fn parse_to_singleptr<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
+where T2: DataType, for<'a> T2: FromParsedBuf<'a, T2>
 {
     ares_fn_wrapper(out, || {
-        let aresreplies = parse_to_vec::<T1, T2>(abuf, alen, expected_record_type)?;
+        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        let aresreplies = T2::parse_buf_to_vec(buf, expected_record_type)?;
         if aresreplies.len() > 1 {
             return Err(ARES_EBADRESP);
         }
@@ -592,15 +591,46 @@ where T1: RRParser + IntoAresData<T2>, T2: DataType
     })
 }
 
-pub unsafe fn parse_to_clinkedlist<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
-where T1: RRParser + IntoAresData<T2>, T2: CLinkedList + DataType {
+/// Trait to bridge lifetime-carrying parsed types to the non-lifetime output type.
+/// This avoids HRTB issues with parse_to_clinkedlist/parse_to_singleptr.
+trait FromParsedBuf<'a, T2> {
+    fn parse_buf_to_vec(buf: &'a [u8], expected_record_type: u16) -> Result<Vec<T2>, c_int>;
+    fn parse_buf_to_clinkedlist_parts(buf: &'a [u8], expected_record_type: u16) -> Result<(Vec<T2>, usize), c_int>;
+}
+
+// Macro to implement FromParsedBuf for each (T1, T2) pair
+macro_rules! impl_from_parsed_buf {
+    ($t1:ty, $t2:ty) => {
+        impl<'a> FromParsedBuf<'a, $t2> for $t2 {
+            fn parse_buf_to_vec(buf: &'a [u8], expected_record_type: u16) -> Result<Vec<$t2>, c_int> {
+                unsafe { parse_to_vec::<$t1, $t2>(buf, expected_record_type) }
+            }
+            fn parse_buf_to_clinkedlist_parts(buf: &'a [u8], expected_record_type: u16) -> Result<(Vec<$t2>, usize), c_int> {
+                let res = ParsedResponse::from_buf(buf)?;
+                let parsed_rrs = res.process_answers::<$t1>(buf, expected_record_type)?;
+                let success = parsed_rrs.success;
+                let aresreplies: Vec<_> = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(buf)).collect();
+                Ok((aresreplies, success))
+            }
+        }
+    };
+}
+
+impl_from_parsed_buf!(MxReply<'a>, AresMxReply);
+impl_from_parsed_buf!(CaaReply<'a>, AresCaaReply);
+impl_from_parsed_buf!(TxtReply<'a>, AresTxtReply);
+impl_from_parsed_buf!(NaptrReply<'a>, AresNaptrReply);
+impl_from_parsed_buf!(SoaReply<'a>, AresSoaReply);
+impl_from_parsed_buf!(SrvReply<'a>, AresSrvReply);
+impl_from_parsed_buf!(UriReply<'a>, AresUriReply);
+
+unsafe fn parse_to_clinkedlist<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
+where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
     ares_fn_wrapper(out, || {
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let res = ParsedResponse::from_buf(buf)?;
-        let parsed_rrs = res.process_answers::<T1>(&buf, expected_record_type)?;
-        let aresreplies: Vec<_> = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(&buf)).collect();
+        let (aresreplies, success) = T2::parse_buf_to_clinkedlist_parts(buf, expected_record_type)?;
         let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
-            return Err(if parsed_rrs.success > 0 { ARES_SUCCESS } else { ARES_EBADRESP });
+            return Err(if success > 0 { ARES_SUCCESS } else { ARES_EBADRESP });
         };
 
         let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
@@ -611,17 +641,17 @@ where T1: RRParser + IntoAresData<T2>, T2: CLinkedList + DataType {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<CaaReply, AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
+    unsafe { parse_to_clinkedlist::<AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_naptr_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresNaptrReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<NaptrReply, AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
+    unsafe { parse_to_clinkedlist::<AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSrvReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<SrvReply, AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
+    unsafe { parse_to_clinkedlist::<AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
 }
 
 unsafe fn ares_fn_wrapper<T, F>(out: *mut *mut T, f: F) -> c_int
@@ -641,10 +671,10 @@ where F: FnOnce() -> Result<*mut T, c_int>
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<UriReply, AresUriReply>(abuf, alen, out, RECORD_TYPE_URI) }
+    unsafe { parse_to_clinkedlist::<AresUriReply>(abuf, alen, out, RECORD_TYPE_URI) }
 }
 
-impl DnsLabel {
+impl DnsLabel<'_> {
     pub fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
         Some(CString::new(self.build_string(main_buf)?).ok()?)
     }
@@ -708,7 +738,7 @@ unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u
     let try_parse = || -> Result<ParsedRRs<AddrRecord>, c_int> {
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let res = ParsedResponse::from_buf(buf)?;
-        let addr_records = res.process_answers::<AddrRecord>(&buf, expected_record_type)?;
+        let addr_records = res.process_answers::<AddrRecord>(buf, expected_record_type)?;
         if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
             return Err(ARES_ENODATA);
         }
@@ -744,10 +774,11 @@ pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out
     parse_to_hostent(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6)
 }
 
-impl RRParser for CString {
-    fn parse_rr(answer: &DnsAnswer) -> Option<CString> {
-        let name = DnsLabel::parse(&mut Cursor::new(&answer.data))?;
-        Some(name.build_cstring(&answer.data)?)
+impl RRParser<'_> for CString {
+    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<CString> {
+        let mut buf = SliceBuf::new(answer.data);
+        let name = DnsLabel::parse(&mut buf)?;
+        Some(name.build_cstring(answer.data)?)
     }
 }
 
@@ -756,7 +787,7 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
     ares_fn_wrapper(out, || {
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let res = ParsedResponse::from_buf(buf)?;
-        let mut addr_records = res.process_answers::<AddrRecord>(&buf, RECORD_TYPE_PTR)?;
+        let mut addr_records = res.process_answers::<AddrRecord>(buf, RECORD_TYPE_PTR)?;
         if addr_records.aliases.is_empty() {
             return Err(ARES_ENODATA);
         }
@@ -769,7 +800,7 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
-    let ret = parse_to_singleptr::<SoaReply, AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA);
+    let ret = parse_to_singleptr::<AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA);
     if ret == ARES_ENODATA { return ARES_EBADRESP; }
     ret
 }
@@ -860,45 +891,35 @@ fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallback, ffidata:
 }
 
 fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: AresNameinfoCallback, ffidata: &FFIData) {
-    // We need access to the services database for service name lookup
-    // Since we don't have it here, we'll load it fresh (or could cache it globally)
     let services = Services::default();
 
-    // Determine if we want service lookup based on flags
     let want_service = (ffidata.nameinfo_flags & ARES_NI_LOOKUPSERVICE) != 0;
 
-    // Try to get hostname from PTR response
     let hostname_result = (|| -> Result<CString, c_int> {
         let buf = res?;
         let parsed = ParsedResponse::from_buf(buf)?;
         let ptr_records = parsed.process_answers::<CString>(buf, RECORD_TYPE_PTR)?;
-        
-        // Get the hostname from PTR response
+
         if ptr_records.aliases.is_empty() {
             return Err(ARES_ENOTFOUND);
         }
-        
+
         let mut name = ptr_records.name;
-        
-        // If ARES_NI_NOFQDN is set, strip the domain part
+
         if ffidata.nameinfo_flags & ARES_NI_NOFQDN != 0 {
             let name_str = name.to_string_lossy();
             if let Some(dot_pos) = name_str.find('.') {
                 name = CString::new(&name_str[..dot_pos]).map_err(|_| ARES_EBADSTR)?;
             }
         }
-        
+
         Ok(name)
     })();
-    
-    // Handle the result
+
     let (status, hostname) = match hostname_result {
         Ok(name) => (ARES_SUCCESS, Some(name)),
         Err(err) => {
-            // Only fall back to numeric IP on ARES_ENOTFOUND and when ARES_NI_NAMEREQD is not set
-            // For other errors (timeout, etc.), propagate the error
             if err == ARES_ENOTFOUND && (ffidata.nameinfo_flags & ARES_NI_NAMEREQD) == 0 {
-                // Fall back to numeric IP (with scope_id for IPv6)
                 let ip_str = format_ip_with_scope(&ffidata.ip.unwrap(), ffidata.scope_id, ffidata.nameinfo_flags);
                 match CString::new(ip_str) {
                     Ok(name) => (ARES_SUCCESS, Some(name)),
@@ -908,20 +929,18 @@ fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: AresNameinfoC
                     }
                 }
             } else {
-                // Propagate the error (ARES_ENOTFOUND if NAMEREQD was set, or timeout/other errors)
                 unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
                 return;
             }
         }
     };
-    
-    // Get the service name if requested
+
     let service = if want_service {
         get_service_string(&services, ffidata.port, ffidata.nameinfo_flags)
     } else {
         None
     };
-    
+
     let hostname_ptr = hostname.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
     let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
     unsafe { callback(ffidata.arg, status, 0, hostname_ptr, service_ptr) };

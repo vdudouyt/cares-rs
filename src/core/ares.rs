@@ -7,7 +7,6 @@ use std::rc::Rc;
 use crate::core::sysconfig::SysConfig;
 use crate::core::hostfile::Hosts;
 use crate::core::services::Services;
-use crate::core::packets::*;
 use crate::ffi::SocketFactory;
 use crate::ffi::{ ares_socket, RECORD_TYPE_PTR };
 
@@ -94,22 +93,13 @@ impl<T> Ares<T> {
         self.tasks.push(task);
         self.tasks.last().unwrap()
     }
-    pub fn query(&mut self, name: &str, dnsclass: u16, dnstype: u16, userdata: T) {
+    pub fn query(&mut self, name: &str, _dnsclass: u16, dnstype: u16, userdata: T) {
         let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
-        let query = DnsQuery {
-            name: name.split(".").map(str::to_owned).collect(),
-            qtype: dnstype,
-            qclass: dnsclass,
-        };
-        let request = DnsFrame {
-            transaction_id: rand::thread_rng().r#gen::<u16>(),
-            flags: 0x100,
-            queries: vec![query],
-            answers: vec![],
-        };
+        let transaction_id = rand::thread_rng().r#gen::<u16>();
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
-        let mut task = Task { status: Status::Writing, sock, writebuf: BytesMut::with_capacity(12 + name.len() + 2 + 4), userdata, expires_at };
-        request.write(&mut task.writebuf);
+        let mut writebuf = BytesMut::with_capacity(12 + name.len() + 2 + 4);
+        write_dns_query_direct(&mut writebuf, name, dnstype, transaction_id);
+        let task = Task { status: Status::Writing, sock, writebuf, userdata, expires_at };
         self.tasks.push(task);
     }
     pub fn write_impl(&mut self, task: &mut Task<T>) {

@@ -1,5 +1,52 @@
-use std::io::Cursor;
-use bytes::{ Buf, BufMut };
+use std::borrow::Cow;
+use bytes::BufMut;
+
+pub struct SliceBuf<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SliceBuf<'a> {
+    pub fn new(data: &'a [u8]) -> Self { Self { data, pos: 0 } }
+    pub fn remaining(&self) -> usize { self.data.len() - self.pos }
+    pub fn chunk(&self) -> &'a [u8] { &self.data[self.pos..] }
+    pub fn advance(&mut self, n: usize) { self.pos += n; }
+
+    pub fn get_u8(&mut self) -> Option<u8> {
+        let val = *self.data.get(self.pos)?;
+        self.pos += 1;
+        Some(val)
+    }
+
+    pub fn get_u16(&mut self) -> Option<u16> {
+        let hi = *self.data.get(self.pos)? as u16;
+        let lo = *self.data.get(self.pos + 1)? as u16;
+        self.pos += 2;
+        Some((hi << 8) | lo)
+    }
+
+    pub fn get_u32(&mut self) -> Option<u32> {
+        let b0 = *self.data.get(self.pos)? as u32;
+        let b1 = *self.data.get(self.pos + 1)? as u32;
+        let b2 = *self.data.get(self.pos + 2)? as u32;
+        let b3 = *self.data.get(self.pos + 3)? as u32;
+        self.pos += 4;
+        Some((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+    }
+
+    pub fn get_slice(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos + n;
+        if end > self.data.len() { return None; }
+        let slice = &self.data[self.pos..end];
+        self.pos = end;
+        Some(slice)
+    }
+
+    pub fn get_str(&mut self, n: usize) -> Option<&'a str> {
+        let slice = self.get_slice(n)?;
+        std::str::from_utf8(slice).ok()
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub struct DnsHeader {
@@ -12,14 +59,14 @@ pub struct DnsHeader {
 }
 
 impl DnsHeader {
-    pub fn parse<B: Buf>(buf: &mut B) -> Option<DnsHeader> {
+    pub fn parse(buf: &mut SliceBuf<'_>) -> Option<DnsHeader> {
         let h = DnsHeader {
-            transaction_id: buf.try_get_u16().ok()?,
-            flags:   buf.try_get_u16().ok()?,
-            qdcount: buf.try_get_u16().ok()?,
-            ancount: buf.try_get_u16().ok()?,
-            nscount: buf.try_get_u16().ok()?,
-            arcount: buf.try_get_u16().ok()?,
+            transaction_id: buf.get_u16()?,
+            flags:   buf.get_u16()?,
+            qdcount: buf.get_u16()?,
+            ancount: buf.get_u16()?,
+            nscount: buf.get_u16()?,
+            arcount: buf.get_u16()?,
         };
         Some(h)
     }
@@ -35,26 +82,26 @@ impl DnsHeader {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct DnsQuery {
-    pub name: Vec<String>,
+pub struct DnsQuery<'a> {
+    pub name: Vec<&'a str>,
     pub qtype: u16,
     pub qclass: u16,
 }
 
-impl DnsQuery {
+impl<'a> DnsQuery<'a> {
     #[cfg(test)]
-    pub fn new(domain: &str, qtype: u16, qclass: u16) -> DnsQuery {
+    pub fn new(domain: &'a str, qtype: u16, qclass: u16) -> DnsQuery<'a> {
         DnsQuery {
-            name: domain.split(".").map(str::to_owned).collect(),
+            name: domain.split(".").collect(),
             qtype,
             qclass
         }
     }
-    pub fn parse<B: Buf>(buf: &mut B) -> Option<DnsQuery> {
+    pub fn parse(buf: &mut SliceBuf<'a>) -> Option<DnsQuery<'a>> {
         let label = DnsLabel::parse(buf)?;
-        let qtype = buf.try_get_u16().ok()?;
-        let qclass = buf.try_get_u16().ok()?;
-        Some(DnsQuery { name: label.name.into_iter().collect(), qtype, qclass })
+        let qtype = buf.get_u16()?;
+        let qclass = buf.get_u16()?;
+        Some(DnsQuery { name: label.name, qtype, qclass })
     }
     pub fn write<B: BufMut>(&self, b: &mut B) {
         for label in &self.name {
@@ -68,91 +115,85 @@ impl DnsQuery {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct DnsLabel {
-    pub name: Vec<String>,
+pub struct DnsLabel<'a> {
+    pub name: Vec<&'a str>,
     pub offset: Option<u16>,
 }
 
-impl DnsLabel {
+impl<'a> DnsLabel<'a> {
     #[cfg(test)]
-    pub fn new(name: &[&str], offset: Option<u16>) -> DnsLabel {
-        DnsLabel { name: name.iter().map(ToString::to_string).collect(), offset }
+    pub fn new(name: &[&'a str], offset: Option<u16>) -> DnsLabel<'a> {
+        DnsLabel { name: name.to_vec(), offset }
     }
-    pub fn parse<B: Buf>(buf: &mut B) -> Option<DnsLabel> {
-        let mut cur = Cursor::new(buf.chunk());
-        let mut name: Vec<String> = vec![];
+    pub fn parse(buf: &mut SliceBuf<'a>) -> Option<DnsLabel<'a>> {
+        let saved_pos = buf.pos;
+        let mut name: Vec<&'a str> = vec![];
         let mut offset: Option<u16> = None;
 
         loop {
-            let len = cur.try_get_u8().ok()?;
+            let Some(len) = buf.get_u8() else { buf.pos = saved_pos; return None; };
             if len == 0 {
                 break;
             }
             if len & 0xc0 > 0 {
                 let high_byte = len & 0x3f;
-                let low_byte = cur.try_get_u8().ok()?;
+                let Some(low_byte) = buf.get_u8() else { buf.pos = saved_pos; return None; };
                 offset = Some(((high_byte as u16) << 8) | (low_byte as u16));
                 break;
             }
 
-            let mut dst: Vec<u8> = vec![0; len as usize];
-            cur.try_copy_to_slice(&mut dst[..]).ok()?;
-            name.push(String::from_utf8(dst).ok()?);
+            let Some(s) = buf.get_str(len as usize) else { buf.pos = saved_pos; return None; };
+            name.push(s);
         }
 
-        let bytes_read = cur.position() as usize;
-        buf.advance(bytes_read);
         Some(DnsLabel { name, offset })
     }
     pub fn build_string(&self, main_buf: &[u8]) -> Option<String> {
         let mut name = self.name.clone();
         if let Some(offset) = self.offset {
-            let slice = &main_buf.get(offset as usize..)?;
-            let mut label = DnsLabel::parse(&mut Cursor::new(slice))?;
-            name.append(&mut label.name);
+            let slice = main_buf.get(offset as usize..)?;
+            let mut sub_buf = SliceBuf::new(slice);
+            let label = DnsLabel::parse(&mut sub_buf)?;
+            name.extend(label.name);
         }
         Some(name.join("."))
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DnsAnswer {
-    pub name: DnsLabel,
+pub struct DnsAnswer<'a> {
+    pub name: DnsLabel<'a>,
     pub record_type: u16,
     pub class: u16,
     pub ttl: u32,
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
 }
 
-impl DnsAnswer {
-    pub fn parse<B: Buf>(buf: &mut B) -> Option<DnsAnswer> {
+impl<'a> DnsAnswer<'a> {
+    pub fn parse(buf: &mut SliceBuf<'a>) -> Option<DnsAnswer<'a>> {
         let name = DnsLabel::parse(buf)?;
-        let record_type = buf.try_get_u16().ok()?;
-        let class = buf.try_get_u16().ok()?;
-        let ttl = buf.try_get_u32().ok()?;
-        let data_length = buf.try_get_u16().ok()?;
-
-        let mut data: Vec<u8> = vec![0; data_length as usize];
-        buf.try_copy_to_slice(&mut data[..]).ok()?;
+        let record_type = buf.get_u16()?;
+        let class = buf.get_u16()?;
+        let ttl = buf.get_u32()?;
+        let data_length = buf.get_u16()? as usize;
+        let data = buf.get_slice(data_length)?;
         Some(DnsAnswer { name, record_type, class, ttl, data })
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DnsFrame {
+pub struct DnsFrame<'a> {
     pub transaction_id: u16,
     pub flags: u16,
-    pub queries: Vec<DnsQuery>,
-    pub answers: Vec<DnsAnswer>,
-    // pub authority_responses: Vec<DnsAuthorityResponse>
-    // pub additional_responses: Vec<DnsAdditionalResponse>
+    pub queries: Vec<DnsQuery<'a>>,
+    pub answers: Vec<DnsAnswer<'a>>,
 }
 
-impl DnsFrame {
-    pub fn parse<B: Buf>(buf: &mut B) -> Option<DnsFrame> {
+impl<'a> DnsFrame<'a> {
+    pub fn parse(buf: &mut SliceBuf<'a>) -> Option<DnsFrame<'a>> {
         let header = DnsHeader::parse(buf)?;
-        let mut queries: Vec<DnsQuery> = vec![];
-        let mut answers: Vec<DnsAnswer> = vec![];
+        let mut queries: Vec<DnsQuery<'a>> = vec![];
+        let mut answers: Vec<DnsAnswer<'a>> = vec![];
         for _ in 0..header.qdcount {
             queries.push(DnsQuery::parse(buf)?);
         }
@@ -178,47 +219,41 @@ impl DnsFrame {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct MxReply {
+pub struct MxReply<'a> {
     pub priority: u16,
-    pub label: DnsLabel,
+    pub label: DnsLabel<'a>,
 }
 
-pub trait Parser {
-    fn parse<B: Buf>(buf: &mut B) -> Option<Self> where Self: Sized;
+pub trait Parser<'a> {
+    fn parse(buf: &mut SliceBuf<'a>) -> Option<Self> where Self: Sized;
 }
 
-impl Parser for MxReply {
-    fn parse<B: Buf>(buf: &mut B) -> Option<MxReply> {
-        let priority = buf.try_get_u16().ok()?;
+impl<'a> Parser<'a> for MxReply<'a> {
+    fn parse(buf: &mut SliceBuf<'a>) -> Option<MxReply<'a>> {
+        let priority = buf.get_u16()?;
         let label = DnsLabel::parse(buf)?;
         Some(MxReply { priority, label })
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct CaaReply {
+pub struct CaaReply<'a> {
     pub critical: u32,
-    pub property: String,
+    pub property: &'a str,
     pub plength: u64,
-    pub value: String,
+    pub value: &'a str,
     pub length: u64,
 }
 
-impl Parser for CaaReply {
-    fn parse<B: Buf>(buf: &mut B) -> Option<CaaReply> {
-        let flags = buf.try_get_u8().ok()?;
-        let tag_len = buf.try_get_u8().ok()? as usize;
+impl<'a> Parser<'a> for CaaReply<'a> {
+    fn parse(buf: &mut SliceBuf<'a>) -> Option<CaaReply<'a>> {
+        let flags = buf.get_u8()?;
+        let tag_len = buf.get_u8()? as usize;
 
-        // property
-        let mut tag_bytes = vec![0u8; tag_len];
-        buf.try_copy_to_slice(&mut tag_bytes).ok()?;
-        let property = String::from_utf8(tag_bytes).ok()?;
+        let property = buf.get_str(tag_len)?;
 
-        // value
         let val_len = buf.remaining();
-        let mut val_bytes = vec![0u8; val_len];
-        buf.try_copy_to_slice(&mut val_bytes).ok()?;
-        let value = String::from_utf8(val_bytes).ok()?;
+        let value = buf.get_str(val_len)?;
 
         if tag_len == 0 {
             return None;
@@ -235,36 +270,40 @@ impl Parser for CaaReply {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct TxtReply {
-    pub txt: String,
+pub struct TxtReply<'a> {
+    pub txt: Cow<'a, str>,
     pub length: usize,
 }
 
-impl Parser for TxtReply {
-    fn parse<B: Buf>(buf: &mut B) -> Option<TxtReply> {
-        let mut txt: Vec<String> = vec![];
+impl<'a> Parser<'a> for TxtReply<'a> {
+    fn parse(buf: &mut SliceBuf<'a>) -> Option<TxtReply<'a>> {
+        let mut segments: Vec<&'a str> = vec![];
         while buf.remaining() > 0 {
-            txt.push(parse_prefixed_string(buf)?);
+            segments.push(parse_prefixed_str(buf)?);
         }
-        let txt = txt.join("");
+        let txt = if segments.len() == 1 {
+            Cow::Borrowed(segments[0])
+        } else {
+            Cow::Owned(segments.join(""))
+        };
         let length = txt.len();
         Some(TxtReply { txt, length })
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct TxtReplyExt {
-    pub txt: String,
+pub struct TxtReplyExt<'a> {
+    pub txt: &'a str,
     pub length: usize,
     pub record_start: bool,
 }
 
-impl Parser for Vec<TxtReplyExt> {
-    fn parse<B: Buf>(buf: &mut B) -> Option<Vec<TxtReplyExt>> {
+impl<'a> Parser<'a> for Vec<TxtReplyExt<'a>> {
+    fn parse(buf: &mut SliceBuf<'a>) -> Option<Vec<TxtReplyExt<'a>>> {
         let mut record_start = true;
-        let mut ret: Vec<TxtReplyExt> = vec![];
+        let mut ret: Vec<TxtReplyExt<'a>> = vec![];
         while buf.remaining() > 0 {
-            let txt = parse_prefixed_string(buf)?;
+            let txt = parse_prefixed_str(buf)?;
             let length = txt.len();
             ret.push(TxtReplyExt { txt, length, record_start });
             record_start = false;
@@ -273,55 +312,52 @@ impl Parser for Vec<TxtReplyExt> {
     }
 }
 
-impl<T: Parser> RRParser for T {
-    fn parse_rr(answer: &DnsAnswer) -> Option<T> {
-        let mut buf = Cursor::new(&answer.data);
+impl<'a, T: Parser<'a>> RRParser<'a> for T {
+    fn parse_rr(answer: &DnsAnswer<'a>) -> Option<T> {
+        let mut buf = SliceBuf::new(answer.data);
         T::parse(&mut buf)
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct NaptrReply {
+pub struct NaptrReply<'a> {
     pub order: u16,
     pub preference: u16,
-    pub flags: String,
-    pub service: String,
-    pub regexp: String,
-    pub replacement: String,
+    pub flags: &'a str,
+    pub service: &'a str,
+    pub regexp: &'a str,
+    pub replacement: &'a str,
 }
 
-fn parse_prefixed_string<B: Buf>(buf: &mut B) -> Option<String> {
-    let len = buf.try_get_u8().ok()? as usize;
-    let mut dst: Vec<u8> = vec![0; len as usize];
-    buf.try_copy_to_slice(&mut dst[..]).ok()?;
-    String::from_utf8(dst).ok()
+fn parse_prefixed_str<'a>(buf: &mut SliceBuf<'a>) -> Option<&'a str> {
+    let len = buf.get_u8()? as usize;
+    buf.get_str(len)
 }
 
-impl Parser for NaptrReply {
-    fn parse<B: Buf>(buf: &mut B) -> Option<NaptrReply> {
-        let order = buf.try_get_u16().ok()?;
-        let preference = buf.try_get_u16().ok()?;
-        let flags = parse_prefixed_string(buf)?;
-        let service = parse_prefixed_string(buf)?;
-        let regexp = parse_prefixed_string(buf)?;
-        let replacement = parse_prefixed_string(buf)?;
+impl<'a> Parser<'a> for NaptrReply<'a> {
+    fn parse(buf: &mut SliceBuf<'a>) -> Option<NaptrReply<'a>> {
+        let order = buf.get_u16()?;
+        let preference = buf.get_u16()?;
+        let flags = parse_prefixed_str(buf)?;
+        let service = parse_prefixed_str(buf)?;
+        let regexp = parse_prefixed_str(buf)?;
+        let replacement = parse_prefixed_str(buf)?;
 
-        let ret = NaptrReply {
+        Some(NaptrReply {
             order,
             preference,
             flags,
             service,
             regexp,
             replacement,
-        };
-        Some(ret)
+        })
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct SoaReply {
-    pub nsname: DnsLabel,
-    pub hostmaster: DnsLabel,
+pub struct SoaReply<'a> {
+    pub nsname: DnsLabel<'a>,
+    pub hostmaster: DnsLabel<'a>,
     pub serial: u32,
     pub refresh: u32,
     pub retry: u32,
@@ -329,16 +365,16 @@ pub struct SoaReply {
     pub minttl: u32,
 }
 
-impl Parser for SoaReply {
-    fn parse<B: Buf>(buf: &mut B) -> Option<SoaReply> {
+impl<'a> Parser<'a> for SoaReply<'a> {
+    fn parse(buf: &mut SliceBuf<'a>) -> Option<SoaReply<'a>> {
         let nsname = DnsLabel::parse(buf)?;
         let hostmaster = DnsLabel::parse(buf)?;
 
-        let serial = buf.try_get_u32().ok()?;
-        let refresh = buf.try_get_u32().ok()?;
-        let retry = buf.try_get_u32().ok()?;
-        let expire = buf.try_get_u32().ok()?;
-        let minttl = buf.try_get_u32().ok()?;
+        let serial = buf.get_u32()?;
+        let refresh = buf.get_u32()?;
+        let retry = buf.get_u32()?;
+        let expire = buf.get_u32()?;
+        let minttl = buf.get_u32()?;
 
         Some(SoaReply {
             nsname,
@@ -353,18 +389,18 @@ impl Parser for SoaReply {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct SrvReply {
-    pub host: DnsLabel,
+pub struct SrvReply<'a> {
+    pub host: DnsLabel<'a>,
     pub priority: u16,
     pub weight: u16,
     pub port: u16,
 }
 
-impl Parser for SrvReply {
-    fn parse<B: Buf>(buf: &mut B) -> Option<SrvReply> {
-        let priority = buf.try_get_u16().ok()?;
-        let weight = buf.try_get_u16().ok()?;
-        let port = buf.try_get_u16().ok()?;
+impl<'a> Parser<'a> for SrvReply<'a> {
+    fn parse(buf: &mut SliceBuf<'a>) -> Option<SrvReply<'a>> {
+        let priority = buf.get_u16()?;
+        let weight = buf.get_u16()?;
+        let port = buf.get_u16()?;
         let host = DnsLabel::parse(buf)?;
 
         Some(SrvReply {
@@ -376,28 +412,26 @@ impl Parser for SrvReply {
     }
 }
 
-pub trait RRParser {
-    fn parse_rr(answer: &DnsAnswer) -> Option<Self> where Self: Sized;
+pub trait RRParser<'a> {
+    fn parse_rr(answer: &DnsAnswer<'a>) -> Option<Self> where Self: Sized;
 }
 
 #[derive(Debug, PartialEq)]
-pub struct UriReply {
+pub struct UriReply<'a> {
     pub priority: u16,
     pub weight: u16,
-    pub uri: String,
+    pub uri: &'a str,
     pub ttl: u32,
 }
 
-impl RRParser for UriReply {
-    fn parse_rr(answer: &DnsAnswer) -> Option<UriReply> {
-        let mut buf = Cursor::new(&answer.data);
-        let priority = buf.try_get_u16().ok()?;
-        let weight = buf.try_get_u16().ok()?;
+impl<'a> RRParser<'a> for UriReply<'a> {
+    fn parse_rr(answer: &DnsAnswer<'a>) -> Option<UriReply<'a>> {
+        let mut buf = SliceBuf::new(answer.data);
+        let priority = buf.get_u16()?;
+        let weight = buf.get_u16()?;
 
         let uri_len = buf.remaining();
-        let mut uri_bytes = vec![0u8; uri_len];
-        buf.try_copy_to_slice(&mut uri_bytes).ok()?;
-        let uri = String::from_utf8(uri_bytes).ok()?;
+        let uri = buf.get_str(uri_len)?;
 
         if uri_len == 0 {
             return None;
@@ -417,10 +451,11 @@ pub struct PtrReply {
     pub name: String,
 }
 
-impl RRParser for PtrReply {
-    fn parse_rr(answer: &DnsAnswer) -> Option<PtrReply> {
-        let name = DnsLabel::parse(&mut Cursor::new(&answer.data))?;
-        Some(PtrReply { name: name.build_string(&answer.data)? })
+impl RRParser<'_> for PtrReply {
+    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<PtrReply> {
+        let mut buf = SliceBuf::new(answer.data);
+        let name = DnsLabel::parse(&mut buf)?;
+        Some(PtrReply { name: name.build_string(answer.data)? })
     }
 }
 
@@ -430,7 +465,7 @@ mod tests {
     #[test]
     fn test_parse_dns_header() {
         let buf: Vec<u8> = b"\x8a\x70\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00ASDF".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         let expected = DnsHeader {
             transaction_id: 0x8a70,
             flags: 0x100,
@@ -460,29 +495,29 @@ mod tests {
     #[test]
     fn test_parse_dns_label() {
         let buf: Vec<u8> = b"\x06google\x03com\x00asdf".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         assert_eq!(DnsLabel::parse(&mut cur), Some(DnsLabel::new(&["google", "com"], None)));
         assert_eq!(cur.chunk(), b"asdf");
 
         let buf: Vec<u8> = b"\x06google\x03com".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         assert_eq!(DnsLabel::parse(&mut cur), None);
         assert_eq!(cur.chunk(), b"\x06google\x03com");
 
         let buf: Vec<u8> = b"\x06google\x03com\xc0\x0casdf".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         assert_eq!(DnsLabel::parse(&mut cur), Some(DnsLabel::new(&["google", "com"], Some(0x0c))));
         assert_eq!(cur.chunk(), b"asdf");
 
         let buf: Vec<u8> = b"\xff\xffasdf".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         assert_eq!(DnsLabel::parse(&mut cur), Some(DnsLabel::new(&[], Some(0x3fff))));
         assert_eq!(cur.chunk(), b"asdf");
     }
     #[test]
     fn test_parse_dns_query() {
         let buf: Vec<u8> = b"\x06\x67\x6f\x6f\x67\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01ASDF".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         assert_eq!(DnsQuery::parse(&mut cur), Some(DnsQuery::new("google.com", 1, 1)));
         assert_eq!(cur.chunk(), b"ASDF");
     }
@@ -496,13 +531,13 @@ mod tests {
     #[test]
     fn test_parse_dns_answer() {
         let buf: Vec<u8> = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x01\x2c\x00\x04\x8e\xfa\xb8\x8eASDF".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         let expected = DnsAnswer {
             name: DnsLabel::new(&[], Some(0x0c)),
             record_type: 1, // Host address
             class: 1, // IN
             ttl: 0x012c, // 5 minutes
-            data: vec![0x8e, 0xfa, 0xb8, 0x8e],
+            data: &[0x8e, 0xfa, 0xb8, 0x8e],
         };
         assert_eq!(DnsAnswer::parse(&mut cur), Some(expected));
         assert_eq!(cur.chunk(), b"ASDF");
@@ -510,14 +545,14 @@ mod tests {
     #[test]
     fn test_parse_dns_frame() {
         let buf: Vec<u8> = b"\x8a\x70\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00\x06\x67\x6f\x6f\x67\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x0c\x00\x01\x00\x01\x00\x00\x01\x2c\x00\x04\x8e\xfa\xb8\x8e".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         let query = DnsQuery::new("google.com", 1, 1);
         let answer = DnsAnswer {
             name: DnsLabel::new(&[], Some(0x0c)),
             record_type: 1, // Host address
             class: 1, // IN
             ttl: 0x012c, // 5 minutes
-            data: vec![0x8e, 0xfa, 0xb8, 0x8e],
+            data: &[0x8e, 0xfa, 0xb8, 0x8e],
         };
         let expected = DnsFrame {
             transaction_id: 0x8a70,
@@ -543,15 +578,15 @@ mod tests {
     #[test]
     fn test_parse_mx_response() {
         let buf: Vec<u8> = b"\x00\x14\x07\x73\x6d\x74\x70\x69\x6e\x32\xc0\x0c".to_vec();
-        let mut cur = Cursor::new(&buf);
+        let mut cur = SliceBuf::new(&buf);
         let expected = MxReply { priority: 20, label: DnsLabel::new(&["smtpin2"], Some(0x0c)) };
         assert_eq!(MxReply::parse(&mut cur), Some(expected));
     }
     #[test]
     fn test_parse_txt_response() {
         let buf: Vec<u8> = b"\x04abcd".to_vec();
-        let mut cur = Cursor::new(&buf);
-        let expected = TxtReply { length: 4, txt: "abcd".to_string() };
+        let mut cur = SliceBuf::new(&buf);
+        let expected = TxtReply { length: 4, txt: Cow::Borrowed("abcd") };
         assert_eq!(TxtReply::parse(&mut cur), Some(expected));
     }
 }
