@@ -52,6 +52,7 @@ pub struct ChannelData {
     ares: Ares<FFIData>,
     sock_create_callback: Option<AresSockCreateCallback>,
     sock_create_callback_arg: *mut libc::c_void,
+    readbuf: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -62,7 +63,7 @@ enum Callback {
 }
 
 impl Callback {
-    fn run(&self, buf: Result<Vec<u8>, c_int>, ffidata: &FFIData) {
+    fn run(&self, buf: Result<&[u8], c_int>, ffidata: &FFIData) {
         match self {
             Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, ffidata),
             Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata),
@@ -139,7 +140,7 @@ impl AddrTTL for ares_addr6ttl {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     let ares = Ares::from_sysconfig();
-    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut() };
+    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535] };
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -829,11 +830,11 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timev
     tv
 }
 
-fn run_ares_host_callback(res: Result<Vec<u8>, c_int>, callback: AresHostCallback, ffidata: &FFIData) {
+fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHostCallback, ffidata: &FFIData) {
     let res = (|| {
         let buf = res?;
-        let res = ParsedResponse::from_buf(&buf)?;
-        let mut addr_records = res.process_answers::<AddrRecord>(&buf, ffidata.expected_record_type as u16)?;
+        let res = ParsedResponse::from_buf(buf)?;
+        let mut addr_records = res.process_answers::<AddrRecord>(buf, ffidata.expected_record_type as u16)?;
         if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
             return Err(ARES_ENODATA);
         }
@@ -851,26 +852,26 @@ fn run_ares_host_callback(res: Result<Vec<u8>, c_int>, callback: AresHostCallbac
     }
 }
 
-fn run_ares_callback(res: Result<Vec<u8>, c_int>, callback: AresCallback, ffidata: &FFIData) {
+fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallback, ffidata: &FFIData) {
     match res {
-        Ok(mut buf) => unsafe { callback(ffidata.arg, ARES_SUCCESS, 0, buf.as_mut_ptr(), buf.len() as c_int) },
+        Ok(buf) => unsafe { callback(ffidata.arg, ARES_SUCCESS, 0, buf.as_ptr() as *mut u8, buf.len() as c_int) },
         Err(err) => unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut(), 0) },
     }
 }
 
-fn run_ares_nameinfo_callback(res: Result<Vec<u8>, c_int>, callback: AresNameinfoCallback, ffidata: &FFIData) {
+fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: AresNameinfoCallback, ffidata: &FFIData) {
     // We need access to the services database for service name lookup
     // Since we don't have it here, we'll load it fresh (or could cache it globally)
     let services = Services::default();
-    
+
     // Determine if we want service lookup based on flags
     let want_service = (ffidata.nameinfo_flags & ARES_NI_LOOKUPSERVICE) != 0;
-    
+
     // Try to get hostname from PTR response
     let hostname_result = (|| -> Result<CString, c_int> {
         let buf = res?;
-        let parsed = ParsedResponse::from_buf(&buf)?;
-        let ptr_records = parsed.process_answers::<CString>(&buf, RECORD_TYPE_PTR)?;
+        let parsed = ParsedResponse::from_buf(buf)?;
+        let ptr_records = parsed.process_answers::<CString>(buf, RECORD_TYPE_PTR)?;
         
         // Get the hostname from PTR response
         if ptr_records.aliases.is_empty() {
@@ -945,8 +946,8 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
             channeldata.ares.write_impl(task);
         }
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), read_fds) } {
-            if let Some(buf) = channeldata.ares.read_impl(task) {
-                (task.userdata.callback).run(Ok(buf), &task.userdata);
+            if let Some(len) = Ares::read_impl(task, &mut channeldata.readbuf) {
+                (task.userdata.callback).run(Ok(&channeldata.readbuf[..len]), &task.userdata);
             }
         }
     }

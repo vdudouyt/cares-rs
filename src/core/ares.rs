@@ -22,7 +22,6 @@ pub struct Ares<T> {
     pub services: Services,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
-    readbuf: Vec<u8>,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -59,7 +58,6 @@ impl<T> Ares<T> {
             services: Services::default(),
             default_udp_port: 53,
             default_tcp_port: 53,
-            readbuf: vec![0u8; 65_535],
         }
     }
     pub fn from_sysconfig() -> Self {
@@ -115,10 +113,10 @@ impl<T> Ares<T> {
         let _len = task.sock.send(&task.writebuf).unwrap();
         task.status = Status::Reading;
     }
-    pub fn read_impl(&mut self, task: &mut Task<T>) -> Option<Vec<u8>> {
-        let (len, _src) = task.sock.recv(&mut self.readbuf).unwrap();
+    pub fn read_impl(task: &mut Task<T>, readbuf: &mut [u8]) -> Option<usize> {
+        let (len, _src) = task.sock.recv(readbuf).unwrap();
         task.status = Status::Completed;
-        Some(self.readbuf[..len].to_vec())
+        Some(len)
     }
     pub fn max_wait_time(&self) -> Duration {
         self.tasks.iter().map(Task::time_remaining).min().unwrap()

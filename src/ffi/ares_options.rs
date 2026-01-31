@@ -121,7 +121,7 @@ pub const ARES_OPT_SERVER_FAILOVER: c_int = 1 << 23;
 #[no_mangle]
 pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
     let ares = Ares::from_sysconfig();
-    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut() };
+    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535] };
 
     let options = unsafe { & *options };
     if optmask & ARES_OPT_SERVERS != 0 && !options.servers.is_null() {
