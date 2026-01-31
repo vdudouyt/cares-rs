@@ -17,3 +17,7 @@ crate-type = ["cdylib", "rlib"]
 [[bench]]
 name = "req100k"
 harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1

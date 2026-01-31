@@ -155,7 +155,7 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
-    let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
+    let hostname = unsafe { CStr::from_ptr(hostname).to_str().unwrap_or("") };
     let expected_record_type = match family {
         libc::AF_INET => RECORD_TYPE_A,
         libc::AF_INET6 => RECORD_TYPE_AAAA,
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         libc::AF_INET6 => Family::Ipv6,
         _ => panic!("unexpected family value: {}", family),
     };
-    let newtask = channeldata.ares.gethostbyname(&hostname, family, ffidata);
+    let newtask = channeldata.ares.gethostbyname(hostname, family, ffidata);
     if let Some(cb) = channeldata.sock_create_callback {
         cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
     }
@@ -178,7 +178,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
     if channel.is_null() { return ARES_ENOTFOUND; }
     let channeldata = unsafe { &*channel };
-    let name_str = unsafe { CStr::from_ptr(name).to_string_lossy() };
+    let name_str = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
 
     // Convert C family constant to our Family enum
     let family_filter = match family {
@@ -246,9 +246,9 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 #[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
-    let name = unsafe { CStr::from_ptr(name).to_string_lossy() };
+    let name = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
     let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0 };
-    channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
+    channeldata.ares.query(name, dnsclass as u16, dnstype as u16, ffidata);
 }
 
 /// Looks up the node name and service name for a socket address.
