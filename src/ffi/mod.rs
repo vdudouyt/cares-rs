@@ -178,7 +178,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 #[no_mangle]
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
     if channel.is_null() { return ARES_ENOTFOUND; }
-    let channeldata = unsafe { &*channel };
+    let channeldata = unsafe { &mut *channel };
     let name_str = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
 
     // Convert C family constant to our Family enum
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
     };
 
     // Lookup in the hosts file cache
-    let Some(lookup) = channeldata.ares.hosts.lookup(&name_str, family_filter) else {
+    let Some(lookup) = channeldata.ares.hosts().lookup(&name_str, family_filter) else {
         unsafe { *host = std::ptr::null_mut() };
         return ARES_ENOTFOUND;
     };
@@ -291,7 +291,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 
     // If only service lookup requested (no host), return immediately
     if want_service && !want_host {
-        let service = get_service_string(&channeldata.ares.services, addr_info.port, flags);
+        let service = get_service_string(channeldata.ares.services(), addr_info.port, flags);
         let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
         unsafe { callback(arg, ARES_SUCCESS, 0, std::ptr::null_mut(), service_ptr) };
         return;
@@ -309,7 +309,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 
             let node = CString::new(format_ip_with_scope(&addr_info.ip, addr_info.scope_id, flags)).unwrap();
             let service = if want_service {
-                get_service_string(&channeldata.ares.services, addr_info.port, flags)
+                get_service_string(channeldata.ares.services(), addr_info.port, flags)
             } else {
                 None
             };

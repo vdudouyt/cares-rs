@@ -17,8 +17,8 @@ pub struct Ares<T> {
     pub config: SysConfig,
     pub socket_factory: Rc<SocketFactory>,
     pub tasks: Vec<Task<T>>,
-    pub hosts: Hosts,
-    pub services: Services,
+    hosts: Option<Hosts>,
+    services: Option<Services>,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
 }
@@ -53,14 +53,20 @@ impl<T> Ares<T> {
             config,
             socket_factory: Rc::new(SocketFactory::default()),
             tasks: vec![],
-            hosts: Hosts::from_path("/etc/hosts").unwrap(),
-            services: Services::default(),
+            hosts: None,
+            services: None,
             default_udp_port: 53,
             default_tcp_port: 53,
         }
     }
     pub fn from_sysconfig() -> Self {
         Ares::new(build_sysconfig())
+    }
+    pub fn hosts(&mut self) -> &Hosts {
+        self.hosts.get_or_insert_with(|| Hosts::from_path("/etc/hosts").unwrap())
+    }
+    pub fn services(&mut self) -> &Services {
+        self.services.get_or_insert_with(Services::default)
     }
     pub fn gethostbyname(&mut self, hostname: &str, family: Family, userdata: T) -> &Task<T> {
         let qtype = match family {
