@@ -277,6 +277,11 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
+    ares_query(channel, name, dnsclass, dnstype, callback, arg)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let name = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
