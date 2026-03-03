@@ -163,6 +163,15 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_cancel(channel: Channel) {
+    let channeldata = unsafe { &mut *channel };
+    for task in channeldata.ares.tasks.drain(..) {
+        task.userdata.callback.run(Err(ARES_ECANCELLED), &task.userdata);
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     unsafe { drop(Box::from_raw(channel)); }
 }
