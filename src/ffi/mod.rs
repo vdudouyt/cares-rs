@@ -148,6 +148,21 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int {
+    let src = unsafe { &*source };
+    let ares = Ares::new(src.ares.config.clone());
+    let channeldata = ChannelData {
+        ares,
+        sock_create_callback: src.sock_create_callback,
+        sock_create_callback_arg: src.sock_create_callback_arg,
+        readbuf: vec![0u8; 65_535],
+    };
+    unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     unsafe { drop(Box::from_raw(channel)); }
 }
