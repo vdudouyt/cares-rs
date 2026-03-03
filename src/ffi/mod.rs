@@ -23,7 +23,7 @@ use crate::ffi::clinkedlist::*;
 use crate::ffi::error::*;
 use crate::cstr;
 pub use crate::ffi::ares_socket::{SocketFactory, AresSocketFunctions};
-use crate::core::hostfile::AddressFamily;
+use crate::core::hostfile::{AddressFamily, HostLookup};
 use std::io::Cursor;
 
 pub const ARES_SUCCESS: i32 = 0;
@@ -190,6 +190,43 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         }
     };
 
+    let family_filter = match family {
+        libc::AF_INET => AddressFamily::Ipv4,
+        libc::AF_INET6 => AddressFamily::Ipv6,
+        _ => AddressFamily::Any,
+    };
+
+    // Check IP literal first
+    if let Ok(ip) = hostname.parse::<IpAddr>() {
+        let matches = match family_filter {
+            AddressFamily::Ipv4 => ip.is_ipv4(),
+            AddressFamily::Ipv6 => ip.is_ipv6(),
+            AddressFamily::Any => true,
+        };
+        if matches {
+            let lookup = HostLookup {
+                canonical: hostname.to_string(),
+                aliases: vec![],
+                addrs: vec![ip],
+            };
+            let hostent = hostent_from_lookup(lookup);
+            unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
+            ares_free_hostent(hostent);
+            return;
+        }
+    }
+
+    // Check hosts file
+    if let Some(lookup) = channeldata.ares.hosts().lookup(hostname, family_filter) {
+        if !lookup.addrs.is_empty() {
+            let hostent = hostent_from_lookup(lookup);
+            unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
+            ares_free_hostent(hostent);
+            return;
+        }
+    }
+
+    // Fall through to DNS
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: expected_record_type as c_int, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0 };
     let newtask = channeldata.ares.gethostbyname(hostname, core_family, ffidata);
     if let Some(cb) = channeldata.sock_create_callback {
@@ -225,6 +262,11 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
         return ARES_ENOTFOUND;
     }
 
+    unsafe { *host = hostent_from_lookup(lookup) };
+    ARES_SUCCESS
+}
+
+unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hostent {
     // Determine h_addrtype and h_length from the first address
     let (h_addrtype, h_length) = match lookup.addrs[0] {
         IpAddr::V4(_) => (libc::AF_INET, 4),
@@ -249,8 +291,7 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
         h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
     };
 
-    unsafe { *host = Box::into_raw(Box::new(hostent)) };
-    ARES_SUCCESS
+    Box::into_raw(Box::new(hostent))
 }
 
 #[no_mangle]
@@ -269,6 +310,15 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
             return;
         }
     };
+    // Check hosts file first
+    if let Some(lookup) = channeldata.ares.hosts().reverse_lookup(addr) {
+        let hostent = hostent_from_lookup(lookup);
+        unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
+        ares_free_hostent(hostent);
+        return;
+    }
+
+    // Fall through to DNS
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(addr), nameinfo_flags: 0, port: 0, scope_id: 0 };
     let newtask = channeldata.ares.gethostbyaddr(addr, ffidata);
     if let Some(cb) = channeldata.sock_create_callback {
