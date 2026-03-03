@@ -1103,6 +1103,12 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const c_char) -> c_int {
+    ares_set_servers_ports_csv(channel, servers)
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
     let (major, minor, patch) = (1, 17, 1);
     let v = (major << 16) | (minor << 8) | patch;
