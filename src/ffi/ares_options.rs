@@ -141,3 +141,136 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     unsafe { *out_channel = channel };
     ARES_SUCCESS
 }
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_options, optmask: *mut c_int) -> c_int {
+    if channel.is_null() || options.is_null() || optmask.is_null() {
+        return ARES_ENODATA;
+    }
+    let channeldata = unsafe { &*channel };
+    let config = &channeldata.ares.config;
+    let opts = &config.options;
+
+    let out = unsafe { &mut *options };
+    *out = ares_options::default();
+
+    let mut mask: c_int = 0;
+
+    // flags
+    let mut flags: c_int = 0;
+    if opts.use_vc { flags |= ARES_FLAG_USEVC; }
+    if opts.edns0 { flags |= ARES_FLAG_EDNS; }
+    out.flags = flags;
+    mask |= ARES_OPT_FLAGS;
+
+    // timeout (in milliseconds)
+    out.timeout = (opts.timeout_secs * 1000) as c_int;
+    mask |= ARES_OPT_TIMEOUTMS;
+
+    // tries
+    out.tries = opts.attempts as c_int;
+    mask |= ARES_OPT_TRIES;
+
+    // ndots
+    out.ndots = opts.ndots as c_int;
+    mask |= ARES_OPT_NDOTS;
+
+    // udp/tcp ports
+    out.udp_port = channeldata.ares.default_udp_port;
+    mask |= ARES_OPT_UDP_PORT;
+    out.tcp_port = channeldata.ares.default_tcp_port;
+    mask |= ARES_OPT_TCP_PORT;
+
+    // servers (IPv4 only in ares_options)
+    let v4_servers: Vec<in_addr> = config.nameservers.iter().filter_map(|(ip, _)| {
+        match ip {
+            IpAddr::V4(v4) => {
+                Some(in_addr { s_addr: u32::from(*v4).to_be() })
+            }
+            _ => None,
+        }
+    }).collect();
+    if !v4_servers.is_empty() {
+        let count = v4_servers.len();
+        let ptr = unsafe { libc::malloc(count * std::mem::size_of::<in_addr>()) as *mut in_addr };
+        if !ptr.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(v4_servers.as_ptr(), ptr, count) };
+            out.servers = ptr;
+            out.nservers = count as c_int;
+            mask |= ARES_OPT_SERVERS;
+        }
+    }
+
+    // domains
+    if !config.search.is_empty() {
+        let count = config.search.len();
+        let arr = unsafe { libc::malloc(count * std::mem::size_of::<*mut c_char>()) as *mut *mut c_char };
+        if !arr.is_null() {
+            for (i, domain) in config.search.iter().enumerate() {
+                let cstr = std::ffi::CString::new(domain.as_str()).unwrap_or_default();
+                unsafe { *arr.add(i) = cstr.into_raw() };
+            }
+            out.domains = arr;
+            out.ndomains = count as c_int;
+            mask |= ARES_OPT_DOMAINS;
+        }
+    }
+
+    // rotate
+    if opts.rotate {
+        mask |= ARES_OPT_ROTATE;
+    } else {
+        mask |= ARES_OPT_NOROTATE;
+    }
+
+    unsafe { *optmask = mask };
+    ARES_SUCCESS
+}
+
+const ARES_FLAG_USEVC: c_int = 1 << 0;
+const ARES_FLAG_NOCHECKRESP: c_int = 1 << 7;
+const ARES_FLAG_EDNS: c_int = 1 << 8;
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_destroy_options(options: *mut ares_options) {
+    if options.is_null() { return; }
+    let opts = unsafe { &mut *options };
+
+    // Free servers array
+    if !opts.servers.is_null() {
+        unsafe { libc::free(opts.servers as *mut c_void) };
+        opts.servers = std::ptr::null_mut();
+    }
+
+    // Free domains array
+    if !opts.domains.is_null() {
+        for i in 0..opts.ndomains as usize {
+            let ptr = unsafe { *opts.domains.add(i) };
+            if !ptr.is_null() {
+                drop(unsafe { std::ffi::CString::from_raw(ptr) });
+            }
+        }
+        unsafe { libc::free(opts.domains as *mut c_void) };
+        opts.domains = std::ptr::null_mut();
+    }
+
+    // Free lookups string
+    if !opts.lookups.is_null() {
+        drop(unsafe { std::ffi::CString::from_raw(opts.lookups) });
+        opts.lookups = std::ptr::null_mut();
+    }
+
+    // Free resolvconf_path
+    if !opts.resolvconf_path.is_null() {
+        drop(unsafe { std::ffi::CString::from_raw(opts.resolvconf_path) });
+        opts.resolvconf_path = std::ptr::null_mut();
+    }
+
+    // Free hosts_path
+    if !opts.hosts_path.is_null() {
+        drop(unsafe { std::ffi::CString::from_raw(opts.hosts_path) });
+        opts.hosts_path = std::ptr::null_mut();
+    }
+}
