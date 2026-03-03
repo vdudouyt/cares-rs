@@ -3,8 +3,8 @@ use arrayvec::ArrayVec;
 use bytes::BufMut;
 
 /// Max DNS label segments (e.g. "www.example.com" = 3 segments).
-/// DNS spec allows up to 127, but real names rarely exceed 8.
-const MAX_LABEL_PARTS: usize = 8;
+/// IPv6 reverse DNS (ip6.arpa) needs up to 34 segments.
+const MAX_LABEL_PARTS: usize = 40;
 
 pub type LabelVec<'a> = ArrayVec<&'a str, MAX_LABEL_PARTS>;
 
@@ -151,7 +151,7 @@ impl<'a> DnsLabel<'a> {
             }
 
             let Some(s) = buf.get_str(len as usize) else { buf.pos = saved_pos; return None; };
-            name.push(s);
+            if name.try_push(s).is_err() { buf.pos = saved_pos; return None; }
         }
 
         Some(DnsLabel { name, offset })

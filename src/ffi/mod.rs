@@ -157,19 +157,17 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { CStr::from_ptr(hostname).to_str().unwrap_or("") };
-    let expected_record_type = match family {
-        libc::AF_INET => RECORD_TYPE_A,
-        libc::AF_INET6 => RECORD_TYPE_AAAA,
-        _ => panic!("unexpected family value: {}", family),
+    let (expected_record_type, core_family) = match family {
+        libc::AF_INET => (RECORD_TYPE_A, Family::Ipv4),
+        libc::AF_INET6 => (RECORD_TYPE_AAAA, Family::Ipv6),
+        _ => {
+            unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
+            return;
+        }
     };
 
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: expected_record_type as c_int, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0 };
-    let family = match family {
-        libc::AF_INET => Family::Ipv4,
-        libc::AF_INET6 => Family::Ipv6,
-        _ => panic!("unexpected family value: {}", family),
-    };
-    let newtask = channeldata.ares.gethostbyname(hostname, family, ffidata);
+    let newtask = channeldata.ares.gethostbyname(hostname, core_family, ffidata);
     if let Some(cb) = channeldata.sock_create_callback {
         cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
     }
@@ -235,8 +233,18 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
+    if family != libc::AF_INET && family != libc::AF_INET6 {
+        unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
+        return;
+    }
     let addrbuf = unsafe { std::slice::from_raw_parts(addr as *mut u8, addrlen as usize) };
-    let addr = buf_to_ip(addrbuf).unwrap();
+    let addr = match buf_to_ip(addrbuf) {
+        Ok(ip) => ip,
+        Err(_) => {
+            unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
+            return;
+        }
+    };
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(addr), nameinfo_flags: 0, port: 0, scope_id: 0 };
     let newtask = channeldata.ares.gethostbyaddr(addr, ffidata);
     if let Some(cb) = channeldata.sock_create_callback {
@@ -487,10 +495,11 @@ impl<'a> ParsedResponse<'a> {
             return Err(ARES_ENODATA);
         }
         let mut answers = Vec::with_capacity(answer_count);
-        // Parse answer section (ancount), plus authority (nscount) and additional (arcount)
-        let total = answer_count + header.nscount as usize + header.arcount as usize;
-        for _ in 0..total {
-            let Some(answer) = DnsAnswer::parse(&mut sbuf) else { break };
+        // Only parse answer section (ancount); authority and additional sections are skipped
+        for _ in 0..answer_count {
+            let Some(answer) = DnsAnswer::parse(&mut sbuf) else {
+                return Err(ARES_EBADRESP);
+            };
             answers.push(answer);
         }
         if answers.is_empty() {
@@ -566,7 +575,10 @@ pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out:
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReplyExt) -> c_int {
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let res = ParsedResponse::from_buf(buf).unwrap();
+    let res = match ParsedResponse::from_buf(buf) {
+        Ok(res) => res,
+        Err(err) => return err,
+    };
 
     let parsed_rrs = match res.process_answers::<Vec<TxtReplyExt>>(buf, RECORD_TYPE_TXT) {
         Ok(res) => res,
@@ -997,7 +1009,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) {
+pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) -> c_int {
     let channeldata = unsafe { &mut *channel };
     channeldata.ares.config.nameservers.clear();
     while !head.is_null() {
@@ -1008,6 +1020,7 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
         }
         head = unsafe { (*head).next };
     }
+    ARES_SUCCESS
 }
 
 fn ipv4_to_in_addr(ip: IpAddr) -> Option<AresAddrUnion> {
