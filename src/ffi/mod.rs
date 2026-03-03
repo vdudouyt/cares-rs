@@ -150,7 +150,8 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int {
     let src = unsafe { &*source };
-    let ares = Ares::new(src.ares.config.clone());
+    let mut ares = Ares::new(src.ares.config.clone());
+    ares.socket_factory = src.ares.socket_factory.clone();
     let channeldata = ChannelData {
         ares,
         sock_create_callback: src.sock_create_callback,
