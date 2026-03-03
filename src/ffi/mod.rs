@@ -1023,6 +1023,32 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
     ARES_SUCCESS
 }
 
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut AresAddrPortNode) -> c_int {
+    if channel.is_null() { return ARES_ENODATA; }
+    let channeldata = unsafe { &mut *channel };
+    channeldata.ares.config.nameservers.clear();
+    while !head.is_null() {
+        let node = unsafe { &*head };
+        let port = node.udp_port as u16;
+        let port = if port == 0 || port == 53 { None } else { Some(port) };
+        match node.family {
+            libc::AF_INET => {
+                let octets = unsafe { node.addr.addr4.s_addr.to_ne_bytes() };
+                channeldata.ares.config.nameservers.push((IpAddr::from(octets), port));
+            }
+            libc::AF_INET6 => {
+                let octets = unsafe { node.addr.addr6.s6_addr };
+                channeldata.ares.config.nameservers.push((IpAddr::from(octets), port));
+            }
+            _ => {}
+        }
+        head = node.next;
+    }
+    ARES_SUCCESS
+}
+
 fn ipv4_to_in_addr(ip: IpAddr) -> Option<AresAddrUnion> {
     match ip {
         IpAddr::V4(v4) => {
@@ -1039,10 +1065,19 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut
     let channeldata = unsafe { &mut *channel };
     let mut data: Vec<AresAddrPortNode> = vec![];
     for srv in &channeldata.ares.config.nameservers {
+        let (family, addr) = match srv.0 {
+            IpAddr::V4(v4) => {
+                let s_addr = u32::from_ne_bytes(v4.octets());
+                (libc::AF_INET, AresAddrUnion { addr4: libc::in_addr { s_addr } })
+            }
+            IpAddr::V6(v6) => {
+                (libc::AF_INET6, AresAddrUnion { addr6: libc::in6_addr { s6_addr: v6.octets() } })
+            }
+        };
         data.push(AresAddrPortNode {
             next: std::ptr::null_mut(),
-            family: libc::AF_INET,
-            addr: ipv4_to_in_addr(srv.0).unwrap(),
+            family,
+            addr,
             udp_port: srv.1.unwrap_or(channeldata.ares.default_udp_port) as c_int,
             tcp_port: srv.1.unwrap_or(channeldata.ares.default_tcp_port) as c_int,
         });
