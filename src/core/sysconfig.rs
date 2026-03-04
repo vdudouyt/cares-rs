@@ -3,7 +3,8 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SysConfig {
-    pub nameservers: Vec<(IpAddr, Option<u16>)>,
+    pub nameservers: Vec<(IpAddr, Option<u16>)>, // (ip, udp_port_override)
+    pub tcp_ports: Vec<Option<u16>>, // per-server TCP port overrides
     pub domain: Option<String>,
     pub search: Vec<String>,
     pub options: SysConfigOptions,
@@ -22,7 +23,7 @@ pub struct SysConfigOptions {
 
 impl Default for SysConfigOptions {
     fn default() -> Self {
-        SysConfigOptions { ndots: 0, attempts: 4, timeout_secs: 5, use_vc: false, rotate: false, inet6: false, edns0: false }
+        SysConfigOptions { ndots: 1, attempts: 4, timeout_secs: 5, use_vc: false, rotate: false, inet6: false, edns0: false }
     }
 }
 
@@ -51,6 +52,7 @@ impl FromStr for SysConfig {
                 "nameserver" => {
                     for tok in rest {
                         conf.nameservers.push(parse_ns_addr(tok).unwrap());
+                        conf.tcp_ports.push(None);
                     }
                 }
                 "domain" => conf.domain = Some(arg1.to_string()),

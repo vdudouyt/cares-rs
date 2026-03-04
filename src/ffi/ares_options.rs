@@ -5,7 +5,7 @@ use libc::{in_addr};
 use crate::ffi::{ Channel, Ares };
 use crate::ChannelData;
 use std::net::{ IpAddr, Ipv4Addr };
-use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
 use crate::ares_socket_t;
 
@@ -121,7 +121,7 @@ pub const ARES_OPT_SERVER_FAILOVER: c_int = 1 << 23;
 #[no_mangle]
 pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
     let ares = Ares::from_sysconfig();
-    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535] };
+    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![] };
 
     let options = unsafe { & *options };
     if optmask & ARES_OPT_SERVERS != 0 && !options.servers.is_null() {
@@ -129,6 +129,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         for server in servers {
             let ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(server.s_addr)));
             channeldata.ares.config.nameservers.push((ip, None));
+            channeldata.ares.config.tcp_ports.push(None);
         }
     }
     if optmask & ARES_OPT_UDP_PORT != 0 {
@@ -137,6 +138,34 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     if optmask & ARES_OPT_TCP_PORT != 0 {
         channeldata.ares.default_tcp_port = options.tcp_port;
     }
+    if optmask & ARES_OPT_TIMEOUTMS != 0 {
+        channeldata.ares.config.options.timeout_secs = std::cmp::max(1, (options.timeout as u32 + 999) / 1000);
+    }
+    if optmask & ARES_OPT_TIMEOUT != 0 {
+        channeldata.ares.config.options.timeout_secs = options.timeout as u32;
+    }
+    if optmask & ARES_OPT_TRIES != 0 {
+        channeldata.ares.config.options.attempts = options.tries as u32;
+    }
+    if optmask & ARES_OPT_NDOTS != 0 {
+        channeldata.ares.config.options.ndots = options.ndots as u32;
+    }
+    if optmask & ARES_OPT_FLAGS != 0 {
+        channeldata.ares.config.options.use_vc = (options.flags & ARES_FLAG_USEVC) != 0;
+    }
+    if optmask & ARES_OPT_DOMAINS != 0 && !options.domains.is_null() {
+        let domains = std::slice::from_raw_parts(options.domains, options.ndomains as usize);
+        channeldata.ares.config.search = domains.iter()
+            .map(|&p| CStr::from_ptr(p).to_string_lossy().into_owned())
+            .collect();
+    }
+    if optmask & ARES_OPT_NOROTATE != 0 {
+        channeldata.ares.config.options.rotate = false;
+    }
+    if optmask & ARES_OPT_ROTATE != 0 {
+        channeldata.ares.config.options.rotate = true;
+    }
+    channeldata.server_failures = vec![0; channeldata.ares.config.nameservers.len()];
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
