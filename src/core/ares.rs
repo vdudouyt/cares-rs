@@ -1,4 +1,4 @@
-use std::net::{ SocketAddr, IpAddr, Ipv4Addr };
+use std::net::{ SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr };
 use bytes::{ BytesMut, BufMut };
 use rand::Rng;
 use std::time::{ Instant, Duration };
@@ -10,7 +10,8 @@ use crate::core::services::Services;
 use crate::ffi::SocketFactory;
 use crate::ffi::{ ares_socket, RECORD_TYPE_PTR };
 
-const BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+const BIND_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+const BIND_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
 
 /* TODO: reconcile ChannelData here */
 pub struct Ares<T> {
@@ -68,12 +69,18 @@ impl<T> Ares<T> {
     pub fn services(&mut self) -> &Services {
         self.services.get_or_insert_with(Services::default)
     }
+    fn bind_addr(&self) -> SocketAddr {
+        match self.config.nameservers.first() {
+            Some((IpAddr::V6(_), _)) => BIND_ADDR_V6,
+            _ => BIND_ADDR_V4,
+        }
+    }
     pub fn gethostbyname(&mut self, hostname: &str, family: Family, userdata: T) -> &Task<T> {
         let qtype = match family {
             Family::Ipv4 => 0x01, // A
             Family::Ipv6 => 0x1c, // AAAA
         };
-        let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
+        let sock = self.socket_factory.create_udp(self.bind_addr()).unwrap();
         let transaction_id = rand::thread_rng().r#gen::<u16>();
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
         let mut writebuf = BytesMut::with_capacity(12 + hostname.len() + 2 + 4);
@@ -84,7 +91,7 @@ impl<T> Ares<T> {
     }
     pub fn gethostbyaddr(&mut self, addr: IpAddr, userdata: T) -> &Task<T> {
         let rhostname = rdns_name(addr);
-        let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
+        let sock = self.socket_factory.create_udp(self.bind_addr()).unwrap();
         let transaction_id = rand::thread_rng().r#gen::<u16>();
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
         let mut writebuf = BytesMut::with_capacity(12 + rhostname.len() + 2 + 4);
@@ -94,7 +101,7 @@ impl<T> Ares<T> {
         self.tasks.last().unwrap()
     }
     pub fn query(&mut self, name: &str, _dnsclass: u16, dnstype: u16, userdata: T) {
-        let sock = self.socket_factory.create_udp(BIND_ADDR).unwrap();
+        let sock = self.socket_factory.create_udp(self.bind_addr()).unwrap();
         let transaction_id = rand::thread_rng().r#gen::<u16>();
         let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
         let mut writebuf = BytesMut::with_capacity(12 + name.len() + 2 + 4);
