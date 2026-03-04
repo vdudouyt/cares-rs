@@ -10,7 +10,7 @@ pub type LabelVec<'a> = ArrayVec<&'a str, MAX_LABEL_PARTS>;
 
 pub struct SliceBuf<'a> {
     data: &'a [u8],
-    pos: usize,
+    pub(crate) pos: usize,
 }
 
 impl<'a> SliceBuf<'a> {

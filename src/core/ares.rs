@@ -102,15 +102,20 @@ impl<T> Ares<T> {
         let task = Task { status: Status::Writing, sock, writebuf, userdata, expires_at };
         self.tasks.push(task);
     }
-    pub fn write_impl(&mut self, task: &mut Task<T>) {
+    pub fn write_impl(&mut self, task: &mut Task<T>) -> bool {
         let ns_addr = self.config.nameservers.first().unwrap();
         let socket_addr = SocketAddr::from((ns_addr.0, ns_addr.1.unwrap_or(self.default_udp_port)));
-        task.sock.connect(socket_addr);
-        let _len = task.sock.send(&task.writebuf).unwrap();
-        task.status = Status::Reading;
+        let _ = task.sock.connect(socket_addr);
+        match task.sock.send(&task.writebuf) {
+            Ok(_) => { task.status = Status::Reading; true }
+            Err(_) => { task.status = Status::Completed; false }
+        }
     }
     pub fn read_impl(task: &mut Task<T>, readbuf: &mut [u8]) -> Option<usize> {
-        let (len, _src) = task.sock.recv(readbuf).unwrap();
+        let (len, _src) = match task.sock.recv(readbuf) {
+            Ok(result) => result,
+            Err(_) => { task.status = Status::Completed; return None; }
+        };
         task.status = Status::Completed;
         Some(len)
     }
