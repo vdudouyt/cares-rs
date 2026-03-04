@@ -20,7 +20,7 @@ struct CAresVariant {
     ares_timeout: unsafe extern "C" fn(_channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval,
     ares_fds: unsafe extern "C" fn(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int,
     ares_process: unsafe extern "C" fn(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set),
-    ares_set_servers: unsafe extern "C" fn(channel: Channel, head: *mut ares_addr_node),
+    ares_set_servers: unsafe extern "C" fn(channel: Channel, head: *mut ares_addr_node) -> c_int,
 }
 
 impl CAresVariant {
