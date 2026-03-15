@@ -14,7 +14,7 @@ pub struct SysConfig {
 pub struct SysConfigOptions {
     pub ndots: u32,
     pub attempts: u32,
-    pub timeout_secs: u32,
+    pub timeout_ms: u32,
     pub use_vc: bool,
     pub rotate: bool,
     pub inet6: bool,
@@ -23,7 +23,7 @@ pub struct SysConfigOptions {
 
 impl Default for SysConfigOptions {
     fn default() -> Self {
-        SysConfigOptions { ndots: 1, attempts: 4, timeout_secs: 5, use_vc: false, rotate: false, inet6: false, edns0: false }
+        SysConfigOptions { ndots: 1, attempts: 4, timeout_ms: 5000, use_vc: false, rotate: false, inet6: false, edns0: false }
     }
 }
 
@@ -78,7 +78,7 @@ fn parse_options_into(opts: &mut SysConfigOptions, src: &str) -> Result<(), Pars
         match key {
             "ndots" => opts.ndots = take_num_arg(key, val)?,
             "attempts" => opts.attempts = take_num_arg(key, val)?,
-            "timeout" | "retrans" => opts.timeout_secs = take_num_arg(key, val)?,
+            "timeout" | "retrans" => opts.timeout_ms = take_num_arg::<u32>(key, val)? * 1000,
             "use-vc" | "usevc" => opts.use_vc = true,
             "rotate" => opts.rotate = true,
             "inet6" => opts.inet6 = true,
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(conf.nameservers.len(), 1);
         assert_eq!(conf.domain, None);
         assert!(conf.search.is_empty());
-        assert_eq!(conf.options.timeout_secs, 5);
+        assert_eq!(conf.options.timeout_ms, 5000);
         assert_eq!(conf.options.attempts, 4);
     }
 
@@ -147,7 +147,7 @@ mod tests {
         assert_eq!(conf.search, vec!["corp.local", "example.org"]);
         assert_eq!(conf.options.ndots, 2);
         assert_eq!(conf.options.attempts, 4);
-        assert_eq!(conf.options.timeout_secs, 3);
+        assert_eq!(conf.options.timeout_ms, 3000);
         assert!(conf.options.rotate);
         assert!(conf.options.use_vc);
     }
@@ -156,7 +156,7 @@ mod tests {
     fn parse_options_variants() {
         let input = "options retrans=7 edns0 foo=bar baz:9 qux";
         let conf: SysConfig = input.parse().unwrap();
-        assert_eq!(conf.options.timeout_secs, 7);
+        assert_eq!(conf.options.timeout_ms, 7000);
         assert!(conf.options.edns0);
     }
 

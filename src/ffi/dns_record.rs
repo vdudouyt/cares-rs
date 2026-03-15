@@ -1773,8 +1773,8 @@ pub unsafe extern "C" fn ares_dns_rec_type_tostr(rtype: c_uint) -> *const c_char
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rec_type_fromstr(
-    str_ptr: *const c_char,
     rtype: *mut c_uint,
+    str_ptr: *const c_char,
 ) -> c_int {
     if str_ptr.is_null() || rtype.is_null() {
         return ARES_FALSE;

@@ -158,23 +158,31 @@ impl<'a> DnsLabel<'a> {
     }
     pub fn build_string(&self, main_buf: &[u8]) -> Option<String> {
         if self.offset.is_none() {
-            return Some(self.name.join("."));
+            return Some(join_escaped_labels(self.name.iter()));
         }
         let offset = self.offset.unwrap();
         let slice = main_buf.get(offset as usize..)?;
         let mut sub_buf = SliceBuf::new(slice);
         let label = DnsLabel::parse(&mut sub_buf)?;
-        // Calculate capacity: self.name parts + label parts, with dots
-        let cap = self.name.iter().chain(label.name.iter())
-            .map(|s| s.len()).sum::<usize>()
-            + self.name.len() + label.name.len();
-        let mut result = String::with_capacity(cap);
-        for (i, part) in self.name.iter().chain(label.name.iter()).enumerate() {
-            if i > 0 { result.push('.'); }
-            result.push_str(part);
-        }
-        Some(result)
+        Some(join_escaped_labels(self.name.iter().chain(label.name.iter())))
     }
+}
+
+/// Join DNS labels with '.', escaping any '.' or '\\' characters within individual labels.
+fn join_escaped_labels<'a, I: Iterator<Item = &'a &'a str>>(labels: I) -> String {
+    let mut result = String::new();
+    for (i, label) in labels.enumerate() {
+        if i > 0 {
+            result.push('.');
+        }
+        for &b in label.as_bytes() {
+            if b == b'.' || b == b'\\' {
+                result.push('\\');
+            }
+            result.push(b as char);
+        }
+    }
+    result
 }
 
 #[derive(Debug, PartialEq)]

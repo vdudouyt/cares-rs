@@ -29,8 +29,8 @@ pub struct Ares<T> {
 pub enum Family { Ipv4, Ipv6 }
 
 pub enum DnsSocket {
-    Udp(ares_socket::UdpSocket),
-    Tcp(ares_socket::TcpSocket),
+    Udp(Rc<ares_socket::UdpSocket>),
+    Tcp(Rc<ares_socket::TcpSocket>),
 }
 
 impl DnsSocket {
@@ -117,12 +117,32 @@ impl<T> Ares<T> {
         };
         let sock = self.socket_factory.create_udp(self.bind_addr_for_server(server_index)).unwrap();
         let transaction_id = rand::thread_rng().r#gen::<u16>();
-        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
         let mut writebuf = BytesMut::with_capacity(12 + hostname.len() + 2 + 4);
         write_dns_query_direct(&mut writebuf, hostname, qtype, transaction_id);
-        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(sock), writebuf, userdata, expires_at, server_index, tries_remaining: 0 };
+        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(Rc::new(sock)), writebuf, userdata, expires_at, server_index, tries_remaining: 0 };
         self.tasks.push(task);
         self.tasks.last().unwrap()
+    }
+    pub fn gethostbyname_to_server_shared(&mut self, hostname: &str, family: Family, userdata: T, server_index: usize, shared_sock: Rc<ares_socket::UdpSocket>) -> &Task<T> {
+        let qtype = match family {
+            Family::Ipv4 => 0x01,
+            Family::Ipv6 => 0x1c,
+        };
+        let transaction_id = rand::thread_rng().r#gen::<u16>();
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
+        let mut writebuf = BytesMut::with_capacity(12 + hostname.len() + 2 + 4);
+        write_dns_query_direct(&mut writebuf, hostname, qtype, transaction_id);
+        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(shared_sock), writebuf, userdata, expires_at, server_index, tries_remaining: 0 };
+        self.tasks.push(task);
+        self.tasks.last().unwrap()
+    }
+    pub fn send_raw_to_server_shared(&mut self, packet: &[u8], userdata: T, server_index: usize, shared_sock: Rc<ares_socket::UdpSocket>) {
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
+        let mut writebuf = BytesMut::with_capacity(packet.len());
+        writebuf.extend_from_slice(packet);
+        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(shared_sock), writebuf, userdata, expires_at, server_index, tries_remaining: 0 };
+        self.tasks.push(task);
     }
     pub fn gethostbyname_tcp(&mut self, hostname: &str, family: Family, userdata: T) -> &Task<T> {
         self.gethostbyname_tcp_to_server(hostname, family, userdata, 0)
@@ -141,7 +161,7 @@ impl<T> Ares<T> {
         let _ = sock.connect(socket_addr);
 
         let transaction_id = rand::thread_rng().r#gen::<u16>();
-        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
         let mut writebuf = BytesMut::with_capacity(2 + 12 + hostname.len() + 2 + 4);
         // DNS query payload (without length prefix yet)
         let payload_start = writebuf.len();
@@ -151,44 +171,71 @@ impl<T> Ares<T> {
         let mut framed = BytesMut::with_capacity(2 + payload_len);
         framed.put_u16(payload_len as u16);
         framed.extend_from_slice(&writebuf);
-        let task = Task { status: Status::Writing, sock: DnsSocket::Tcp(sock), writebuf: framed, userdata, expires_at, server_index, tries_remaining: 0 };
+        let task = Task { status: Status::Writing, sock: DnsSocket::Tcp(Rc::new(sock)), writebuf: framed, userdata, expires_at, server_index, tries_remaining: 0 };
         self.tasks.push(task);
         self.tasks.last().unwrap()
+    }
+    pub fn gethostbyname_tcp_to_server_shared(&mut self, hostname: &str, family: Family, userdata: T, server_index: usize, shared_sock: Rc<ares_socket::TcpSocket>) -> &Task<T> {
+        let qtype = match family {
+            Family::Ipv4 => 0x01,
+            Family::Ipv6 => 0x1c,
+        };
+        let transaction_id = rand::thread_rng().r#gen::<u16>();
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
+        let mut writebuf = BytesMut::with_capacity(2 + 12 + hostname.len() + 2 + 4);
+        let payload_start = writebuf.len();
+        write_dns_query_direct(&mut writebuf, hostname, qtype, transaction_id);
+        let payload_len = writebuf.len() - payload_start;
+        let mut framed = BytesMut::with_capacity(2 + payload_len);
+        framed.put_u16(payload_len as u16);
+        framed.extend_from_slice(&writebuf);
+        let task = Task { status: Status::Writing, sock: DnsSocket::Tcp(shared_sock), writebuf: framed, userdata, expires_at, server_index, tries_remaining: 0 };
+        self.tasks.push(task);
+        self.tasks.last().unwrap()
+    }
+    pub fn send_raw_tcp_to_server_shared(&mut self, packet: &[u8], userdata: T, server_index: usize, shared_sock: Rc<ares_socket::TcpSocket>) {
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
+        let payload_len = packet.len();
+        let mut framed = BytesMut::with_capacity(2 + payload_len);
+        framed.put_u16(payload_len as u16);
+        framed.extend_from_slice(packet);
+        let task = Task { status: Status::Writing, sock: DnsSocket::Tcp(shared_sock), writebuf: framed, userdata, expires_at, server_index, tries_remaining: 0 };
+        self.tasks.push(task);
     }
     pub fn gethostbyaddr(&mut self, addr: IpAddr, userdata: T) -> &Task<T> {
         let rhostname = rdns_name(addr);
         let sock = self.socket_factory.create_udp(self.bind_addr()).unwrap();
         let transaction_id = rand::thread_rng().r#gen::<u16>();
-        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
         let mut writebuf = BytesMut::with_capacity(12 + rhostname.len() + 2 + 4);
         write_dns_query_direct(&mut writebuf, &rhostname, RECORD_TYPE_PTR, transaction_id);
-        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(sock), writebuf, userdata, expires_at, server_index: 0, tries_remaining: 0 };
+        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(Rc::new(sock)), writebuf, userdata, expires_at, server_index: 0, tries_remaining: 0 };
         self.tasks.push(task);
         self.tasks.last().unwrap()
     }
     pub fn query(&mut self, name: &str, _dnsclass: u16, dnstype: u16, userdata: T) {
         let sock = self.socket_factory.create_udp(self.bind_addr()).unwrap();
         let transaction_id = rand::thread_rng().r#gen::<u16>();
-        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
         let mut writebuf = BytesMut::with_capacity(12 + name.len() + 2 + 4);
         write_dns_query_direct(&mut writebuf, name, dnstype, transaction_id);
-        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(sock), writebuf, userdata, expires_at, server_index: 0, tries_remaining: 0 };
+        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(Rc::new(sock)), writebuf, userdata, expires_at, server_index: 0, tries_remaining: 0 };
         self.tasks.push(task);
     }
     pub fn send_raw(&mut self, packet: &[u8], userdata: T) {
         let sock = self.socket_factory.create_udp(self.bind_addr()).unwrap();
-        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
         let mut writebuf = BytesMut::with_capacity(packet.len());
         writebuf.extend_from_slice(packet);
-        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(sock), writebuf, userdata, expires_at, server_index: 0, tries_remaining: 0 };
+        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(Rc::new(sock)), writebuf, userdata, expires_at, server_index: 0, tries_remaining: 0 };
         self.tasks.push(task);
     }
     pub fn send_raw_to_server(&mut self, packet: &[u8], userdata: T, server_index: usize) {
         let sock = self.socket_factory.create_udp(self.bind_addr_for_server(server_index)).unwrap();
-        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
         let mut writebuf = BytesMut::with_capacity(packet.len());
         writebuf.extend_from_slice(packet);
-        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(sock), writebuf, userdata, expires_at, server_index, tries_remaining: 0 };
+        let task = Task { status: Status::Writing, sock: DnsSocket::Udp(Rc::new(sock)), writebuf, userdata, expires_at, server_index, tries_remaining: 0 };
         self.tasks.push(task);
     }
     pub fn send_raw_tcp_to_server(&mut self, packet: &[u8], userdata: T, server_index: usize) {
@@ -198,12 +245,12 @@ impl<T> Ares<T> {
         let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
         let socket_addr = SocketAddr::from((ns_addr.0, tcp_port));
         let _ = sock.connect(socket_addr);
-        let expires_at = Instant::now() + Duration::new(1, 0) * self.config.options.timeout_secs;
+        let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
         let payload_len = packet.len();
         let mut framed = BytesMut::with_capacity(2 + payload_len);
         framed.put_u16(payload_len as u16);
         framed.extend_from_slice(packet);
-        let task = Task { status: Status::Writing, sock: DnsSocket::Tcp(sock), writebuf: framed, userdata, expires_at, server_index, tries_remaining: 0 };
+        let task = Task { status: Status::Writing, sock: DnsSocket::Tcp(Rc::new(sock)), writebuf: framed, userdata, expires_at, server_index, tries_remaining: 0 };
         self.tasks.push(task);
     }
     pub fn write_impl(&mut self, task: &mut Task<T>) -> WriteResult {
@@ -228,21 +275,18 @@ impl<T> Ares<T> {
     pub fn read_impl(task: &mut Task<T>, readbuf: &mut [u8]) -> Option<(usize, usize)> {
         let (len, _src) = match task.sock.recv(readbuf) {
             Ok(result) => result,
-            Err(ref e) if task.sock.is_tcp() && e.kind() == std::io::ErrorKind::WouldBlock => {
-                // TCP: no data yet, stay in Reading status
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No data yet, stay in Reading status
                 return None;
             }
             Err(_) => { task.status = Status::Completed; return None; }
         };
         if task.sock.is_tcp() {
-            // TCP: skip first 2 bytes (length prefix)
-            // If the payload is too short for a DNS header (12 bytes), keep waiting/timeout
-            if len < 14 {
-                // Don't mark as completed; let it time out
-                return None;
-            }
+            if len < 2 { return None; }
+            let payload_len = u16::from_be_bytes([readbuf[0], readbuf[1]]) as usize;
+            if len < 2 + payload_len { return None; }
             task.status = Status::Completed;
-            Some((2, len - 2))
+            Some((2, payload_len))
         } else {
             task.status = Status::Completed;
             Some((0, len))
