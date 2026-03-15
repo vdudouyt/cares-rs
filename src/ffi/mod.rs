@@ -5,10 +5,11 @@ pub mod ares_socket;
 mod cnullterminated;
 mod cstr;
 mod clinkedlist;
+mod dns_record;
 mod error;
 mod offset_of;
 
-use std::ffi::{ c_int, c_void, c_char };
+use std::ffi::{ c_int, c_uint, c_void, c_char };
 use std::ffi::{ CString, CStr };
 use std::net::IpAddr;
 use std::cmp::min;
@@ -51,8 +52,13 @@ pub struct ChannelData {
     ares: Ares<FFIData>,
     sock_create_callback: Option<AresSockCreateCallback>,
     sock_create_callback_arg: *mut libc::c_void,
+    sock_config_callback: Option<AresSockConfigureCallback>,
+    sock_config_callback_arg: *mut libc::c_void,
+    server_state_callback: Option<AresServerStateCallback>,
+    server_state_callback_arg: *mut libc::c_void,
     readbuf: Vec<u8>,
     server_failures: Vec<u32>,
+    sortlist: Vec<SortlistEntry>,
 }
 
 struct AddrInfoState {
@@ -77,6 +83,7 @@ struct AddrInfoState {
 enum Callback {
     AresHostCallback(AresHostCallback),
     AresCallback(AresCallback),
+    AresCallbackDnsRec(AresCallbackDnsRec),
     AresNameinfoCallback(AresNameinfoCallback),
     AresAddrInfoCallback(*mut AddrInfoState),
 }
@@ -86,8 +93,18 @@ impl Callback {
         match self {
             Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, ffidata),
             Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata),
+            Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, ffidata),
             Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, ffidata),
             Self::AresAddrInfoCallback(state_ptr) => unsafe { run_ares_addrinfo_callback(buf, *state_ptr, ffidata) },
+        }
+    }
+    fn clone_for_retry(&self) -> Self {
+        match self {
+            Self::AresHostCallback(cb) => Self::AresHostCallback(*cb),
+            Self::AresCallback(cb) => Self::AresCallback(*cb),
+            Self::AresCallbackDnsRec(cb) => Self::AresCallbackDnsRec(*cb),
+            Self::AresNameinfoCallback(cb) => Self::AresNameinfoCallback(*cb),
+            Self::AresAddrInfoCallback(ptr) => Self::AresAddrInfoCallback(*ptr),
         }
     }
 }
@@ -161,7 +178,7 @@ impl AddrTTL for ares_addr6ttl {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     let ares = Ares::from_sysconfig();
-    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![] };
+    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![] };
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -170,6 +187,7 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int {
+    if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
     let src = unsafe { &*source };
     let mut ares = Ares::new(src.ares.config.clone());
     ares.socket_factory = src.ares.socket_factory.clone();
@@ -177,8 +195,13 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
         ares,
         sock_create_callback: src.sock_create_callback,
         sock_create_callback_arg: src.sock_create_callback_arg,
+        sock_config_callback: src.sock_config_callback,
+        sock_config_callback_arg: src.sock_config_callback_arg,
+        server_state_callback: src.server_state_callback,
+        server_state_callback_arg: src.server_state_callback_arg,
         readbuf: vec![0u8; 65_535],
         server_failures: src.server_failures.clone(),
+        sortlist: src.sortlist.clone(),
     };
     unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
     ARES_SUCCESS
@@ -187,6 +210,7 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     for task in channeldata.ares.tasks.drain(..) {
         if task.status != Status::Completed {
@@ -198,7 +222,9 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
-    unsafe { drop(Box::from_raw(channel)); }
+    if !channel.is_null() {
+        unsafe { drop(Box::from_raw(channel)); }
+    }
 }
 
 #[no_mangle]
@@ -206,6 +232,13 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { CStr::from_ptr(hostname).to_str().unwrap_or("") };
+
+    // Reject .onion domains immediately (RFC 7686)
+    if (hostname.len() >= 6 && hostname[hostname.len()-6..].eq_ignore_ascii_case(".onion")) || hostname.eq_ignore_ascii_case("onion") {
+        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
+        return;
+    }
+
     let (expected_record_type, core_family) = match family {
         libc::AF_INET => (RECORD_TYPE_A, Family::Ipv4),
         libc::AF_INET6 => (RECORD_TYPE_AAAA, Family::Ipv6),
@@ -251,11 +284,20 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         }
     }
 
+    // No servers configured — return ENOSERVER immediately
+    if channeldata.ares.config.nameservers.is_empty() {
+        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
+        return;
+    }
+
     // Fall through to DNS
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: expected_record_type as c_int, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0 };
-    let newtask = channeldata.ares.gethostbyname(hostname, core_family, ffidata);
-    if let Some(cb) = channeldata.sock_create_callback {
-        cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
+    channeldata.ares.gethostbyname(hostname, core_family, ffidata);
+    let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+    if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
+        channeldata.ares.tasks.pop();
+        unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
+        return;
     }
 }
 
@@ -322,6 +364,7 @@ unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hostent {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     if family != libc::AF_INET && family != libc::AF_INET6 {
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
@@ -343,11 +386,20 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         return;
     }
 
+    // No servers configured
+    if channeldata.ares.config.nameservers.is_empty() {
+        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
+        return;
+    }
+
     // Fall through to DNS
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(addr), nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0 };
-    let newtask = channeldata.ares.gethostbyaddr(addr, ffidata);
-    if let Some(cb) = channeldata.sock_create_callback {
-        cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
+    channeldata.ares.gethostbyaddr(addr, ffidata);
+    let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+    if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
+        channeldata.ares.tasks.pop();
+        unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
+        return;
     }
 }
 
@@ -358,15 +410,71 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
         return;
     }
+
+    // Reject .onion domains immediately (RFC 7686)
+    if (name_str.len() >= 6 && name_str[name_str.len()-6..].eq_ignore_ascii_case(".onion")) || name_str.eq_ignore_ascii_case("onion") {
+        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
+        return;
+    }
+
     ares_query(channel, name, dnsclass, dnstype, callback, arg)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
+    if channeldata.ares.config.nameservers.is_empty() {
+        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut(), 0) };
+        return;
+    }
     let name = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
     let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0 };
     channeldata.ares.query(name, dnsclass as u16, dnstype as u16, ffidata);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_query_dnsrec(
+    channel: Channel,
+    name: *const c_char,
+    dnsclass: c_int,
+    dnstype: c_int,
+    callback: AresCallbackDnsRec,
+    arg: *mut c_void,
+    _qid: *mut c_int, // output parameter for query ID, ignored for now
+) {
+    if channel.is_null() { return; }
+    let channeldata = unsafe { &mut *channel };
+    if channeldata.ares.config.nameservers.is_empty() {
+        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
+        return;
+    }
+    let name = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
+    let ffidata = FFIData { callback: Callback::AresCallbackDnsRec(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0 };
+    channeldata.ares.query(name, dnsclass as u16, dnstype as u16, ffidata);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_search_dnsrec(
+    channel: Channel,
+    dnsrec: *mut dns_record::ares_dns_record_t,
+    callback: AresCallbackDnsRec,
+    arg: *mut c_void,
+) {
+    // Extract the query name and type from the dns record
+    if dnsrec.is_null() { return; }
+    let mut name_ptr: *const c_char = std::ptr::null();
+    let mut qtype: c_uint = 0;
+    let mut qclass: c_uint = 0;
+    if dns_record::ares_dns_record_query_cnt(dnsrec) > 0 {
+        dns_record::ares_dns_record_query_get(dnsrec, 0, &mut name_ptr, &mut qtype, &mut qclass);
+    }
+    if name_ptr.is_null() { return; }
+    let name = CStr::from_ptr(name_ptr).to_str().unwrap_or("");
+
+    let channeldata = unsafe { &mut *channel };
+    let ffidata = FFIData { callback: Callback::AresCallbackDnsRec(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0 };
+    channeldata.ares.query(name, qclass as u16, qtype as u16, ffidata);
 }
 
 /// Looks up the node name and service name for a socket address.
@@ -384,6 +492,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: AresNameinfoCallback, arg: *mut c_void) {
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
 
     // Extract IP address and port from sockaddr
@@ -449,9 +558,12 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         };
 
         // Start the PTR lookup
-        let newtask = channeldata.ares.gethostbyaddr(addr_info.ip, ffidata);
-        if let Some(cb) = channeldata.sock_create_callback {
-            cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
+        channeldata.ares.gethostbyaddr(addr_info.ip, ffidata);
+        let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+        if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
+            channeldata.ares.tasks.pop();
+            unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+            return;
         }
     }
 }
@@ -960,6 +1072,7 @@ pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
 
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 pub type AresCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int);
+pub type AresCallbackDnsRec = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: usize, dnsrec: *mut dns_record::ares_dns_record_t);
 pub type AresSockCreateCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void);
 pub type AresNameinfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, node: *mut c_char, service: *mut c_char);
 pub type AresAddrInfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, res: *mut ares_addrinfo);
@@ -1026,6 +1139,7 @@ pub const ARES_NI_LOOKUPSERVICE: c_int = 1 << 9;
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
+    if channel.is_null() { return 0; }
     let channeldata = unsafe { &mut *channel };
     unsafe { libc::FD_ZERO(write_fds) };
     unsafe { libc::FD_ZERO(read_fds) };
@@ -1070,7 +1184,11 @@ fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHostCallback,
         let buf = res?;
         let res = ParsedResponse::from_buf(buf)?;
         let mut addr_records = res.process_answers::<AddrRecord>(buf, ffidata.expected_record_type as u16)?;
-        if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
+        if ffidata.expected_record_type as u16 == RECORD_TYPE_PTR {
+            if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
+                return Err(ARES_ENODATA);
+            }
+        } else if addr_records.items.is_empty() {
             return Err(ARES_ENODATA);
         }
         if ffidata.expected_record_type as u16 == RECORD_TYPE_PTR {
@@ -1091,6 +1209,22 @@ fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallback, ffidata:
     match res {
         Ok(buf) => unsafe { callback(ffidata.arg, ARES_SUCCESS, 0, buf.as_ptr() as *mut u8, buf.len() as c_int) },
         Err(err) => unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut(), 0) },
+    }
+}
+
+fn run_ares_callback_dnsrec(res: Result<&[u8], c_int>, callback: AresCallbackDnsRec, ffidata: &FFIData) {
+    match res {
+        Ok(buf) => {
+            let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
+            let status = unsafe { dns_record::ares_dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec) };
+            if status == ARES_SUCCESS {
+                unsafe { callback(ffidata.arg, ARES_SUCCESS, 0, dnsrec) };
+                unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
+            } else {
+                unsafe { callback(ffidata.arg, status, 0, std::ptr::null_mut()) };
+            }
+        }
+        Err(err) => unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut()) },
     }
 }
 
@@ -1155,15 +1289,56 @@ fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: AresNameinfoC
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     let channeldata = unsafe { &mut *channel };
 
-    // Process expired tasks (take out first to allow callbacks to add new tasks)
+    // Process expired tasks — retry or fail
+    let max_tries = channeldata.ares.config.options.attempts as u32;
     let mut tasks = std::mem::take(&mut channeldata.ares.tasks);
+    // Collect retry info first, then process retries after restoring tasks
+    let mut retries: Vec<(usize, Vec<u8>, bool)> = Vec::new(); // (server_index, payload, is_tcp)
     for task in &mut tasks {
         if task.is_expired() && task.status != Status::Completed {
-            task.userdata.callback.run(Err(ARES_ETIMEOUT), &task.userdata);
-            task.status = Status::Completed;
+            task.tries_remaining += 1;
+            if task.tries_remaining < max_tries {
+                // Collect info for retry
+                let si = task.server_index;
+                let is_tcp = task.sock.is_tcp();
+                let writebuf_data = task.writebuf.to_vec();
+                let payload = if is_tcp && writebuf_data.len() > 2 {
+                    writebuf_data[2..].to_vec()
+                } else {
+                    writebuf_data
+                };
+                let new_ffidata = FFIData {
+                    callback: task.userdata.callback.clone_for_retry(),
+                    arg: task.userdata.arg,
+                    family: task.userdata.family,
+                    expected_record_type: task.userdata.expected_record_type,
+                    ip: task.userdata.ip,
+                    nameinfo_flags: task.userdata.nameinfo_flags,
+                    port: task.userdata.port,
+                    scope_id: task.userdata.scope_id,
+                    server_index: si,
+                };
+                task.status = Status::Completed;
+                // Create new task via ares methods
+                if is_tcp {
+                    channeldata.ares.send_raw_tcp_to_server(&payload, new_ffidata, si);
+                } else {
+                    channeldata.ares.send_raw_to_server(&payload, new_ffidata, si);
+                }
+                // Set tries_remaining on the new task
+                if let Some(new_task) = channeldata.ares.tasks.last_mut() {
+                    new_task.tries_remaining = task.tries_remaining;
+                }
+                let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
+                invoke_sock_callbacks(channeldata, fd, sock_type);
+            } else {
+                task.userdata.callback.run(Err(ARES_ETIMEOUT), &task.userdata);
+                task.status = Status::Completed;
+            }
         }
     }
-    // Merge back: new tasks from callbacks + processed tasks
+    // Merge back: new tasks from callbacks/retries + processed tasks
     let mut new_tasks = std::mem::take(&mut channeldata.ares.tasks);
     tasks.append(&mut new_tasks);
     channeldata.ares.tasks = tasks;
@@ -1188,7 +1363,72 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
         if task.status == Status::Completed { continue; }
         if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), read_fds) } {
             if let Some((offset, len)) = Ares::read_impl(task, &mut channeldata.readbuf) {
-                (task.userdata.callback).run(Ok(&channeldata.readbuf[offset..offset+len]), &task.userdata);
+                let buf = &channeldata.readbuf[offset..offset+len];
+                // Check DNS rcode for server failover (rcode in lower 4 bits of byte 3)
+                let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0 };
+                let is_server_error = rcode == 2 || rcode == 4 || rcode == 5; // SERVFAIL, NOTIMP, REFUSED
+                let nservers = channeldata.server_failures.len();
+                let is_addrinfo = matches!(task.userdata.callback, Callback::AresAddrInfoCallback(_));
+                if is_server_error && nservers > 1 && !is_addrinfo {
+                    let si = task.userdata.server_index;
+                    if si < nservers {
+                        channeldata.server_failures[si] += 1;
+                    }
+                    let max_attempts = nservers * channeldata.ares.config.options.attempts as usize;
+                    if (si + 1) < max_attempts {
+                        let next_server = pick_next_server(&channeldata.server_failures);
+                        let new_ffidata = FFIData {
+                            callback: task.userdata.callback.clone_for_retry(),
+                            arg: task.userdata.arg,
+                            family: task.userdata.family,
+                            expected_record_type: task.userdata.expected_record_type,
+                            ip: task.userdata.ip,
+                            nameinfo_flags: task.userdata.nameinfo_flags,
+                            port: task.userdata.port,
+                            scope_id: task.userdata.scope_id,
+                            server_index: next_server,
+                        };
+                        let is_tcp = task.sock.is_tcp();
+                        let writebuf_data = task.writebuf.to_vec();
+                        let payload = if is_tcp && writebuf_data.len() > 2 {
+                            &writebuf_data[2..]
+                        } else {
+                            &writebuf_data[..]
+                        };
+                        if is_tcp {
+                            channeldata.ares.send_raw_tcp_to_server(payload, new_ffidata, next_server);
+                        } else {
+                            channeldata.ares.send_raw_to_server(payload, new_ffidata, next_server);
+                        }
+                        let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                        let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
+                        invoke_sock_callbacks(channeldata, fd, sock_type);
+                        task.status = Status::Completed;
+                        continue;
+                    }
+                }
+                // Check TC (truncation) flag — retry over TCP if truncated and currently UDP
+                if is_truncated(buf) && !task.sock.is_tcp() && !is_addrinfo {
+                    let si = task.userdata.server_index;
+                    let new_ffidata = FFIData {
+                        callback: task.userdata.callback.clone_for_retry(),
+                        arg: task.userdata.arg,
+                        family: task.userdata.family,
+                        expected_record_type: task.userdata.expected_record_type,
+                        ip: task.userdata.ip,
+                        nameinfo_flags: task.userdata.nameinfo_flags,
+                        port: task.userdata.port,
+                        scope_id: task.userdata.scope_id,
+                        server_index: si,
+                    };
+                    let writebuf_data = task.writebuf.to_vec();
+                    channeldata.ares.send_raw_tcp_to_server(&writebuf_data, new_ffidata, si);
+                    let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                    invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
+                    task.status = Status::Completed;
+                    continue;
+                }
+                (task.userdata.callback).run(Ok(buf), &task.userdata);
             }
         }
     }
@@ -1201,6 +1441,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) -> c_int {
+    if channel.is_null() { return ARES_ENODATA; }
     let channeldata = unsafe { &mut *channel };
     channeldata.ares.config.nameservers.clear();
     channeldata.ares.config.tcp_ports.clear();
@@ -1270,6 +1511,7 @@ fn ipv4_to_in_addr(ip: IpAddr) -> Option<AresAddrUnion> {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut AresAddrPortNode) -> c_int {
+    if channel.is_null() { return ARES_ENODATA; }
     let channeldata = unsafe { &mut *channel };
     let mut data: Vec<AresAddrPortNode> = vec![];
     for srv in &channeldata.ares.config.nameservers {
@@ -1303,12 +1545,35 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
+    if channel.is_null() { return ARES_ENODATA; }
     let channeldata = unsafe { &mut *channel };
-    let mut cursor = Cursor::new(CStr::from_ptr(servers).to_str().unwrap());
-    channeldata.ares.config.nameservers = servers_csv::parse_from_reader(&mut cursor).unwrap();
-    channeldata.ares.config.tcp_ports = vec![None; channeldata.ares.config.nameservers.len()];
-    channeldata.server_failures = vec![0; channeldata.ares.config.nameservers.len()];
-    ARES_SUCCESS
+    // NULL or empty string clears servers
+    if servers.is_null() {
+        channeldata.ares.config.nameservers.clear();
+        channeldata.ares.config.tcp_ports.clear();
+        channeldata.server_failures.clear();
+        return ARES_SUCCESS;
+    }
+    let s = match CStr::from_ptr(servers).to_str() {
+        Ok(s) => s,
+        Err(_) => return ARES_EBADSTR,
+    };
+    if s.is_empty() {
+        channeldata.ares.config.nameservers.clear();
+        channeldata.ares.config.tcp_ports.clear();
+        channeldata.server_failures.clear();
+        return ARES_SUCCESS;
+    }
+    let mut cursor = Cursor::new(s);
+    match servers_csv::parse_from_reader(&mut cursor) {
+        Some(ns) => {
+            channeldata.ares.config.tcp_ports = vec![None; ns.len()];
+            channeldata.server_failures = vec![0; ns.len()];
+            channeldata.ares.config.nameservers = ns;
+            ARES_SUCCESS
+        }
+        None => ARES_EBADSTR,
+    }
 }
 
 #[no_mangle]
@@ -1320,10 +1585,10 @@ pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
-    let (major, minor, patch) = (1, 17, 1);
+    let (major, minor, patch) = (1, 27, 0);
     let v = (major << 16) | (minor << 8) | patch;
     if !version.is_null() { unsafe { *version = v } }
-    cstr!("1.17.1-rs")
+    cstr!("1.27.0")
 }
 
 pub const ARES_GETSOCK_MAXNUM: usize = 16; // per c-ares headers
@@ -1353,17 +1618,24 @@ pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
 }
 
 #[no_mangle]
-pub extern "C" fn ares_set_local_ip4(_channel: Channel, _local_ip: u32) {}
+pub extern "C" fn ares_set_local_ip4(_channel: Channel, _local_ip: u32) {
+    if _channel.is_null() { return; }
+}
 
 #[no_mangle]
-pub extern "C" fn ares_set_local_ip6(_channel: Channel, _local_ip6: *const u8) {}
+pub extern "C" fn ares_set_local_ip6(_channel: Channel, _local_ip6: *const u8) {
+    if _channel.is_null() { return; }
+}
 
 #[no_mangle]
-pub extern "C" fn ares_set_local_dev(_channel: Channel, _local_dev_name: *const c_char) {}
+pub extern "C" fn ares_set_local_dev(_channel: Channel, _local_dev_name: *const c_char) {
+    if _channel.is_null() { return; }
+}
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: Option<AresSockCreateCallback>, arg: *mut c_void) {
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     channeldata.sock_create_callback = callback;
     channeldata.sock_create_callback_arg = arg;
@@ -1400,6 +1672,9 @@ pub unsafe extern "C" fn ares_expand_name(
     s: *mut *mut c_char,
     enclen: *mut libc::c_long,
 ) -> c_int {
+    if encoded.is_null() || abuf.is_null() || s.is_null() || enclen.is_null() {
+        return ARES_EBADNAME;
+    }
     let full_buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let offset = unsafe { encoded.offset_from(abuf) };
     if offset < 0 || offset as usize >= full_buf.len() {
@@ -1493,6 +1768,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     callback: AresAddrInfoCallback,
     arg: *mut c_void,
 ) {
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
 
     let ai_family = if hints.is_null() { libc::AF_UNSPEC } else { unsafe { (*hints).ai_family } };
@@ -1501,6 +1777,12 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
 
     if hostname.is_empty() {
+        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
+        return;
+    }
+
+    // Reject .onion domains immediately (RFC 7686)
+    if (hostname.len() >= 6 && hostname[hostname.len()-6..].eq_ignore_ascii_case(".onion")) || hostname.eq_ignore_ascii_case("onion") {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
         return;
     }
@@ -1537,6 +1819,12 @@ pub unsafe extern "C" fn ares_getaddrinfo(
             unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
             return;
         }
+    }
+
+    // No servers configured
+    if channeldata.ares.config.nameservers.is_empty() {
+        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
+        return;
     }
 
     // DNS path: determine search domains
@@ -1590,16 +1878,20 @@ unsafe fn launch_addrinfo_queries(channeldata: &mut ChannelData, state: *mut Add
             scope_id: 0,
             server_index,
         };
-        let sock_type;
-        let newtask = if use_tcp {
-            sock_type = libc::SOCK_STREAM;
-            channeldata.ares.gethostbyname_tcp_to_server(hostname, core_family, ffidata, server_index)
+        let sock_type = if use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
+        if use_tcp {
+            channeldata.ares.gethostbyname_tcp_to_server(hostname, core_family, ffidata, server_index);
         } else {
-            sock_type = libc::SOCK_DGRAM;
-            channeldata.ares.gethostbyname_to_server(hostname, core_family, ffidata, server_index)
+            channeldata.ares.gethostbyname_to_server(hostname, core_family, ffidata, server_index);
         };
-        if let Some(cb) = channeldata.sock_create_callback {
-            cb(newtask.sock.as_raw_fd(), sock_type, channeldata.sock_create_callback_arg);
+        let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+        if !invoke_sock_callbacks(channeldata, fd, sock_type) {
+            // Configure callback failed - mark task as completed with error
+            let task = channeldata.ares.tasks.last_mut().unwrap();
+            task.status = Status::Completed;
+            let st = unsafe { &mut *state };
+            st.pending -= 1;
+            st.last_error = ARES_ECONNREFUSED;
         }
     };
 
@@ -1660,10 +1952,9 @@ unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state_ptr: *mut 
                     scope_id: 0,
                     server_index: ffidata.server_index,
                 };
-                let newtask = channeldata.ares.gethostbyname_tcp_to_server(&state.name, core_family, new_ffidata, ffidata.server_index);
-                if let Some(cb) = channeldata.sock_create_callback {
-                    cb(newtask.sock.as_raw_fd(), libc::SOCK_STREAM, channeldata.sock_create_callback_arg);
-                }
+                channeldata.ares.gethostbyname_tcp_to_server(&state.name, core_family, new_ffidata, ffidata.server_index);
+                let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
                 // Don't decrement pending — the new task replaces this one
                 return;
             }
@@ -1758,17 +2049,14 @@ unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state_ptr: *mut 
                                 scope_id: 0,
                                 server_index: next_server,
                             };
-                            let sock_type;
-                            let newtask = if state.use_tcp {
-                                sock_type = libc::SOCK_STREAM;
-                                channeldata.ares.gethostbyname_tcp_to_server(&state.name, core_family, new_ffidata, next_server)
+                            let sock_type = if state.use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
+                            if state.use_tcp {
+                                channeldata.ares.gethostbyname_tcp_to_server(&state.name, core_family, new_ffidata, next_server);
                             } else {
-                                sock_type = libc::SOCK_DGRAM;
-                                channeldata.ares.gethostbyname_to_server(&state.name, core_family, new_ffidata, next_server)
+                                channeldata.ares.gethostbyname_to_server(&state.name, core_family, new_ffidata, next_server);
                             };
-                            if let Some(cb) = channeldata.sock_create_callback {
-                                cb(newtask.sock.as_raw_fd(), sock_type, channeldata.sock_create_callback_arg);
-                            }
+                            let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                            invoke_sock_callbacks(channeldata, fd, sock_type);
                             // Don't decrement pending — the new task replaces this one
                             return;
                         }
@@ -1877,4 +2165,447 @@ pub unsafe extern "C" fn ares_freeaddrinfo(ai: *mut ares_addrinfo) {
     if !ai.name.is_null() {
         drop(unsafe { CString::from_raw(ai.name) });
     }
+}
+
+// --- New callback types ---
+
+pub type AresSockConfigureCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int;
+pub type AresServerStateCallback = unsafe extern "C" fn(server_string: *const c_char, success: c_int, flags: c_int, arg: *mut libc::c_void);
+
+/// Call socket create + configure callbacks. Returns false if configure callback fails.
+unsafe fn invoke_sock_callbacks(channeldata: &ChannelData, fd: c_int, sock_type: c_int) -> bool {
+    if let Some(cb) = channeldata.sock_create_callback {
+        cb(fd, sock_type, channeldata.sock_create_callback_arg);
+    }
+    if let Some(cb) = channeldata.sock_config_callback {
+        let ret = cb(fd, sock_type, channeldata.sock_config_callback_arg);
+        if ret != 0 { return false; }
+    }
+    true
+}
+
+// --- Sortlist support ---
+
+#[derive(Clone, Debug)]
+struct SortlistEntry {
+    addr: IpAddr,
+    mask_bits: u8,
+}
+
+impl SortlistEntry {
+    fn matches(&self, ip: &IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(candidate)) => {
+                let mask = if self.mask_bits >= 32 { u32::MAX } else { u32::MAX << (32 - self.mask_bits) };
+                u32::from(net) & mask == u32::from(*candidate) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(candidate)) => {
+                let net_bits = u128::from(net);
+                let cand_bits = u128::from(*candidate);
+                let mask = if self.mask_bits >= 128 { u128::MAX } else { u128::MAX << (128 - self.mask_bits) };
+                net_bits & mask == cand_bits & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+fn parse_sortlist(s: &str) -> Result<Vec<SortlistEntry>, c_int> {
+    let mut entries = Vec::new();
+    for token in s.split_whitespace().filter(|t| !t.is_empty()) {
+        // Formats: "ip/mask" or "ip/bits" or just "ip"
+        if let Some((addr_s, mask_s)) = token.split_once('/') {
+            let addr: IpAddr = addr_s.parse().map_err(|_| ARES_EBADSTR)?;
+            // Try as CIDR bits first
+            if let Ok(bits) = mask_s.parse::<u8>() {
+                let max = if addr.is_ipv4() { 32 } else { 128 };
+                if bits > max { return Err(ARES_EBADSTR); }
+                entries.push(SortlistEntry { addr, mask_bits: bits });
+            } else {
+                // Try as dotted netmask (IPv4 only)
+                let mask: std::net::Ipv4Addr = mask_s.parse().map_err(|_| ARES_EBADSTR)?;
+                let mask_u32 = u32::from(mask);
+                let bits = mask_u32.leading_ones() as u8;
+                entries.push(SortlistEntry { addr, mask_bits: bits });
+            }
+        } else {
+            // Bare address - use /32 or /128 default
+            let addr: IpAddr = token.parse().map_err(|_| ARES_EBADSTR)?;
+            let bits = if addr.is_ipv4() { 32 } else { 128 };
+            entries.push(SortlistEntry { addr, mask_bits: bits });
+        }
+    }
+    Ok(entries)
+}
+
+// --- Phase 1: Simple FFI functions ---
+
+#[no_mangle]
+pub extern "C" fn ares_library_initialized() -> c_int {
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_inet_ntop(af: c_int, src: *const c_void, dst: *mut c_char, size: libc::socklen_t) -> *const c_char {
+    // Manually implement inet_ntop since libc crate doesn't expose it on all platforms
+    match af {
+        libc::AF_INET => {
+            let addr = unsafe { *(src as *const [u8; 4]) };
+            let s = format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
+            if s.len() + 1 > size as usize { return std::ptr::null(); }
+            let cs = CString::new(s).unwrap();
+            let bytes = cs.as_bytes_with_nul();
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
+            dst
+        }
+        libc::AF_INET6 => {
+            let addr = unsafe { *(src as *const [u8; 16]) };
+            let ip6 = std::net::Ipv6Addr::from(addr);
+            let s = ip6.to_string();
+            if s.len() + 1 > size as usize { return std::ptr::null(); }
+            let cs = CString::new(s).unwrap();
+            let bytes = cs.as_bytes_with_nul();
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
+            dst
+        }
+        _ => std::ptr::null(),
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_addr_node) -> c_int {
+    let channeldata = unsafe { &mut *channel };
+    let mut head: *mut ares_addr_node = std::ptr::null_mut();
+    let mut tail: *mut ares_addr_node = std::ptr::null_mut();
+    for srv in &channeldata.ares.config.nameservers {
+        let mut node = Box::new(ares_addr_node {
+            next: std::ptr::null_mut(),
+            family: 0,
+            data: [0u8; 16],
+        });
+        match srv.0 {
+            IpAddr::V4(v4) => {
+                node.family = libc::AF_INET;
+                node.data[0..4].copy_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                node.family = libc::AF_INET6;
+                node.data[0..16].copy_from_slice(&v6.octets());
+            }
+        }
+        let node_ptr = Box::into_raw(node);
+        if head.is_null() {
+            head = node_ptr;
+        } else {
+            unsafe { (*tail).next = node_ptr };
+        }
+        tail = node_ptr;
+    }
+    unsafe { *out = head };
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
+    if channel.is_null() { return std::ptr::null_mut(); }
+    let channeldata = unsafe { &*channel };
+    let default_port = channeldata.ares.default_udp_port;
+    let csv: String = channeldata.ares.config.nameservers.iter()
+        .map(|(ip, port_opt)| {
+            let port = port_opt.unwrap_or(default_port);
+            match ip {
+                IpAddr::V6(_) => format!("[{}]:{}", ip, port),
+                _ => format!("{}:{}", ip, port),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    match CString::new(csv) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_expand_string(
+    encoded: *const u8,
+    abuf: *const u8,
+    alen: c_int,
+    s: *mut *mut u8,
+    enclen: *mut libc::c_long,
+) -> c_int {
+    if encoded.is_null() || abuf.is_null() || s.is_null() || enclen.is_null() {
+        return ARES_EBADSTR;
+    }
+    let full_buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+    let offset = unsafe { encoded.offset_from(abuf) };
+    if offset < 0 || offset as usize >= full_buf.len() {
+        return ARES_EBADSTR;
+    }
+    let start = offset as usize;
+    let remaining = &full_buf[start..];
+    if remaining.is_empty() {
+        return ARES_EBADSTR;
+    }
+    let str_len = remaining[0] as usize;
+    if str_len + 1 > remaining.len() {
+        return ARES_EBADSTR;
+    }
+    let str_data = &remaining[1..1 + str_len];
+    // Allocate with malloc-like allocation (CString)
+    let mut output = Vec::with_capacity(str_len + 1);
+    output.extend_from_slice(str_data);
+    output.push(0); // null terminate
+    let cstr = CString::from_vec_with_nul(output).unwrap();
+    unsafe {
+        *s = cstr.into_raw() as *mut u8;
+        *enclen = (str_len + 1) as libc::c_long; // length byte + string bytes
+    }
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_create_query(
+    name: *const c_char,
+    dnsclass: c_int,
+    qtype: c_int,
+    id: c_int,
+    rd: c_int,
+    buf: *mut *mut u8,
+    buflen: *mut c_int,
+    max_udp_size: c_int,
+) -> c_int {
+    if name.is_null() || buf.is_null() || buflen.is_null() {
+        return ARES_EBADQUERY;
+    }
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return ARES_EBADNAME,
+    };
+
+    // Reject .onion domains
+    let lower = name_str.to_lowercase();
+    let check = lower.strip_suffix('.').unwrap_or(&lower);
+    if check.ends_with(".onion") || check == "onion" {
+        return ARES_ENOTFOUND;
+    }
+
+    // Validate name length
+    let clean_name = name_str.strip_suffix('.').unwrap_or(name_str);
+    if clean_name.len() > 253 {
+        return ARES_EBADNAME;
+    }
+
+    // Check for escaped dots and handle them
+    let labels: Vec<&str> = if clean_name.is_empty() {
+        vec![] // root query
+    } else {
+        // Handle escaped dots: split only on unescaped dots
+        let mut result = Vec::new();
+        let mut current_start = 0;
+        let bytes = clean_name.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2; // skip escaped char
+            } else if bytes[i] == b'.' {
+                result.push(&clean_name[current_start..i]);
+                current_start = i + 1;
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if current_start <= bytes.len() {
+            let last = &clean_name[current_start..];
+            if !last.is_empty() {
+                result.push(last);
+            }
+        }
+        result
+    };
+
+    // Validate label lengths
+    for label in &labels {
+        // Unescape to get actual label bytes
+        let unescaped = unescape_label(label);
+        if unescaped.len() > 63 {
+            return ARES_EBADNAME;
+        }
+    }
+
+    // Build DNS packet
+    let flags: u16 = if rd != 0 { 0x0100 } else { 0x0000 }; // RD flag
+    let mut packet = Vec::with_capacity(512);
+    // Header
+    packet.extend_from_slice(&(id as u16).to_be_bytes());
+    packet.extend_from_slice(&flags.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    packet.extend_from_slice(&0u16.to_be_bytes()); // ancount
+    packet.extend_from_slice(&0u16.to_be_bytes()); // nscount
+    let arcount: u16 = if max_udp_size > 0 { 1 } else { 0 };
+    packet.extend_from_slice(&arcount.to_be_bytes()); // arcount
+
+    // Question: encode labels
+    for label in &labels {
+        let unescaped = unescape_label(label);
+        if unescaped.len() > 63 { return ARES_EBADNAME; }
+        packet.push(unescaped.len() as u8);
+        packet.extend_from_slice(&unescaped);
+    }
+    packet.push(0); // root label
+    packet.extend_from_slice(&(qtype as u16).to_be_bytes());
+    packet.extend_from_slice(&(dnsclass as u16).to_be_bytes());
+
+    // OPT pseudo-RR for EDNS if max_udp_size > 0
+    if max_udp_size > 0 {
+        packet.push(0); // root name
+        packet.extend_from_slice(&41u16.to_be_bytes()); // type OPT
+        packet.extend_from_slice(&(max_udp_size as u16).to_be_bytes()); // class = UDP payload size
+        packet.extend_from_slice(&0u32.to_be_bytes()); // TTL (extended RCODE + flags)
+        packet.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH
+    }
+
+    let len = packet.len();
+    // Use raw allocation since DNS packets can contain null bytes
+    let ptr = unsafe { libc::malloc(len) as *mut u8 };
+    if ptr.is_null() { return ARES_ENOMEM; }
+    unsafe {
+        std::ptr::copy_nonoverlapping(packet.as_ptr(), ptr, len);
+        *buf = ptr;
+        *buflen = len as c_int;
+    }
+    ARES_SUCCESS
+}
+
+fn unescape_label(label: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(label.len());
+    let bytes = label.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            // Check for numeric escape \DDD
+            if i + 3 < bytes.len() && bytes[i+1].is_ascii_digit() && bytes[i+2].is_ascii_digit() && bytes[i+3].is_ascii_digit() {
+                let val = (bytes[i+1] - b'0') as u16 * 100 + (bytes[i+2] - b'0') as u16 * 10 + (bytes[i+3] - b'0') as u16;
+                result.push(val as u8);
+                i += 4;
+            } else {
+                result.push(bytes[i+1]);
+                i += 2;
+            }
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_mkquery(
+    name: *const c_char,
+    dnsclass: c_int,
+    qtype: c_int,
+    id: c_int,
+    rd: c_int,
+    buf: *mut *mut u8,
+    buflen: *mut c_int,
+) -> c_int {
+    ares_create_query(name, dnsclass, qtype, id, rd, buf, buflen, 0)
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: AresCallback, arg: *mut c_void) {
+    if qbuf.is_null() || qlen < 2 {
+        unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut(), 0) };
+        return;
+    }
+    let channeldata = unsafe { &mut *channel };
+    if channeldata.ares.config.nameservers.is_empty() {
+        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut(), 0) };
+        return;
+    }
+    let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
+
+    // Extract query name and type from the packet for routing
+    let ffidata = FFIData {
+        callback: Callback::AresCallback(callback),
+        arg,
+        family: 0,
+        expected_record_type: 0,
+        ip: None,
+        nameinfo_flags: 0,
+        port: 0,
+        scope_id: 0,
+        server_index: 0,
+    };
+
+    // Send the pre-built packet
+    channeldata.ares.send_raw(query_buf, ffidata);
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_char) -> c_int {
+    if channel.is_null() { return ARES_ENODATA; }
+    let channeldata = unsafe { &mut *channel };
+    if sortstr.is_null() {
+        channeldata.sortlist.clear();
+        return ARES_SUCCESS;
+    }
+    let s = match unsafe { CStr::from_ptr(sortstr) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return ARES_EBADSTR,
+    };
+    match parse_sortlist(s) {
+        Ok(entries) => {
+            channeldata.sortlist = entries;
+            ARES_SUCCESS
+        }
+        Err(e) => e,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
+    if channel.is_null() { return ARES_ENODATA; }
+    // Re-read sysconfig
+    let channeldata = unsafe { &mut *channel };
+    let new_config = crate::core::ares::build_sysconfig();
+    channeldata.ares.config = new_config;
+    channeldata.server_failures = vec![0; channeldata.ares.config.nameservers.len()];
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, callback: Option<AresSockConfigureCallback>, arg: *mut c_void) {
+    if channel.is_null() { return; }
+    let channeldata = unsafe { &mut *channel };
+    channeldata.sock_config_callback = callback;
+    channeldata.sock_config_callback_arg = arg;
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callback: Option<AresServerStateCallback>, arg: *mut c_void) {
+    let channeldata = unsafe { &mut *channel };
+    channeldata.server_state_callback = callback;
+    channeldata.server_state_callback_arg = arg;
+}
+
+#[no_mangle]
+pub extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
+    if channel.is_null() { return 0; }
+    let channeldata = unsafe { &*channel };
+    channeldata.ares.tasks.iter()
+        .filter(|t| t.status != Status::Completed)
+        .count() as c_int
 }

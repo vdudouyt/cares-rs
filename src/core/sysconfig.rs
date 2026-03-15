@@ -106,6 +106,14 @@ pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
         return Some((ip, None))
     }
 
+    // Handle bracketed IPv6 without port, e.g. "[::1]"
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len()-1];
+        if let Ok(ip) = IpAddr::from_str(inner) {
+            return Some((ip, None));
+        }
+    }
+
     None
 }
 

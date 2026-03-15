@@ -55,7 +55,6 @@ pub struct ares_options {
     pub maxtimeout: c_int,                   // milliseconds
     pub qcache_max_ttl: c_uint,              // seconds; 0 disables cache
     pub evsys: ares_evsys_t,                 // set to ARES_EVSYS_DEFAULT (0)
-    pub server_failover_opts: ares_server_failover_options,
 }
 
 impl Default for ares_options {
@@ -85,10 +84,6 @@ impl Default for ares_options {
             maxtimeout: 0,
             qcache_max_ttl: 0,
             evsys: 0, // ARES_EVSYS_DEFAULT
-            server_failover_opts: ares_server_failover_options {
-                retry_chance: 0,
-                retry_delay: 0,
-            },
         }
     }
 }
@@ -121,7 +116,7 @@ pub const ARES_OPT_SERVER_FAILOVER: c_int = 1 << 23;
 #[no_mangle]
 pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
     let ares = Ares::from_sysconfig();
-    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![] };
+    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![] };
 
     let options = unsafe { & *options };
     if optmask & ARES_OPT_SERVERS != 0 && !options.servers.is_null() {

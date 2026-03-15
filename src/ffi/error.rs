@@ -23,6 +23,8 @@ pub const ARES_EBADFLAGS: c_int = 18;
 pub const ARES_ENONAME: c_int = 19;
 pub const ARES_EBADHINTS: c_int = 20;
 pub const ARES_ENOTINITIALIZED: c_int = 21;
+pub const ARES_ELOADIPHLPAPI: c_int = 22;
+pub const ARES_EADDRGETNETWORKPARAMS: c_int = 23;
 pub const ARES_ECANCELLED: c_int = 24;
 pub const ARES_ESERVICE: c_int = 25;
 pub const ARES_ENOSERVER: c_int = 26;
@@ -52,6 +54,8 @@ pub extern "C" fn ares_strerror(code: c_int) -> *const c_char {
         ARES_ENONAME => cstr!("Given hostname is not numeric"),
         ARES_EBADHINTS => cstr!("Illegal hints flags specified"),
         ARES_ENOTINITIALIZED => cstr!("c-ares library initialization not yet performed"),
+        ARES_ELOADIPHLPAPI => cstr!("Error loading iphlpapi.dll"),
+        ARES_EADDRGETNETWORKPARAMS => cstr!("Could not find GetNetworkParams function"),
         ARES_ECANCELLED => cstr!("DNS query cancelled"),
         ARES_ESERVICE => cstr!("Invalid service name or number"),
         ARES_ENOSERVER => cstr!("No DNS servers were configured"),
