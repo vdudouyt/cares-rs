@@ -335,5 +335,7 @@ impl<T> Task<T> {
 
 pub fn build_sysconfig() -> SysConfig {
     let try_resolv_conf = || std::fs::read_to_string("/etc/resolv.conf").ok()?.parse::<SysConfig>().ok();
-    try_resolv_conf().unwrap_or_else(SysConfig::default)
+    let mut config = try_resolv_conf().unwrap_or_else(SysConfig::default);
+    crate::core::sysconfig::apply_env_overrides(&mut config);
+    config
 }

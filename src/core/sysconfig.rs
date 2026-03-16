@@ -97,6 +97,28 @@ fn take_num_arg<T: FromStr>(keyword: &str, val: &str) -> Result<T, ParseError> {
     
 }
 
+/// Apply `RES_OPTIONS` environment variable overrides to a SysConfig.
+pub fn apply_env_overrides(config: &mut SysConfig) {
+    // LOCALDOMAIN overrides search/domain
+    if let Ok(val) = std::env::var("LOCALDOMAIN") {
+        let val = val.trim();
+        if !val.is_empty() {
+            config.search = val.split_whitespace().map(|s| s.to_string()).collect();
+            config.domain = config.search.first().cloned();
+        }
+    }
+
+    // RES_OPTIONS overrides options
+    if let Ok(val) = std::env::var("RES_OPTIONS") {
+        let val = val.trim();
+        if !val.is_empty() {
+            // Strip leading "options" keyword if present
+            let opts_str = val.strip_prefix("options").map(|s| s.trim_start()).unwrap_or(val);
+            let _ = parse_options_into(&mut config.options, opts_str);
+        }
+    }
+}
+
 pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
     if let Ok(sa) = SocketAddr::from_str(s) {
         return Some((sa.ip(), Some(sa.port())));

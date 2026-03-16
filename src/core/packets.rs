@@ -143,11 +143,22 @@ impl<'a> DnsLabel<'a> {
             if len == 0 {
                 break;
             }
-            if len & 0xc0 > 0 {
+            if len & 0xc0 == 0xc0 {
+                // Compression pointer: top 2 bits are 11
                 let high_byte = len & 0x3f;
                 let Some(low_byte) = buf.get_u8() else { buf.pos = saved_pos; return None; };
                 offset = Some(((high_byte as u16) << 8) | (low_byte as u16));
                 break;
+            }
+            if len & 0xc0 != 0 {
+                // Invalid top 2 bits (01 or 10) — not a valid label or compression pointer
+                buf.pos = saved_pos;
+                return None;
+            }
+            // Label length must be <= 63
+            if len > 63 {
+                buf.pos = saved_pos;
+                return None;
             }
 
             let Some(s) = buf.get_str(len as usize) else { buf.pos = saved_pos; return None; };
@@ -160,11 +171,56 @@ impl<'a> DnsLabel<'a> {
         if self.offset.is_none() {
             return Some(join_escaped_labels(self.name.iter()));
         }
-        let offset = self.offset.unwrap();
-        let slice = main_buf.get(offset as usize..)?;
-        let mut sub_buf = SliceBuf::new(slice);
-        let label = DnsLabel::parse(&mut sub_buf)?;
-        Some(join_escaped_labels(self.name.iter().chain(label.name.iter())))
+        // Need to follow compression pointer chain — resolve fully
+        let mut result = String::new();
+        let mut idx = 0;
+        for &s in self.name.iter() {
+            if idx > 0 { result.push('.'); }
+            for &b in s.as_bytes() {
+                if b == b'.' || b == b'\\' { result.push('\\'); }
+                result.push(b as char);
+            }
+            idx += 1;
+        }
+
+        // Follow compression pointer chain with loop detection
+        let mut current_offset = self.offset;
+        let mut visited = std::collections::HashSet::new();
+        while let Some(off) = current_offset {
+            if !visited.insert(off) {
+                return None; // Loop detected
+            }
+            // Manually parse labels at offset, don't borrow from sub_buf
+            let mut pos = off as usize;
+            loop {
+                let &len = main_buf.get(pos)?;
+                pos += 1;
+                if len == 0 {
+                    current_offset = None;
+                    break;
+                }
+                if len & 0xc0 == 0xc0 {
+                    let &low = main_buf.get(pos)?;
+                    pos += 1;
+                    let _ = pos; // suppress unused
+                    current_offset = Some(((len as u16 & 0x3f) << 8) | low as u16);
+                    break;
+                }
+                if len & 0xc0 != 0 || len > 63 {
+                    return None;
+                }
+                let end = pos + len as usize;
+                let label_bytes = main_buf.get(pos..end)?;
+                if idx > 0 { result.push('.'); }
+                for &b in label_bytes {
+                    if b == b'.' || b == b'\\' { result.push('\\'); }
+                    result.push(b as char);
+                }
+                idx += 1;
+                pos = end;
+            }
+        }
+        Some(result)
     }
 }
 

@@ -128,6 +128,19 @@ struct SearchState {
     attempt_count: usize,
 }
 
+struct SearchStateDnsRec {
+    callback: AresCallbackDnsRec,
+    arg: *mut c_void,
+    channel: Channel,
+    name: String,
+    base_name: String,
+    search_domains: Vec<String>,
+    dnsclass: u16,
+    dnstype: u16,
+    last_error: c_int,
+    had_nodata: bool,
+}
+
 #[derive(Debug)]
 enum Callback {
     AresHostCallback(AresHostCallback),
@@ -137,6 +150,7 @@ enum Callback {
     AresAddrInfoCallback(*mut AddrInfoState),
     AresHostByNameCallback(*mut HostByNameState),
     AresSearchCallback(*mut SearchState),
+    AresSearchCallbackDnsRec(*mut SearchStateDnsRec),
     Probe(Channel), // Server failover probe — no user callback
 }
 
@@ -175,6 +189,12 @@ impl Callback {
                         drop(Box::from_raw(*state_ptr));
                         return;
                     },
+                    Self::AresSearchCallbackDnsRec(state_ptr) => unsafe {
+                        let state = &mut **state_ptr;
+                        (state.callback)(state.arg, *status, ffidata.timeouts as usize, std::ptr::null_mut());
+                        drop(Box::from_raw(*state_ptr));
+                        return;
+                    },
                     Self::Probe(_) => return, // Probes silently ignore cancel/destroy
                     _ => {}
                 }
@@ -188,6 +208,7 @@ impl Callback {
             Self::AresAddrInfoCallback(state_ptr) => unsafe { run_ares_addrinfo_callback(buf, *state_ptr, ffidata) },
             Self::AresHostByNameCallback(state_ptr) => unsafe { run_ares_hostbyname_callback(buf, *state_ptr, ffidata) },
             Self::AresSearchCallback(state_ptr) => unsafe { run_ares_search_callback(buf, *state_ptr, ffidata) },
+            Self::AresSearchCallbackDnsRec(state_ptr) => unsafe { run_ares_search_callback_dnsrec(buf, *state_ptr, ffidata) },
             Self::Probe(channel) => unsafe { run_probe_callback(buf, *channel, ffidata) },
         }
     }
@@ -200,6 +221,7 @@ impl Callback {
             Self::AresAddrInfoCallback(ptr) => Self::AresAddrInfoCallback(*ptr),
             Self::AresHostByNameCallback(ptr) => Self::AresHostByNameCallback(*ptr),
             Self::AresSearchCallback(ptr) => Self::AresSearchCallback(*ptr),
+            Self::AresSearchCallbackDnsRec(ptr) => Self::AresSearchCallbackDnsRec(*ptr),
             Self::Probe(ch) => Self::Probe(*ch),
         }
     }
@@ -403,13 +425,36 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
 
     // Check hosts file
-    if let Some(lookup) = channeldata.ares.hosts().lookup(hostname, family_filter) {
+    let hosts_result = channeldata.ares.hosts().lookup(hostname, family_filter);
+    if let Some(ref lookup) = hosts_result {
         if !lookup.addrs.is_empty() {
-            let hostent = hostent_from_lookup(lookup);
+            let hostent = hostent_from_lookup(lookup.clone());
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
             ares_free_hostent(hostent);
             return;
         }
+    }
+
+    // RFC 6761 section 6.3: recognize "localhost" and any name under ".localhost"
+    // as special and always return the loopback address.
+    if is_localhost(hostname) {
+        let addrs = match family_filter {
+            AddressFamily::Ipv4 => vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+            AddressFamily::Ipv6 => vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
+            AddressFamily::Any => vec![
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            ],
+        };
+        let lookup = HostLookup {
+            canonical: hostname.to_string(),
+            aliases: vec![],
+            addrs,
+        };
+        let hostent = hostent_from_lookup(lookup);
+        unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
+        ares_free_hostent(hostent);
+        return;
     }
 
     // Check HOSTALIASES env var for single-label names
@@ -728,7 +773,28 @@ pub unsafe extern "C" fn ares_query_dnsrec(
         return;
     }
     let name = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
-    let ffidata = FFIData { callback: Callback::AresCallbackDnsRec(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts: 0 };
+    let name_clean = name.strip_suffix('.').unwrap_or(name);
+
+    // Check query cache
+    if channeldata.query_cache_max_ttl > 0 {
+        let cache_key = (name_clean.to_string(), dnstype as u16);
+        if let Some((cached_buf, expires_at)) = channeldata.query_cache.get(&cache_key) {
+            if Instant::now() < *expires_at {
+                let cached_buf = cached_buf.clone();
+                let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
+                let status = dns_record::ares_dns_parse(cached_buf.as_ptr(), cached_buf.len(), 0, &mut dnsrec);
+                if status == ARES_SUCCESS {
+                    callback(arg, ARES_SUCCESS, 0, dnsrec);
+                    dns_record::ares_dns_record_destroy(dnsrec);
+                    return;
+                }
+            } else {
+                channeldata.query_cache.remove(&cache_key);
+            }
+        }
+    }
+
+    let ffidata = FFIData { callback: Callback::AresCallbackDnsRec(callback), arg, family: 0, expected_record_type: dnstype, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts: 0 };
     channeldata.ares.query(name, dnsclass as u16, dnstype as u16, ffidata);
 }
 
@@ -748,11 +814,73 @@ pub unsafe extern "C" fn ares_search_dnsrec(
         dns_record::ares_dns_record_query_get(dnsrec, 0, &mut name_ptr, &mut qtype, &mut qclass);
     }
     if name_ptr.is_null() { return; }
-    let name = CStr::from_ptr(name_ptr).to_str().unwrap_or("");
+    let name_str = CStr::from_ptr(name_ptr).to_str().unwrap_or("");
 
+    if name_str.is_empty() {
+        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
+        return;
+    }
+
+    // Reject .onion domains (RFC 7686)
+    if (name_str.len() >= 6 && name_str[name_str.len()-6..].eq_ignore_ascii_case(".onion")) || name_str.eq_ignore_ascii_case("onion") {
+        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
+        return;
+    }
+
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
-    let ffidata = FFIData { callback: Callback::AresCallbackDnsRec(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts: 0 };
-    channeldata.ares.query(name, qclass as u16, qtype as u16, ffidata);
+    if channeldata.ares.config.nameservers.is_empty() {
+        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
+        return;
+    }
+
+    // Determine search domains
+    let has_trailing_dot = name_str.ends_with('.');
+    let name_clean = name_str.strip_suffix('.').unwrap_or(name_str);
+    let ndots = channeldata.ares.config.options.ndots;
+    let dot_count = name_clean.chars().filter(|&c| c == '.').count() as u32;
+
+    let mut search_domains: Vec<String> = Vec::new();
+    let mut query_hostname = name_clean.to_string();
+
+    if !has_trailing_dot && !channeldata.ares.config.search.is_empty() {
+        if dot_count >= ndots {
+            // High dots: try bare name first, then search domains as fallback
+            search_domains = channeldata.ares.config.search.clone();
+        } else {
+            // Low dots: try search domains first, then bare name as fallback
+            search_domains = channeldata.ares.config.search.clone();
+            let first_domain = search_domains.remove(0);
+            query_hostname = format!("{}.{}", name_clean, first_domain);
+        }
+    }
+
+    let state = Box::into_raw(Box::new(SearchStateDnsRec {
+        callback,
+        arg,
+        channel,
+        name: query_hostname.clone(),
+        base_name: name_clean.to_string(),
+        search_domains,
+        dnsclass: qclass as u16,
+        dnstype: qtype as u16,
+        last_error: ARES_ENODATA,
+        had_nodata: false,
+    }));
+
+    let ffidata = FFIData {
+        callback: Callback::AresSearchCallbackDnsRec(state),
+        arg: std::ptr::null_mut(),
+        family: 0,
+        expected_record_type: 0,
+        ip: None,
+        nameinfo_flags: 0,
+        port: 0,
+        scope_id: 0,
+        server_index: 0,
+        timeouts: 0,
+    };
+    channeldata.ares.query(&query_hostname, qclass as u16, qtype as u16, ffidata);
 }
 
 /// Looks up the node name and service name for a socket address.
@@ -1026,7 +1154,7 @@ impl<'a> ParsedResponse<'a> {
         for mut answer in self.answers {
             if answer.record_type == RECORD_TYPE_CNAME {
                 let mut cname_buf = SliceBuf::new(answer.data);
-                let alias_of = DnsLabel::parse(&mut cname_buf).unwrap();
+                let alias_of = DnsLabel::parse(&mut cname_buf).ok_or(ARES_EBADRESP)?;
                 let alias_of = alias_of.build_cstring(buf).ok_or(ARES_EBADRESP)?;
                 if expected_record_type != RECORD_TYPE_PTR {
                     aliases.push(name);
@@ -1042,8 +1170,8 @@ impl<'a> ParsedResponse<'a> {
 
             if answer.record_type == RECORD_TYPE_PTR || answer.record_type == RECORD_TYPE_NS {
                 let mut ptr_buf = SliceBuf::new(answer.data);
-                let alias_of = DnsLabel::parse(&mut ptr_buf).unwrap();
-                let alias_of = alias_of.build_cstring(buf).unwrap();
+                let alias_of = DnsLabel::parse(&mut ptr_buf).ok_or(ARES_EBADRESP)?;
+                let alias_of = alias_of.build_cstring(buf).ok_or(ARES_EBADRESP)?;
                 aliases.push(alias_of.clone());
                 if answer.record_type == RECORD_TYPE_PTR { name = alias_of; }
                 continue;
@@ -1166,6 +1294,9 @@ impl_from_parsed_buf!(UriReply<'a>, AresUriReply);
 unsafe fn parse_to_clinkedlist<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
     ares_fn_wrapper(out, || {
+        if abuf.is_null() || alen < 0 {
+            return Err(ARES_EBADRESP);
+        }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let (aresreplies, success) = T2::parse_buf_to_clinkedlist_parts(buf, expected_record_type)?;
         let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
@@ -1770,6 +1901,146 @@ unsafe fn run_ares_search_callback(res: Result<&[u8], c_int>, state_ptr: *mut Se
     drop(Box::from_raw(state_ptr));
 }
 
+unsafe fn run_ares_search_callback_dnsrec(res: Result<&[u8], c_int>, state_ptr: *mut SearchStateDnsRec, ffidata: &FFIData) {
+    let state = unsafe { &mut *state_ptr };
+    let channel = state.channel;
+    let channeldata = unsafe { &mut *channel };
+
+    match res {
+        Ok(buf) => {
+            let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0 };
+            match rcode {
+                3 => { // NXDOMAIN
+                    state.last_error = ARES_ENOTFOUND;
+                }
+                2 | 4 | 5 => { // SERVFAIL, NOTIMP, REFUSED
+                    state.last_error = match rcode {
+                        2 => ARES_ESERVFAIL,
+                        4 => ARES_ENOTIMP,
+                        _ => ARES_EREFUSED,
+                    };
+                }
+                0 => {
+                    let ancount = if buf.len() >= 8 { u16::from_be_bytes([buf[6], buf[7]]) } else { 0 };
+                    if ancount == 0 {
+                        state.had_nodata = true;
+                        state.last_error = ARES_ENODATA;
+                    } else {
+                        // Success — parse and deliver as dns record
+                        let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
+                        let parse_status = dns_record::ares_dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec);
+                        if parse_status == ARES_SUCCESS {
+                            (state.callback)(state.arg, ARES_SUCCESS, ffidata.timeouts as usize, dnsrec);
+                            dns_record::ares_dns_record_destroy(dnsrec);
+                        } else {
+                            (state.callback)(state.arg, parse_status, ffidata.timeouts as usize, std::ptr::null_mut());
+                        }
+                        drop(Box::from_raw(state_ptr));
+                        return;
+                    }
+                }
+                _ => {
+                    state.had_nodata = true;
+                    state.last_error = ARES_ENODATA;
+                }
+            }
+        }
+        Err(status) => {
+            state.last_error = status;
+        }
+    }
+
+    // Search domain iteration
+    if state.last_error == ARES_ENOTFOUND || state.last_error == ARES_ENODATA || state.last_error == ARES_ETIMEOUT {
+        if !state.search_domains.is_empty() {
+            let next_domain = state.search_domains.remove(0);
+            let new_hostname = format!("{}.{}", state.base_name, next_domain);
+            state.name = new_hostname.clone();
+            let new_ffidata = FFIData {
+                callback: Callback::AresSearchCallbackDnsRec(state_ptr),
+                arg: std::ptr::null_mut(),
+                family: 0,
+                expected_record_type: 0,
+                ip: None,
+                nameinfo_flags: 0,
+                port: 0,
+                scope_id: 0,
+                server_index: 0,
+                timeouts: ffidata.timeouts,
+            };
+            channeldata.ares.query(&new_hostname, state.dnsclass, state.dnstype, new_ffidata);
+            return;
+        } else if state.name != state.base_name && !state.base_name.is_empty() {
+            // Try bare name as fallback
+            let bare_name = state.base_name.clone();
+            state.name = bare_name.clone();
+            state.base_name = String::new(); // Prevent infinite recursion
+            let new_ffidata = FFIData {
+                callback: Callback::AresSearchCallbackDnsRec(state_ptr),
+                arg: std::ptr::null_mut(),
+                family: 0,
+                expected_record_type: 0,
+                ip: None,
+                nameinfo_flags: 0,
+                port: 0,
+                scope_id: 0,
+                server_index: 0,
+                timeouts: ffidata.timeouts,
+            };
+            channeldata.ares.query(&bare_name, state.dnsclass, state.dnstype, new_ffidata);
+            return;
+        }
+    }
+
+    // Also iterate on SERVFAIL/REFUSED/NOTIMP (try next search domain)
+    if state.last_error == ARES_ESERVFAIL || state.last_error == ARES_EREFUSED || state.last_error == ARES_ENOTIMP {
+        if !state.search_domains.is_empty() {
+            let next_domain = state.search_domains.remove(0);
+            let new_hostname = format!("{}.{}", state.base_name, next_domain);
+            state.name = new_hostname.clone();
+            let new_ffidata = FFIData {
+                callback: Callback::AresSearchCallbackDnsRec(state_ptr),
+                arg: std::ptr::null_mut(),
+                family: 0,
+                expected_record_type: 0,
+                ip: None,
+                nameinfo_flags: 0,
+                port: 0,
+                scope_id: 0,
+                server_index: 0,
+                timeouts: ffidata.timeouts,
+            };
+            channeldata.ares.query(&new_hostname, state.dnsclass, state.dnstype, new_ffidata);
+            return;
+        } else if state.name != state.base_name && !state.base_name.is_empty() {
+            let bare_name = state.base_name.clone();
+            state.name = bare_name.clone();
+            state.base_name = String::new();
+            let new_ffidata = FFIData {
+                callback: Callback::AresSearchCallbackDnsRec(state_ptr),
+                arg: std::ptr::null_mut(),
+                family: 0,
+                expected_record_type: 0,
+                ip: None,
+                nameinfo_flags: 0,
+                port: 0,
+                scope_id: 0,
+                server_index: 0,
+                timeouts: ffidata.timeouts,
+            };
+            channeldata.ares.query(&bare_name, state.dnsclass, state.dnstype, new_ffidata);
+            return;
+        }
+    }
+
+    // Finalize
+    if state.had_nodata && state.last_error == ARES_ENOTFOUND {
+        state.last_error = ARES_ENODATA;
+    }
+    (state.callback)(state.arg, state.last_error, ffidata.timeouts as usize, std::ptr::null_mut());
+    drop(Box::from_raw(state_ptr));
+}
+
 unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, state_ptr: *mut HostByNameState, ffidata: &FFIData) {
     let state = unsafe { &mut *state_ptr };
     let channel = state.channel;
@@ -2094,6 +2365,27 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
                     task.status = Status::Completed;
                     continue;
+                }
+                // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
+                if channeldata.query_cache_max_ttl > 0 {
+                    if matches!(task.userdata.callback, Callback::AresCallbackDnsRec(_) | Callback::AresSearchCallbackDnsRec(_)) {
+                        // Extract query name and type from the response buffer
+                        if let Ok(parsed) = ParsedResponse::from_buf(buf) {
+                            let qname = parsed.query.name.join(".");
+                            let qtype = parsed.query.qtype;
+                            let ancount = if buf.len() >= 8 { u16::from_be_bytes([buf[6], buf[7]]) } else { 0 };
+                            if ancount > 0 {
+                                // Find minimum TTL from answers
+                                let min_ttl = parsed.answers.iter().map(|a| a.ttl).min().unwrap_or(0);
+                                let cache_ttl = std::cmp::min(min_ttl, channeldata.query_cache_max_ttl);
+                                if cache_ttl > 0 {
+                                    let expires = Instant::now() + Duration::from_secs(cache_ttl as u64);
+                                    let cache_key = (qname, qtype);
+                                    channeldata.query_cache.insert(cache_key, (buf.to_vec(), expires));
+                                }
+                            }
+                        }
+                    }
                 }
                 (task.userdata.callback).run(Ok(buf), &task.userdata);
             }
@@ -2704,6 +2996,12 @@ fn is_truncated(buf: &[u8]) -> bool {
     buf.len() >= 4 && (buf[2] & 0x02) != 0
 }
 
+/// RFC 6761 section 6.3: "localhost" or any name under ".localhost"
+fn is_localhost(name: &str) -> bool {
+    name.eq_ignore_ascii_case("localhost")
+        || (name.len() >= 10 && name[name.len()-10..].eq_ignore_ascii_case(".localhost"))
+}
+
 /// Pick the best server to try next based on failure counts.
 /// Returns the server index with lowest (failure_count, original_index).
 fn pick_next_server(server_failures: &[u32]) -> usize {
@@ -3208,6 +3506,9 @@ pub unsafe extern "C" fn ares_inet_ntop(af: c_int, src: *const c_void, dst: *mut
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_addr_node) -> c_int {
+    if channel.is_null() || out.is_null() {
+        return ARES_ENODATA;
+    }
     let channeldata = unsafe { &mut *channel };
     let mut head: *mut ares_addr_node = std::ptr::null_mut();
     let mut tail: *mut ares_addr_node = std::ptr::null_mut();
@@ -3312,8 +3613,11 @@ pub unsafe extern "C" fn ares_create_query(
     buflen: *mut c_int,
     max_udp_size: c_int,
 ) -> c_int {
-    if name.is_null() || buf.is_null() || buflen.is_null() {
-        return ARES_EBADQUERY;
+    if name.is_null() {
+        return ARES_EFORMERR;
+    }
+    if buf.is_null() || buflen.is_null() {
+        return ARES_EFORMERR;
     }
     let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
         Ok(s) => s,
@@ -3385,10 +3689,12 @@ pub unsafe extern "C" fn ares_create_query(
         result
     };
 
-    // Validate label lengths
+    // Validate label lengths and reject empty labels
     for label in &labels {
-        // Unescape to get actual label bytes
         let unescaped = unescape_label(label);
+        if unescaped.is_empty() {
+            return ARES_EBADNAME;
+        }
         if unescaped.len() > 63 {
             return ARES_EBADNAME;
         }

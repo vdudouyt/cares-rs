@@ -111,73 +111,74 @@ pub const ARES_DATATYPE_ABINP: u16 = 11;
 // ---------------------------------------------------------------------------
 // ares_dns_rr_key_t
 // ---------------------------------------------------------------------------
-// A record keys
-pub const ARES_RR_A_ADDR: u16 = 1;
-// NS record keys
-pub const ARES_RR_NS_NSDNAME: u16 = 2;
-// CNAME record keys
-pub const ARES_RR_CNAME_CNAME: u16 = 3;
-// SOA record keys
-pub const ARES_RR_SOA_MNAME: u16 = 4;
-pub const ARES_RR_SOA_RNAME: u16 = 5;
-pub const ARES_RR_SOA_SERIAL: u16 = 6;
-pub const ARES_RR_SOA_REFRESH: u16 = 7;
-pub const ARES_RR_SOA_RETRY: u16 = 8;
-pub const ARES_RR_SOA_EXPIRE: u16 = 9;
-pub const ARES_RR_SOA_MINIMUM: u16 = 10;
-// PTR record keys
-pub const ARES_RR_PTR_DNAME: u16 = 11;
-// HINFO record keys
-pub const ARES_RR_HINFO_CPU: u16 = 12;
-pub const ARES_RR_HINFO_OS: u16 = 13;
-// MX record keys
-pub const ARES_RR_MX_PREFERENCE: u16 = 14;
-pub const ARES_RR_MX_EXCHANGE: u16 = 15;
-// TXT record keys
-pub const ARES_RR_TXT_DATA: u16 = 16;
-// AAAA record keys
-pub const ARES_RR_AAAA_ADDR: u16 = 17;
-// SRV record keys
-pub const ARES_RR_SRV_PRIORITY: u16 = 18;
-pub const ARES_RR_SRV_WEIGHT: u16 = 19;
-pub const ARES_RR_SRV_PORT: u16 = 20;
-pub const ARES_RR_SRV_TARGET: u16 = 21;
-// NAPTR record keys
-pub const ARES_RR_NAPTR_ORDER: u16 = 22;
-pub const ARES_RR_NAPTR_PREFERENCE: u16 = 23;
-pub const ARES_RR_NAPTR_FLAGS: u16 = 24;
-pub const ARES_RR_NAPTR_SERVICES: u16 = 25;
-pub const ARES_RR_NAPTR_REGEXP: u16 = 26;
-pub const ARES_RR_NAPTR_REPLACEMENT: u16 = 27;
-// OPT record keys
-pub const ARES_RR_OPT_UDP_SIZE: u16 = 28;
-pub const ARES_RR_OPT_VERSION: u16 = 29;
-pub const ARES_RR_OPT_FLAGS: u16 = 30;
-pub const ARES_RR_OPT_OPTIONS: u16 = 31;
-// TLSA record keys
-pub const ARES_RR_TLSA_CERT_USAGE: u16 = 32;
-pub const ARES_RR_TLSA_SELECTOR: u16 = 33;
-pub const ARES_RR_TLSA_MATCH: u16 = 34;
-pub const ARES_RR_TLSA_DATA: u16 = 35;
-// SVCB record keys
-pub const ARES_RR_SVCB_PRIORITY: u16 = 36;
-pub const ARES_RR_SVCB_TARGET: u16 = 37;
-pub const ARES_RR_SVCB_PARAMS: u16 = 38;
-// HTTPS record keys
-pub const ARES_RR_HTTPS_PRIORITY: u16 = 39;
-pub const ARES_RR_HTTPS_TARGET: u16 = 40;
-pub const ARES_RR_HTTPS_PARAMS: u16 = 41;
-// URI record keys
-pub const ARES_RR_URI_PRIORITY: u16 = 42;
-pub const ARES_RR_URI_WEIGHT: u16 = 43;
-pub const ARES_RR_URI_TARGET: u16 = 44;
-// CAA record keys
-pub const ARES_RR_CAA_CRITICAL: u16 = 45;
-pub const ARES_RR_CAA_TAG: u16 = 46;
-pub const ARES_RR_CAA_VALUE: u16 = 47;
-// RAW RR keys
-pub const ARES_RR_RAW_RR_TYPE: u16 = 48;
-pub const ARES_RR_RAW_RR_DATA: u16 = 49;
+// RR keys — formula: RECORD_TYPE * 100 + index (matches c-ares ares_dns_rr_key_t)
+// A record keys (type=1)
+pub const ARES_RR_A_ADDR: u32 = 1 * 100 + 1;
+// NS record keys (type=2)
+pub const ARES_RR_NS_NSDNAME: u32 = 2 * 100 + 1;
+// CNAME record keys (type=5)
+pub const ARES_RR_CNAME_CNAME: u32 = 5 * 100 + 1;
+// SOA record keys (type=6)
+pub const ARES_RR_SOA_MNAME: u32 = 6 * 100 + 1;
+pub const ARES_RR_SOA_RNAME: u32 = 6 * 100 + 2;
+pub const ARES_RR_SOA_SERIAL: u32 = 6 * 100 + 3;
+pub const ARES_RR_SOA_REFRESH: u32 = 6 * 100 + 4;
+pub const ARES_RR_SOA_RETRY: u32 = 6 * 100 + 5;
+pub const ARES_RR_SOA_EXPIRE: u32 = 6 * 100 + 6;
+pub const ARES_RR_SOA_MINIMUM: u32 = 6 * 100 + 7;
+// PTR record keys (type=12)
+pub const ARES_RR_PTR_DNAME: u32 = 12 * 100 + 1;
+// HINFO record keys (type=13)
+pub const ARES_RR_HINFO_CPU: u32 = 13 * 100 + 1;
+pub const ARES_RR_HINFO_OS: u32 = 13 * 100 + 2;
+// MX record keys (type=15)
+pub const ARES_RR_MX_PREFERENCE: u32 = 15 * 100 + 1;
+pub const ARES_RR_MX_EXCHANGE: u32 = 15 * 100 + 2;
+// TXT record keys (type=16)
+pub const ARES_RR_TXT_DATA: u32 = 16 * 100 + 1;
+// AAAA record keys (type=28)
+pub const ARES_RR_AAAA_ADDR: u32 = 28 * 100 + 1;
+// SRV record keys (type=33)
+pub const ARES_RR_SRV_PRIORITY: u32 = 33 * 100 + 2;
+pub const ARES_RR_SRV_WEIGHT: u32 = 33 * 100 + 3;
+pub const ARES_RR_SRV_PORT: u32 = 33 * 100 + 4;
+pub const ARES_RR_SRV_TARGET: u32 = 33 * 100 + 5;
+// NAPTR record keys (type=35)
+pub const ARES_RR_NAPTR_ORDER: u32 = 35 * 100 + 1;
+pub const ARES_RR_NAPTR_PREFERENCE: u32 = 35 * 100 + 2;
+pub const ARES_RR_NAPTR_FLAGS: u32 = 35 * 100 + 3;
+pub const ARES_RR_NAPTR_SERVICES: u32 = 35 * 100 + 4;
+pub const ARES_RR_NAPTR_REGEXP: u32 = 35 * 100 + 5;
+pub const ARES_RR_NAPTR_REPLACEMENT: u32 = 35 * 100 + 6;
+// OPT record keys (type=41)
+pub const ARES_RR_OPT_UDP_SIZE: u32 = 41 * 100 + 1;
+pub const ARES_RR_OPT_VERSION: u32 = 41 * 100 + 3;
+pub const ARES_RR_OPT_FLAGS: u32 = 41 * 100 + 4;
+pub const ARES_RR_OPT_OPTIONS: u32 = 41 * 100 + 5;
+// TLSA record keys (type=52)
+pub const ARES_RR_TLSA_CERT_USAGE: u32 = 52 * 100 + 1;
+pub const ARES_RR_TLSA_SELECTOR: u32 = 52 * 100 + 2;
+pub const ARES_RR_TLSA_MATCH: u32 = 52 * 100 + 3;
+pub const ARES_RR_TLSA_DATA: u32 = 52 * 100 + 4;
+// SVCB record keys (type=64)
+pub const ARES_RR_SVCB_PRIORITY: u32 = 64 * 100 + 1;
+pub const ARES_RR_SVCB_TARGET: u32 = 64 * 100 + 2;
+pub const ARES_RR_SVCB_PARAMS: u32 = 64 * 100 + 3;
+// HTTPS record keys (type=65)
+pub const ARES_RR_HTTPS_PRIORITY: u32 = 65 * 100 + 1;
+pub const ARES_RR_HTTPS_TARGET: u32 = 65 * 100 + 2;
+pub const ARES_RR_HTTPS_PARAMS: u32 = 65 * 100 + 3;
+// URI record keys (type=256)
+pub const ARES_RR_URI_PRIORITY: u32 = 256 * 100 + 1;
+pub const ARES_RR_URI_WEIGHT: u32 = 256 * 100 + 2;
+pub const ARES_RR_URI_TARGET: u32 = 256 * 100 + 3;
+// CAA record keys (type=257)
+pub const ARES_RR_CAA_CRITICAL: u32 = 257 * 100 + 1;
+pub const ARES_RR_CAA_TAG: u32 = 257 * 100 + 2;
+pub const ARES_RR_CAA_VALUE: u32 = 257 * 100 + 3;
+// RAW RR keys (type=65536)
+pub const ARES_RR_RAW_RR_TYPE: u32 = 65536 * 100 + 1;
+pub const ARES_RR_RAW_RR_DATA: u32 = 65536 * 100 + 2;
 
 // ---------------------------------------------------------------------------
 // RRValue - discriminated union for RR field values
@@ -208,7 +209,7 @@ pub struct ares_dns_rr_t {
     rtype: u16,
     rclass: u16,
     ttl: u32,
-    data: HashMap<u16, RRValue>,
+    data: HashMap<u32, RRValue>,
     opts: Vec<(u16, Vec<u8>)>,
     // Cached libc structs for returning pointers
     cached_in_addr: libc::in_addr,
@@ -388,9 +389,18 @@ fn parse_rdata(
             }
         }
         ARES_REC_TYPE_TXT => {
-            // TXT records: one or more length-prefixed strings, stored as raw binary
+            // TXT records: concatenate all length-prefixed strings (strip length bytes)
+            let mut txt_data = Vec::new();
+            let mut pos = 0;
+            while pos < rdata.len() {
+                let slen = rdata[pos] as usize;
+                pos += 1;
+                if pos + slen > rdata.len() { break; }
+                txt_data.extend_from_slice(&rdata[pos..pos + slen]);
+                pos += slen;
+            }
             rr.data
-                .insert(ARES_RR_TXT_DATA, RRValue::Bin(rdata.to_vec()));
+                .insert(ARES_RR_TXT_DATA, RRValue::Bin(txt_data));
         }
         ARES_REC_TYPE_SOA => {
             let mut pos = rdata_start;
@@ -695,7 +705,18 @@ fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) {
         }
         ARES_REC_TYPE_TXT => {
             if let Some(RRValue::Bin(data)) = rr.data.get(&ARES_RR_TXT_DATA) {
-                out.extend_from_slice(data);
+                // Re-encode as length-prefixed strings (split into 255-byte chunks max)
+                if data.is_empty() {
+                    out.push(0); // empty string: single 0-length prefix
+                } else {
+                    let mut pos = 0;
+                    while pos < data.len() {
+                        let chunk_len = std::cmp::min(255, data.len() - pos);
+                        out.push(chunk_len as u8);
+                        out.extend_from_slice(&data[pos..pos + chunk_len]);
+                        pos += chunk_len;
+                    }
+                }
             }
         }
         ARES_REC_TYPE_SOA => {
@@ -1217,7 +1238,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr(
         return std::ptr::null();
     }
     let rr_mut = rr as *mut ares_dns_rr_t;
-    if let Some(RRValue::Addr(addr)) = (*rr_mut).data.get(&(key as u16)) {
+    if let Some(RRValue::Addr(addr)) = (*rr_mut).data.get(&key) {
         let octets = addr.octets();
         (*rr_mut).cached_in_addr = libc::in_addr {
             s_addr: u32::from_ne_bytes(octets),
@@ -1237,7 +1258,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr6(
         return std::ptr::null();
     }
     let rr_mut = rr as *mut ares_dns_rr_t;
-    if let Some(RRValue::Addr6(addr)) = (*rr_mut).data.get(&(key as u16)) {
+    if let Some(RRValue::Addr6(addr)) = (*rr_mut).data.get(&key) {
         (*rr_mut).cached_in6_addr = libc::in6_addr {
             s6_addr: addr.octets(),
         };
@@ -1255,7 +1276,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_str(
     if rr.is_null() {
         return std::ptr::null();
     }
-    if let Some(RRValue::Str(s)) = (*rr).data.get(&(key as u16)) {
+    if let Some(RRValue::Str(s)) = (*rr).data.get(&key) {
         s.as_ptr()
     } else {
         std::ptr::null()
@@ -1270,7 +1291,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u8(
     if rr.is_null() {
         return 0;
     }
-    if let Some(RRValue::U8(v)) = (*rr).data.get(&(key as u16)) {
+    if let Some(RRValue::U8(v)) = (*rr).data.get(&key) {
         *v
     } else {
         0
@@ -1285,7 +1306,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u16(
     if rr.is_null() {
         return 0;
     }
-    if let Some(RRValue::U16(v)) = (*rr).data.get(&(key as u16)) {
+    if let Some(RRValue::U16(v)) = (*rr).data.get(&key) {
         *v
     } else {
         0
@@ -1300,7 +1321,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u32(
     if rr.is_null() {
         return 0;
     }
-    if let Some(RRValue::U32(v)) = (*rr).data.get(&(key as u16)) {
+    if let Some(RRValue::U32(v)) = (*rr).data.get(&key) {
         *v
     } else {
         0
@@ -1311,28 +1332,28 @@ pub unsafe extern "C" fn ares_dns_rr_get_u32(
 pub unsafe extern "C" fn ares_dns_rr_get_bin(
     rr: *const ares_dns_rr_t,
     key: c_uint,
-    val: *mut *const u8,
     len: *mut usize,
-) -> c_int {
+) -> *const u8 {
     if rr.is_null() {
-        return ARES_EBADRESP;
+        if !len.is_null() { *len = 0; }
+        return std::ptr::null();
     }
-    if let Some(RRValue::Bin(data)) = (*rr).data.get(&(key as u16)) {
-        if !val.is_null() {
-            *val = data.as_ptr();
-        }
+    if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
         if !len.is_null() {
             *len = data.len();
         }
-        ARES_SUCCESS
-    } else {
-        if !val.is_null() {
-            *val = std::ptr::null();
+        if data.is_empty() {
+            // Return a non-null pointer for empty data
+            static EMPTY: u8 = 0;
+            &EMPTY as *const u8
+        } else {
+            data.as_ptr()
         }
+    } else {
         if !len.is_null() {
             *len = 0;
         }
-        ARES_EBADRESP
+        std::ptr::null()
     }
 }
 
@@ -1351,7 +1372,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_addr(
     }
     let octets = (*addr).s_addr.to_ne_bytes();
     let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
-    (*rr).data.insert(key as u16, RRValue::Addr(ip));
+    (*rr).data.insert(key, RRValue::Addr(ip));
     ARES_SUCCESS
 }
 
@@ -1365,7 +1386,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_addr6(
         return ARES_EBADRESP;
     }
     let ip = Ipv6Addr::from((*addr).s6_addr);
-    (*rr).data.insert(key as u16, RRValue::Addr6(ip));
+    (*rr).data.insert(key, RRValue::Addr6(ip));
     ARES_SUCCESS
 }
 
@@ -1380,7 +1401,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_str(
     }
     let cstr = CStr::from_ptr(val);
     let owned = CString::from(cstr);
-    (*rr).data.insert(key as u16, RRValue::Str(owned));
+    (*rr).data.insert(key, RRValue::Str(owned));
     ARES_SUCCESS
 }
 
@@ -1393,7 +1414,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u8(
     if rr.is_null() {
         return ARES_EBADRESP;
     }
-    (*rr).data.insert(key as u16, RRValue::U8(val));
+    (*rr).data.insert(key, RRValue::U8(val));
     ARES_SUCCESS
 }
 
@@ -1406,7 +1427,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u16(
     if rr.is_null() {
         return ARES_EBADRESP;
     }
-    (*rr).data.insert(key as u16, RRValue::U16(val));
+    (*rr).data.insert(key, RRValue::U16(val));
     ARES_SUCCESS
 }
 
@@ -1419,7 +1440,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u32(
     if rr.is_null() {
         return ARES_EBADRESP;
     }
-    (*rr).data.insert(key as u16, RRValue::U32(val));
+    (*rr).data.insert(key, RRValue::U32(val));
     ARES_SUCCESS
 }
 
@@ -1438,7 +1459,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
     } else {
         std::slice::from_raw_parts(val, len).to_vec()
     };
-    (*rr).data.insert(key as u16, RRValue::Bin(data));
+    (*rr).data.insert(key, RRValue::Bin(data));
     ARES_SUCCESS
 }
 
@@ -1847,7 +1868,7 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_key_tostr(key: c_uint) -> *const c_char {
-    match key as u16 {
+    match key {
         ARES_RR_A_ADDR => cstr!("A.ADDR"),
         ARES_RR_NS_NSDNAME => cstr!("NS.NSDNAME"),
         ARES_RR_CNAME_CNAME => cstr!("CNAME.CNAME"),
@@ -2013,7 +2034,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_keys(
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_key_datatype(key: c_uint) -> c_uint {
-    match key as u16 {
+    match key {
         ARES_RR_A_ADDR => ARES_DATATYPE_INADDR as c_uint,
         ARES_RR_NS_NSDNAME => ARES_DATATYPE_NAME as c_uint,
         ARES_RR_CNAME_CNAME => ARES_DATATYPE_NAME as c_uint,
@@ -2069,7 +2090,7 @@ pub unsafe extern "C" fn ares_dns_rr_key_datatype(key: c_uint) -> c_uint {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_key_to_rec_type(key: c_uint) -> c_uint {
-    match key as u16 {
+    match key {
         ARES_RR_A_ADDR => ARES_REC_TYPE_A as c_uint,
         ARES_RR_NS_NSDNAME => ARES_REC_TYPE_NS as c_uint,
         ARES_RR_CNAME_CNAME => ARES_REC_TYPE_CNAME as c_uint,
