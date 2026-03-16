@@ -600,6 +600,48 @@ mod tests {
         assert_eq!(cur.chunk(), b"asdf");
     }
     #[test]
+    fn test_parse_dns_label_invalid_bits() {
+        // Top 2 bits = 01 (0x40) — invalid, neither label nor compression pointer
+        let buf: Vec<u8> = b"\x40abcd".to_vec();
+        let mut cur = SliceBuf::new(&buf);
+        assert_eq!(DnsLabel::parse(&mut cur), None);
+        assert_eq!(cur.pos, 0); // position restored
+
+        // Top 2 bits = 10 (0x80) — also invalid
+        let buf: Vec<u8> = b"\x80abcd".to_vec();
+        let mut cur = SliceBuf::new(&buf);
+        assert_eq!(DnsLabel::parse(&mut cur), None);
+        assert_eq!(cur.pos, 0);
+
+        // 0x7f = 0b01111111 — top 2 bits are 01, invalid
+        let buf: Vec<u8> = b"\x7fabcd".to_vec();
+        let mut cur = SliceBuf::new(&buf);
+        assert_eq!(DnsLabel::parse(&mut cur), None);
+        assert_eq!(cur.pos, 0);
+
+        // Valid label followed by invalid bits
+        let buf: Vec<u8> = b"\x03abc\x80xx".to_vec();
+        let mut cur = SliceBuf::new(&buf);
+        assert_eq!(DnsLabel::parse(&mut cur), None);
+        assert_eq!(cur.pos, 0);
+    }
+    #[test]
+    fn test_parse_dns_label_truncated_compression() {
+        // Compression pointer byte without the second byte
+        let buf: Vec<u8> = b"\xc0".to_vec();
+        let mut cur = SliceBuf::new(&buf);
+        assert_eq!(DnsLabel::parse(&mut cur), None);
+        assert_eq!(cur.pos, 0);
+    }
+    #[test]
+    fn test_parse_dns_label_truncated_label_data() {
+        // Label says 5 bytes but only 3 available
+        let buf: Vec<u8> = b"\x05abc".to_vec();
+        let mut cur = SliceBuf::new(&buf);
+        assert_eq!(DnsLabel::parse(&mut cur), None);
+        assert_eq!(cur.pos, 0);
+    }
+    #[test]
     fn test_parse_dns_query() {
         let buf: Vec<u8> = b"\x06\x67\x6f\x6f\x67\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01ASDF".to_vec();
         let mut cur = SliceBuf::new(&buf);
