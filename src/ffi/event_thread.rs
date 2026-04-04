@@ -3,18 +3,63 @@
 //! Activated via ARES_OPT_EVENT_THREAD in ares_init_options.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use crate::ffi::{Channel, ChannelData};
 use crate::ffi::ares_socket::ares_socket_t;
 
 const ARES_SOCKET_BAD: ares_socket_t = -1;
 
+/// Recursive mutex wrapping pthread_mutex_t with PTHREAD_MUTEX_RECURSIVE.
+/// Required because c-ares callbacks may re-enter the channel API (e.g.
+/// a callback calling ares_cancel while the event thread holds the lock).
+struct RecursiveMutex {
+    inner: libc::pthread_mutex_t,
+}
+
+unsafe impl Send for RecursiveMutex {}
+unsafe impl Sync for RecursiveMutex {}
+
+impl RecursiveMutex {
+    fn new() -> Self {
+        unsafe {
+            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
+            libc::pthread_mutexattr_init(&mut attr);
+            libc::pthread_mutexattr_settype(&mut attr, libc::PTHREAD_MUTEX_RECURSIVE);
+            let mut mutex: libc::pthread_mutex_t = std::mem::zeroed();
+            libc::pthread_mutex_init(&mut mutex, &attr);
+            libc::pthread_mutexattr_destroy(&mut attr);
+            RecursiveMutex { inner: mutex }
+        }
+    }
+
+    fn lock(&self) -> RecursiveMutexGuard<'_> {
+        unsafe { libc::pthread_mutex_lock(&self.inner as *const _ as *mut _); }
+        RecursiveMutexGuard { mutex: self }
+    }
+}
+
+impl Drop for RecursiveMutex {
+    fn drop(&mut self) {
+        unsafe { libc::pthread_mutex_destroy(&mut self.inner); }
+    }
+}
+
+struct RecursiveMutexGuard<'a> {
+    mutex: &'a RecursiveMutex,
+}
+
+impl<'a> Drop for RecursiveMutexGuard<'a> {
+    fn drop(&mut self) {
+        unsafe { libc::pthread_mutex_unlock(&self.mutex.inner as *const _ as *mut _); }
+    }
+}
+
 /// Opaque event thread state, stored as *mut c_void in channeldata.event_thread.
 struct EventThread {
     thread: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
-    mutex: Arc<Mutex<()>>,
+    mutex: Arc<RecursiveMutex>,
     wake_write: i32, // write end of self-pipe
     wake_read: i32,  // read end of self-pipe (owned by thread)
 }
@@ -40,7 +85,7 @@ pub(crate) fn start(channel: Channel) {
     }
 
     let running = Arc::new(AtomicBool::new(true));
-    let mutex = Arc::new(Mutex::new(()));
+    let mutex = Arc::new(RecursiveMutex::new());
 
     let running_clone = running.clone();
     let mutex_clone = mutex.clone();
@@ -93,9 +138,9 @@ pub(crate) fn wake_if_active(channel: Channel) {
     wake(et);
 }
 
-/// Guard that holds the event thread mutex and wakes the thread on drop.
+/// Guard that holds the recursive mutex and wakes the event thread on drop.
 pub(crate) struct EventThreadGuard {
-    _mutex_guard: std::sync::MutexGuard<'static, ()>,
+    _mutex_guard: RecursiveMutexGuard<'static>,
     wake_fd: i32,
 }
 
@@ -109,6 +154,7 @@ impl Drop for EventThreadGuard {
 
 /// Lock the event thread mutex if active. Returns a guard that wakes the
 /// event thread on drop (after the API call completes).
+/// Uses a recursive mutex so callbacks can safely re-enter the API.
 pub(crate) fn lock_if_active(channel: Channel) -> Option<EventThreadGuard> {
     if channel.is_null() { return None; }
     let channeldata = unsafe { &*channel };
@@ -116,11 +162,11 @@ pub(crate) fn lock_if_active(channel: Channel) -> Option<EventThreadGuard> {
     let et = unsafe { &*(channeldata.event_thread as *const EventThread) };
     // Safety: EventThread lives as long as the channel, and we hold a reference
     // to it through the channel pointer. We transmute the lifetime to 'static
-    // because the MutexGuard needs a static reference but EventThread outlives
+    // because the guard needs a static reference but EventThread outlives
     // any single API call.
-    let mutex: &'static Mutex<()> = unsafe { std::mem::transmute(&*et.mutex) };
+    let mutex: &'static RecursiveMutex = unsafe { std::mem::transmute(&*et.mutex) };
     Some(EventThreadGuard {
-        _mutex_guard: mutex.lock().unwrap(),
+        _mutex_guard: mutex.lock(),
         wake_fd: et.wake_write,
     })
 }
@@ -138,13 +184,13 @@ fn drain_wake_pipe(wake_read: i32) {
     }
 }
 
-fn event_loop(channel: Channel, running: Arc<AtomicBool>, mutex: Arc<Mutex<()>>, wake_read: i32) {
+fn event_loop(channel: Channel, running: Arc<AtomicBool>, mutex: Arc<RecursiveMutex>, wake_read: i32) {
     let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(17); // 16 socks + wake pipe
 
     while running.load(Ordering::Relaxed) {
         // 1. Under lock: get active sockets
         let (socks, bitmask) = {
-            let _guard = mutex.lock().unwrap();
+            let _guard = mutex.lock();
             let mut socks = [ARES_SOCKET_BAD; 16];
             let channeldata = unsafe { &mut *channel };
             let bitmask = unsafe {
@@ -180,7 +226,7 @@ fn event_loop(channel: Channel, running: Arc<AtomicBool>, mutex: Arc<Mutex<()>>,
         }
 
         // 5. Under lock: process ready sockets + handle timeouts
-        let _guard = mutex.lock().unwrap();
+        let _guard = mutex.lock();
         if n > 0 {
             for pfd in &pollfds[1..] { // skip wake pipe
                 let r = if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 { pfd.fd } else { ARES_SOCKET_BAD };

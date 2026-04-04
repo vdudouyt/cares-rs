@@ -217,6 +217,7 @@ pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_
     if channel.is_null() || options.is_null() || optmask.is_null() {
         return ARES_ENODATA;
     }
+    let _et_guard = crate::ffi::event_thread::lock_if_active(channel);
     let channeldata = unsafe { &*channel };
     let config = &channeldata.ares.config;
     let opts = &config.options;
