@@ -356,6 +356,10 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
             task.userdata.callback.run(Err(ARES_ECANCELLED), &task.userdata);
         }
     }
+    // Clear connection pools so stale sockets don't linger
+    channeldata.udp_connections.clear();
+    channeldata.tcp_connections.clear();
+    channeldata.tcp_recv_buffers.clear();
 }
 
 #[no_mangle]
