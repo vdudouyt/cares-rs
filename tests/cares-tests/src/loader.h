@@ -73,6 +73,23 @@ void        ares_set_server_state_callback(ares_channel_t *channel,
 
 ares_dns_record_t *ares_dns_record_duplicate(const ares_dns_record_t *dnsrec);
 
+// Functions from c-ares 1.34.6 not in system header
+const char         *ares_dns_opcode_tostr(ares_dns_opcode_t opcode);
+const char         *ares_dns_rcode_tostr(ares_dns_rcode_t rcode);
+const char         *ares_dns_section_tostr(ares_dns_section_t section);
+ares_dns_class_t    ares_dns_rr_get_class(const ares_dns_rr_t *rr);
+unsigned int        ares_dns_rr_get_ttl(const ares_dns_rr_t *rr);
+const struct in_addr *ares_dns_rr_get_addr(const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key);
+const struct ares_in6_addr *ares_dns_rr_get_addr6(const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key);
+const char         *ares_dns_rr_get_str(const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key);
+unsigned char       ares_dns_rr_get_u8(const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key);
+unsigned short      ares_dns_rr_get_u16(const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key);
+unsigned int        ares_dns_rr_get_u32(const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key);
+size_t              ares_dns_rr_get_abin_cnt(const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key);
+const unsigned char *ares_dns_rr_get_abin(const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key,
+                                          size_t idx, size_t *len);
+void                ares_free(void *ptr);
+
 #ifdef __cplusplus
 }
 #endif

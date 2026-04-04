@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types, dead_code, unused_variables)]
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_uint, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::cstr;
@@ -2125,5 +2125,92 @@ pub unsafe extern "C" fn ares_dns_rr_key_to_rec_type(key: c_uint) -> c_uint {
         }
         ARES_RR_RAW_RR_TYPE | ARES_RR_RAW_RR_DATA => ARES_REC_TYPE_RAW_RR as c_uint,
         _ => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ares_dns_opcode_tostr(opcode: c_uint) -> *const c_char {
+    let s: &[u8] = match opcode {
+        0 => b"QUERY\0",
+        1 => b"IQUERY\0",
+        2 => b"STATUS\0",
+        4 => b"NOTIFY\0",
+        5 => b"UPDATE\0",
+        _ => b"UNKNOWN\0",
+    };
+    s.as_ptr() as *const c_char
+}
+
+#[no_mangle]
+pub extern "C" fn ares_dns_rcode_tostr(rcode: c_uint) -> *const c_char {
+    let s: &[u8] = match rcode {
+        0 => b"NOERROR\0",
+        1 => b"FORMERR\0",
+        2 => b"SERVFAIL\0",
+        3 => b"NXDOMAIN\0",
+        4 => b"NOTIMP\0",
+        5 => b"REFUSED\0",
+        6 => b"YXDOMAIN\0",
+        7 => b"YXRRSET\0",
+        8 => b"NXRRSET\0",
+        9 => b"NOTAUTH\0",
+        10 => b"NOTZONE\0",
+        _ => b"UNKNOWN\0",
+    };
+    s.as_ptr() as *const c_char
+}
+
+#[no_mangle]
+pub extern "C" fn ares_dns_section_tostr(section: c_uint) -> *const c_char {
+    let s: &[u8] = match section {
+        1 => b"ANSWER\0",
+        2 => b"AUTHORITY\0",
+        3 => b"ADDITIONAL\0",
+        _ => b"UNKNOWN\0",
+    };
+    s.as_ptr() as *const c_char
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_dns_rr_get_abin_cnt(
+    rr: *const ares_dns_rr_t,
+    key: c_uint,
+) -> usize {
+    if rr.is_null() { return 0; }
+    // We store TXT as a single Bin blob; for abin API, treat as 1 entry if non-empty
+    if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
+        if data.is_empty() { 0 } else { 1 }
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_dns_rr_get_abin(
+    rr: *const ares_dns_rr_t,
+    key: c_uint,
+    idx: usize,
+    len: *mut usize,
+) -> *const u8 {
+    if rr.is_null() || len.is_null() { return std::ptr::null(); }
+    if idx != 0 { *len = 0; return std::ptr::null(); }
+    if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
+        *len = data.len();
+        if data.is_empty() {
+            static EMPTY: u8 = 0;
+            &EMPTY as *const u8
+        } else {
+            data.as_ptr()
+        }
+    } else {
+        *len = 0;
+        std::ptr::null()
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_free(ptr: *mut c_void) {
+    if !ptr.is_null() {
+        libc::free(ptr);
     }
 }

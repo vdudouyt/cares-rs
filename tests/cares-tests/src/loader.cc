@@ -162,3 +162,26 @@ IMPL_SHIM(ares_dns_datatype_t, ares_dns_rr_key_datatype, (ares_dns_rr_key_t key)
 IMPL_SHIM(ares_dns_rec_type_t, ares_dns_rr_key_to_rec_type, (ares_dns_rr_key_t key), (key));
 IMPL_SHIM(const ares_dns_rr_key_t *, ares_dns_rr_get_keys, (ares_dns_rec_type_t type, size_t *cnt), (type, cnt));
 IMPL_SHIM(const char *, ares_dns_class_tostr, (ares_dns_class_t qclass), (qclass));
+
+IMPL_SHIM(size_t, ares_dns_rr_get_opt_cnt, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key), (dns_rr, key));
+IMPL_SHIM(ares_bool_t, ares_dns_rr_get_opt, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key, size_t idx, unsigned short *opt, const unsigned char **val, size_t *val_len), (dns_rr, key, idx, opt, val, val_len));
+
+// DNS RR getters (from c-ares 1.34.6 API)
+IMPL_SHIM(ares_dns_class_t, ares_dns_rr_get_class, (const ares_dns_rr_t *rr), (rr));
+IMPL_SHIM(unsigned int, ares_dns_rr_get_ttl, (const ares_dns_rr_t *rr), (rr));
+IMPL_SHIM(const struct in_addr *, ares_dns_rr_get_addr, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key), (dns_rr, key));
+IMPL_SHIM(const struct ares_in6_addr *, ares_dns_rr_get_addr6, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key), (dns_rr, key));
+IMPL_SHIM(const char *, ares_dns_rr_get_str, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key), (dns_rr, key));
+IMPL_SHIM(unsigned char, ares_dns_rr_get_u8, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key), (dns_rr, key));
+IMPL_SHIM(unsigned short, ares_dns_rr_get_u16, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key), (dns_rr, key));
+IMPL_SHIM(unsigned int, ares_dns_rr_get_u32, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key), (dns_rr, key));
+IMPL_SHIM(size_t, ares_dns_rr_get_abin_cnt, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key), (dns_rr, key));
+IMPL_SHIM(const unsigned char *, ares_dns_rr_get_abin, (const ares_dns_rr_t *dns_rr, ares_dns_rr_key_t key, size_t idx, size_t *len), (dns_rr, key, idx, len));
+
+// String conversion (from c-ares 1.34.6 API)
+IMPL_SHIM(const char *, ares_dns_opcode_tostr, (ares_dns_opcode_t opcode), (opcode));
+IMPL_SHIM(const char *, ares_dns_rcode_tostr, (ares_dns_rcode_t rcode), (rcode));
+IMPL_SHIM(const char *, ares_dns_section_tostr, (ares_dns_section_t section), (section));
+
+// Memory
+IMPL_SHIM(void, ares_free, (void *ptr), (ptr));

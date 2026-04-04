@@ -3508,7 +3508,7 @@ pub extern "C" fn ares_library_initialized() -> c_int {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_inet_ntop(af: c_int, src: *const c_void, dst: *mut c_char, size: libc::socklen_t) -> *const c_char {
-    // Manually implement inet_ntop since libc crate doesn't expose it on all platforms
+    if src.is_null() || dst.is_null() { return std::ptr::null(); }
     match af {
         libc::AF_INET => {
             let addr = unsafe { *(src as *const [u8; 4]) };
