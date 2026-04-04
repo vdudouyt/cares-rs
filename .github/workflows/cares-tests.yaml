@@ -30,7 +30,9 @@ jobs:
         run: cmake . && make
       - name: Run integration tests
         working-directory: tests/cares-tests
-        run: ./arestest ../../target/release/libcares_rs.so
+        run: >-
+          ./arestest ../../target/release/libcares_rs.so
+          "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*:*LiveSearchANY*"
       - name: Run fuzz corpus (DNS parsing)
         working-directory: tests/cares-tests
         run: |

@@ -301,24 +301,25 @@ impl<T> Ares<T> {
             }
         }
     }
-    pub fn read_impl(task: &mut Task<T>, readbuf: &mut [u8]) -> Option<(usize, usize)> {
+    /// Returns Ok(Some((offset, len))) on success, Ok(None) on WouldBlock, Err on fatal recv error.
+    pub fn read_impl(task: &mut Task<T>, readbuf: &mut [u8]) -> Result<Option<(usize, usize)>, ()> {
         let (len, _src) = match task.sock.recv(readbuf) {
             Ok(result) => result,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No data yet, stay in Reading status
-                return None;
+                return Ok(None);
             }
-            Err(_) => { task.status = Status::Completed; return None; }
+            Err(_) => { task.status = Status::Completed; return Err(()); }
         };
         if task.sock.is_tcp() {
-            if len < 2 { return None; }
+            if len < 2 { return Ok(None); }
             let payload_len = u16::from_be_bytes([readbuf[0], readbuf[1]]) as usize;
-            if len < 2 + payload_len { return None; }
+            if len < 2 + payload_len { return Ok(None); }
             task.status = Status::Completed;
-            Some((2, payload_len))
+            Ok(Some((2, payload_len)))
         } else {
             task.status = Status::Completed;
-            Some((0, len))
+            Ok(Some((0, len)))
         }
     }
     pub fn max_wait_time(&self) -> Duration {

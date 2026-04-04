@@ -2306,7 +2306,14 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 } else { None }
             } else {
                 // UDP: use existing read_impl
-                Ares::read_impl(task, &mut channeldata.readbuf)
+                match Ares::read_impl(task, &mut channeldata.readbuf) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        // recv failed (e.g. ECONNREFUSED) — fire callback
+                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata);
+                        continue;
+                    }
+                }
             };
             if let Some((offset, len)) = read_result {
                 let buf = &channeldata.readbuf[offset..offset+len];
