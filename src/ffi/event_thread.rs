@@ -93,9 +93,23 @@ pub(crate) fn wake_if_active(channel: Channel) {
     wake(et);
 }
 
-/// Lock the event thread mutex if active. Returns a guard that must be held
-/// for the duration of the API call.
-pub(crate) fn lock_if_active(channel: Channel) -> Option<std::sync::MutexGuard<'static, ()>> {
+/// Guard that holds the event thread mutex and wakes the thread on drop.
+pub(crate) struct EventThreadGuard {
+    _mutex_guard: std::sync::MutexGuard<'static, ()>,
+    wake_fd: i32,
+}
+
+impl Drop for EventThreadGuard {
+    fn drop(&mut self) {
+        // Wake the event thread so it re-polls with updated socket state
+        let buf = [1u8];
+        unsafe { libc::write(self.wake_fd, buf.as_ptr() as *const libc::c_void, 1); }
+    }
+}
+
+/// Lock the event thread mutex if active. Returns a guard that wakes the
+/// event thread on drop (after the API call completes).
+pub(crate) fn lock_if_active(channel: Channel) -> Option<EventThreadGuard> {
     if channel.is_null() { return None; }
     let channeldata = unsafe { &*channel };
     if channeldata.event_thread.is_null() { return None; }
@@ -105,7 +119,10 @@ pub(crate) fn lock_if_active(channel: Channel) -> Option<std::sync::MutexGuard<'
     // because the MutexGuard needs a static reference but EventThread outlives
     // any single API call.
     let mutex: &'static Mutex<()> = unsafe { std::mem::transmute(&*et.mutex) };
-    Some(mutex.lock().unwrap())
+    Some(EventThreadGuard {
+        _mutex_guard: mutex.lock().unwrap(),
+        wake_fd: et.wake_write,
+    })
 }
 
 fn wake(et: &EventThread) {
@@ -151,33 +168,30 @@ fn event_loop(channel: Channel, running: Arc<AtomicBool>, mutex: Arc<Mutex<()>>,
             }
         }
 
-        // 3. poll() — unlock during wait
-        let timeout_ms = if pollfds.len() > 1 { 500 } else { 100 }; // shorter timeout when no sockets
+        // 3. poll() — no lock held, caller thread can add queries
+        let timeout_ms = 50; // short timeout for responsiveness
         let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms) };
 
         if !running.load(Ordering::Relaxed) { break; }
 
         // 4. Drain wake pipe if signaled
-        if pollfds[0].revents & libc::POLLIN != 0 {
+        if n > 0 && pollfds[0].revents & libc::POLLIN != 0 {
             drain_wake_pipe(wake_read);
         }
 
-        if n <= 0 {
-            // Timeout — still process for expired queries
-            let _guard = mutex.lock().unwrap();
-            unsafe { crate::ffi::ares_process_fd(channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD); }
-            continue;
-        }
-
-        // 5. Under lock: process ready sockets via ares_process_fd
+        // 5. Under lock: process ready sockets + handle timeouts
         let _guard = mutex.lock().unwrap();
-        for pfd in &pollfds[1..] { // skip wake pipe
-            let r = if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 { pfd.fd } else { ARES_SOCKET_BAD };
-            let w = if pfd.revents & libc::POLLOUT != 0 { pfd.fd } else { ARES_SOCKET_BAD };
-            if r != ARES_SOCKET_BAD || w != ARES_SOCKET_BAD {
-                unsafe { crate::ffi::ares_process_fd(channel, r, w); }
+        if n > 0 {
+            for pfd in &pollfds[1..] { // skip wake pipe
+                let r = if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 { pfd.fd } else { ARES_SOCKET_BAD };
+                let w = if pfd.revents & libc::POLLOUT != 0 { pfd.fd } else { ARES_SOCKET_BAD };
+                if r != ARES_SOCKET_BAD || w != ARES_SOCKET_BAD {
+                    unsafe { crate::ffi::ares_process_fd(channel, r, w); }
+                }
             }
         }
+        // Always call with BAD/BAD to handle timeouts and newly queued tasks
+        unsafe { crate::ffi::ares_process_fd(channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD); }
     }
 }
 
