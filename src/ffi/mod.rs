@@ -461,18 +461,23 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let hostname_str = hostname.to_string();
     let resolved_name = if !hostname.contains('.') {
         if let Ok(aliases_path) = std::env::var("HOSTALIASES") {
-            if let Ok(content) = std::fs::read_to_string(&aliases_path) {
-                let mut alias_found = None;
-                for line in content.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 && parts[0].eq_ignore_ascii_case(hostname) {
-                        alias_found = Some(parts[1].to_string());
-                        break;
+            match std::fs::read_to_string(&aliases_path) {
+                Ok(content) => {
+                    let mut alias_found = None;
+                    for line in content.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 && parts[0].eq_ignore_ascii_case(hostname) {
+                            alias_found = Some(parts[1].to_string());
+                            break;
+                        }
                     }
+                    alias_found.unwrap_or_else(|| hostname_str.clone())
                 }
-                alias_found.unwrap_or_else(|| hostname_str.clone())
-            } else {
-                hostname_str.clone()
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    unsafe { callback(arg, ARES_EFILE, 0, std::ptr::null_mut()) };
+                    return;
+                }
+                Err(_) => hostname_str.clone(),
             }
         } else {
             hostname_str.clone()
