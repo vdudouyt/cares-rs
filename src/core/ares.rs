@@ -93,7 +93,7 @@ impl<T> Ares<T> {
         Ares::new(build_sysconfig())
     }
     pub fn hosts(&mut self) -> &Hosts {
-        self.hosts.get_or_insert_with(|| Hosts::from_path("/etc/hosts").unwrap())
+        self.hosts.get_or_insert_with(|| Hosts::from_path("/etc/hosts").unwrap_or_default())
     }
     pub fn services(&mut self) -> &Services {
         self.services.get_or_insert_with(Services::default)
