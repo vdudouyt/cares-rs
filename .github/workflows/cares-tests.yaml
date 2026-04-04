@@ -32,7 +32,7 @@ jobs:
         working-directory: tests/cares-tests
         run: >-
           ./arestest ../../target/release/libcares_rs.so
-          "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*:*LiveSearchANY*"
+          "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*"
       - name: Run fuzz corpus (DNS parsing)
         working-directory: tests/cares-tests
         run: |
