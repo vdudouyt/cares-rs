@@ -974,7 +974,7 @@ INSTANTIATE_TEST_SUITE_P(TransportModesAI, NoRotateMultiMockTestAI,
 			::testing::ValuesIn(ares::test::families_modes), PrintFamilyMode);
 
 // Requires send-failure retry handling (reconnect after asendv returns ECONNREFUSED)
-TEST_P(MockChannelTestAI, DISABLED_TriggerResendThenConnFailSERVFAIL) {
+TEST_P(MockChannelTestAI, TriggerResendThenConnFailSERVFAIL) {
   DNSPacket badrsp4;
   badrsp4.set_response().set_aa().set_rcode(SERVFAIL)
     .add_question(new DNSQuestion("www.google.com", T_A));
@@ -1017,7 +1017,7 @@ TEST_P(MockChannelTestAI, DISABLED_TriggerResendThenConnFailSERVFAIL) {
 }
 
 // Requires send-failure retry handling (reconnect after asendv returns ECONNREFUSED)
-TEST_P(MockUDPChannelTestAI, DISABLED_ConnectionRefusedOnSearchDomainRetry) {
+TEST_P(MockUDPChannelTestAI, ConnectionRefusedOnSearchDomainRetry) {
   DNSPacket badrsp4;
   badrsp4.set_response().set_aa()
     .add_question(new DNSQuestion("www.google.com", T_A))

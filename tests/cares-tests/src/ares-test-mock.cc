@@ -1723,7 +1723,7 @@ INSTANTIATE_TEST_SUITE_P(TransportModes, NoRotateMultiMockTest, ::testing::Value
 INSTANTIATE_TEST_SUITE_P(TransportModes, ServerFailoverOptsMultiMockTest, ::testing::ValuesIn(ares::test::families_modes), PrintFamilyMode);
 
 // Requires send-failure retry handling (reconnect after asendv returns ECONNREFUSED)
-TEST_P(MockChannelTest, DISABLED_TriggerResendThenConnFailSERVFAIL) {
+TEST_P(MockChannelTest, TriggerResendThenConnFailSERVFAIL) {
   DNSPacket badrsp;
   badrsp.set_response().set_aa().set_rcode(SERVFAIL)
     .add_question(new DNSQuestion("www.google.com", T_A));

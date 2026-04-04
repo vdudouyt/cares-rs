@@ -261,14 +261,43 @@ impl<T> Ares<T> {
             match task.sock.send(&task.writebuf) {
                 Ok(_) => { task.status = Status::Reading; WriteResult::Ok }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => WriteResult::TryAgain,
-                Err(_) => { task.status = Status::Completed; WriteResult::Failed }
+                Err(_) => {
+                    // TCP send failed — reconnect and retry once
+                    let bind_addr = self.bind_addr_for_server(server_index);
+                    if let Ok(new_sock) = self.socket_factory.create_tcp(bind_addr) {
+                        let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
+                        let socket_addr = SocketAddr::from((ns_addr.0, tcp_port));
+                        let _ = new_sock.connect(socket_addr);
+                        task.sock = DnsSocket::Tcp(Rc::new(new_sock));
+                        match task.sock.send(&task.writebuf) {
+                            Ok(_) => { task.status = Status::Reading; WriteResult::Ok }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => WriteResult::TryAgain,
+                            Err(_) => { task.status = Status::Completed; WriteResult::Failed }
+                        }
+                    } else {
+                        task.status = Status::Completed; WriteResult::Failed
+                    }
+                }
             }
         } else {
             let socket_addr = SocketAddr::from((ns_addr.0, ns_addr.1.unwrap_or(self.default_udp_port)));
             let _ = task.sock.connect(socket_addr);
             match task.sock.send(&task.writebuf) {
                 Ok(_) => { task.status = Status::Reading; WriteResult::Ok }
-                Err(_) => { task.status = Status::Completed; WriteResult::Failed }
+                Err(_) => {
+                    // UDP send failed — create new socket and retry once
+                    let bind_addr = self.bind_addr_for_server(server_index);
+                    if let Ok(new_sock) = self.socket_factory.create_udp(bind_addr) {
+                        task.sock = DnsSocket::Udp(Rc::new(new_sock));
+                        let _ = task.sock.connect(socket_addr);
+                        match task.sock.send(&task.writebuf) {
+                            Ok(_) => { task.status = Status::Reading; WriteResult::Ok }
+                            Err(_) => { task.status = Status::Completed; WriteResult::Failed }
+                        }
+                    } else {
+                        task.status = Status::Completed; WriteResult::Failed
+                    }
+                }
             }
         }
     }

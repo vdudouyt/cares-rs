@@ -3238,11 +3238,11 @@ unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state_ptr: *mut 
                     }
                 }
                 Err(e) => {
-                    // Server failover: on SERVFAIL/NOTIMP/REFUSED, try next server
+                    // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
                     let nservers = channeldata.server_failures.len();
-                    let max_attempts = nservers * channeldata.ares.config.options.attempts as usize;
+                    let max_attempts = std::cmp::max(nservers, 1) * channeldata.ares.config.options.attempts as usize;
                     if (e == ARES_ESERVFAIL || e == ARES_ENOTIMP || e == ARES_EREFUSED)
-                        && nservers > 1
+                        && nservers >= 1
                     {
                         // Increment failure counter for this server
                         if ffidata.server_index < nservers {
