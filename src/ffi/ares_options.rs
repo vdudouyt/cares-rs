@@ -124,7 +124,7 @@ const ARES_FLAG_EDNS: c_int = 1 << 8;
 #[no_mangle]
 pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
     let ares = Ares::from_sysconfig();
-    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![] };
+    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![], event_thread: std::ptr::null_mut() };
 
     let options = unsafe { & *options };
     if optmask & ARES_OPT_SERVERS != 0 {
@@ -211,6 +211,9 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     channeldata.server_failures = vec![0; channeldata.ares.config.nameservers.len()];
     channeldata.server_last_failure = vec![None; channeldata.ares.config.nameservers.len()];
     let channel = Box::into_raw(Box::new(channeldata));
+    if optmask & ARES_OPT_EVENT_THREAD != 0 {
+        crate::ffi::event_thread::start(channel);
+    }
     unsafe { *out_channel = channel };
     ARES_SUCCESS
 }

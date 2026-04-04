@@ -1,12 +1,13 @@
 mod ares_data;
 mod ares_hostent;
-mod ares_options;
+pub mod ares_options;
 pub mod ares_socket;
 mod cnullterminated;
 mod cstr;
 mod clinkedlist;
 mod dns_record;
 mod error;
+pub mod event_thread;
 mod offset_of;
 
 use std::ffi::{ c_int, c_uint, c_void, c_char };
@@ -74,6 +75,7 @@ pub struct ChannelData {
     server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     server_failover_retry_delay: u64,  // milliseconds
     server_last_failure: Vec<Option<Instant>>, // per-server last failure timestamp
+    event_thread: *mut libc::c_void, // null when no event thread; Box<EventThread> when active
 }
 
 struct HostByNameState {
@@ -297,7 +299,7 @@ impl AddrTTL for ares_addr6ttl {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     let ares = Ares::from_sysconfig();
-    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![] };
+    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![], event_thread: std::ptr::null_mut() };
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -337,6 +339,7 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
         server_failover_retry_chance: src.server_failover_retry_chance,
         server_failover_retry_delay: src.server_failover_retry_delay,
         server_last_failure: vec![None; src.server_last_failure.len()],
+        event_thread: std::ptr::null_mut(), // dup does not inherit event thread
     };
     unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
     ARES_SUCCESS
@@ -346,6 +349,7 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     if channel.is_null() { return; }
+    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     for task in channeldata.ares.tasks.drain(..) {
         if task.status != Status::Completed {
@@ -358,6 +362,8 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     if !channel.is_null() {
+        // Stop event thread before firing destruction callbacks
+        event_thread::stop(channel);
         // Fire callbacks with ARES_EDESTRUCTION for all pending tasks
         let channeldata = unsafe { &mut *channel };
         for task in channeldata.ares.tasks.drain(..) {
@@ -372,6 +378,7 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
+    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { CStr::from_ptr(hostname).to_str().unwrap_or("") };
 
@@ -639,6 +646,7 @@ unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hostent {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     if channel.is_null() { return; }
+    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     if family != libc::AF_INET && family != libc::AF_INET6 {
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
@@ -679,6 +687,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
+    let _et_guard = event_thread::lock_if_active(channel);
     let name_str = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
     if name_str.is_empty() {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
@@ -751,6 +760,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
 #[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
     if channel.is_null() { return; }
+    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     if channeldata.ares.config.nameservers.is_empty() {
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut(), 0) };
@@ -772,6 +782,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     _qid: *mut c_int, // output parameter for query ID, ignored for now
 ) {
     if channel.is_null() { return; }
+    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     if channeldata.ares.config.nameservers.is_empty() {
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
@@ -812,6 +823,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
 ) {
     // Extract the query name and type from the dns record
     if dnsrec.is_null() { return; }
+    let _et_guard = event_thread::lock_if_active(channel);
     let mut name_ptr: *const c_char = std::ptr::null();
     let mut qtype: c_uint = 0;
     let mut qclass: c_uint = 0;
@@ -904,6 +916,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: AresNameinfoCallback, arg: *mut c_void) {
     if channel.is_null() { return; }
+    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
 
     // Extract IP address and port from sockaddr
@@ -2844,6 +2857,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     arg: *mut c_void,
 ) {
     if channel.is_null() { return; }
+    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
 
     let ai_family = if hints.is_null() { libc::AF_UNSPEC } else { unsafe { (*hints).ai_family } };
@@ -3814,6 +3828,7 @@ pub unsafe extern "C" fn ares_mkquery(
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: AresCallback, arg: *mut c_void) {
+    let _et_guard = event_thread::lock_if_active(channel);
     if qbuf.is_null() || qlen < 12 {
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut(), 0) };
         return;
