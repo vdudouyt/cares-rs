@@ -93,6 +93,7 @@ IMPL_SHIM(void, ares_set_server_state_callback, (ares_channel_t *channel, ares_s
 // Utility
 IMPL_SHIM(int, ares_library_initialized, (void), ())
 IMPL_SHIM(size_t, ares_queue_active_queries, (const ares_channel_t *channel), (channel))
+IMPL_SHIM(ares_status_t, ares_queue_wait_empty, (ares_channel_t *channel, int timeout_ms), (channel, timeout_ms))
 IMPL_SHIM(int, ares_expand_name, (const unsigned char *encoded, const unsigned char *abuf, int alen, char **s, long *enclen), (encoded, abuf, alen, s, enclen))
 IMPL_SHIM(int, ares_expand_string, (const unsigned char *encoded, const unsigned char *abuf, int alen, unsigned char **s, long *enclen), (encoded, abuf, alen, s, enclen))
 IMPL_SHIM(int, ares_create_query, (const char *name, int dnsclass, int type, unsigned short id, int rd, unsigned char **buf, int *buflen, int max_udp_size), (name, dnsclass, type, id, rd, buf, buflen, max_udp_size))

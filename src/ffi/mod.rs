@@ -3931,3 +3931,20 @@ pub extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
         .filter(|t| t.status != Status::Completed)
         .count() as c_int
 }
+
+#[no_mangle]
+pub extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_int) -> c_int {
+    if channel.is_null() { return ARES_ENOTIMP; }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
+    loop {
+        let _et_guard = event_thread::lock_if_active(channel);
+        let channeldata = unsafe { &*channel };
+        let active = channeldata.ares.tasks.iter()
+            .filter(|t| t.status != Status::Completed)
+            .count();
+        if active == 0 { return ARES_SUCCESS; }
+        drop(_et_guard);
+        if Instant::now() >= deadline { return ARES_ETIMEOUT; }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
