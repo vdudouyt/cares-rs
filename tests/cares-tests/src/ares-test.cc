@@ -491,17 +491,10 @@ MockChannelOptsTest::MockChannelOptsTest(int count,
   : servers_(BuildServers(count, family, mock_port)),
     server_(*servers_[0].get()), channel_(nullptr) {
   const char *domains[3] = {"first.com", "second.org", "third.gov"};
-  // Use ares_options_ext to hold both base ares_options and server_failover_opts
-  struct ares_options_ext opts_ext;
-  memset(&opts_ext, 0, sizeof(opts_ext));
-  struct ares_options &opts = opts_ext.base;
+  struct ares_options opts;
+  memset(&opts, 0, sizeof(opts));
   if (givenopts) {
     memcpy(&opts, givenopts, sizeof(opts));
-    // If caller provided server failover options (appended after base), copy those too
-    if (optmask & ARES_OPT_SERVER_FAILOVER) {
-      struct ares_options_ext *src_ext = (struct ares_options_ext *)givenopts;
-      opts_ext.server_failover_opts = src_ext->server_failover_opts;
-    }
   }
 
   if (!honor_sysconfig) {

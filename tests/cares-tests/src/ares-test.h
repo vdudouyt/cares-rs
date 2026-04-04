@@ -408,17 +408,17 @@ class ServerFailoverOptsMultiMockTest
 public:
   ServerFailoverOptsMultiMockTest()
     : MockChannelOptsTest(4, GetParam().first, GetParam().second, false,
-                          FillOptions(&opts_ext_),
+                          FillOptions(&opts_),
                           ARES_OPT_SERVER_FAILOVER | ARES_OPT_NOROTATE) {}
   void CheckExample();
-  static struct ares_options* FillOptions(struct ares_options_ext *opts) {
-    memset(opts, 0, sizeof(struct ares_options_ext));
+  static struct ares_options* FillOptions(struct ares_options *opts) {
+    memset(opts, 0, sizeof(struct ares_options));
     opts->server_failover_opts.retry_chance = 1;
     opts->server_failover_opts.retry_delay = SERVER_FAILOVER_RETRY_DELAY;
-    return &opts->base;
+    return opts;
   }
 private:
-  struct ares_options_ext opts_ext_;
+  struct ares_options opts_;
 };
 
 // gMock actions

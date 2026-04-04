@@ -55,9 +55,7 @@ pub struct ares_options {
     pub maxtimeout: c_int,                   // milliseconds
     pub qcache_max_ttl: c_uint,              // seconds; 0 disables cache
     pub evsys: ares_evsys_t,                 // set to ARES_EVSYS_DEFAULT (0)
-    // NOTE: server_failover_opts is NOT part of the system ares_options struct (136 bytes).
-    // Callers pass it via ares_options_ext (appended after the base struct).
-    // Read it via raw pointer arithmetic in ares_init_options when ARES_OPT_SERVER_FAILOVER is set.
+    pub server_failover_opts: ares_server_failover_options,
 }
 
 impl Default for ares_options {
@@ -87,6 +85,7 @@ impl Default for ares_options {
             maxtimeout: 0,
             qcache_max_ttl: 0,
             evsys: 0, // ARES_EVSYS_DEFAULT
+            server_failover_opts: ares_server_failover_options { retry_chance: 0, retry_delay: 0 },
         }
     }
 }
@@ -199,14 +198,8 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         channeldata.udp_max_queries = options.udp_max_queries as u32;
     }
     if optmask & ARES_OPT_SERVER_FAILOVER != 0 {
-        // server_failover_opts is NOT part of the system ares_options (136 bytes).
-        // Callers pass it appended after the base struct (ares_options_ext layout).
-        // Read via raw pointer at offset = sizeof(ares_options) = 136 bytes.
-        let base_ptr = options as *const ares_options as *const u8;
-        let failover_ptr = unsafe { base_ptr.add(std::mem::size_of::<ares_options>()) as *const ares_server_failover_options };
-        let failover_opts = unsafe { *failover_ptr };
-        channeldata.server_failover_retry_chance = failover_opts.retry_chance;
-        channeldata.server_failover_retry_delay = failover_opts.retry_delay as u64;
+        channeldata.server_failover_retry_chance = options.server_failover_opts.retry_chance;
+        channeldata.server_failover_retry_delay = options.server_failover_opts.retry_delay as u64;
     }
     channeldata.server_failures = vec![0; channeldata.ares.config.nameservers.len()];
     channeldata.server_last_failure = vec![None; channeldata.ares.config.nameservers.len()];

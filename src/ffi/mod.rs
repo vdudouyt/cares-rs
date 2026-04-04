@@ -2667,10 +2667,10 @@ pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
-    let (major, minor, patch) = (1, 27, 0);
+    let (major, minor, patch) = (1, 34, 6);
     let v = (major << 16) | (minor << 8) | patch;
     if !version.is_null() { unsafe { *version = v } }
-    cstr!("1.27.0")
+    cstr!("1.34.6")
 }
 
 pub const ARES_GETSOCK_MAXNUM: usize = 16; // per c-ares headers

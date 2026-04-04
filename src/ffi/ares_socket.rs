@@ -1,5 +1,5 @@
 use libc::{close, connect, fcntl, iovec, recvfrom, sockaddr, socket, socklen_t, writev, F_GETFL, F_SETFL, O_NONBLOCK, sockaddr_in, sockaddr_in6, AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM};
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_uint, c_void};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::io;
@@ -14,6 +14,37 @@ pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *con
     if channel.is_null() || funcs.is_null() { return }
     let channeldata = unsafe { &mut *channel };
     channeldata.ares.socket_factory = SocketFactory::new((*funcs).clone(), user_data);
+}
+
+/// Extended socket functions (c-ares 1.34.6 API).
+/// Maps to the basic AresSocketFunctions internally.
+#[repr(C)]
+pub struct AresSocketFunctionsEx {
+    pub version: c_uint,
+    pub flags: c_uint,
+    pub asocket: Option<unsafe extern "C" fn(c_int, c_int, c_int, *mut c_void) -> ares_socket_t>,
+    pub aclose: Option<unsafe extern "C" fn(ares_socket_t, *mut c_void) -> c_int>,
+    pub asetsockopt: Option<unsafe extern "C" fn(ares_socket_t, c_int, *const c_void, socklen_t, *mut c_void) -> c_int>,
+    pub aconnect: Option<unsafe extern "C" fn(ares_socket_t, *const sockaddr, socklen_t, c_uint, *mut c_void) -> c_int>,
+    pub arecvfrom: Option<unsafe extern "C" fn(ares_socket_t, *mut c_void, usize, c_int, *mut sockaddr, *mut socklen_t, *mut c_void) -> ares_ssize_t>,
+    pub asendto: Option<unsafe extern "C" fn(ares_socket_t, *const c_void, usize, c_int, *const sockaddr, socklen_t, *mut c_void) -> ares_ssize_t>,
+    // Additional optional fields omitted — we only use the above
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *const AresSocketFunctionsEx, user_data: *mut c_void) -> c_int {
+    if channel.is_null() || funcs.is_null() { return 0; }
+    let ex = unsafe { &*funcs };
+    let basic = AresSocketFunctions {
+        asocket: ex.asocket,
+        aclose: ex.aclose,
+        aconnect: None, // ex.aconnect has different signature (extra flags param)
+        arecvfrom: ex.arecvfrom,
+        asendv: None, // ex.asendto has different signature
+    };
+    let channeldata = unsafe { &mut *channel };
+    channeldata.ares.socket_factory = SocketFactory::new(basic, user_data);
+    0 // ARES_SUCCESS
 }
 
 #[repr(C)]
