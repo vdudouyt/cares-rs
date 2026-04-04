@@ -2669,12 +2669,18 @@ pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
 
     let mut mask: c_int = 0;
+    let active_tasks: Vec<_> = channeldata.ares.tasks.iter()
+        .filter(|t| t.status != Status::Completed)
+        .collect();
     for i in 0..n {
-        let maybe_task = channeldata.ares.tasks.get(i);
-        std::ptr::write(socks.add(i), maybe_task.map(|x| x.sock.as_raw_fd()).unwrap_or(ARES_SOCKET_BAD));
+        let maybe_task = active_tasks.get(i);
+        unsafe { std::ptr::write(socks.add(i), maybe_task.map(|x| x.sock.as_raw_fd()).unwrap_or(ARES_SOCKET_BAD)) };
 
-        if maybe_task.is_some() {
-            mask |= 1 << i; // No need to wait ARES_GETSOCK_WRITABLE for UDP sockets
+        if let Some(task) = maybe_task {
+            if task.status == Status::Writing {
+                mask |= 1 << (i + 16); // writable
+            }
+            mask |= 1 << i; // readable
         }
     }
 

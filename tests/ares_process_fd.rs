@@ -119,6 +119,40 @@ fn resolves_localhost() {
 }
 
 #[test]
+fn getsock_reports_writable_for_pending_query() {
+    unsafe {
+        let mut channel: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut channel), ARES_SUCCESS);
+
+        // Before any query, no sockets should be active
+        let mut socks = [ARES_SOCKET_BAD; ARES_GETSOCK_MAXNUM];
+        let bitmask = ares_getsock(channel, socks.as_mut_ptr(), ARES_GETSOCK_MAXNUM as c_int);
+        assert_eq!(bitmask, 0, "no sockets before query");
+
+        // Issue a query to an external domain (won't resolve from /etc/hosts)
+        let mut result = CallbackResult { done: false, status: -1 };
+        let name = CString::new("www.example.com.").unwrap();
+        ares_gethostbyname(
+            channel,
+            name.as_ptr(),
+            libc::AF_INET,
+            host_callback,
+            &mut result as *mut _ as *mut c_void,
+        );
+
+        // Now getsock should report a socket with the writable bit set
+        let mut socks = [ARES_SOCKET_BAD; ARES_GETSOCK_MAXNUM];
+        let bitmask = ares_getsock(channel, socks.as_mut_ptr(), ARES_GETSOCK_MAXNUM as c_int);
+        assert_ne!(bitmask, 0, "should have active sockets after query");
+        assert_ne!(socks[0], ARES_SOCKET_BAD, "first socket should be valid");
+        assert!(ares_getsock_writable(bitmask, 0), "pending query socket should be writable");
+
+        ares_cancel(channel);
+        ares_destroy(channel);
+    }
+}
+
+#[test]
 fn null_channel_noop() {
     unsafe {
         // Should not crash with null channel
