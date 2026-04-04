@@ -8,3 +8,12 @@ include_directories(${GTEST_INCLUDE_DIRS})
 
 add_executable(arestest src/main.cc src/loader.cc src/dns-proto.cc src/ares-test.cc src/ares-test-parse-a.cc src/ares-test-parse-aaaa.cc src/ares-test-parse-caa.cc src/ares-test-parse-mx.cc src/ares-test-parse-naptr.cc src/ares-test-parse-ns.cc src/ares-test-parse-ptr.cc src/ares-test-parse-soa-any.cc src/ares-test-parse-soa.cc src/ares-test-parse-srv.cc src/ares-test-parse-txt.cc src/ares-test-parse-uri.cc src/ares-test-live.cc src/ares-test-mock-ai.cc src/ares-test-mock.cc src/ares-test-misc.cc src/ares-test-init.cc src/ares-test-parse.cc)
 target_link_libraries(arestest GTest::GTest GTest::Main GTest::gmock pthread)
+
+# Fuzz corpus test binaries
+add_executable(aresfuzz src/ares-fuzz-main.cc src/ares-test-fuzz.c src/loader.cc)
+target_compile_definitions(aresfuzz PRIVATE USE_LEGACY_FUZZERS)
+target_link_libraries(aresfuzz pthread)
+
+add_executable(aresfuzzname src/ares-fuzz-main.cc src/ares-test-fuzz-name.c src/loader.cc)
+target_compile_definitions(aresfuzzname PRIVATE USE_LEGACY_FUZZERS)
+target_link_libraries(aresfuzzname pthread)

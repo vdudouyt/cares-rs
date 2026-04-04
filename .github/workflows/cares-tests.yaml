@@ -31,3 +31,9 @@ jobs:
       - name: Run integration tests
         working-directory: tests/cares-tests
         run: ./arestest ../../target/release/libcares_rs.so
+      - name: Run fuzz corpus (DNS parsing)
+        working-directory: tests/cares-tests
+        run: ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
+      - name: Run fuzz corpus (server CSV)
+        working-directory: tests/cares-tests
+        run: ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
