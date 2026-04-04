@@ -33,7 +33,13 @@ jobs:
         run: ./arestest ../../target/release/libcares_rs.so
       - name: Run fuzz corpus (DNS parsing)
         working-directory: tests/cares-tests
-        run: ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
+        run: |
+          ls fuzzinput/ | wc -l
+          ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
+          echo "aresfuzz completed successfully"
       - name: Run fuzz corpus (server CSV)
         working-directory: tests/cares-tests
-        run: ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
+        run: |
+          ls fuzznames/ | wc -l
+          ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
+          echo "aresfuzzname completed successfully"
