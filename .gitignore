@@ -1,1 +1,6 @@
 /target
+tests/cares-tests/CMakeCache.txt
+tests/cares-tests/CMakeFiles/
+tests/cares-tests/Makefile
+tests/cares-tests/cmake_install.cmake
+tests/cares-tests/arestest
