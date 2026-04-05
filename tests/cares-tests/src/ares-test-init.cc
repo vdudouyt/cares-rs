@@ -206,6 +206,7 @@ TEST_F(LibraryTest, EnvInitModernOptions) {
   EXPECT_EQ(5000, opts.timeout);
   EXPECT_EQ(4, opts.tries);
 
+  ares_destroy_options(&opts);
   ares_destroy(channel);
 }
 

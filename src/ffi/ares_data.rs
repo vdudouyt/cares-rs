@@ -39,8 +39,10 @@ unsafe fn restore_original_ptr(dataptr: *mut c_void) -> *mut c_void {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
+    if dataptr.is_null() { return; }
     let aresdata = restore_original_ptr(dataptr) as *mut AresData<*mut c_void>;
     match (*aresdata).data_type {
+        // Most types' Drop impls walk the `next` chain recursively.
         AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
         AresDataType::CaaReply => drop(Box::from_raw(aresdata as *mut AresData<AresCaaReply>)),
         AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
@@ -48,8 +50,20 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
         AresDataType::NaptrReply => drop(Box::from_raw(aresdata as *mut AresData<AresNaptrReply>)),
         AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
         AresDataType::SrvReply => drop(Box::from_raw(aresdata as *mut AresData<AresSrvReply>)),
-        AresDataType::UriReply => drop(Box::from_raw(aresdata as *mut AresData<AresUriReply>)),
         AresDataType::AddrPortNode => drop(Box::from_raw(aresdata as *mut AresData<AresAddrPortNode>)),
+        // AresUriReply::Drop doesn't walk next — handle it here.
+        AresDataType::UriReply => {
+            let p = aresdata as *mut AresData<AresUriReply>;
+            let mut next = *(*p).data.next();
+            // Null out next before dropping head to prevent double-free if Drop is ever added
+            *(*p).data.next() = std::ptr::null_mut();
+            drop(Box::from_raw(p));
+            while !next.is_null() {
+                let nn = *(*next).next();
+                drop(Box::from_raw(next));
+                next = nn;
+            }
+        }
     }
 }
 

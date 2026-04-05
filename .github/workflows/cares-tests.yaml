@@ -72,11 +72,11 @@ jobs:
       - name: Run integration tests under Valgrind
         working-directory: tests/cares-tests
         run: >-
-          valgrind --error-exitcode=1
+          valgrind --leak-check=full --error-exitcode=1
           ./arestest ../../target/release/libcares_rs.so
           "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*:*EventThread*:*Live*"
       - name: Run fuzz corpus under Valgrind
         working-directory: tests/cares-tests
         run: |
-          valgrind --error-exitcode=1 ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
-          valgrind --error-exitcode=1 ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
+          valgrind --leak-check=full --error-exitcode=1 ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
+          valgrind --leak-check=full --error-exitcode=1 ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
