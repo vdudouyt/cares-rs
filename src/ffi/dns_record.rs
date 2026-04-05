@@ -190,7 +190,17 @@ enum RRValue {
     Addr(Ipv4Addr),
     Addr6(Ipv6Addr),
     Str(CString),
-    Bin(Vec<u8>),
+    Bin(Vec<u8>), // Always null-terminated: last byte is \0, not counted in logical length
+}
+
+/// Create a null-terminated Bin value. The trailing \0 is part of the Vec
+/// but not part of the logical data length (ares_dns_rr_get_bin reports
+/// len without the null). This ensures C code can safely strlen() the data.
+fn bin_nul(data: &[u8]) -> RRValue {
+    let mut v = Vec::with_capacity(data.len() + 1);
+    v.extend_from_slice(data);
+    v.push(0);
+    RRValue::Bin(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -400,7 +410,7 @@ fn parse_rdata(
                 pos += slen;
             }
             rr.data
-                .insert(ARES_RR_TXT_DATA, RRValue::Bin(txt_data));
+                .insert(ARES_RR_TXT_DATA, bin_nul(&txt_data));
         }
         ARES_REC_TYPE_SOA => {
             let mut pos = rdata_start;
@@ -565,7 +575,7 @@ fn parse_rdata(
                     .insert(ARES_RR_TLSA_SELECTOR, RRValue::U8(rdata[1]));
                 rr.data.insert(ARES_RR_TLSA_MATCH, RRValue::U8(rdata[2]));
                 rr.data
-                    .insert(ARES_RR_TLSA_DATA, RRValue::Bin(rdata[3..].to_vec()));
+                    .insert(ARES_RR_TLSA_DATA, bin_nul(&rdata[3..]));
             }
         }
         ARES_REC_TYPE_SVCB => {
@@ -584,7 +594,7 @@ fn parse_rdata(
                 if consumed < rdata.len() {
                     rr.data.insert(
                         ARES_RR_SVCB_PARAMS,
-                        RRValue::Bin(rdata[consumed..].to_vec()),
+                        bin_nul(&rdata[consumed..]),
                     );
                 }
             }
@@ -605,7 +615,7 @@ fn parse_rdata(
                 if consumed < rdata.len() {
                     rr.data.insert(
                         ARES_RR_HTTPS_PARAMS,
-                        RRValue::Bin(rdata[consumed..].to_vec()),
+                        bin_nul(&rdata[consumed..]),
                     );
                 }
             }
@@ -625,7 +635,7 @@ fn parse_rdata(
                     );
                     let val = &rdata[2 + tag_len..];
                     rr.data
-                        .insert(ARES_RR_CAA_VALUE, RRValue::Bin(val.to_vec()));
+                        .insert(ARES_RR_CAA_VALUE, bin_nul(val));
                 }
             }
         }
@@ -661,7 +671,7 @@ fn parse_rdata(
             // Unknown type: store as RAW_RR
             rr.data.insert(ARES_RR_RAW_RR_TYPE, RRValue::U16(rtype));
             rr.data
-                .insert(ARES_RR_RAW_RR_DATA, RRValue::Bin(rdata.to_vec()));
+                .insert(ARES_RR_RAW_RR_DATA, bin_nul(rdata));
         }
     }
 }
@@ -1339,11 +1349,12 @@ pub unsafe extern "C" fn ares_dns_rr_get_bin(
         return std::ptr::null();
     }
     if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
+        // Bin data is null-terminated; logical length excludes the trailing \0
+        let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
         if !len.is_null() {
-            *len = data.len();
+            *len = logical_len;
         }
         if data.is_empty() {
-            // Return a non-null pointer for empty data
             static EMPTY: u8 = 0;
             &EMPTY as *const u8
         } else {
@@ -1455,11 +1466,11 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
         return ARES_EBADRESP;
     }
     let data = if val.is_null() || len == 0 {
-        Vec::new()
+        &[] as &[u8]
     } else {
-        std::slice::from_raw_parts(val, len).to_vec()
+        std::slice::from_raw_parts(val, len)
     };
-    (*rr).data.insert(key, RRValue::Bin(data));
+    (*rr).data.insert(key, bin_nul(data));
     ARES_SUCCESS
 }
 
@@ -2179,7 +2190,8 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin_cnt(
     if rr.is_null() { return 0; }
     // We store TXT as a single Bin blob; for abin API, treat as 1 entry if non-empty
     if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
-        if data.is_empty() { 0 } else { 1 }
+        let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
+        if logical_len == 0 { 0 } else { 1 }
     } else {
         0
     }
@@ -2195,7 +2207,8 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
     if rr.is_null() || len.is_null() { return std::ptr::null(); }
     if idx != 0 { *len = 0; return std::ptr::null(); }
     if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
-        *len = data.len();
+        let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
+        *len = logical_len;
         if data.is_empty() {
             static EMPTY: u8 = 0;
             &EMPTY as *const u8

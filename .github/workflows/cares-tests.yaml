@@ -45,3 +45,38 @@ jobs:
           ls fuzznames/ | wc -l
           ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
           echo "aresfuzzname completed successfully"
+
+  valgrind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-valgrind-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-valgrind-
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc-ares-dev libgtest-dev libgmock-dev cmake valgrind
+      - name: Build Rust library (debug symbols)
+        run: cargo build --release
+      - name: Build C++ tests
+        working-directory: tests/cares-tests
+        run: cmake -DCMAKE_BUILD_TYPE=Debug . && make
+      - name: Run integration tests under Valgrind
+        working-directory: tests/cares-tests
+        run: >-
+          valgrind --error-exitcode=1
+          ./arestest ../../target/release/libcares_rs.so
+          "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*:*EventThread*:*Live*"
+      - name: Run fuzz corpus under Valgrind
+        working-directory: tests/cares-tests
+        run: |
+          valgrind --error-exitcode=1 ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
+          valgrind --error-exitcode=1 ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
