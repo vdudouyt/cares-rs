@@ -60,8 +60,8 @@ struct EventThread {
     thread: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
     mutex: Arc<RecursiveMutex>,
-    wake_write: i32, // write end of self-pipe
-    wake_read: i32,  // read end of self-pipe (owned by thread)
+    wake_write: i32,
+    wake_read: i32,
 }
 
 /// Start the event thread for a channel. Called from ares_init_options.
@@ -89,11 +89,10 @@ pub(crate) fn start(channel: Channel) {
 
     let running_clone = running.clone();
     let mutex_clone = mutex.clone();
-    let channel_ptr = channel as usize; // Send as usize, reconstruct in thread
+    let channel_ptr = channel as usize;
 
     let thread = thread::spawn(move || {
-        event_loop(channel_ptr as Channel, running_clone, mutex_clone, wake_read);
-        // Close read end when thread exits
+        event_loop(channel_ptr as Channel, &running_clone, &mutex_clone, wake_read);
         unsafe { libc::close(wake_read); }
     });
 
@@ -113,20 +112,25 @@ pub(crate) fn stop(channel: Channel) {
     let channeldata = unsafe { &mut *channel };
     if channeldata.event_thread.is_null() { return; }
 
-    let et = unsafe { Box::from_raw(channeldata.event_thread as *mut EventThread) };
+    let mut et = unsafe { Box::from_raw(channeldata.event_thread as *mut EventThread) };
     channeldata.event_thread = std::ptr::null_mut();
 
-    // Signal thread to stop
-    et.running.store(false, Ordering::Relaxed);
+    // Signal thread to stop and wake it
+    et.running.store(false, Ordering::Release);
     wake(&et);
 
-    // Join thread
-    if let Some(handle) = et.thread {
+    // Join thread — must complete before dropping Arc clones
+    let thread = std::mem::take(&mut et.thread);
+    if let Some(handle) = thread {
         let _ = handle.join();
     }
 
-    // Close write end of pipe
-    unsafe { libc::close(et.wake_write); }
+    // Close write end of pipe (read end closed by thread on exit)
+    let wake_write = et.wake_write;
+    unsafe { libc::close(wake_write); }
+
+    // Drop everything — thread has exited, Arc refcounts will reach 0
+    drop(et);
 }
 
 /// Wake the event thread (called after adding queries).
@@ -160,10 +164,6 @@ pub(crate) fn lock_if_active(channel: Channel) -> Option<EventThreadGuard> {
     let channeldata = unsafe { &*channel };
     if channeldata.event_thread.is_null() { return None; }
     let et = unsafe { &*(channeldata.event_thread as *const EventThread) };
-    // Safety: EventThread lives as long as the channel, and we hold a reference
-    // to it through the channel pointer. We transmute the lifetime to 'static
-    // because the guard needs a static reference but EventThread outlives
-    // any single API call.
     let mutex: &'static RecursiveMutex = unsafe { std::mem::transmute(&*et.mutex) };
     Some(EventThreadGuard {
         _mutex_guard: mutex.lock(),
@@ -184,7 +184,7 @@ fn drain_wake_pipe(wake_read: i32) {
     }
 }
 
-fn event_loop(channel: Channel, running: Arc<AtomicBool>, mutex: Arc<RecursiveMutex>, wake_read: i32) {
+fn event_loop(channel: Channel, running: &AtomicBool, mutex: &RecursiveMutex, wake_read: i32) {
     let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(17); // 16 socks + wake pipe
 
     while running.load(Ordering::Relaxed) {
