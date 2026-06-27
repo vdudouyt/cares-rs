@@ -24,7 +24,10 @@ Tests are organized by file:
 - **EDNS / DNS cookies / DNS 0x20** — not implemented in cares-rs
 - **Alloc-failure injection** — not applicable to Rust
 - **Container/namespace** — tests access channel struct internals incompatible with our opaque Rust struct
-- **Event thread** — requires ares_evsys event thread infrastructure
+- **Event thread** — the built-in event thread (`ARES_OPT_EVENT_THREAD`) is not
+  supported; `ares_init_options` returns `ARES_ENOTIMP` and `ares_threadsafety()`
+  returns 0, matching c-ares on a non-threaded build. Drive the channel via the
+  manual reactor API (`ares_fds`/`ares_process`/`ares_process_fd`/`ares_timeout`) instead.
 - **Internal API** — tests c-ares private functions not exposed via FFI
 
 ## Fuzz corpus tests (aresfuzz, aresfuzzname)

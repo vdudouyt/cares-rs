@@ -11,7 +11,6 @@ pub type ares_ssize_t = isize;
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
-    let _et_guard = crate::ffi::event_thread::lock_if_active(channel);
     if channel.is_null() || funcs.is_null() { return }
     let channeldata = unsafe { &mut *channel };
     channeldata.ares.socket_factory = SocketFactory::new((*funcs).clone(), user_data);
@@ -34,7 +33,6 @@ pub struct AresSocketFunctionsEx {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *const AresSocketFunctionsEx, user_data: *mut c_void) -> c_int {
-    let _et_guard = crate::ffi::event_thread::lock_if_active(channel);
     if channel.is_null() || funcs.is_null() { return 0; }
     let ex = unsafe { &*funcs };
     let basic = AresSocketFunctions {

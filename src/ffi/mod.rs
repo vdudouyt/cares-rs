@@ -7,7 +7,6 @@ mod cstr;
 mod clinkedlist;
 mod dns_record;
 mod error;
-pub mod event_thread;
 mod offset_of;
 
 use std::ffi::{ c_int, c_uint, c_void, c_char };
@@ -48,6 +47,13 @@ pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
 pub extern "C" fn ares_library_cleanup() {
 }
 
+/// We do not provide the built-in event thread, so the library is not
+/// thread-safe. Report ARES_FALSE (0), matching c-ares on non-threaded builds.
+#[no_mangle]
+pub extern "C" fn ares_threadsafety() -> i32 {
+    0
+}
+
 pub type Channel = *mut ChannelData;
 
 pub struct ChannelData {
@@ -75,7 +81,6 @@ pub struct ChannelData {
     server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     server_failover_retry_delay: u64,  // milliseconds
     server_last_failure: Vec<Option<Instant>>, // per-server last failure timestamp
-    event_thread: *mut libc::c_void, // null when no event thread; Box<EventThread> when active
 }
 
 struct HostByNameState {
@@ -299,7 +304,7 @@ impl AddrTTL for ares_addr6ttl {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     let ares = Ares::from_sysconfig();
-    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![], event_thread: std::ptr::null_mut() };
+    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![] };
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -309,7 +314,6 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int {
     if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
-    let _et_guard = event_thread::lock_if_active(source);
     let src = unsafe { &*source };
     let mut ares = Ares::new(src.ares.config.clone());
     ares.socket_factory = src.ares.socket_factory.clone();
@@ -340,7 +344,6 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
         server_failover_retry_chance: src.server_failover_retry_chance,
         server_failover_retry_delay: src.server_failover_retry_delay,
         server_last_failure: vec![None; src.server_last_failure.len()],
-        event_thread: std::ptr::null_mut(), // dup does not inherit event thread
     };
     unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
     ARES_SUCCESS
@@ -350,7 +353,6 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     if channel.is_null() { return; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     for task in channeldata.ares.tasks.drain(..) {
         if task.status != Status::Completed {
@@ -367,8 +369,6 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     if !channel.is_null() {
-        // Stop event thread before firing destruction callbacks
-        event_thread::stop(channel);
         // Fire callbacks with ARES_EDESTRUCTION for all pending tasks
         let channeldata = unsafe { &mut *channel };
         for task in channeldata.ares.tasks.drain(..) {
@@ -383,7 +383,6 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { CStr::from_ptr(hostname).to_str().unwrap_or("") };
 
@@ -589,7 +588,6 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
-    let _et_guard = event_thread::lock_if_active(channel);
     if channel.is_null() { return ARES_ENOTFOUND; }
     let channeldata = unsafe { &mut *channel };
     let name_str = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
@@ -652,7 +650,6 @@ unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hostent {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
     if channel.is_null() { return; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     if family != libc::AF_INET && family != libc::AF_INET6 {
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
@@ -693,7 +690,6 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
-    let _et_guard = event_thread::lock_if_active(channel);
     let name_str = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
     if name_str.is_empty() {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
@@ -766,7 +762,6 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
 #[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
     if channel.is_null() { return; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     if channeldata.ares.config.nameservers.is_empty() {
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut(), 0) };
@@ -788,7 +783,6 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     _qid: *mut c_int, // output parameter for query ID, ignored for now
 ) {
     if channel.is_null() { return; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     if channeldata.ares.config.nameservers.is_empty() {
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
@@ -829,7 +823,6 @@ pub unsafe extern "C" fn ares_search_dnsrec(
 ) {
     // Extract the query name and type from the dns record
     if dnsrec.is_null() { return; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let mut name_ptr: *const c_char = std::ptr::null();
     let mut qtype: c_uint = 0;
     let mut qclass: c_uint = 0;
@@ -922,7 +915,6 @@ pub unsafe extern "C" fn ares_search_dnsrec(
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: AresNameinfoCallback, arg: *mut c_void) {
     if channel.is_null() { return; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
 
     // Extract IP address and port from sockaddr
@@ -1573,7 +1565,6 @@ pub const ARES_NI_LOOKUPSERVICE: c_int = 1 << 9;
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
-    let _et_guard = event_thread::lock_if_active(channel);
     if channel.is_null() { return 0; }
     let channeldata = unsafe { &mut *channel };
     unsafe { libc::FD_ZERO(write_fds) };
@@ -1595,7 +1586,6 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     if channeldata.ares.tasks.is_empty() {
         if maxtv.is_null() { return std::ptr::null_mut(); }
@@ -2534,7 +2524,6 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) -> c_int {
     if channel.is_null() { return ARES_ENODATA; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     channeldata.ares.config.nameservers.clear();
     channeldata.ares.config.tcp_ports.clear();
@@ -2564,7 +2553,6 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut AresAddrPortNode) -> c_int {
     if channel.is_null() { return ARES_ENODATA; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     channeldata.ares.config.nameservers.clear();
     channeldata.ares.config.tcp_ports.clear();
@@ -2608,7 +2596,6 @@ fn ipv4_to_in_addr(ip: IpAddr) -> Option<AresAddrUnion> {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut AresAddrPortNode) -> c_int {
     if channel.is_null() { return ARES_ENODATA; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     let mut data: Vec<AresAddrPortNode> = vec![];
     for srv in &channeldata.ares.config.nameservers {
@@ -2643,7 +2630,6 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
     if channel.is_null() { return ARES_ENODATA; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     // NULL or empty string clears servers
     if servers.is_null() {
@@ -2742,7 +2728,6 @@ pub extern "C" fn ares_set_local_dev(_channel: Channel, _local_dev_name: *const 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: Option<AresSockCreateCallback>, arg: *mut c_void) {
-    let _et_guard = crate::ffi::event_thread::lock_if_active(channel);
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     channeldata.sock_create_callback = callback;
@@ -2877,7 +2862,6 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     arg: *mut c_void,
 ) {
     if channel.is_null() { return; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
 
     let ai_family = if hints.is_null() { libc::AF_UNSPEC } else { unsafe { (*hints).ai_family } };
@@ -3573,7 +3557,6 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
     if channel.is_null() || out.is_null() {
         return ARES_ENODATA;
     }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     let mut head: *mut ares_addr_node = std::ptr::null_mut();
     let mut tail: *mut ares_addr_node = std::ptr::null_mut();
@@ -3609,7 +3592,6 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
     if channel.is_null() { return std::ptr::null_mut(); }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &*channel };
     let default_port = channeldata.ares.default_udp_port;
     let csv: String = channeldata.ares.config.nameservers.iter()
@@ -3850,7 +3832,6 @@ pub unsafe extern "C" fn ares_mkquery(
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: AresCallback, arg: *mut c_void) {
-    let _et_guard = event_thread::lock_if_active(channel);
     if qbuf.is_null() || qlen < 12 {
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut(), 0) };
         return;
@@ -3884,7 +3865,6 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_char) -> c_int {
     if channel.is_null() { return ARES_ENODATA; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     if sortstr.is_null() {
         channeldata.sortlist.clear();
@@ -3906,7 +3886,6 @@ pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_c
 #[no_mangle]
 pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
     if channel.is_null() { return ARES_ENODATA; }
-    let _et_guard = event_thread::lock_if_active(channel);
     // Re-read sysconfig but preserve explicitly configured servers
     // For now, this is a no-op to avoid overwriting mock/test nameservers
     ARES_SUCCESS
@@ -3915,7 +3894,6 @@ pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, callback: Option<AresSockConfigureCallback>, arg: *mut c_void) {
-    let _et_guard = crate::ffi::event_thread::lock_if_active(channel);
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     channeldata.sock_config_callback = callback;
@@ -3943,7 +3921,6 @@ unsafe fn invoke_server_state_callback(channeldata: &ChannelData, server_index: 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callback: Option<AresServerStateCallback>, arg: *mut c_void) {
-    let _et_guard = crate::ffi::event_thread::lock_if_active(channel);
     let channeldata = unsafe { &mut *channel };
     channeldata.server_state_callback = callback;
     channeldata.server_state_callback_arg = arg;
@@ -3952,7 +3929,6 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 #[no_mangle]
 pub extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
     if channel.is_null() { return 0; }
-    let _et_guard = event_thread::lock_if_active(channel);
     let channeldata = unsafe { &*channel };
     channeldata.ares.tasks.iter()
         .filter(|t| t.status != Status::Completed)
@@ -3960,18 +3936,8 @@ pub extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_int) -> c_int {
-    if channel.is_null() { return ARES_ENOTIMP; }
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
-    loop {
-        let _et_guard = event_thread::lock_if_active(channel);
-        let channeldata = unsafe { &*channel };
-        let active = channeldata.ares.tasks.iter()
-            .filter(|t| t.status != Status::Completed)
-            .count();
-        if active == 0 { return ARES_SUCCESS; }
-        drop(_et_guard);
-        if Instant::now() >= deadline { return ARES_ETIMEOUT; }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+pub extern "C" fn ares_queue_wait_empty(_channel: Channel, _timeout_ms: c_int) -> c_int {
+    // Only meaningful with the built-in event thread, which we no longer
+    // provide. Match upstream c-ares on a non-threaded build (!ares_threadsafety()).
+    ARES_ENOTIMP
 }

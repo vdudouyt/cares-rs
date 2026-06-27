@@ -74,7 +74,7 @@ jobs:
         run: >-
           valgrind --leak-check=full --error-exitcode=1
           ./arestest ../../target/release/libcares_rs.so
-          "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*:*EventThread*:*Live*"
+          "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*:*Live*"
       - name: Run fuzz corpus under Valgrind
         working-directory: tests/cares-tests
         run: |
