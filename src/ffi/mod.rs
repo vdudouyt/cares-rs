@@ -1162,7 +1162,9 @@ impl<'a> ParsedResponse<'a> {
     }
 
     pub fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, c_int> {
-        let mut name = CString::new(self.query.name.join(".")).unwrap();
+        // The echoed question name comes from the (untrusted) response and may
+        // contain an embedded NUL byte; fail gracefully instead of panicking.
+        let mut name = CString::new(self.query.name.join(".")).map_err(|_| ARES_EBADRESP)?;
         let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
         let mut success = 0;
         let mut aliases: Vec<CString> = vec![];
@@ -1237,7 +1239,10 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
     let answers = parsed_rrs.items;
     let parsed_count = parsed_rrs.success;
     let answers: Vec<_> = answers.into_iter().flatten().collect();
-    let aresreplies: Vec<_> = answers.into_iter().map(|x| x.into_ares_data(buf)).collect();
+    let Some(aresreplies) = answers.into_iter().map(|x| x.into_ares_data(buf)).collect::<Option<Vec<_>>>() else {
+        unsafe { *out = std::ptr::null_mut() };
+        return ARES_EBADRESP;
+    };
 
     let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
         unsafe { *out = std::ptr::null_mut() };
@@ -1255,7 +1260,7 @@ where T1: RRParser<'a> + IntoAresData<T2>, T2: DataType
 {
     let res = ParsedResponse::from_buf(buf)?;
     let parsed_rrs = res.process_answers::<T1>(buf, expected_record_type)?;
-    Ok(parsed_rrs.items.into_iter().map(|x| x.into_ares_data(buf)).collect())
+    parsed_rrs.items.into_iter().map(|x| x.into_ares_data(buf)).collect::<Option<Vec<_>>>().ok_or(ARES_EBADRESP)
 }
 
 unsafe fn parse_to_singleptr<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
@@ -1292,7 +1297,7 @@ macro_rules! impl_from_parsed_buf {
                 let res = ParsedResponse::from_buf(buf)?;
                 let parsed_rrs = res.process_answers::<$t1>(buf, expected_record_type)?;
                 let success = parsed_rrs.success;
-                let aresreplies: Vec<_> = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(buf)).collect();
+                let aresreplies = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(buf)).collect::<Option<Vec<_>>>().ok_or(ARES_EBADRESP)?;
                 Ok((aresreplies, success))
             }
         }
@@ -3641,7 +3646,11 @@ pub unsafe extern "C" fn ares_expand_string(
     let mut output = Vec::with_capacity(str_len + 1);
     output.extend_from_slice(str_data);
     output.push(0); // null terminate
-    let cstr = CString::from_vec_with_nul(output).unwrap();
+    // The string body comes from the (untrusted) buffer and may contain an
+    // embedded NUL; reject it instead of panicking across the FFI boundary.
+    let Ok(cstr) = CString::from_vec_with_nul(output) else {
+        return ARES_EBADSTR;
+    };
     unsafe {
         *s = cstr.into_raw() as *mut u8;
         *enclen = (str_len + 1) as libc::c_long; // length byte + string bytes
