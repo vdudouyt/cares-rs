@@ -1166,7 +1166,12 @@ impl<'a> ParsedResponse<'a> {
         if answer_count == 0 {
             return Err(ARES_ENODATA);
         }
-        let mut answers = Vec::with_capacity(answer_count);
+        // Grow on demand rather than pre-allocating `answer_count` (ancount is
+        // attacker-controlled, up to 65535, and DnsAnswer is large, so a tiny
+        // response could otherwise reserve tens of MB). The loop is self-bounding:
+        // each DnsAnswer::parse consumes >= 11 bytes, so it stops when the buffer
+        // is exhausted regardless of the claimed ancount.
+        let mut answers = Vec::new();
         // Only parse answer section (ancount); authority and additional sections are skipped
         for _ in 0..answer_count {
             let Some(answer) = DnsAnswer::parse(&mut sbuf) else {

@@ -227,3 +227,30 @@ fn null_callback_is_noop_not_ub() {
         ares_destroy(ch);
     }
 }
+
+/// A tiny response claiming ancount=0xFFFF must not pre-allocate based on that
+/// count. Answers grow on demand, so the first (missing) answer parse fails
+/// cleanly with ARES_EBADRESP and no oversized reservation happens.
+#[test]
+fn parse_reply_inflated_ancount_no_huge_alloc() {
+    #[rustfmt::skip]
+    let resp: [u8; 17] = [
+        0x12, 0x34,             // id
+        0x81, 0x80,             // flags: QR=1, rcode=0
+        0x00, 0x01,             // qdcount = 1
+        0xFF, 0xFF,             // ancount = 65535 (attacker-inflated)
+        0x00, 0x00,             // nscount = 0
+        0x00, 0x00,             // arcount = 0
+        0x00,                   // question name = root
+        0x00, 0x01,             // qtype = A
+        0x00, 0x01,             // qclass = IN
+        // no answer records follow
+    ];
+    let mut host: *mut libc::hostent = ptr::null_mut();
+    let mut naddrttls: c_int = 0;
+    let rc = unsafe {
+        ares_parse_a_reply(resp.as_ptr(), resp.len() as c_int, &mut host, ptr::null_mut(), &mut naddrttls)
+    };
+    assert_eq!(rc, ARES_EBADRESP);
+    assert!(host.is_null());
+}
