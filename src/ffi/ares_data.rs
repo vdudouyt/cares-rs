@@ -13,8 +13,9 @@ pub trait IntoAresData<T> {
 
 impl IntoAresData<AresTxtReply> for TxtReply<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresTxtReply> {
-        let bytes = self.txt.into_owned().into_bytes();
+        let mut bytes = self.txt.into_owned().into_bytes();
         let length = bytes.len();
+        bytes.push(0); // NUL terminator (not counted in `length`), matching upstream
         let txt = Box::into_raw(bytes.into_boxed_slice());
         Some(AresTxtReply { next: std::ptr::null_mut(), txt: txt as *const i8, length })
     }
@@ -22,8 +23,9 @@ impl IntoAresData<AresTxtReply> for TxtReply<'_> {
 
 impl IntoAresData<AresTxtReplyExt> for TxtReplyExt<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresTxtReplyExt> {
-        let bytes = self.txt.as_bytes().to_vec();
+        let mut bytes = self.txt.as_bytes().to_vec();
         let length = bytes.len();
+        bytes.push(0); // NUL terminator (not counted in `length`), matching upstream
         let txt = Box::into_raw(bytes.into_boxed_slice());
         Some(AresTxtReplyExt { next: std::ptr::null_mut(), txt: txt as *const i8, length, record_start: self.record_start as c_char })
     }
@@ -214,7 +216,8 @@ impl Drop for AresMxReply {
 
 impl Drop for AresTxtReply {
     fn drop(&mut self) {
-        drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length, self.length) });
+        // txt was allocated with length+1 bytes (data + NUL terminator).
+        drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length + 1, self.length + 1) });
         if !self.next.is_null() {
             drop(unsafe { Box::from_raw(self.next) })
         }
@@ -223,7 +226,8 @@ impl Drop for AresTxtReply {
 
 impl Drop for AresTxtReplyExt {
     fn drop(&mut self) {
-        drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length, self.length) });
+        // txt was allocated with length+1 bytes (data + NUL terminator).
+        drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length + 1, self.length + 1) });
         if !self.next.is_null() {
             drop(unsafe { Box::from_raw(self.next) })
         }
@@ -425,7 +429,11 @@ mod tests {
 
     impl Default for AresTxtReply {
         fn default() -> Self {
-            AresTxtReply { next: std::ptr::null_mut(), txt: CString::new("default").unwrap().into_raw(), length: 0}
+            // Build through the production path so txt is length+1 bytes (data +
+            // NUL terminator) and the Drop impl frees the matching size.
+            TxtReply { txt: std::borrow::Cow::Borrowed("default"), length: 7 }
+                .into_ares_data(&[])
+                .unwrap()
         }
     }
 
@@ -464,5 +472,42 @@ mod tests {
         let dataptr = std::ptr::addr_of!(base.data) as *mut c_void;
         let restoredptr = unsafe { restore_original_ptr(dataptr) };
         assert_eq!(std::ptr::addr_of!(base) as *mut c_void, restoredptr);
+    }
+
+    // The `txt` buffer must be NUL-terminated (data + a trailing 0) like upstream
+    // c-ares, with `length` excluding the terminator, so a C consumer's
+    // strlen/printf does not read past the allocation.
+    #[test]
+    fn txt_reply_is_nul_terminated() {
+        let data = TxtReply { txt: std::borrow::Cow::Borrowed("abc"), length: 3 }
+            .into_ares_data(&[]).unwrap();
+        assert_eq!(data.length, 3, "length excludes the NUL terminator");
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(data.txt as *const u8, data.length), b"abc");
+            assert_eq!(*data.txt.add(data.length), 0, "txt[length] must be the NUL terminator");
+        }
+        drop(data); // frees length+1 bytes; must be sound
+    }
+
+    #[test]
+    fn txt_reply_ext_is_nul_terminated() {
+        let data = TxtReplyExt { txt: "hi", length: 2, record_start: true }
+            .into_ares_data(&[]).unwrap();
+        assert_eq!(data.length, 2);
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(data.txt as *const u8, data.length), b"hi");
+            assert_eq!(*data.txt.add(data.length), 0);
+        }
+        drop(data);
+    }
+
+    #[test]
+    fn empty_txt_is_nul_terminated() {
+        // length 0 -> a 1-byte allocation holding just the terminator.
+        let data = TxtReply { txt: std::borrow::Cow::Borrowed(""), length: 0 }
+            .into_ares_data(&[]).unwrap();
+        assert_eq!(data.length, 0);
+        unsafe { assert_eq!(*data.txt.add(0), 0); }
+        drop(data);
     }
 }
