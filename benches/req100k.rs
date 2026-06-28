@@ -16,7 +16,7 @@ struct CAresVariant {
     ares_library_init: extern "C" fn(_flags: c_int) -> c_int,
     ares_init: unsafe extern "C" fn(out_channel: *mut Channel) -> c_int,
     ares_destroy: unsafe extern "C" fn(channel: Channel),
-    ares_gethostbyname: unsafe extern "C" fn(channel: Channel, hostname: *const c_char, _family: c_int, callback: AresHostCallback, arg: *mut c_void),
+    ares_gethostbyname: unsafe extern "C" fn(channel: Channel, hostname: *const c_char, _family: c_int, callback: Option<AresHostCallback>, arg: *mut c_void),
     ares_timeout: unsafe extern "C" fn(_channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval,
     ares_fds: unsafe extern "C" fn(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int,
     ares_process: unsafe extern "C" fn(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set),
@@ -87,7 +87,7 @@ impl BenchRunner {
         
         let domain_name = CString::new("mydomain.local").unwrap();
         for _ in 1..=10 {
-            unsafe { (self.cares.ares_gethostbyname)(channel, domain_name.as_ptr(), AF_INET, cares_callback, std::ptr::null_mut()) };
+            unsafe { (self.cares.ares_gethostbyname)(channel, domain_name.as_ptr(), AF_INET, Some(cares_callback), std::ptr::null_mut()) };
         }
         
         loop {
