@@ -655,6 +655,10 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
         return;
     }
+    if addr.is_null() || addrlen < 0 {
+        unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
+        return;
+    }
     let addrbuf = unsafe { std::slice::from_raw_parts(addr as *mut u8, addrlen as usize) };
     let addr = match buf_to_ip(addrbuf) {
         Ok(ip) => ip,
@@ -1225,6 +1229,9 @@ pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out:
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReplyExt) -> c_int {
+    if abuf.is_null() || alen < 0 {
+        return ARES_EBADRESP;
+    }
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let res = match ParsedResponse::from_buf(buf) {
         Ok(res) => res,
@@ -1267,6 +1274,9 @@ unsafe fn parse_to_singleptr<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2
 where T2: DataType, for<'a> T2: FromParsedBuf<'a, T2>
 {
     ares_fn_wrapper(out, || {
+        if abuf.is_null() || alen < 0 {
+            return Err(ARES_EBADRESP);
+        }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let aresreplies = T2::parse_buf_to_vec(buf, expected_record_type)?;
         if aresreplies.len() > 1 {
@@ -1427,6 +1437,9 @@ unsafe fn fill_addrttls<T: AddrTTL>(input: &Vec<AddrRecord>, addrttls: *mut T, n
 
 unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, out_addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
     let try_parse = || -> Result<ParsedRRs<AddrRecord>, c_int> {
+        if abuf.is_null() || alen < 0 {
+            return Err(ARES_EBADRESP);
+        }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let res = ParsedResponse::from_buf(buf)?;
         let addr_records = res.process_answers::<AddrRecord>(buf, expected_record_type)?;
@@ -1476,11 +1489,17 @@ impl RRParser<'_> for CString {
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
     ares_fn_wrapper(out, || {
+        if abuf.is_null() || alen < 0 {
+            return Err(ARES_EBADRESP);
+        }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let res = ParsedResponse::from_buf(buf)?;
         let mut addr_records = res.process_answers::<AddrRecord>(buf, RECORD_TYPE_PTR)?;
         if addr_records.aliases.is_empty() {
             return Err(ARES_ENODATA);
+        }
+        if addr.is_null() || addrlen < 0 {
+            return Err(ARES_EBADRESP);
         }
         let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
         let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
@@ -2785,7 +2804,7 @@ pub unsafe extern "C" fn ares_expand_name(
     s: *mut *mut c_char,
     enclen: *mut libc::c_long,
 ) -> c_int {
-    if encoded.is_null() || abuf.is_null() || s.is_null() || enclen.is_null() {
+    if encoded.is_null() || abuf.is_null() || s.is_null() || enclen.is_null() || alen < 0 {
         return ARES_EBADNAME;
     }
     let full_buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
@@ -3639,7 +3658,7 @@ pub unsafe extern "C" fn ares_expand_string(
     s: *mut *mut u8,
     enclen: *mut libc::c_long,
 ) -> c_int {
-    if encoded.is_null() || abuf.is_null() || s.is_null() || enclen.is_null() {
+    if encoded.is_null() || abuf.is_null() || s.is_null() || enclen.is_null() || alen < 0 {
         return ARES_EBADSTR;
     }
     let full_buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
