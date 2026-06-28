@@ -1,11 +1,12 @@
 //! Regression tests for H2: an embedded NUL byte in attacker-controlled DNS
 //! data must yield a clean error, not a panic/abort across the FFI boundary.
 
-use std::ffi::{c_int, c_long, c_void};
+use std::ffi::{c_int, c_long, c_void, CString};
 use std::ptr;
 
 use cares_rs::*;
 
+const ARES_SUCCESS: c_int = 0;
 const ARES_EBADRESP: c_int = 10;
 const ARES_EBADSTR: c_int = 17;
 
@@ -62,4 +63,29 @@ fn parse_reply_with_nul_in_question_name_returns_ebadresp() {
     };
     assert_eq!(rc, ARES_EBADRESP, "NUL in question name must be rejected, not panic");
     assert!(out.is_null(), "no data should be allocated on error");
+}
+
+/// H3: `ares_create_query` returns a libc::malloc'd binary DNS packet freed via
+/// `ares_free_string`. With id=0 the packet starts with a 0x00 transaction-id
+/// byte, which the old strlen-based `CString::from_raw` free mishandled. The
+/// allocate/free round-trip must be clean (verified under Valgrind in CI).
+#[test]
+fn create_query_buffer_freed_cleanly_with_zero_id() {
+    let name = CString::new("example.com").unwrap();
+    let mut buf: *mut u8 = ptr::null_mut();
+    let mut buflen: c_int = 0;
+    let rc = unsafe {
+        // dnsclass=IN(1), qtype=A(1), id=0 -> transaction id 0x0000, rd=1, no EDNS.
+        ares_create_query(name.as_ptr(), 1, 1, 0, 1, &mut buf, &mut buflen, 0)
+    };
+    assert_eq!(rc, ARES_SUCCESS, "create_query should succeed");
+    assert!(!buf.is_null());
+    assert!(buflen > 12, "a DNS query has at least a 12-byte header");
+    unsafe {
+        // First two bytes are the transaction id = 0x0000 (the strlen-mishandled case).
+        assert_eq!(*buf, 0);
+        assert_eq!(*buf.add(1), 0);
+        // Must free without abort/corruption (now libc::free of a libc::malloc buffer).
+        ares_free_string(buf as *mut c_void);
+    }
 }

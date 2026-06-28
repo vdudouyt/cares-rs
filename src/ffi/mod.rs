@@ -2710,9 +2710,24 @@ pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_
     mask
 }
 
+/// Copy `bytes` into a libc::malloc'd buffer with a trailing NUL, so the caller
+/// frees it with ares_free_string (libc::free). Returns null on allocation failure.
+unsafe fn malloc_cstr(bytes: &[u8]) -> *mut c_char {
+    let len = bytes.len();
+    let p = libc::malloc(len + 1) as *mut u8;
+    if p.is_null() { return std::ptr::null_mut(); }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len);
+    *p.add(len) = 0; // NUL terminator
+    p as *mut c_char
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
-    drop(CString::from_raw(s as *mut c_char));
+    // All buffers handed to the caller (ares_create_query/mkquery/expand_name/
+    // expand_string/get_servers_csv) are libc::malloc'd, so free with libc::free.
+    if !s.is_null() {
+        libc::free(s);
+    }
 }
 
 #[no_mangle]
@@ -2792,8 +2807,10 @@ pub unsafe extern "C" fn ares_expand_name(
         Ok(c) => c,
         Err(_) => return ARES_EBADNAME,
     };
+    let out = unsafe { malloc_cstr(cname.as_bytes()) };
+    if out.is_null() { return ARES_ENOMEM; }
     unsafe {
-        *s = cname.into_raw();
+        *s = out;
         *enclen = consumed as libc::c_long;
     }
     ARES_SUCCESS
@@ -3609,10 +3626,8 @@ pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
         })
         .collect::<Vec<_>>()
         .join(",");
-    match CString::new(csv) {
-        Ok(cs) => cs.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
+    unsafe { malloc_cstr(csv.as_bytes()) }
 }
 
 #[no_mangle]
@@ -3642,17 +3657,16 @@ pub unsafe extern "C" fn ares_expand_string(
         return ARES_EBADSTR;
     }
     let str_data = &remaining[1..1 + str_len];
-    // Allocate with malloc-like allocation (CString)
-    let mut output = Vec::with_capacity(str_len + 1);
-    output.extend_from_slice(str_data);
-    output.push(0); // null terminate
     // The string body comes from the (untrusted) buffer and may contain an
-    // embedded NUL; reject it instead of panicking across the FFI boundary.
-    let Ok(cstr) = CString::from_vec_with_nul(output) else {
+    // embedded NUL; reject it (can't be represented as a C string) instead of
+    // returning a buffer a strlen-based consumer would silently truncate.
+    if str_data.contains(&0) {
         return ARES_EBADSTR;
-    };
+    }
+    let out = unsafe { malloc_cstr(str_data) };
+    if out.is_null() { return ARES_ENOMEM; }
     unsafe {
-        *s = cstr.into_raw() as *mut u8;
+        *s = out as *mut u8;
         *enclen = (str_len + 1) as libc::c_long; // length byte + string bytes
     }
     ARES_SUCCESS
