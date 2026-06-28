@@ -303,6 +303,13 @@ fn parse_dns_name(buf: &[u8], pos: &mut usize) -> Option<String> {
                 return None;
             }
             let offset = (((len_byte & 0x3F) as usize) << 8) | (buf[cur + 1] as usize);
+            // A compression pointer must reference strictly-earlier data (RFC 1035
+            // §4.1.4). Enforcing offset < cur makes `cur` strictly decrease on every
+            // jump, so the loop always terminates — this rejects self-referential and
+            // forward/cyclic pointers that would otherwise spin forever (DoS).
+            if offset >= cur {
+                return None;
+            }
             if !jumped {
                 end_pos = cur + 2;
             }
@@ -2225,5 +2232,54 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
 pub unsafe extern "C" fn ares_free(ptr: *mut c_void) {
     if !ptr.is_null() {
         libc::free(ptr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_dns_name;
+
+    #[test]
+    fn parses_simple_name() {
+        // "ab.cd" as uncompressed labels.
+        let buf = [2, b'a', b'b', 2, b'c', b'd', 0];
+        let mut pos = 0usize;
+        assert_eq!(parse_dns_name(&buf, &mut pos), Some("ab.cd".to_string()));
+        assert_eq!(pos, buf.len()); // consumed through the root label
+    }
+
+    #[test]
+    fn follows_backward_compression_pointer() {
+        // "ab" at offset 0, then a pointer at offset 4 -> offset 0.
+        let buf = [2, b'a', b'b', 0, 0xC0, 0x00];
+        let mut pos = 4usize;
+        assert_eq!(parse_dns_name(&buf, &mut pos), Some("ab".to_string()));
+        assert_eq!(pos, 6); // pointer consumes exactly 2 bytes
+    }
+
+    #[test]
+    fn rejects_self_referential_pointer() {
+        // Pointer at offset 0 that points to offset 0 — would spin forever
+        // without the strictly-backward guard. Must return None and not hang.
+        let buf = [0xC0, 0x00];
+        let mut pos = 0usize;
+        assert_eq!(parse_dns_name(&buf, &mut pos), None);
+    }
+
+    #[test]
+    fn rejects_forward_pointer() {
+        // Pointer at offset 0 -> offset 4 (forward). Rejected.
+        let buf = [0xC0, 0x04, 0, 0, 0, 0];
+        let mut pos = 0usize;
+        assert_eq!(parse_dns_name(&buf, &mut pos), None);
+    }
+
+    #[test]
+    fn rejects_cyclic_pointers() {
+        // A 2-pointer cycle: offset 2 -> offset 0 -> offset 2. The second
+        // (forward) jump is rejected, so the loop terminates with None.
+        let buf = [0xC0, 0x02, 0xC0, 0x00];
+        let mut pos = 2usize;
+        assert_eq!(parse_dns_name(&buf, &mut pos), None);
     }
 }
