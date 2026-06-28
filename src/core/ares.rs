@@ -8,7 +8,7 @@ use crate::core::sysconfig::SysConfig;
 use crate::core::hostfile::Hosts;
 use crate::core::services::Services;
 use crate::ffi::SocketFactory;
-use crate::ffi::{ ares_socket, RECORD_TYPE_PTR };
+use crate::ffi::ares_socket;
 
 const BIND_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 const BIND_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
@@ -49,6 +49,25 @@ impl DnsSocket {
     pub fn is_tcp(&self) -> bool { matches!(self, Self::Tcp(_)) }
 }
 
+/// How `enqueue` should obtain the socket for a query.
+#[derive(Default)]
+pub enum SocketSource {
+    /// Create a fresh UDP socket bound for the target server.
+    #[default]
+    Udp,
+    /// Create a fresh TCP socket and connect it to the target server.
+    Tcp,
+    /// Reuse an already-open (pooled) socket.
+    Shared(DnsSocket),
+}
+
+impl SocketSource {
+    /// `Tcp` when `use_tcp`, else `Udp` — collapses the common transport branch.
+    pub fn fresh(use_tcp: bool) -> Self {
+        if use_tcp { Self::Tcp } else { Self::Udp }
+    }
+}
+
 /// Write a DNS query directly to the buffer from a hostname string,
 /// avoiding intermediate Vec<String>, DnsQuery, and DnsFrame allocations.
 fn write_dns_query_direct(buf: &mut BytesMut, hostname: &str, qtype: u16, transaction_id: u16) {
@@ -71,7 +90,7 @@ fn write_dns_query_direct(buf: &mut BytesMut, hostname: &str, qtype: u16, transa
 }
 
 /// A/AAAA query type for an address family.
-fn qtype_of(family: Family) -> u16 {
+pub fn qtype_of(family: Family) -> u16 {
     match family {
         Family::Ipv4 => 0x01, // A
         Family::Ipv6 => 0x1c, // AAAA
@@ -79,7 +98,7 @@ fn qtype_of(family: Family) -> u16 {
 }
 
 /// Build a UDP-form DNS query payload (with a fresh random transaction id).
-fn dns_query_payload(name: &str, qtype: u16) -> BytesMut {
+pub fn dns_query_payload(name: &str, qtype: u16) -> BytesMut {
     let transaction_id = rand::thread_rng().r#gen::<u16>();
     let mut buf = BytesMut::with_capacity(12 + name.len() + 2 + 4);
     write_dns_query_direct(&mut buf, name, qtype, transaction_id);
@@ -128,14 +147,25 @@ impl<T> Ares<T> {
             _ => BIND_ADDR_V4,
         }
     }
-    fn bind_addr(&self) -> SocketAddr {
-        self.bind_addr_for_server(0)
-    }
-    /// Compute the expiry, build the task, and enqueue it — the single tail
-    /// shared by every query-issuing method below.
-    fn enqueue(&mut self, sock: DnsSocket, writebuf: BytesMut, userdata: T, server_index: usize) {
+    /// Issue a query: resolve the socket (a fresh UDP/TCP one or a pooled one),
+    /// apply TCP framing when needed, and enqueue the task. The single entry point
+    /// for every query the engine sends. Errs only if a fresh socket can't be
+    /// created (the `Shared` arm is infallible).
+    pub fn enqueue(&mut self, payload: BytesMut, socket: SocketSource, server_index: usize, userdata: T) -> Result<(), std::io::Error> {
+        let sock = match socket {
+            SocketSource::Udp => DnsSocket::Udp(Rc::new(self.socket_factory.create_udp(self.bind_addr_for_server(server_index))?)),
+            SocketSource::Tcp => {
+                let s = self.socket_factory.create_tcp(self.bind_addr_for_server(server_index))?;
+                self.connect_tcp(&s, server_index);
+                DnsSocket::Tcp(Rc::new(s))
+            }
+            SocketSource::Shared(ds) => ds,
+        };
+        // TCP needs the 2-byte length prefix; UDP sends the payload as-is.
+        let writebuf = if sock.is_tcp() { frame_tcp(&payload) } else { payload };
         let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
         self.tasks.push(Task { status: Status::Writing, sock, writebuf, userdata, expires_at, server_index, tries_remaining: 0 });
+        Ok(())
     }
     /// Connect a freshly-created TCP socket to the given server's address.
     fn connect_tcp(&self, sock: &ares_socket::TcpSocket, server_index: usize) {
@@ -145,65 +175,6 @@ impl<T> Ares<T> {
         let ns_addr = &self.config.nameservers[idx];
         let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
         let _ = sock.connect(SocketAddr::from((ns_addr.0, tcp_port)));
-    }
-    pub fn gethostbyname(&mut self, hostname: &str, family: Family, userdata: T) -> Result<(), std::io::Error> {
-        self.gethostbyname_to_server(hostname, family, userdata, 0)
-    }
-    pub fn gethostbyname_to_server(&mut self, hostname: &str, family: Family, userdata: T, server_index: usize) -> Result<(), std::io::Error> {
-        let sock = self.socket_factory.create_udp(self.bind_addr_for_server(server_index))?;
-        self.enqueue(DnsSocket::Udp(Rc::new(sock)), dns_query_payload(hostname, qtype_of(family)), userdata, server_index);
-        Ok(())
-    }
-    pub fn gethostbyname_to_server_shared(&mut self, hostname: &str, family: Family, userdata: T, server_index: usize, shared_sock: Rc<ares_socket::UdpSocket>) -> &Task<T> {
-        self.enqueue(DnsSocket::Udp(shared_sock), dns_query_payload(hostname, qtype_of(family)), userdata, server_index);
-        self.tasks.last().unwrap()
-    }
-    pub fn send_raw_to_server_shared(&mut self, packet: &[u8], userdata: T, server_index: usize, shared_sock: Rc<ares_socket::UdpSocket>) {
-        self.enqueue(DnsSocket::Udp(shared_sock), BytesMut::from(packet), userdata, server_index);
-    }
-    pub fn gethostbyname_tcp(&mut self, hostname: &str, family: Family, userdata: T) -> Result<(), std::io::Error> {
-        self.gethostbyname_tcp_to_server(hostname, family, userdata, 0)
-    }
-    pub fn gethostbyname_tcp_to_server(&mut self, hostname: &str, family: Family, userdata: T, server_index: usize) -> Result<(), std::io::Error> {
-        let sock = self.socket_factory.create_tcp(self.bind_addr_for_server(server_index))?;
-        self.connect_tcp(&sock, server_index);
-        let payload = dns_query_payload(hostname, qtype_of(family));
-        self.enqueue(DnsSocket::Tcp(Rc::new(sock)), frame_tcp(&payload), userdata, server_index);
-        Ok(())
-    }
-    pub fn gethostbyname_tcp_to_server_shared(&mut self, hostname: &str, family: Family, userdata: T, server_index: usize, shared_sock: Rc<ares_socket::TcpSocket>) -> &Task<T> {
-        let payload = dns_query_payload(hostname, qtype_of(family));
-        self.enqueue(DnsSocket::Tcp(shared_sock), frame_tcp(&payload), userdata, server_index);
-        self.tasks.last().unwrap()
-    }
-    pub fn send_raw_tcp_to_server_shared(&mut self, packet: &[u8], userdata: T, server_index: usize, shared_sock: Rc<ares_socket::TcpSocket>) {
-        self.enqueue(DnsSocket::Tcp(shared_sock), frame_tcp(packet), userdata, server_index);
-    }
-    pub fn gethostbyaddr(&mut self, addr: IpAddr, userdata: T) -> Result<(), std::io::Error> {
-        let sock = self.socket_factory.create_udp(self.bind_addr())?;
-        self.enqueue(DnsSocket::Udp(Rc::new(sock)), dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), userdata, 0);
-        Ok(())
-    }
-    pub fn query(&mut self, name: &str, _dnsclass: u16, dnstype: u16, userdata: T) -> Result<(), std::io::Error> {
-        let sock = self.socket_factory.create_udp(self.bind_addr())?;
-        self.enqueue(DnsSocket::Udp(Rc::new(sock)), dns_query_payload(name, dnstype), userdata, 0);
-        Ok(())
-    }
-    pub fn send_raw(&mut self, packet: &[u8], userdata: T) -> Result<(), std::io::Error> {
-        let sock = self.socket_factory.create_udp(self.bind_addr())?;
-        self.enqueue(DnsSocket::Udp(Rc::new(sock)), BytesMut::from(packet), userdata, 0);
-        Ok(())
-    }
-    pub fn send_raw_to_server(&mut self, packet: &[u8], userdata: T, server_index: usize) -> Result<(), std::io::Error> {
-        let sock = self.socket_factory.create_udp(self.bind_addr_for_server(server_index))?;
-        self.enqueue(DnsSocket::Udp(Rc::new(sock)), BytesMut::from(packet), userdata, server_index);
-        Ok(())
-    }
-    pub fn send_raw_tcp_to_server(&mut self, packet: &[u8], userdata: T, server_index: usize) -> Result<(), std::io::Error> {
-        let sock = self.socket_factory.create_tcp(self.bind_addr_for_server(server_index))?;
-        self.connect_tcp(&sock, server_index);
-        self.enqueue(DnsSocket::Tcp(Rc::new(sock)), frame_tcp(packet), userdata, server_index);
-        Ok(())
     }
     pub fn write_impl(&mut self, task: &mut Task<T>) -> WriteResult {
         let server_index = task.server_index;
@@ -286,7 +257,7 @@ impl<T> Ares<T> {
     }
 }
 
-fn rdns_name(ip: IpAddr) -> String {
+pub fn rdns_name(ip: IpAddr) -> String {
     match ip {
         // decimal
         IpAddr::V4(v4) => v4.octets().into_iter().rev().map(|b| b.to_string())
@@ -337,7 +308,7 @@ mod tests {
         // (WriteResult::Failed) rather than index nameservers out of bounds.
         let config = "nameserver 1.1.1.1\n".parse::<SysConfig>().unwrap();
         let mut ares: Ares<()> = Ares::new(config);
-        ares.gethostbyname_to_server("example.com", Family::Ipv4, (), 0);
+        ares.enqueue(dns_query_payload("example.com", qtype_of(Family::Ipv4)), SocketSource::Udp, 0, ()).unwrap();
         let mut task = ares.tasks.pop().expect("a task was pushed");
         ares.config.nameservers.clear(); // server list shrank under the in-flight task
         assert!(matches!(ares.write_impl(&mut task), WriteResult::Failed));

@@ -14,8 +14,9 @@ use std::ffi::{ CString, CStr };
 use std::net::IpAddr;
 use std::cmp::min;
 use std::time::{Instant, Duration};
+use bytes::BytesMut;
 use crate::core::packets::*;
-use crate::core::ares::{ Ares, Status, Family, WriteResult };
+use crate::core::ares::{ Ares, Status, Family, WriteResult, SocketSource, DnsSocket, dns_query_payload, qtype_of, rdns_name };
 use crate::core::servers_csv;
 use crate::core::services::Services;
 use crate::ffi::ares_hostent::*;
@@ -697,7 +698,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 
     // Fall through to DNS
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(addr), nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts: 0 };
-    if channeldata.ares.gethostbyaddr(addr, ffidata).is_err() {
+    if channeldata.ares.enqueue(dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::Udp, 0, ffidata).is_err() {
         unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
         return;
     }
@@ -778,7 +779,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
         server_index: 0,
         timeouts: 0,
     };
-    if channeldata.ares.query(&query_hostname, dnsclass as u16, dnstype as u16, ffidata).is_err() {
+    if channeldata.ares.enqueue(dns_query_payload(&query_hostname, dnstype as u16), SocketSource::Udp, 0, ffidata).is_err() {
         // Socket creation failed: deliver the error and free the search state.
         let st = unsafe { &mut *state };
         unsafe { (st.callback)(st.arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), 0) };
@@ -787,7 +788,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: Option<AresCallback>, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsclass: c_int, dnstype: c_int, callback: Option<AresCallback>, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
@@ -797,7 +798,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     }
     let name = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
     let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts: 0 };
-    if channeldata.ares.query(name, dnsclass as u16, dnstype as u16, ffidata).is_err() {
+    if channeldata.ares.enqueue(dns_query_payload(name, dnstype as u16), SocketSource::Udp, 0, ffidata).is_err() {
         unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), 0) };
     }
 }
@@ -806,7 +807,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
 pub unsafe extern "C" fn ares_query_dnsrec(
     channel: Channel,
     name: *const c_char,
-    dnsclass: c_int,
+    _dnsclass: c_int,
     dnstype: c_int,
     callback: Option<AresCallbackDnsRec>,
     arg: *mut c_void,
@@ -842,7 +843,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     }
 
     let ffidata = FFIData { callback: Callback::AresCallbackDnsRec(callback), arg, family: 0, expected_record_type: dnstype, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts: 0 };
-    if channeldata.ares.query(name, dnsclass as u16, dnstype as u16, ffidata).is_err() {
+    if channeldata.ares.enqueue(dns_query_payload(name, dnstype as u16), SocketSource::Udp, 0, ffidata).is_err() {
         unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
     }
 }
@@ -930,7 +931,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
         server_index: 0,
         timeouts: 0,
     };
-    if channeldata.ares.query(&query_hostname, qclass as u16, qtype as u16, ffidata).is_err() {
+    if channeldata.ares.enqueue(dns_query_payload(&query_hostname, qtype as u16), SocketSource::Udp, 0, ffidata).is_err() {
         // Socket creation failed: deliver the error and free the search state.
         let st = unsafe { &mut *state };
         unsafe { (st.callback)(st.arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
@@ -1021,7 +1022,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         };
 
         // Start the PTR lookup
-        if channeldata.ares.gethostbyaddr(addr_info.ip, ffidata).is_err() {
+        if channeldata.ares.enqueue(dns_query_payload(&rdns_name(addr_info.ip), RECORD_TYPE_PTR), SocketSource::Udp, 0, ffidata).is_err() {
             unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
             return;
         }
@@ -1808,7 +1809,7 @@ unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, state: *mut Hos
                 server_index: si,
                 timeouts: 0,
             };
-            channeldata.ares.gethostbyname_tcp_to_server_shared(hostname, core_family, ffidata, si, shared_sock);
+            let _ = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(DnsSocket::Tcp(shared_sock)), si, ffidata);
             return;
         }
         // No existing TCP connection — fall through to create one
@@ -1833,7 +1834,7 @@ unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, state: *mut Hos
                 server_index: si,
                 timeouts: 0,
             };
-            channeldata.ares.gethostbyname_to_server_shared(hostname, core_family, ffidata, si, shared_sock);
+            let _ = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(DnsSocket::Udp(shared_sock)), si, ffidata);
             return;
         }
         // No reusable connection — fall through to create a new one, then add to pool
@@ -1852,11 +1853,7 @@ unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, state: *mut Hos
             server_index: si,
             timeouts: 0,
         };
-        let issued = if use_tcp {
-            channeldata.ares.gethostbyname_tcp_to_server(hostname, core_family, ffidata, si).is_ok()
-        } else {
-            channeldata.ares.gethostbyname_to_server(hostname, core_family, ffidata, si).is_ok()
-        };
+        let issued = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, ffidata).is_ok();
         if !issued {
             // Socket creation failed (e.g. fd exhaustion): treat as a server
             // failure and try the next server, like upstream c-ares.
@@ -1907,13 +1904,13 @@ unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, state: *mut Hos
 /// Issue the next search-domain query for an `ares_search`. On socket-creation
 /// failure, deliver ARES_ECONNREFUSED to the user and free the search state
 /// (rather than panicking or leaking).
-unsafe fn issue_search_query(channeldata: &mut ChannelData, hostname: &str, dnsclass: u16, dnstype: u16, state_ptr: *mut SearchState, timeouts: c_int) {
+unsafe fn issue_search_query(channeldata: &mut ChannelData, hostname: &str, _dnsclass: u16, dnstype: u16, state_ptr: *mut SearchState, timeouts: c_int) {
     let new_ffidata = FFIData {
         callback: Callback::AresSearchCallback(state_ptr),
         arg: std::ptr::null_mut(), family: 0, expected_record_type: 0, ip: None,
         nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts,
     };
-    if channeldata.ares.query(hostname, dnsclass, dnstype, new_ffidata).is_err() {
+    if channeldata.ares.enqueue(dns_query_payload(hostname, dnstype), SocketSource::Udp, 0, new_ffidata).is_err() {
         let st = unsafe { &mut *state_ptr };
         unsafe { (st.callback)(st.arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), 0) };
         unsafe { drop(Box::from_raw(state_ptr)) };
@@ -1921,13 +1918,13 @@ unsafe fn issue_search_query(channeldata: &mut ChannelData, hostname: &str, dnsc
 }
 
 /// Same as `issue_search_query` for the `ares_search_dnsrec` state.
-unsafe fn issue_search_dnsrec_query(channeldata: &mut ChannelData, hostname: &str, dnsclass: u16, dnstype: u16, state_ptr: *mut SearchStateDnsRec, timeouts: c_int) {
+unsafe fn issue_search_dnsrec_query(channeldata: &mut ChannelData, hostname: &str, _dnsclass: u16, dnstype: u16, state_ptr: *mut SearchStateDnsRec, timeouts: c_int) {
     let new_ffidata = FFIData {
         callback: Callback::AresSearchCallbackDnsRec(state_ptr),
         arg: std::ptr::null_mut(), family: 0, expected_record_type: 0, ip: None,
         nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts,
     };
-    if channeldata.ares.query(hostname, dnsclass, dnstype, new_ffidata).is_err() {
+    if channeldata.ares.enqueue(dns_query_payload(hostname, dnstype), SocketSource::Udp, 0, new_ffidata).is_err() {
         let st = unsafe { &mut *state_ptr };
         unsafe { (st.callback)(st.arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
         unsafe { drop(Box::from_raw(state_ptr)) };
@@ -2407,11 +2404,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                             } else {
                                 &writebuf_data[..]
                             };
-                            let issued = if is_tcp {
-                                channeldata.ares.send_raw_tcp_to_server(payload, new_ffidata, next_server).is_ok()
-                            } else {
-                                channeldata.ares.send_raw_to_server(payload, new_ffidata, next_server).is_ok()
-                            };
+                            let issued = channeldata.ares.enqueue(BytesMut::from(payload), SocketSource::fresh(is_tcp), next_server, new_ffidata).is_ok();
                             if issued {
                                 let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                                 let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
@@ -2452,7 +2445,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                         timeouts: task.userdata.timeouts,
                     };
                     let writebuf_data = task.writebuf.to_vec();
-                    if channeldata.ares.send_raw_tcp_to_server(&writebuf_data, new_ffidata, si).is_ok() {
+                    if channeldata.ares.enqueue(BytesMut::from(&writebuf_data[..]), SocketSource::Tcp, si, new_ffidata).is_ok() {
                         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                         invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
                     } else {
@@ -2534,11 +2527,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 };
                 task.status = Status::Completed;
                 // Create new task via ares methods
-                let issued = if is_tcp {
-                    channeldata.ares.send_raw_tcp_to_server(&payload, new_ffidata, si).is_ok()
-                } else {
-                    channeldata.ares.send_raw_to_server(&payload, new_ffidata, si).is_ok()
-                };
+                let issued = channeldata.ares.enqueue(BytesMut::from(&payload[..]), SocketSource::fresh(is_tcp), si, new_ffidata).is_ok();
                 if issued {
                     // Set tries_remaining on the new task
                     if let Some(new_task) = channeldata.ares.tasks.last_mut() {
@@ -3101,11 +3090,7 @@ unsafe fn launch_addrinfo_queries(channeldata: &mut ChannelData, state: *mut Add
             timeouts: 0,
         };
         let sock_type = if use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-        let issued = if use_tcp {
-            channeldata.ares.gethostbyname_tcp_to_server(hostname, core_family, ffidata, server_index).is_ok()
-        } else {
-            channeldata.ares.gethostbyname_to_server(hostname, core_family, ffidata, server_index).is_ok()
-        };
+        let issued = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), server_index, ffidata).is_ok();
         if !issued {
             // Socket creation failed: this query won't launch. Account for it and,
             // if it was the last outstanding query, deliver the error now (the same
@@ -3245,11 +3230,7 @@ unsafe fn maybe_launch_probe(
         timeouts: 0,
     };
     let sock_type = if use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-    let issued = if use_tcp {
-        channeldata.ares.gethostbyname_tcp_to_server(hostname, core_family, ffidata, probe_server).is_ok()
-    } else {
-        channeldata.ares.gethostbyname_to_server(hostname, core_family, ffidata, probe_server).is_ok()
-    };
+    let issued = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), probe_server, ffidata).is_ok();
     // A probe has no user callback; if its socket can't be created, just skip it.
     if issued {
         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
@@ -3320,7 +3301,7 @@ unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state_ptr: *mut 
                     server_index: ffidata.server_index,
                     timeouts: ffidata.timeouts,
                 };
-                if channeldata.ares.gethostbyname_tcp_to_server(&state.name, core_family, new_ffidata, ffidata.server_index).is_ok() {
+                if channeldata.ares.enqueue(dns_query_payload(&state.name, qtype_of(core_family)), SocketSource::Tcp, ffidata.server_index, new_ffidata).is_ok() {
                     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                     invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
                 } else {
@@ -3436,11 +3417,7 @@ unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state_ptr: *mut 
                                 timeouts: ffidata.timeouts,
                             };
                             let sock_type = if state.use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                            let issued = if state.use_tcp {
-                                channeldata.ares.gethostbyname_tcp_to_server(&state.name, core_family, new_ffidata, next_server).is_ok()
-                            } else {
-                                channeldata.ares.gethostbyname_to_server(&state.name, core_family, new_ffidata, next_server).is_ok()
-                            };
+                            let issued = channeldata.ares.enqueue(dns_query_payload(&state.name, qtype_of(core_family)), SocketSource::fresh(state.use_tcp), next_server, new_ffidata).is_ok();
                             if issued {
                                 let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                                 invoke_sock_callbacks(channeldata, fd, sock_type);
@@ -3991,7 +3968,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     };
 
     // Send the pre-built packet
-    if channeldata.ares.send_raw(query_buf, ffidata).is_err() {
+    if channeldata.ares.enqueue(BytesMut::from(query_buf), SocketSource::Udp, 0, ffidata).is_err() {
         unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), 0) };
     }
 }
