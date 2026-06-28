@@ -355,7 +355,10 @@ pub unsafe extern "C" fn ares_destroy_options(options: *mut ares_options) {
 
     // Free domains array
     if !opts.domains.is_null() {
-        for i in 0..opts.ndomains as usize {
+        // Clamp a negative ndomains to 0 (a negative `as usize` would otherwise
+        // become a huge count and read/free out of bounds). Matches upstream's
+        // signed `for (i = 0; i < ndomains; i++)` loop.
+        for i in 0..opts.ndomains.max(0) as usize {
             let ptr = unsafe { *opts.domains.add(i) };
             if !ptr.is_null() {
                 drop(unsafe { std::ffi::CString::from_raw(ptr) });

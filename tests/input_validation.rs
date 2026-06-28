@@ -2,7 +2,7 @@
 //! becomes a huge usize) or a NULL buffer must produce a clean error, not a
 //! `slice::from_raw_parts` out-of-bounds / UB across the FFI boundary.
 
-use std::ffi::{c_int, c_long, c_void, CString};
+use std::ffi::{c_char, c_int, c_long, c_void, CString};
 use std::ptr;
 
 use cares_rs::*;
@@ -174,5 +174,29 @@ fn process_and_setters_null_channel_no_crash() {
         let mut wfds: libc::fd_set = std::mem::zeroed();
         ares_process(ptr::null_mut(), &mut rfds, &mut wfds); // no-op, must not crash
         ares_set_server_state_callback(ptr::null_mut(), None, ptr::null_mut()); // no-op
+    }
+}
+
+// ---- Medium: NULL / negative-count free guards (match upstream c-ares) ----
+
+/// Upstream `ares_free_hostent(NULL)` is a documented no-op; ours must not
+/// `Box::from_raw(NULL)`.
+#[test]
+fn free_hostent_null_is_noop() {
+    unsafe { ares_free_hostent(ptr::null_mut()); }
+}
+
+/// A negative `ndomains` must not turn into a huge `usize` loop bound that reads
+/// and frees out of bounds. The per-domain loop is skipped; the array is freed.
+#[test]
+fn destroy_options_negative_ndomains_no_crash() {
+    use cares_rs::ares_options::{ares_destroy_options, ares_options};
+    unsafe {
+        let mut opts: ares_options = std::mem::zeroed();
+        let domains = libc::malloc(std::mem::size_of::<*mut c_char>()) as *mut *mut c_char;
+        *domains = ptr::null_mut();
+        opts.domains = domains;
+        opts.ndomains = -1; // negative count
+        ares_destroy_options(&mut opts); // must not crash / OOB; frees `domains`
     }
 }
