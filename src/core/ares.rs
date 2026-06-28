@@ -176,57 +176,53 @@ impl<T> Ares<T> {
         let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
         let _ = sock.connect(SocketAddr::from((ns_addr.0, tcp_port)));
     }
+    /// Create a fresh socket of the given transport, bound for `server_index` and
+    /// connected to `addr` — used by `write_impl` to recover from a send failure.
+    fn fresh_socket(&self, is_tcp: bool, server_index: usize, addr: SocketAddr) -> std::io::Result<DnsSocket> {
+        let bind = self.bind_addr_for_server(server_index);
+        let sock = if is_tcp {
+            DnsSocket::Tcp(Rc::new(self.socket_factory.create_tcp(bind)?))
+        } else {
+            DnsSocket::Udp(Rc::new(self.socket_factory.create_udp(bind)?))
+        };
+        let _ = sock.connect(addr); // dispatches per-variant; == the old connect-then-wrap
+        Ok(sock)
+    }
     pub fn write_impl(&mut self, task: &mut Task<T>) -> WriteResult {
         let server_index = task.server_index;
         // The server list can shrink under an in-flight task (e.g. ares_set_servers
         // mid-query); fail the write instead of indexing out of bounds.
-        let Some(ns_addr) = self.config.nameservers.get(server_index) else {
+        let Some(&(ns_ip, ns_port)) = self.config.nameservers.get(server_index) else {
             return WriteResult::Failed;
         };
-        if task.sock.is_tcp() {
-            // TCP: already connected, just send
-            match task.sock.send(&task.writebuf) {
-                Ok(_) => { task.status = Status::Reading; WriteResult::Ok }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => WriteResult::TryAgain,
-                Err(_) => {
-                    // TCP send failed — reconnect and retry once
-                    let bind_addr = self.bind_addr_for_server(server_index);
-                    if let Ok(new_sock) = self.socket_factory.create_tcp(bind_addr) {
-                        let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
-                        let socket_addr = SocketAddr::from((ns_addr.0, tcp_port));
-                        let _ = new_sock.connect(socket_addr);
-                        task.sock = DnsSocket::Tcp(Rc::new(new_sock));
-                        match task.sock.send(&task.writebuf) {
-                            Ok(_) => { task.status = Status::Reading; WriteResult::Ok }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => WriteResult::TryAgain,
-                            Err(_) => { task.status = Status::Completed; WriteResult::Failed }
-                        }
-                    } else {
-                        task.status = Status::Completed; WriteResult::Failed
-                    }
-                }
-            }
+        let is_tcp = task.sock.is_tcp();
+        let socket_addr = if is_tcp {
+            let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
+            SocketAddr::from((ns_ip, tcp_port))
         } else {
-            let socket_addr = SocketAddr::from((ns_addr.0, ns_addr.1.unwrap_or(self.default_udp_port)));
+            SocketAddr::from((ns_ip, ns_port.unwrap_or(self.default_udp_port)))
+        };
+        // UDP connects before each send; TCP was already connected at issue time.
+        if !is_tcp {
             let _ = task.sock.connect(socket_addr);
+        }
+        // Send; on a hard error, recreate the socket once and resend.
+        let mut recreated = false;
+        loop {
             match task.sock.send(&task.writebuf) {
-                Ok(_) => { task.status = Status::Reading; WriteResult::Ok }
-                Err(_) => {
-                    // UDP send failed — create new socket and retry once
-                    let bind_addr = self.bind_addr_for_server(server_index);
-                    if let Ok(new_sock) = self.socket_factory.create_udp(bind_addr) {
-                        task.sock = DnsSocket::Udp(Rc::new(new_sock));
-                        let _ = task.sock.connect(socket_addr);
-                        match task.sock.send(&task.writebuf) {
-                            Ok(_) => { task.status = Status::Reading; WriteResult::Ok }
-                            Err(_) => { task.status = Status::Completed; WriteResult::Failed }
-                        }
-                    } else {
-                        task.status = Status::Completed; WriteResult::Failed
-                    }
+                Ok(_) => { task.status = Status::Reading; return WriteResult::Ok; }
+                // TCP treats a full send buffer as "wait for writable"; UDP recreates.
+                Err(ref e) if is_tcp && e.kind() == std::io::ErrorKind::WouldBlock => return WriteResult::TryAgain,
+                Err(_) if !recreated => {
+                    recreated = true;
+                    let Ok(s) = self.fresh_socket(is_tcp, server_index, socket_addr) else { break };
+                    task.sock = s;
                 }
+                Err(_) => break,
             }
         }
+        task.status = Status::Completed;
+        WriteResult::Failed
     }
     /// Returns Ok(Some((offset, len))) on success, Ok(None) on WouldBlock, Err on fatal recv error.
     pub fn read_impl(task: &mut Task<T>, readbuf: &mut [u8]) -> Result<Option<(usize, usize)>, ()> {
