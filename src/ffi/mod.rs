@@ -380,6 +380,20 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     }
 }
 
+/// RFC 7686: does `name` name a `.onion` domain? Case-insensitive ASCII byte
+/// comparison — never allocates, never validates UTF-8, and never panics on
+/// non-ASCII input (a byte slice has no char-boundary concept). Matches upstream
+/// c-ares (`.onion` and the trailing-dot `.onion.` FQDN form).
+fn is_onion_domain(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("onion") {
+        return true;
+    }
+    let b = name.as_bytes();
+    let ends_with_ci = |suf: &[u8]| b.len() >= suf.len()
+        && b[b.len() - suf.len()..].eq_ignore_ascii_case(suf);
+    ends_with_ci(b".onion") || ends_with_ci(b".onion.")
+}
+
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
@@ -397,7 +411,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
 
     // Reject .onion domains immediately (RFC 7686)
-    if (hostname.len() >= 6 && hostname[hostname.len()-6..].eq_ignore_ascii_case(".onion")) || hostname.eq_ignore_ascii_case("onion") {
+    if is_onion_domain(hostname) {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
         return;
     }
@@ -705,7 +719,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     }
 
     // Reject .onion domains immediately (RFC 7686)
-    if (name_str.len() >= 6 && name_str[name_str.len()-6..].eq_ignore_ascii_case(".onion")) || name_str.eq_ignore_ascii_case("onion") {
+    if is_onion_domain(name_str) {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
         return;
     }
@@ -846,7 +860,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     }
 
     // Reject .onion domains (RFC 7686)
-    if (name_str.len() >= 6 && name_str[name_str.len()-6..].eq_ignore_ascii_case(".onion")) || name_str.eq_ignore_ascii_case("onion") {
+    if is_onion_domain(name_str) {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
         return;
     }
@@ -2962,7 +2976,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     }
 
     // Reject .onion domains immediately (RFC 7686)
-    if (hostname.len() >= 6 && hostname[hostname.len()-6..].eq_ignore_ascii_case(".onion")) || hostname.eq_ignore_ascii_case("onion") {
+    if is_onion_domain(hostname) {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
         return;
     }
@@ -3996,4 +4010,36 @@ pub extern "C" fn ares_queue_wait_empty(_channel: Channel, _timeout_ms: c_int) -
     // Only meaningful with the built-in event thread, which we no longer
     // provide. Match upstream c-ares on a non-threaded build (!ares_threadsafety()).
     ARES_ENOTIMP
+}
+
+#[cfg(test)]
+mod onion_tests {
+    use super::is_onion_domain;
+
+    #[test]
+    fn matches_onion_domains() {
+        assert!(is_onion_domain("dontleak.onion"));
+        assert!(is_onion_domain("DontLeak.ONION"));   // case-insensitive
+        assert!(is_onion_domain("x.onion."));          // trailing-dot FQDN form
+        assert!(is_onion_domain("onion"));             // bare single label
+    }
+
+    #[test]
+    fn rejects_non_onion_domains() {
+        assert!(!is_onion_domain("example.com"));
+        assert!(!is_onion_domain("notonion"));          // suffix without the dot
+        assert!(!is_onion_domain("onion.example.com")); // .onion not at the end
+        assert!(!is_onion_domain(""));
+    }
+
+    #[test]
+    fn non_ascii_names_do_not_panic() {
+        // These byte sequences are exactly what made the old `name[len-6..]`
+        // slice panic (len-6 lands inside a multibyte UTF-8 code point).
+        assert!(!is_onion_domain("😀😀"));
+        assert!(!is_onion_domain("café"));
+        assert!(!is_onion_domain("日本語.example"));
+        // A non-ASCII name that still ends in .onion is matched without panic.
+        assert!(is_onion_domain("café.onion"));
+    }
 }
