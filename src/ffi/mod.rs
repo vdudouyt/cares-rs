@@ -383,6 +383,10 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
+    if channel.is_null() || hostname.is_null() {
+        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
+        return;
+    }
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { CStr::from_ptr(hostname).to_str().unwrap_or("") };
 
@@ -1610,6 +1614,10 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
+    // Upstream: NULL channel or output buffer -> return NULL.
+    if channel.is_null() || tv.is_null() {
+        return std::ptr::null_mut();
+    }
     let channeldata = unsafe { &mut *channel };
     if channeldata.ares.tasks.is_empty() {
         if maxtv.is_null() { return std::ptr::null_mut(); }
@@ -2271,6 +2279,7 @@ pub unsafe extern "C" fn ares_process_fd(channel: Channel, read_fd: c_int, write
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
 
     // Phase 1: I/O (write + read) processing
@@ -2707,6 +2716,10 @@ pub const ARES_SOCKET_BAD: ares_socket_t = -1;
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
+    // Upstream: NULL channel or non-positive numsocks -> return 0 (no sockets).
+    if channel.is_null() || numsocks <= 0 {
+        return 0;
+    }
     let channeldata = unsafe { &mut *channel };
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
 
@@ -3963,6 +3976,7 @@ unsafe fn invoke_server_state_callback(channeldata: &ChannelData, server_index: 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callback: Option<AresServerStateCallback>, arg: *mut c_void) {
+    if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     channeldata.server_state_callback = callback;
     channeldata.server_state_callback_arg = arg;

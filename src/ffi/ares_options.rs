@@ -127,10 +127,23 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     if optmask & ARES_OPT_EVENT_THREAD != 0 {
         return ARES_ENOTIMP;
     }
+    // Upstream allows a NULL options pointer only when optmask == 0 (equivalent
+    // to ares_init); a non-zero optmask with NULL options is ARES_ENODATA.
+    if options.is_null() && optmask != 0 {
+        return ARES_ENODATA;
+    }
     let ares = Ares::from_sysconfig();
     let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![] };
 
-    let options = unsafe { & *options };
+    // options may be NULL here only when optmask == 0 (checked above); bind a
+    // zeroed default in that case so no field is ever read through a NULL pointer.
+    let default_opts;
+    let options = if options.is_null() {
+        default_opts = ares_options::default();
+        &default_opts
+    } else {
+        unsafe { & *options }
+    };
     if optmask & ARES_OPT_SERVERS != 0 {
         // Clear sysconfig servers when user explicitly provides servers
         channeldata.ares.config.nameservers.clear();
