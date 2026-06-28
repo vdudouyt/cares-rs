@@ -390,7 +390,8 @@ fn is_onion_domain(name: &str) -> bool {
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: Option<AresHostCallback>, arg: *mut c_void) {
+    let Some(callback) = callback else { return; };
     if channel.is_null() || hostname.is_null() {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
         return;
@@ -660,7 +661,8 @@ unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hostent {
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: Option<AresHostCallback>, arg: *mut c_void) {
+    let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     if family != libc::AF_INET && family != libc::AF_INET6 {
@@ -705,7 +707,8 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: Option<AresCallback>, arg: *mut c_void) {
+    let Some(callback) = callback else { return; };
     let name_str = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
     if name_str.is_empty() {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
@@ -776,7 +779,8 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: Option<AresCallback>, arg: *mut c_void) {
+    let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     if channeldata.ares.config.nameservers.is_empty() {
@@ -794,10 +798,11 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     name: *const c_char,
     dnsclass: c_int,
     dnstype: c_int,
-    callback: AresCallbackDnsRec,
+    callback: Option<AresCallbackDnsRec>,
     arg: *mut c_void,
     _qid: *mut c_int, // output parameter for query ID, ignored for now
 ) {
+    let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
     if channeldata.ares.config.nameservers.is_empty() {
@@ -834,9 +839,10 @@ pub unsafe extern "C" fn ares_query_dnsrec(
 pub unsafe extern "C" fn ares_search_dnsrec(
     channel: Channel,
     dnsrec: *mut dns_record::ares_dns_record_t,
-    callback: AresCallbackDnsRec,
+    callback: Option<AresCallbackDnsRec>,
     arg: *mut c_void,
 ) {
+    let Some(callback) = callback else { return; };
     // Extract the query name and type from the dns record
     if dnsrec.is_null() { return; }
     let mut name_ptr: *const c_char = std::ptr::null();
@@ -929,7 +935,8 @@ pub unsafe extern "C" fn ares_search_dnsrec(
 /// * `arg` - User data passed to callback
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: AresNameinfoCallback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: Option<AresNameinfoCallback>, arg: *mut c_void) {
+    let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
 
@@ -2920,9 +2927,10 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     name: *const c_char,
     service: *const c_char,
     hints: *const ares_addrinfo_hints,
-    callback: AresAddrInfoCallback,
+    callback: Option<AresAddrInfoCallback>,
     arg: *mut c_void,
 ) {
+    let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
 
@@ -3894,7 +3902,8 @@ pub unsafe extern "C" fn ares_mkquery(
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: AresCallback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: Option<AresCallback>, arg: *mut c_void) {
+    let Some(callback) = callback else { return; };
     if qbuf.is_null() || qlen < 12 {
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut(), 0) };
         return;

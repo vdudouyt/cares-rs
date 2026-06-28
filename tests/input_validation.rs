@@ -83,7 +83,7 @@ fn gethostbyaddr_null_addr_calls_back_with_error() {
             ptr::null_mut(),
             4,
             libc::AF_INET,
-            host_cb,
+            Some(host_cb),
             &mut result as *mut _ as *mut c_void,
         );
         assert!(result.fired, "callback must fire on bad args");
@@ -126,7 +126,7 @@ fn gethostbyname_null_channel_calls_back_with_error() {
     unsafe {
         let mut result = CbResult { fired: false, status: ARES_SUCCESS };
         let name = CString::new("example.com").unwrap();
-        ares_gethostbyname(ptr::null_mut(), name.as_ptr(), libc::AF_INET, host_cb,
+        ares_gethostbyname(ptr::null_mut(), name.as_ptr(), libc::AF_INET, Some(host_cb),
                            &mut result as *mut _ as *mut c_void);
         assert!(result.fired);
         assert_ne!(result.status, ARES_SUCCESS);
@@ -139,7 +139,7 @@ fn gethostbyname_null_name_calls_back_with_error() {
         let mut ch: Channel = ptr::null_mut();
         assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
         let mut result = CbResult { fired: false, status: ARES_SUCCESS };
-        ares_gethostbyname(ch, ptr::null(), libc::AF_INET, host_cb,
+        ares_gethostbyname(ch, ptr::null(), libc::AF_INET, Some(host_cb),
                            &mut result as *mut _ as *mut c_void);
         assert!(result.fired);
         assert_ne!(result.status, ARES_SUCCESS);
@@ -198,5 +198,32 @@ fn destroy_options_negative_ndomains_no_crash() {
         opts.domains = domains;
         opts.ndomains = -1; // negative count
         ares_destroy_options(&mut opts); // must not crash / OOB; frees `domains`
+    }
+}
+
+// ---- H5 follow-up: nullable async callbacks (NULL callback must be a no-op) ----
+
+/// `Option<extern "C" fn>` must use the function-pointer null niche, so a C NULL
+/// maps to `None` with no ABI change. The whole approach relies on this.
+#[test]
+fn option_callback_has_fn_pointer_abi() {
+    assert_eq!(std::mem::size_of::<Option<AresHostCallback>>(), std::mem::size_of::<usize>());
+    assert_eq!(std::mem::size_of::<Option<AresAddrInfoCallback>>(), std::mem::size_of::<usize>());
+}
+
+/// A NULL (None) callback to the async query functions must be a graceful no-op
+/// (the guard returns before any work), not UB / a crash.
+#[test]
+fn null_callback_is_noop_not_ub() {
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+        let name = CString::new("example.com").unwrap();
+        ares_gethostbyname(ch, name.as_ptr(), libc::AF_INET, None, ptr::null_mut());
+        ares_gethostbyaddr(ch, ptr::null_mut(), 4, libc::AF_INET, None, ptr::null_mut());
+        ares_getaddrinfo(ch, name.as_ptr(), ptr::null(), ptr::null(), None, ptr::null_mut());
+        ares_search(ch, name.as_ptr(), 1, 1, None, ptr::null_mut());
+        ares_query(ch, name.as_ptr(), 1, 1, None, ptr::null_mut());
+        ares_destroy(ch);
     }
 }

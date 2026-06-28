@@ -50,7 +50,7 @@ fn resolves_localhost() {
             channel,
             name.as_ptr(),
             libc::AF_INET,
-            host_callback,
+            Some(host_callback),
             &mut result as *mut _ as *mut c_void,
         );
 
@@ -136,7 +136,7 @@ fn getsock_reports_writable_for_pending_query() {
             channel,
             name.as_ptr(),
             libc::AF_INET,
-            host_callback,
+            Some(host_callback),
             &mut result as *mut _ as *mut c_void,
         );
 
