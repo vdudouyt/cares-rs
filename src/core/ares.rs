@@ -154,8 +154,10 @@ impl<T> Ares<T> {
         };
         let bind_addr = self.bind_addr_for_server(server_index);
         let sock = self.socket_factory.create_tcp(bind_addr).unwrap();
-        // Connect TCP immediately
-        let ns_addr = &self.config.nameservers[server_index];
+        // Connect TCP immediately. Clamp the (freshly-selected, non-empty) index
+        // defensively rather than raw-indexing.
+        let idx = server_index.min(self.config.nameservers.len().saturating_sub(1));
+        let ns_addr = &self.config.nameservers[idx];
         let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
         let socket_addr = SocketAddr::from((ns_addr.0, tcp_port));
         let _ = sock.connect(socket_addr);
@@ -241,7 +243,8 @@ impl<T> Ares<T> {
     pub fn send_raw_tcp_to_server(&mut self, packet: &[u8], userdata: T, server_index: usize) {
         let bind_addr = self.bind_addr_for_server(server_index);
         let sock = self.socket_factory.create_tcp(bind_addr).unwrap();
-        let ns_addr = &self.config.nameservers[server_index];
+        let idx = server_index.min(self.config.nameservers.len().saturating_sub(1));
+        let ns_addr = &self.config.nameservers[idx];
         let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
         let socket_addr = SocketAddr::from((ns_addr.0, tcp_port));
         let _ = sock.connect(socket_addr);
@@ -255,7 +258,11 @@ impl<T> Ares<T> {
     }
     pub fn write_impl(&mut self, task: &mut Task<T>) -> WriteResult {
         let server_index = task.server_index;
-        let ns_addr = &self.config.nameservers[server_index];
+        // The server list can shrink under an in-flight task (e.g. ares_set_servers
+        // mid-query); fail the write instead of indexing out of bounds.
+        let Some(ns_addr) = self.config.nameservers.get(server_index) else {
+            return WriteResult::Failed;
+        };
         if task.sock.is_tcp() {
             // TCP: already connected, just send
             match task.sock.send(&task.writebuf) {
@@ -368,4 +375,22 @@ pub fn build_sysconfig() -> SysConfig {
     let mut config = try_resolv_conf().unwrap_or_else(SysConfig::default);
     crate::core::sysconfig::apply_env_overrides(&mut config);
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_impl_stale_server_index_fails_gracefully() {
+        // Issue a query (pushes a task bound to server 0), then shrink the server
+        // list out from under the in-flight task — write_impl must fail gracefully
+        // (WriteResult::Failed) rather than index nameservers out of bounds.
+        let config = "nameserver 1.1.1.1\n".parse::<SysConfig>().unwrap();
+        let mut ares: Ares<()> = Ares::new(config);
+        ares.gethostbyname_to_server("example.com", Family::Ipv4, (), 0);
+        let mut task = ares.tasks.pop().expect("a task was pushed");
+        ares.config.nameservers.clear(); // server list shrank under the in-flight task
+        assert!(matches!(ares.write_impl(&mut task), WriteResult::Failed));
+    }
 }

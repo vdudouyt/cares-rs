@@ -51,8 +51,12 @@ impl FromStr for SysConfig {
             match keyword {
                 "nameserver" => {
                     for tok in rest {
-                        conf.nameservers.push(parse_ns_addr(tok).unwrap());
-                        conf.tcp_ports.push(None);
+                        // Skip invalid nameserver tokens instead of panicking on a
+                        // malformed resolv.conf (matches upstream c-ares).
+                        if let Some(ns) = parse_ns_addr(tok) {
+                            conf.nameservers.push(ns);
+                            conf.tcp_ports.push(None); // keep the parallel vecs in sync
+                        }
                     }
                 }
                 "domain" => conf.domain = Some(arg1.to_string()),
@@ -142,6 +146,15 @@ pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skips_malformed_nameserver() {
+        // A malformed nameserver token must be skipped, not panic on init/reinit.
+        let input = "nameserver 8.8.8.8\nnameserver not-an-ip\nnameserver 1.1.1.1\n";
+        let conf: SysConfig = input.parse().unwrap();
+        assert_eq!(conf.nameservers.len(), 2, "the invalid token is skipped");
+        assert_eq!(conf.nameservers.len(), conf.tcp_ports.len(), "parallel vecs stay in sync");
+    }
 
     #[test]
     fn parse_minimal() {

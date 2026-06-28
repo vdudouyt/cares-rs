@@ -645,11 +645,11 @@ unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hostent {
     let aliases: Vec<*mut i8> = lookup
         .aliases
         .into_iter()
-        .map(|s| CString::new(s).unwrap().into_raw())
+        .filter_map(|s| CString::new(s).ok().map(|c| c.into_raw())) // drop NUL-containing aliases
         .collect();
 
     let hostent = libc::hostent {
-        h_name: CString::new(lookup.canonical).unwrap().into_raw(),
+        h_name: CString::new(lookup.canonical).unwrap_or_default().into_raw(),
         h_aliases: unsafe { cnullterminated::from_vec(aliases) },
         h_addrtype: h_addrtype,
         h_length: h_length as c_int,
