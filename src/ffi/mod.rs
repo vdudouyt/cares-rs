@@ -380,18 +380,12 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     }
 }
 
-/// RFC 7686: does `name` name a `.onion` domain? Case-insensitive ASCII byte
-/// comparison — never allocates, never validates UTF-8, and never panics on
-/// non-ASCII input (a byte slice has no char-boundary concept). Matches upstream
-/// c-ares (`.onion` and the trailing-dot `.onion.` FQDN form).
+/// RFC 7686: does `name` name a `.onion` domain? Case-insensitive ASCII suffix
+/// match on bytes (no alloc, no UTF-8 validation, never panics on non-ASCII).
+/// Tolerates a trailing-dot FQDN and a bare "onion". Mirrors upstream c-ares.
 fn is_onion_domain(name: &str) -> bool {
-    if name.eq_ignore_ascii_case("onion") {
-        return true;
-    }
-    let b = name.as_bytes();
-    let ends_with_ci = |suf: &[u8]| b.len() >= suf.len()
-        && b[b.len() - suf.len()..].eq_ignore_ascii_case(suf);
-    ends_with_ci(b".onion") || ends_with_ci(b".onion.")
+    let b = name.strip_suffix('.').unwrap_or(name).as_bytes();
+    b.len() >= 6 && b[b.len() - 6..].eq_ignore_ascii_case(b".onion") || b.eq_ignore_ascii_case(b"onion")
 }
 
 #[no_mangle]
