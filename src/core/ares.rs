@@ -50,10 +50,8 @@ impl DnsSocket {
 }
 
 /// How `enqueue` should obtain the socket for a query.
-#[derive(Default)]
 pub enum SocketSource {
     /// Create a fresh UDP socket bound for the target server.
-    #[default]
     Udp,
     /// Create a fresh TCP socket and connect it to the target server.
     Tcp,
@@ -147,6 +145,11 @@ impl<T> Ares<T> {
             _ => BIND_ADDR_V4,
         }
     }
+    /// Resolve the TCP port for a server: its per-server override, else the default.
+    /// Uses the raw index (returns the default past the end of `tcp_ports`).
+    fn tcp_port_for_server(&self, server_index: usize) -> u16 {
+        self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port)
+    }
     /// Issue a query: resolve the socket (a fresh UDP/TCP one or a pooled one),
     /// apply TCP framing when needed, and enqueue the task. The single entry point
     /// for every query the engine sends. Errs only if a fresh socket can't be
@@ -173,7 +176,7 @@ impl<T> Ares<T> {
         // lookup deliberately uses the raw index (returns None past the end).
         let idx = server_index.min(self.config.nameservers.len().saturating_sub(1));
         let ns_addr = &self.config.nameservers[idx];
-        let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
+        let tcp_port = self.tcp_port_for_server(server_index);
         let _ = sock.connect(SocketAddr::from((ns_addr.0, tcp_port)));
     }
     /// Create a fresh socket of the given transport, bound for `server_index` and
@@ -185,7 +188,7 @@ impl<T> Ares<T> {
         } else {
             DnsSocket::Udp(Rc::new(self.socket_factory.create_udp(bind)?))
         };
-        let _ = sock.connect(addr); // dispatches per-variant; == the old connect-then-wrap
+        let _ = sock.connect(addr);
         Ok(sock)
     }
     pub fn write_impl(&mut self, task: &mut Task<T>) -> WriteResult {
@@ -197,8 +200,7 @@ impl<T> Ares<T> {
         };
         let is_tcp = task.sock.is_tcp();
         let socket_addr = if is_tcp {
-            let tcp_port = self.config.tcp_ports.get(server_index).copied().flatten().unwrap_or(self.default_tcp_port);
-            SocketAddr::from((ns_ip, tcp_port))
+            SocketAddr::from((ns_ip, self.tcp_port_for_server(server_index)))
         } else {
             SocketAddr::from((ns_ip, ns_port.unwrap_or(self.default_udp_port)))
         };

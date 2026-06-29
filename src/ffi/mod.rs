@@ -2398,11 +2398,10 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                                 timeouts: task.userdata.timeouts,
                             };
                             let is_tcp = task.sock.is_tcp();
-                            let writebuf_data = task.writebuf.to_vec();
-                            let payload = if is_tcp && writebuf_data.len() > 2 {
-                                &writebuf_data[2..]
+                            let payload: &[u8] = if is_tcp && task.writebuf.len() > 2 {
+                                &task.writebuf[2..]
                             } else {
-                                &writebuf_data[..]
+                                &task.writebuf[..]
                             };
                             let issued = channeldata.ares.enqueue(BytesMut::from(payload), SocketSource::fresh(is_tcp), next_server, new_ffidata).is_ok();
                             if issued {
@@ -2444,8 +2443,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                         server_index: si,
                         timeouts: task.userdata.timeouts,
                     };
-                    let writebuf_data = task.writebuf.to_vec();
-                    if channeldata.ares.enqueue(BytesMut::from(&writebuf_data[..]), SocketSource::Tcp, si, new_ffidata).is_ok() {
+                    if channeldata.ares.enqueue(task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata).is_ok() {
                         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                         invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
                     } else {
@@ -2495,11 +2493,10 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
             if task.tries_remaining < max_tries {
                 let nservers = channeldata.server_failures.len();
                 let is_tcp = task.sock.is_tcp();
-                let writebuf_data = task.writebuf.to_vec();
-                let payload = if is_tcp && writebuf_data.len() > 2 {
-                    writebuf_data[2..].to_vec()
+                let payload = if is_tcp && task.writebuf.len() > 2 {
+                    BytesMut::from(&task.writebuf[2..])
                 } else {
-                    writebuf_data
+                    task.writebuf.clone()
                 };
                 // Pick next server on timeout when there are multiple servers
                 let si = if nservers > 1 {
@@ -2527,7 +2524,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 };
                 task.status = Status::Completed;
                 // Create new task via ares methods
-                let issued = channeldata.ares.enqueue(BytesMut::from(&payload[..]), SocketSource::fresh(is_tcp), si, new_ffidata).is_ok();
+                let issued = channeldata.ares.enqueue(payload, SocketSource::fresh(is_tcp), si, new_ffidata).is_ok();
                 if issued {
                     // Set tries_remaining on the new task
                     if let Some(new_task) = channeldata.ares.tasks.last_mut() {
