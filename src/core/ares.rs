@@ -152,15 +152,15 @@ impl<T> Ares<T> {
     }
     /// Issue a query: resolve the socket (a fresh UDP/TCP one or a pooled one),
     /// apply TCP framing when needed, and enqueue the task. The single entry point
-    /// for every query the engine sends. Errs only if a fresh socket can't be
+    /// for every query the engine sends. Errs only if a new socket can't be
     /// created (the `Shared` arm is infallible).
     pub fn enqueue(&mut self, payload: BytesMut, socket: SocketSource, server_index: usize, userdata: T) -> Result<(), std::io::Error> {
         let sock = match socket {
-            SocketSource::Udp => DnsSocket::Udp(Rc::new(self.socket_factory.create_udp(self.bind_addr_for_server(server_index))?)),
+            SocketSource::Udp => self.make_socket(false, server_index)?,
             SocketSource::Tcp => {
-                let s = self.socket_factory.create_tcp(self.bind_addr_for_server(server_index))?;
+                let s = self.make_socket(true, server_index)?;
                 self.connect_tcp(&s, server_index);
-                DnsSocket::Tcp(Rc::new(s))
+                s
             }
             SocketSource::Shared(ds) => ds,
         };
@@ -170,26 +170,23 @@ impl<T> Ares<T> {
         self.tasks.push(Task { status: Status::Writing, sock, writebuf, userdata, expires_at, server_index, tries_remaining: 0 });
         Ok(())
     }
+    /// Create + wrap a transport socket bound for `server_index` (not yet connected).
+    fn make_socket(&self, is_tcp: bool, server_index: usize) -> std::io::Result<DnsSocket> {
+        let bind = self.bind_addr_for_server(server_index);
+        Ok(if is_tcp {
+            DnsSocket::Tcp(Rc::new(self.socket_factory.create_tcp(bind)?))
+        } else {
+            DnsSocket::Udp(Rc::new(self.socket_factory.create_udp(bind)?))
+        })
+    }
     /// Connect a freshly-created TCP socket to the given server's address.
-    fn connect_tcp(&self, sock: &ares_socket::TcpSocket, server_index: usize) {
+    fn connect_tcp(&self, sock: &DnsSocket, server_index: usize) {
         // Clamp the index for the (non-empty) nameservers list; the tcp_ports
         // lookup deliberately uses the raw index (returns None past the end).
         let idx = server_index.min(self.config.nameservers.len().saturating_sub(1));
         let ns_addr = &self.config.nameservers[idx];
         let tcp_port = self.tcp_port_for_server(server_index);
         let _ = sock.connect(SocketAddr::from((ns_addr.0, tcp_port)));
-    }
-    /// Create a fresh socket of the given transport, bound for `server_index` and
-    /// connected to `addr` — used by `write_impl` to recover from a send failure.
-    fn fresh_socket(&self, is_tcp: bool, server_index: usize, addr: SocketAddr) -> std::io::Result<DnsSocket> {
-        let bind = self.bind_addr_for_server(server_index);
-        let sock = if is_tcp {
-            DnsSocket::Tcp(Rc::new(self.socket_factory.create_tcp(bind)?))
-        } else {
-            DnsSocket::Udp(Rc::new(self.socket_factory.create_udp(bind)?))
-        };
-        let _ = sock.connect(addr);
-        Ok(sock)
     }
     pub fn write_impl(&mut self, task: &mut Task<T>) -> WriteResult {
         let server_index = task.server_index;
@@ -217,7 +214,8 @@ impl<T> Ares<T> {
                 Err(ref e) if is_tcp && e.kind() == std::io::ErrorKind::WouldBlock => return WriteResult::TryAgain,
                 Err(_) if !recreated => {
                     recreated = true;
-                    let Ok(s) = self.fresh_socket(is_tcp, server_index, socket_addr) else { break };
+                    let Ok(s) = self.make_socket(is_tcp, server_index) else { break };
+                    let _ = s.connect(socket_addr);
                     task.sock = s;
                 }
                 Err(_) => break,
