@@ -4,6 +4,14 @@ on:
   push:
   pull_request:
 
+# Collapse the redundant branch-run and tag-run of the same commit (e.g. when
+# a commit on a branch is also tagged) into a single run. Keyed on the commit
+# SHA so the branch ref and tag ref share a group; newest wins, so the tag run
+# (which also releases) supersedes the branch run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
 jobs:
   cares-tests:
     runs-on: ubuntu-24.04
