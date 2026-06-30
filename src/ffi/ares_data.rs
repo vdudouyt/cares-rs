@@ -263,6 +263,15 @@ impl CLinkedList for AresAddrPortNode {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
+impl Drop for AresAddrPortNode {
+    fn drop(&mut self) {
+        // No heap-owned fields (addr is an inline union); just walk the chain.
+        if !self.next.is_null() {
+            drop(unsafe { Box::from_raw(self.next) })
+        }
+    }
+}
+
 pub trait DataType {
     fn datatype() -> AresDataType;
 }
