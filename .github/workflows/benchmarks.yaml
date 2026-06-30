@@ -7,11 +7,6 @@ on:
   pull_request:
     branches: [ "*" ]
 
-# Collapse the redundant branch-run and tag-run of the same commit into one.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.sha }}
-  cancel-in-progress: true
-
 jobs:
   run_benchmarks:
     runs-on: ubuntu-24.04
