@@ -43,10 +43,9 @@ override_dh_auto_install:
 	install -d $(RT)/$(LIBDIR)
 	install -m644 target/release/libcares_rs.so $(RT)/$(LIBDIR)/libcares_rs.so.2.0.0
 	ln -sf libcares_rs.so.2.0.0 $(RT)/$(LIBDIR)/libcares_rs.so.2
-	# dev: header (<cares-rs/ares.h>), static lib, dev symlink, pkg-config, cmake
+	# dev: header (<cares-rs/ares.h>), dev symlink, pkg-config, cmake
 	install -d $(DEV)/usr/include/cares-rs $(DEV)/$(LIBDIR)/pkgconfig $(DEV)/$(LIBDIR)/cmake/cares-rs
 	install -m644 include/cares.h $(DEV)/usr/include/cares-rs/ares.h
-	install -m644 target/release/libcares_rs.a $(DEV)/$(LIBDIR)/libcares_rs.a
 	ln -sf libcares_rs.so.2 $(DEV)/$(LIBDIR)/libcares_rs.so
 	sed 's|@MULTIARCH@|$(DEB_HOST_MULTIARCH)|g' debian/libcares-rs.pc.in > $(DEV)/$(LIBDIR)/pkgconfig/libcares-rs.pc
 	install -m644 debian/cmake/cares-rs-config.cmake debian/cmake/cares-rs-config-version.cmake $(DEV)/$(LIBDIR)/cmake/cares-rs/

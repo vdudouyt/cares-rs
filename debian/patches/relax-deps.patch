@@ -30,7 +30,7 @@ index 96c55ab..8dc9974 100644
 -[[bench]]
 -name = "req100k"
 -harness = false
-+crate-type = ["cdylib", "rlib", "staticlib"]
++crate-type = ["cdylib", "rlib"]
  
  [profile.release]
  lto = true
