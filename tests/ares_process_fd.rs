@@ -39,6 +39,7 @@ fn bad_socket_noop() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real reactor: libc::select + UDP sockets; Miri can't run syscalls")]
 fn resolves_localhost() {
     unsafe {
         let mut channel: Channel = ptr::null_mut();
@@ -75,17 +76,17 @@ fn resolves_localhost() {
             libc::FD_ZERO(&mut write_fds);
             let mut max_fd: c_int = -1;
 
-            for i in 0..ARES_GETSOCK_MAXNUM {
-                if socks[i] == ARES_SOCKET_BAD {
+            for (i, &sock) in socks.iter().enumerate() {
+                if sock == ARES_SOCKET_BAD {
                     continue;
                 }
                 if ares_getsock_readable(bitmask, i) {
-                    libc::FD_SET(socks[i], &mut read_fds);
-                    if socks[i] > max_fd { max_fd = socks[i]; }
+                    libc::FD_SET(sock, &mut read_fds);
+                    if sock > max_fd { max_fd = sock; }
                 }
                 if ares_getsock_writable(bitmask, i) {
-                    libc::FD_SET(socks[i], &mut write_fds);
-                    if socks[i] > max_fd { max_fd = socks[i]; }
+                    libc::FD_SET(sock, &mut write_fds);
+                    if sock > max_fd { max_fd = sock; }
                 }
             }
 
@@ -99,12 +100,12 @@ fn resolves_localhost() {
             if n < 0 { break; }
 
             // Call ares_process_fd for each ready socket
-            for i in 0..ARES_GETSOCK_MAXNUM {
-                if socks[i] == ARES_SOCKET_BAD {
+            for &sock in &socks {
+                if sock == ARES_SOCKET_BAD {
                     continue;
                 }
-                let r = if libc::FD_ISSET(socks[i], &read_fds) { socks[i] } else { ARES_SOCKET_BAD };
-                let w = if libc::FD_ISSET(socks[i], &write_fds) { socks[i] } else { ARES_SOCKET_BAD };
+                let r = if libc::FD_ISSET(sock, &read_fds) { sock } else { ARES_SOCKET_BAD };
+                let w = if libc::FD_ISSET(sock, &write_fds) { sock } else { ARES_SOCKET_BAD };
                 if r != ARES_SOCKET_BAD || w != ARES_SOCKET_BAD {
                     ares_process_fd(channel, r, w);
                 }
@@ -119,6 +120,7 @@ fn resolves_localhost() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "issues a real query → creates a UDP socket (libc::socket); Miri can't run syscalls")]
 fn getsock_reports_writable_for_pending_query() {
     unsafe {
         let mut channel: Channel = ptr::null_mut();

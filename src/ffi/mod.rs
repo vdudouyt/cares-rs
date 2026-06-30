@@ -2789,9 +2789,10 @@ pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const 
     ares_set_servers_ports_csv(channel, servers)
 }
 
+/// # Safety
+/// `version` must be null or a valid, writable pointer to a `c_int`.
 #[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
+pub unsafe extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
     let (major, minor, patch) = (1, 34, 6);
     let v = (major << 16) | (minor << 8) | patch;
     if !version.is_null() { unsafe { *version = v } }
@@ -4119,8 +4120,11 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
     channeldata.server_state_callback_arg = arg;
 }
 
+/// # Safety
+/// `channel` must be null or a valid channel handle returned by
+/// `ares_init`/`ares_init_options` and not yet destroyed.
 #[no_mangle]
-pub extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
+pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
     if channel.is_null() { return 0; }
     let channeldata = unsafe { &*channel };
     channeldata.ares.tasks.iter()

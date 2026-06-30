@@ -1,10 +1,19 @@
-// Keep MSRV below 1.77
-// This is a subject to be removed in the future
+// Keep MSRV below 1.77 (avoids depending on the stdlib `core::mem::offset_of!`,
+// stabilized in 1.77). This is a subject to be removed in the future.
 
 #[macro_export]
 macro_rules! offset_of {
     ($parent:ty, $field:tt) => {{
-        let base: *const $parent = core::ptr::NonNull::<$parent>::dangling().as_ptr();
+        // Base must point into a real allocation with valid provenance: deriving it
+        // from `NonNull::dangling()` (a provenance-free address) makes the field
+        // projection below pointer arithmetic on a dangling pointer, which is UB
+        // (Miri flags it). A never-read `MaybeUninit` gives us a real stack
+        // allocation to compute the field address against.
+        let uninit = core::mem::MaybeUninit::<$parent>::uninit();
+        let base: *const $parent = uninit.as_ptr();
+        // SAFETY: we only take the address of the field, never read it; `base`
+        // points to a live (uninitialized) allocation, so the projection is in
+        // bounds with valid provenance.
         let field = unsafe { core::ptr::addr_of!((*base).$field) };
         (field as usize) - (base as usize)
     }};

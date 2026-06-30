@@ -293,6 +293,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "enqueue() creates a real UDP socket (libc::socket); Miri can't run syscalls")]
     fn write_impl_stale_server_index_fails_gracefully() {
         // Issue a query (pushes a task bound to server 0), then shrink the server
         // list out from under the in-flight task — write_impl must fail gracefully
