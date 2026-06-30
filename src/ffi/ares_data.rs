@@ -1,4 +1,4 @@
-use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint, c_short };
+use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint };
 use crate::core::packets::{ TxtReply, TxtReplyExt, MxReply, CaaReply, NaptrReply, SoaReply, SrvReply, UriReply };
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
@@ -181,7 +181,7 @@ impl IntoAresData<AresSoaReply> for SoaReply<'_> {
 #[repr(C)]
 pub union AresAddrUnion {
     pub addr4: libc::in_addr,
-    pub addr6: libc::in6_addr,
+    pub addr6: crate::ffi::ares_in6_addr,
 }
 
 #[repr(C)]
@@ -397,8 +397,8 @@ impl IntoAresData<AresSrvReply> for SrvReply<'_> {
 #[repr(C)]
 pub struct AresUriReply {
     next: *mut AresUriReply,
-    priority: c_short,
-    weight: c_short,
+    priority: c_ushort,
+    weight: c_ushort,
     uri: *const c_char,
     ttl: c_int,
 }
@@ -409,8 +409,8 @@ impl IntoAresData<AresUriReply> for UriReply<'_> {
 
         Some(AresUriReply {
             next: std::ptr::null_mut(),
-            priority: self.priority as c_short,
-            weight: self.weight as c_short,
+            priority: self.priority as c_ushort,
+            weight: self.weight as c_ushort,
             uri: uri.into_raw(),
             ttl: self.ttl as c_int
         })

@@ -1,10 +1,86 @@
 language = "C"
-sys_includes = ["netdb.h"]
-include_guard = "ARES_H"
+style = "both"
+cpp_compat = true
+include_guard = "ARES__H"
+documentation = false
+tab_width = 2
+line_length = 100
+
+sys_includes = ["netdb.h", "sys/socket.h", "netinet/in.h", "sys/select.h", "sys/time.h", "sys/types.h"]
+includes = []
+
+after_includes = """
+
+/* --- Items cbindgen cannot derive from Rust (injected verbatim) --- */
+
+/* Version (upstream ships these in ares_version.h) */
+#define ARES_VERSION_MAJOR 1
+#define ARES_VERSION_MINOR 34
+#define ARES_VERSION_PATCH 6
+#define ARES_VERSION_STR   \"1.34.6\"
+#define ARES_VERSION \\
+  ((ARES_VERSION_MAJOR << 16) | (ARES_VERSION_MINOR << 8) | (ARES_VERSION_PATCH))
+
+/* ares_getsock() bit helpers: function-like macros have no Rust equivalent.
+   ARES_GETSOCK_MAXNUM is emitted by cbindgen and resolved at macro-expansion
+   time in consumer code, so definition order does not matter. */
+#define ARES_GETSOCK_READABLE(bits, num) ((bits) & (1 << (num)))
+#define ARES_GETSOCK_WRITABLE(bits, num) ((bits) & (1 << ((num) + ARES_GETSOCK_MAXNUM)))
+"""
+
+trailer = """
+
+/* Modern channel handle typedef (upstream ares.h). cbindgen already emits the
+   opaque `struct ares_channeldata` and the legacy `ares_channel` pointer typedef. */
+typedef struct ares_channeldata ares_channel_t;
+"""
+
+[export]
+item_types = ["constants", "functions", "structs", "unions", "typedefs", "opaque", "enums"]
+exclude = [
+  "AresData", "AresDataType", "SocketFactory", "UdpSocket", "TcpSocket",
+  # Internal bare-fn callback aliases; the public header uses the ares_*_callback
+  # nullable typedefs instead (cbindgen can't collapse Option<TypeAlias>).
+  "AresHostCallback", "AresCallback", "AresCallbackDnsRec", "AresNameinfoCallback",
+  "AresAddrInfoCallback", "AresSockCreateCallback", "AresSockConfigureCallback",
+  "AresServerStateCallback",
+]
+# Force-emit the upstream type-name aliases (not referenced by any signature, so
+# they'd otherwise be pruned) and the custom IPv6 address type.
+include = [
+  "ares_status_t", "ares_bool_t", "ares_socklen_t",
+  "ares_dns_rec_type_t", "ares_dns_class_t", "ares_dns_section_t",
+  "ares_dns_opcode_t", "ares_dns_rcode_t", "ares_dns_flags_t",
+  "ares_dns_datatype_t", "ares_dns_rr_key_t", "ares_in6_addr",
+]
 
 [export.rename]
-Channel = "ares_channel"
-ChannelData = "ares_channeldata"
-AresHostCallback = "ares_host_callback"
-HostEnt = "hostent"
-timeval = "struct timeval"
+"Channel" = "ares_channel"
+"ChannelData" = "ares_channeldata"
+"AresMxReply" = "ares_mx_reply"
+"AresTxtReply" = "ares_txt_reply"
+"AresTxtReplyExt" = "ares_txt_ext"
+"AresCaaReply" = "ares_caa_reply"
+"AresSoaReply" = "ares_soa_reply"
+"AresNaptrReply" = "ares_naptr_reply"
+"AresSrvReply" = "ares_srv_reply"
+"AresUriReply" = "ares_uri_reply"
+"AresAddrPortNode" = "ares_addr_port_node"
+"AresAddrUnion" = "ares_addr_union"
+"AresSocketFunctions" = "ares_socket_functions"
+"AresSocketFunctionsEx" = "ares_socket_functions_ex"
+"hostent" = "struct hostent"
+"sockaddr" = "struct sockaddr"
+"timeval" = "struct timeval"
+"in_addr" = "struct in_addr"
+"iovec" = "struct iovec"
+
+[const]
+allow_static_const = false
+allow_constexpr = false
+
+[enum]
+prefix_with_name = true
+
+[parse]
+parse_deps = false

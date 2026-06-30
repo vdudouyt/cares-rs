@@ -25,6 +25,16 @@ jobs:
           sudo apt-get install -y libc-ares-dev libgtest-dev libgmock-dev cmake
       - name: Build Rust library
         run: cargo build --release
+      - name: Check generated header is up to date
+        run: |
+          CARES_REGEN_HEADER=1 cargo build
+          git diff --exit-code -- include/cares.h \
+            || (echo "include/cares.h is stale — regenerate with CARES_REGEN_HEADER=1 cargo build"; exit 1)
+      - name: Check C header is a valid drop-in
+        run: |
+          cc -std=c11 -Wall -Wextra -Iinclude -fsyntax-only tests/header_smoke.c
+          cc -std=c11 -Iinclude -c examples/example.c -o /tmp/example.o
+          cc /tmp/example.o -Ltarget/release -lcares_rs -o /tmp/example
       - name: Build C++ tests
         working-directory: tests/cares-tests
         run: cmake . && make

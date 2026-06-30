@@ -223,7 +223,7 @@ pub struct ares_dns_rr_t {
     opts: Vec<(u16, Vec<u8>)>,
     // Cached libc structs for returning pointers
     cached_in_addr: libc::in_addr,
-    cached_in6_addr: libc::in6_addr,
+    cached_in6_addr: crate::ffi::ares_in6_addr,
 }
 
 pub struct ares_dns_record_t {
@@ -270,7 +270,7 @@ fn new_rr(name: &str, rtype: u16, rclass: u16, ttl: u32) -> ares_dns_rr_t {
         data: HashMap::new(),
         opts: Vec::new(),
         cached_in_addr: libc::in_addr { s_addr: 0 },
-        cached_in6_addr: libc::in6_addr { s6_addr: [0u8; 16] },
+        cached_in6_addr: crate::ffi::ares_in6_addr::from_octets([0u8; 16]),
     }
 }
 
@@ -1270,16 +1270,14 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr(
 pub unsafe extern "C" fn ares_dns_rr_get_addr6(
     rr: *const ares_dns_rr_t,
     key: c_uint,
-) -> *const libc::in6_addr {
+) -> *const crate::ffi::ares_in6_addr {
     if rr.is_null() {
         return std::ptr::null();
     }
     let rr_mut = rr as *mut ares_dns_rr_t;
     if let Some(RRValue::Addr6(addr)) = (*rr_mut).data.get(&key) {
-        (*rr_mut).cached_in6_addr = libc::in6_addr {
-            s6_addr: addr.octets(),
-        };
-        &(*rr_mut).cached_in6_addr as *const libc::in6_addr
+        (*rr_mut).cached_in6_addr = crate::ffi::ares_in6_addr::from_octets(addr.octets());
+        &(*rr_mut).cached_in6_addr as *const crate::ffi::ares_in6_addr
     } else {
         std::ptr::null()
     }
@@ -1398,12 +1396,12 @@ pub unsafe extern "C" fn ares_dns_rr_set_addr(
 pub unsafe extern "C" fn ares_dns_rr_set_addr6(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
-    addr: *const libc::in6_addr,
+    addr: *const crate::ffi::ares_in6_addr,
 ) -> c_int {
     if rr.is_null() || addr.is_null() {
         return ARES_EBADRESP;
     }
-    let ip = Ipv6Addr::from((*addr).s6_addr);
+    let ip = Ipv6Addr::from((*addr)._S6_un._S6_u8);
     (*rr).data.insert(key, RRValue::Addr6(ip));
     ARES_SUCCESS
 }

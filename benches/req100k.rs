@@ -102,9 +102,9 @@ impl BenchRunner {
         unsafe { (self.cares.ares_destroy)(channel) };
     }
     fn set_localhost_nameservers(&mut self, channel: Channel) {
-        let localhost = [ &Ipv4Addr::LOCALHOST.octets()[..], &[0u8; 12][..] ].concat();
-        let mut sentinel = ares_addr_node { next: ptr::null_mut(), family: 0, data: [0; 16] };
-        let mut head = ares_addr_node { next: &mut sentinel, family: AF_INET, data: localhost.try_into().unwrap() };
+        let addr4 = in_addr { s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()) };
+        let mut sentinel = ares_addr_node { next: ptr::null_mut(), family: 0, addr: AresAddrUnion { addr4: in_addr { s_addr: 0 } } };
+        let mut head = ares_addr_node { next: &mut sentinel, family: AF_INET, addr: AresAddrUnion { addr4 } };
         unsafe { (self.cares.ares_set_servers)(channel, &mut head) };
     }
 }
