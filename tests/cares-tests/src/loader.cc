@@ -79,6 +79,7 @@ IMPL_SHIM(int, ares_set_sortlist, (ares_channel_t *channel, const char *sortlist
 // Server configuration
 IMPL_SHIM(char *, ares_get_servers_csv, (const ares_channel_t *channel), (channel))
 IMPL_SHIM(int, ares_get_servers, (const ares_channel_t *channel, struct ares_addr_node **servers), (channel, servers))
+IMPL_SHIM(int, ares_get_servers_ports, (const ares_channel_t *channel, struct ares_addr_port_node **servers), (channel, servers))
 IMPL_SHIM(int, ares_set_servers, (ares_channel_t *channel, const struct ares_addr_node *servers), (channel, servers))
 IMPL_SHIM(int, ares_set_servers_csv, (ares_channel_t *channel, const char *servers), (channel, servers))
 IMPL_SHIM(int, ares_set_servers_ports, (ares_channel_t *channel, const struct ares_addr_port_node *servers), (channel, servers))

@@ -39,6 +39,23 @@ TEST_F(DefaultChannelTest, GetServers) {
   }
 }
 
+// cares-rs addition (not in upstream): ares_get_servers_ports returns a
+// heap-linked ares_addr_port_node chain that ares_free_data must free in full.
+// Upstream exercises no such path, so the chain-free is otherwise only covered
+// here — and this test runs under the CI Valgrind job, guarding against leaking
+// the tail nodes.
+TEST_F(DefaultChannelTest, GetServersPorts) {
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_set_servers_csv(channel_, "1.2.3.4,2.3.4.5,3.4.5.6"));
+  struct ares_addr_port_node* servers = nullptr;
+  EXPECT_EQ(ARES_SUCCESS, ares_get_servers_ports(channel_, &servers));
+  ASSERT_NE(nullptr, servers);
+  int count = 0;
+  for (struct ares_addr_port_node* n = servers; n != nullptr; n = n->next) count++;
+  EXPECT_EQ(3, count);
+  ares_free_data(servers);  // must free head + all tail nodes
+}
+
 TEST_F(DefaultChannelTest, SetServers) {
   /* NOTE: This test is because we have actual external users doing test case
    *       simulation and removing all servers to generate various error
