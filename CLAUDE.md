@@ -12,4 +12,4 @@ IMPORTANT: When porting the tests, make sure to just copy the .c files without m
 
 ### Developing
 
-Make sure that you have no build/clippy warnings or new cargo test / gtest failures when commiting
+Make sure that you have no build/clippy warnings when commiting
