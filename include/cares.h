@@ -451,7 +451,7 @@ typedef void (*ares_callback)(void *arg, int status, int timeouts, uint8_t *abuf
 
 typedef void (*ares_callback_dnsrec)(void *arg,
                                      int status,
-                                     uintptr_t timeouts,
+                                     size_t timeouts,
                                      struct ares_dns_record_t *dnsrec);
 
 typedef void (*ares_nameinfo_callback)(void *arg,
@@ -469,13 +469,13 @@ typedef struct ares_mx_reply {
 typedef struct ares_txt_reply {
   struct ares_txt_reply *next;
   const char *txt;
-  uintptr_t length;
+  size_t length;
 } ares_txt_reply;
 
 typedef struct ares_txt_ext {
   struct ares_txt_ext *next;
   const char *txt;
-  uintptr_t length;
+  size_t length;
   char record_start;
 } ares_txt_ext;
 
@@ -483,9 +483,9 @@ typedef struct ares_caa_reply {
   struct ares_caa_reply *next;
   int critical;
   const char *property;
-  uintptr_t plength;
+  size_t plength;
   const char *value;
-  uintptr_t length;
+  size_t length;
 } ares_caa_reply;
 
 typedef struct ares_naptr_reply {
@@ -618,7 +618,7 @@ typedef int ares_evsys_t;
 
 typedef struct ares_server_failover_options {
   unsigned short retry_chance;
-  uintptr_t retry_delay;
+  size_t retry_delay;
 } ares_server_failover_options;
 
 typedef struct ares_options {
@@ -649,7 +649,7 @@ typedef struct ares_options {
   struct ares_server_failover_options server_failover_opts;
 } ares_options;
 
-typedef intptr_t ares_ssize_t;
+typedef ssize_t ares_ssize_t;
 
 typedef struct ares_socket_functions {
   ares_socket_t (*asocket)(int domain, int, int, void *user_data);
@@ -657,7 +657,7 @@ typedef struct ares_socket_functions {
   int (*aconnect)(ares_socket_t fd, const struct sockaddr*, socklen_t, void *user_data);
   ares_ssize_t (*arecvfrom)(ares_socket_t fd,
                             void*,
-                            uintptr_t,
+                            size_t,
                             int,
                             struct sockaddr*,
                             socklen_t*,
@@ -672,16 +672,10 @@ typedef struct ares_socket_functions_ex {
   int (*aclose)(ares_socket_t, void*);
   int (*asetsockopt)(ares_socket_t, int, const void*, socklen_t, void*);
   int (*aconnect)(ares_socket_t, const struct sockaddr*, socklen_t, unsigned int, void*);
-  ares_ssize_t (*arecvfrom)(ares_socket_t,
-                            void*,
-                            uintptr_t,
-                            int,
-                            struct sockaddr*,
-                            socklen_t*,
-                            void*);
+  ares_ssize_t (*arecvfrom)(ares_socket_t, void*, size_t, int, struct sockaddr*, socklen_t*, void*);
   ares_ssize_t (*asendto)(ares_socket_t,
                           const void*,
-                          uintptr_t,
+                          size_t,
                           int,
                           const struct sockaddr*,
                           socklen_t,
@@ -960,20 +954,18 @@ int ares_dns_record_query_add(struct ares_dns_record_t *dnsrec,
                               unsigned int qtype,
                               unsigned int qclass);
 
-uintptr_t ares_dns_record_query_cnt(const struct ares_dns_record_t *dnsrec);
+size_t ares_dns_record_query_cnt(const struct ares_dns_record_t *dnsrec);
 
 int ares_dns_record_query_get(const struct ares_dns_record_t *dnsrec,
-                              uintptr_t idx,
+                              size_t idx,
                               const char **name,
                               unsigned int *qtype,
                               unsigned int *qclass);
 
-int ares_dns_record_query_set_name(struct ares_dns_record_t *dnsrec,
-                                   uintptr_t idx,
-                                   const char *name);
+int ares_dns_record_query_set_name(struct ares_dns_record_t *dnsrec, size_t idx, const char *name);
 
 int ares_dns_record_query_set_type(struct ares_dns_record_t *dnsrec,
-                                   uintptr_t idx,
+                                   size_t idx,
                                    unsigned int qtype);
 
 int ares_dns_record_rr_add(struct ares_dns_rr_t **rr,
@@ -984,17 +976,17 @@ int ares_dns_record_rr_add(struct ares_dns_rr_t **rr,
                            unsigned int rclass,
                            unsigned int ttl);
 
-uintptr_t ares_dns_record_rr_cnt(const struct ares_dns_record_t *dnsrec, unsigned int sect);
+size_t ares_dns_record_rr_cnt(const struct ares_dns_record_t *dnsrec, unsigned int sect);
 
 struct ares_dns_rr_t *ares_dns_record_rr_get(struct ares_dns_record_t *dnsrec,
                                              unsigned int sect,
-                                             uintptr_t idx);
+                                             size_t idx);
 
 const struct ares_dns_rr_t *ares_dns_record_rr_get_const(const struct ares_dns_record_t *dnsrec,
                                                          unsigned int sect,
-                                                         uintptr_t idx);
+                                                         size_t idx);
 
-int ares_dns_record_rr_del(struct ares_dns_record_t *dnsrec, unsigned int sect, uintptr_t idx);
+int ares_dns_record_rr_del(struct ares_dns_record_t *dnsrec, unsigned int sect, size_t idx);
 
 const char *ares_dns_rr_get_name(const struct ares_dns_rr_t *rr);
 
@@ -1016,9 +1008,7 @@ uint16_t ares_dns_rr_get_u16(const struct ares_dns_rr_t *rr, unsigned int key);
 
 uint32_t ares_dns_rr_get_u32(const struct ares_dns_rr_t *rr, unsigned int key);
 
-const uint8_t *ares_dns_rr_get_bin(const struct ares_dns_rr_t *rr,
-                                   unsigned int key,
-                                   uintptr_t *len);
+const uint8_t *ares_dns_rr_get_bin(const struct ares_dns_rr_t *rr, unsigned int key, size_t *len);
 
 int ares_dns_rr_set_addr(struct ares_dns_rr_t *rr, unsigned int key, const struct in_addr *addr);
 
@@ -1034,40 +1024,37 @@ int ares_dns_rr_set_u16(struct ares_dns_rr_t *rr, unsigned int key, uint16_t val
 
 int ares_dns_rr_set_u32(struct ares_dns_rr_t *rr, unsigned int key, uint32_t val);
 
-int ares_dns_rr_set_bin(struct ares_dns_rr_t *rr,
-                        unsigned int key,
-                        const uint8_t *val,
-                        uintptr_t len);
+int ares_dns_rr_set_bin(struct ares_dns_rr_t *rr, unsigned int key, const uint8_t *val, size_t len);
 
 int ares_dns_rr_set_opt(struct ares_dns_rr_t *rr,
                         unsigned int key,
                         unsigned int opt,
                         const uint8_t *val,
-                        uintptr_t val_len);
+                        size_t val_len);
 
-uintptr_t ares_dns_rr_get_opt_cnt(const struct ares_dns_rr_t *rr, unsigned int key);
+size_t ares_dns_rr_get_opt_cnt(const struct ares_dns_rr_t *rr, unsigned int key);
 
 int ares_dns_rr_get_opt(const struct ares_dns_rr_t *rr,
                         unsigned int key,
-                        uintptr_t idx,
+                        size_t idx,
                         unsigned int *opt,
                         const uint8_t **val,
-                        uintptr_t *val_len);
+                        size_t *val_len);
 
 int ares_dns_rr_get_opt_byid(const struct ares_dns_rr_t *rr,
                              unsigned int key,
                              unsigned int opt,
                              const uint8_t **val,
-                             uintptr_t *val_len);
+                             size_t *val_len);
 
 int ares_dns_rr_del_opt_byid(struct ares_dns_rr_t *rr, unsigned int key, unsigned int opt);
 
 int ares_dns_parse(const uint8_t *buf,
-                   uintptr_t buf_len,
+                   size_t buf_len,
                    unsigned int flags,
                    struct ares_dns_record_t **dnsrec);
 
-int ares_dns_write(const struct ares_dns_record_t *dnsrec, uint8_t **buf, uintptr_t *buf_len);
+int ares_dns_write(const struct ares_dns_record_t *dnsrec, uint8_t **buf, size_t *buf_len);
 
 const char *ares_dns_rec_type_tostr(unsigned int rtype);
 
@@ -1079,7 +1066,7 @@ int ares_dns_class_fromstr(const char *str_ptr, unsigned int *qclass);
 
 const char *ares_dns_rr_key_tostr(unsigned int key);
 
-const unsigned int *ares_dns_rr_get_keys(unsigned int rtype, uintptr_t *cnt);
+const unsigned int *ares_dns_rr_get_keys(unsigned int rtype, size_t *cnt);
 
 unsigned int ares_dns_rr_key_datatype(unsigned int key);
 
@@ -1091,12 +1078,12 @@ const char *ares_dns_rcode_tostr(unsigned int rcode);
 
 const char *ares_dns_section_tostr(unsigned int section);
 
-uintptr_t ares_dns_rr_get_abin_cnt(const struct ares_dns_rr_t *rr, unsigned int key);
+size_t ares_dns_rr_get_abin_cnt(const struct ares_dns_rr_t *rr, unsigned int key);
 
 const uint8_t *ares_dns_rr_get_abin(const struct ares_dns_rr_t *rr,
                                     unsigned int key,
-                                    uintptr_t idx,
-                                    uintptr_t *len);
+                                    size_t idx,
+                                    size_t *len);
 
 void ares_free(void *ptr);
 

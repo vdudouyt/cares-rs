@@ -23,7 +23,7 @@ pub type ares_sock_state_cb =
 #[derive(Copy, Clone)]
 pub struct ares_server_failover_options {
     pub retry_chance: c_ushort, // probability (1/N); 0 disables retries
-    pub retry_delay:  usize,    // minimum delay in milliseconds
+    pub retry_delay:  libc::size_t,    // minimum delay in milliseconds
 }
 
 // ------- The ares_options struct itself -------

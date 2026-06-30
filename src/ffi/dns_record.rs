@@ -1022,7 +1022,7 @@ pub unsafe extern "C" fn ares_dns_record_query_add(
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_query_cnt(
     dnsrec: *const ares_dns_record_t,
-) -> usize {
+) -> libc::size_t {
     if dnsrec.is_null() {
         return 0;
     }
@@ -1032,7 +1032,7 @@ pub unsafe extern "C" fn ares_dns_record_query_cnt(
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_query_get(
     dnsrec: *const ares_dns_record_t,
-    idx: usize,
+    idx: libc::size_t,
     name: *mut *const c_char,
     qtype: *mut c_uint,
     qclass: *mut c_uint,
@@ -1060,7 +1060,7 @@ pub unsafe extern "C" fn ares_dns_record_query_get(
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_query_set_name(
     dnsrec: *mut ares_dns_record_t,
-    idx: usize,
+    idx: libc::size_t,
     name: *const c_char,
 ) -> c_int {
     if dnsrec.is_null() || name.is_null() {
@@ -1086,7 +1086,7 @@ pub unsafe extern "C" fn ares_dns_record_query_set_name(
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_query_set_type(
     dnsrec: *mut ares_dns_record_t,
-    idx: usize,
+    idx: libc::size_t,
     qtype: c_uint,
 ) -> c_int {
     if dnsrec.is_null() {
@@ -1137,7 +1137,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_add(
 pub unsafe extern "C" fn ares_dns_record_rr_cnt(
     dnsrec: *const ares_dns_record_t,
     sect: c_uint,
-) -> usize {
+) -> libc::size_t {
     if dnsrec.is_null() {
         return 0;
     }
@@ -1151,7 +1151,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_cnt(
 pub unsafe extern "C" fn ares_dns_record_rr_get(
     dnsrec: *mut ares_dns_record_t,
     sect: c_uint,
-    idx: usize,
+    idx: libc::size_t,
 ) -> *mut ares_dns_rr_t {
     if dnsrec.is_null() {
         return std::ptr::null_mut();
@@ -1171,7 +1171,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_get(
 pub unsafe extern "C" fn ares_dns_record_rr_get_const(
     dnsrec: *const ares_dns_record_t,
     sect: c_uint,
-    idx: usize,
+    idx: libc::size_t,
 ) -> *const ares_dns_rr_t {
     if dnsrec.is_null() {
         return std::ptr::null();
@@ -1191,7 +1191,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_get_const(
 pub unsafe extern "C" fn ares_dns_record_rr_del(
     dnsrec: *mut ares_dns_record_t,
     sect: c_uint,
-    idx: usize,
+    idx: libc::size_t,
 ) -> c_int {
     if dnsrec.is_null() {
         return ARES_EBADRESP;
@@ -1347,7 +1347,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u32(
 pub unsafe extern "C" fn ares_dns_rr_get_bin(
     rr: *const ares_dns_rr_t,
     key: c_uint,
-    len: *mut usize,
+    len: *mut libc::size_t,
 ) -> *const u8 {
     if rr.is_null() {
         if !len.is_null() { *len = 0; }
@@ -1465,7 +1465,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     val: *const u8,
-    len: usize,
+    len: libc::size_t,
 ) -> c_int {
     if rr.is_null() {
         return ARES_EBADRESP;
@@ -1489,7 +1489,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_opt(
     key: c_uint,
     opt: c_uint,
     val: *const u8,
-    val_len: usize,
+    val_len: libc::size_t,
 ) -> c_int {
     if rr.is_null() {
         return ARES_EBADRESP;
@@ -1509,7 +1509,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_opt(
 pub unsafe extern "C" fn ares_dns_rr_get_opt_cnt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
-) -> usize {
+) -> libc::size_t {
     if rr.is_null() {
         return 0;
     }
@@ -1520,10 +1520,10 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt_cnt(
 pub unsafe extern "C" fn ares_dns_rr_get_opt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
-    idx: usize,
+    idx: libc::size_t,
     opt: *mut c_uint,
     val: *mut *const u8,
-    val_len: *mut usize,
+    val_len: *mut libc::size_t,
 ) -> c_int {
     if rr.is_null() {
         return ARES_EBADRESP;
@@ -1550,7 +1550,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt_byid(
     key: c_uint,
     opt: c_uint,
     val: *mut *const u8,
-    val_len: *mut usize,
+    val_len: *mut libc::size_t,
 ) -> c_int {
     if rr.is_null() {
         return ARES_FALSE;
@@ -1596,7 +1596,7 @@ pub unsafe extern "C" fn ares_dns_rr_del_opt_byid(
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_parse(
     buf: *const u8,
-    buf_len: usize,
+    buf_len: libc::size_t,
     flags: c_uint,
     dnsrec: *mut *mut ares_dns_record_t,
 ) -> c_int {
@@ -1708,7 +1708,7 @@ pub unsafe extern "C" fn ares_dns_parse(
 pub unsafe extern "C" fn ares_dns_write(
     dnsrec: *const ares_dns_record_t,
     buf: *mut *mut u8,
-    buf_len: *mut usize,
+    buf_len: *mut libc::size_t,
 ) -> c_int {
     if dnsrec.is_null() || buf.is_null() || buf_len.is_null() {
         return ARES_EBADRESP;
@@ -2015,7 +2015,7 @@ static KEYS_RAW_RR: [c_uint; 2] =
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_get_keys(
     rtype: c_uint,
-    cnt: *mut usize,
+    cnt: *mut libc::size_t,
 ) -> *const c_uint {
     if cnt.is_null() {
         return std::ptr::null();
@@ -2191,7 +2191,7 @@ pub extern "C" fn ares_dns_section_tostr(section: c_uint) -> *const c_char {
 pub unsafe extern "C" fn ares_dns_rr_get_abin_cnt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
-) -> usize {
+) -> libc::size_t {
     if rr.is_null() { return 0; }
     // We store TXT as a single Bin blob; for abin API, treat as 1 entry if non-empty
     if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
@@ -2206,8 +2206,8 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin_cnt(
 pub unsafe extern "C" fn ares_dns_rr_get_abin(
     rr: *const ares_dns_rr_t,
     key: c_uint,
-    idx: usize,
-    len: *mut usize,
+    idx: libc::size_t,
+    len: *mut libc::size_t,
 ) -> *const u8 {
     if rr.is_null() || len.is_null() { return std::ptr::null(); }
     if idx != 0 { *len = 0; return std::ptr::null(); }

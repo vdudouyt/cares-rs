@@ -1658,7 +1658,7 @@ pub type AresAddrInfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c
 // for `Option<TypeAlias>`). Signatures must mirror the bare aliases above.
 #[allow(non_camel_case_types)] pub type ares_host_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent)>;
 #[allow(non_camel_case_types)] pub type ares_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int)>;
-#[allow(non_camel_case_types)] pub type ares_callback_dnsrec = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: usize, dnsrec: *mut dns_record::ares_dns_record_t)>;
+#[allow(non_camel_case_types)] pub type ares_callback_dnsrec = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: libc::size_t, dnsrec: *mut dns_record::ares_dns_record_t)>;
 #[allow(non_camel_case_types)] pub type ares_sock_create_callback = Option<unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int>;
 #[allow(non_camel_case_types)] pub type ares_nameinfo_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, node: *mut c_char, service: *mut c_char)>;
 #[allow(non_camel_case_types)] pub type ares_addrinfo_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, res: *mut ares_addrinfo)>;

@@ -93,14 +93,14 @@ pub struct AresMxReply {
 pub struct AresTxtReply {
     next: *mut AresTxtReply,
     pub txt: *const c_char,
-    pub length: usize, // null termination excluded
+    pub length: libc::size_t, // null termination excluded
 }
 
 #[repr(C)]
 pub struct AresTxtReplyExt {
     next: *mut AresTxtReplyExt,
     pub txt: *const c_char,
-    pub length: usize, // null termination excluded
+    pub length: libc::size_t, // null termination excluded
     pub record_start: c_char,
 }
 
@@ -109,9 +109,9 @@ pub struct AresCaaReply {
     next: *mut AresCaaReply,
     critical: c_int,
     property: *const c_char,
-    plength: usize,
+    plength: libc::size_t,
     value: *const c_char,
-    length: usize,
+    length: libc::size_t,
 }
 
 impl IntoAresData<AresCaaReply> for CaaReply<'_> {

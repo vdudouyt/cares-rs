@@ -9,7 +9,7 @@ use crate::{Channel, ARES_SOCKET_BAD};
 #[allow(non_camel_case_types)]
 pub type ares_socket_t = c_int;
 #[allow(non_camel_case_types)]
-pub type ares_ssize_t = isize;
+pub type ares_ssize_t = libc::ssize_t;
 
 /// # Safety
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
@@ -30,8 +30,8 @@ pub struct AresSocketFunctionsEx {
     pub aclose: Option<unsafe extern "C" fn(ares_socket_t, *mut c_void) -> c_int>,
     pub asetsockopt: Option<unsafe extern "C" fn(ares_socket_t, c_int, *const c_void, socklen_t, *mut c_void) -> c_int>,
     pub aconnect: Option<unsafe extern "C" fn(ares_socket_t, *const sockaddr, socklen_t, c_uint, *mut c_void) -> c_int>,
-    pub arecvfrom: Option<unsafe extern "C" fn(ares_socket_t, *mut c_void, usize, c_int, *mut sockaddr, *mut socklen_t, *mut c_void) -> ares_ssize_t>,
-    pub asendto: Option<unsafe extern "C" fn(ares_socket_t, *const c_void, usize, c_int, *const sockaddr, socklen_t, *mut c_void) -> ares_ssize_t>,
+    pub arecvfrom: Option<unsafe extern "C" fn(ares_socket_t, *mut c_void, libc::size_t, c_int, *mut sockaddr, *mut socklen_t, *mut c_void) -> ares_ssize_t>,
+    pub asendto: Option<unsafe extern "C" fn(ares_socket_t, *const c_void, libc::size_t, c_int, *const sockaddr, socklen_t, *mut c_void) -> ares_ssize_t>,
     // Additional optional fields omitted — we only use the above
 }
 
@@ -59,7 +59,7 @@ pub struct AresSocketFunctions {
     pub asocket: Option<unsafe extern "C" fn(domain: c_int, c_int, c_int, user_data: *mut c_void) -> ares_socket_t>,
     pub aclose: Option<unsafe extern "C" fn(fd: ares_socket_t, user_data: *mut c_void) -> c_int>,
     pub aconnect: Option<unsafe extern "C" fn(fd: ares_socket_t, *const sockaddr, socklen_t, user_data: *mut c_void) -> c_int>,
-    pub arecvfrom: Option<unsafe extern "C" fn(fd: ares_socket_t, *mut c_void, usize, c_int, *mut sockaddr, *mut socklen_t, user_data: *mut c_void) -> ares_ssize_t>,
+    pub arecvfrom: Option<unsafe extern "C" fn(fd: ares_socket_t, *mut c_void, libc::size_t, c_int, *mut sockaddr, *mut socklen_t, user_data: *mut c_void) -> ares_ssize_t>,
     pub asendv: Option<unsafe extern "C" fn(fd: ares_socket_t, *const iovec, c_int, user_data: *mut c_void) -> ares_ssize_t>,
 }
 
