@@ -9,3 +9,7 @@ Rules:
 Mainly we're using the original c-ares tests in tests/cares-tests/ to emphasize behavior as close to original as possible. Currently it's still missing some tests, so we're moving them from original libcares repository.
 
 IMPORTANT: When porting the tests, make sure to just copy the .c files without modifying them (perhaps with an exception to malloc/free tests).
+
+### Developing
+
+Make sure that you have no build/clippy warnings or new cargo test / gtest failures when commiting
