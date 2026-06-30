@@ -108,7 +108,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            debhelper dh-cargo dpkg-dev fakeroot cargo rustc \
+            build-essential debhelper dh-cargo dpkg-dev fakeroot cargo rustc \
             librust-arrayvec-dev librust-bytes-dev librust-libc-dev \
             librust-rand-dev librust-cbindgen-dev
       - name: Set package version from tag
