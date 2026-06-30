@@ -1,4 +1,5 @@
 /target
+/include/cares.h
 tests/cares-tests/CMakeCache.txt
 tests/cares-tests/CMakeFiles/
 tests/cares-tests/Makefile

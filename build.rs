@@ -1,18 +1,20 @@
 use std::env;
 use std::path::PathBuf;
 
-// Generate the public C header (`cares.h`) from the Rust FFI surface with cbindgen,
-// so the shipped header can never drift from the shipped `.so` (both derive from
-// this crate's source). Always emitted to OUT_DIR; the committed, reviewable copy
-// at `include/cares.h` is refreshed only when CARES_REGEN_HEADER is set, so a
-// normal `cargo build` / `cargo package` never mutates the working tree.
+// Generate the public C header (`include/cares.h`) from the Rust FFI surface
+// with cbindgen on every build, so the header can never drift from the `.so`
+// (both derive from this crate's source). The header is a generated build
+// artifact — it is git-ignored, not committed.
 fn main() {
     let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     println!("cargo:rerun-if-changed=src/ffi");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=CARES_REGEN_HEADER");
+    // Watch the output too, so deleting/tampering with the header re-triggers
+    // generation (cbindgen's write_to_file is content-conditional, so an
+    // unchanged regen doesn't bump the mtime → no rebuild loop).
+    println!("cargo:rerun-if-changed=include/cares.h");
 
     let config = cbindgen::Config::from_file(crate_dir.join("cbindgen.toml"))
         .expect("read cbindgen.toml");
@@ -30,10 +32,10 @@ fn main() {
         }
     };
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings.write_to_file(out_dir.join("cares.h"));
-
-    if env::var_os("CARES_REGEN_HEADER").is_some() {
-        bindings.write_to_file(crate_dir.join("include").join("cares.h"));
-    }
+    // The header lives in `include/`, which is git-ignored — create it (a fresh
+    // checkout has no empty dirs) before writing. cbindgen's write_to_file only
+    // rewrites when the contents change, so this won't needlessly touch mtimes.
+    let include_dir = crate_dir.join("include");
+    let _ = std::fs::create_dir_all(&include_dir);
+    bindings.write_to_file(include_dir.join("cares.h"));
 }
