@@ -6,7 +6,7 @@ on:
 
 jobs:
   cares-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
           echo "aresfuzzname completed successfully"
 
   valgrind:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,3 +85,41 @@ jobs:
         run: |
           valgrind --leak-check=full --error-exitcode=1 ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
           valgrind --leak-check=full --error-exitcode=1 ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
+
+  # On a v* tag, after all tests pass, build the .deb packages for that version
+  # and publish them to the GitHub Release.
+  release-deb:
+    needs: [cares-tests, valgrind]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Debian build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debhelper dh-cargo dpkg-dev fakeroot cargo rustc \
+            librust-arrayvec-dev librust-bytes-dev librust-libc-dev \
+            librust-rand-dev librust-cbindgen-dev
+      - name: Set package version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Building cares-rs ${VERSION}"
+          sed -i "1s/.*/cares-rs (${VERSION}-1) unstable; urgency=medium/" debian/changelog
+          sed -i "s/^Version: .*/Version: ${VERSION}/" debian/libcares-rs.pc.in
+          sed -i "s/^set(PACKAGE_VERSION .*/set(PACKAGE_VERSION \"${VERSION}\")/" debian/cmake/cares-rs-config-version.cmake
+      - name: Build .deb packages
+        run: dpkg-buildpackage -us -uc -b
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          mv ../libcares-rs*_*.deb ../libcares-rs*_*.ddeb dist/ 2>/dev/null || true
+          ls -l dist
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.ddeb
