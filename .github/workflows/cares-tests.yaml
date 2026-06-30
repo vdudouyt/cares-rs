@@ -32,7 +32,7 @@ jobs:
             || (echo "include/cares.h is stale — regenerate with CARES_REGEN_HEADER=1 cargo build"; exit 1)
       - name: Check C header is a valid drop-in
         run: |
-          cc -std=c11 -Wall -Wextra -Iinclude -fsyntax-only tests/header_smoke.c
+          cc -std=c11 -Wall -Wextra -Werror -Wpointer-sign -Iinclude -fsyntax-only tests/header_smoke.c
           cc -std=c11 -Iinclude -c examples/example.c -o /tmp/example.o
           cc /tmp/example.o -Ltarget/release -lcares_rs -o /tmp/example
       - name: Build C++ tests

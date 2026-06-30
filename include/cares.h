@@ -462,45 +462,45 @@ typedef void (*ares_nameinfo_callback)(void *arg,
 
 typedef struct ares_mx_reply {
   struct ares_mx_reply *next;
-  const char *host;
+  char *host;
   unsigned short priority;
 } ares_mx_reply;
 
 typedef struct ares_txt_reply {
   struct ares_txt_reply *next;
-  const char *txt;
+  uint8_t *txt;
   size_t length;
 } ares_txt_reply;
 
 typedef struct ares_txt_ext {
   struct ares_txt_ext *next;
-  const char *txt;
+  uint8_t *txt;
   size_t length;
-  char record_start;
+  uint8_t record_start;
 } ares_txt_ext;
 
 typedef struct ares_caa_reply {
   struct ares_caa_reply *next;
   int critical;
-  const char *property;
+  uint8_t *property;
   size_t plength;
-  const char *value;
+  uint8_t *value;
   size_t length;
 } ares_caa_reply;
 
 typedef struct ares_naptr_reply {
   struct ares_naptr_reply *next;
-  const char *flags;
-  const char *service;
-  const char *regexp;
-  const char *replacement;
+  uint8_t *flags;
+  uint8_t *service;
+  uint8_t *regexp;
+  char *replacement;
   uint16_t order;
   uint16_t preference;
 } ares_naptr_reply;
 
 typedef struct ares_srv_reply {
   struct ares_srv_reply *next;
-  const char *host;
+  char *host;
   unsigned short priority;
   unsigned short weight;
   unsigned short port;
@@ -510,7 +510,7 @@ typedef struct ares_uri_reply {
   struct ares_uri_reply *next;
   unsigned short priority;
   unsigned short weight;
-  const char *uri;
+  char *uri;
   int ttl;
 } ares_uri_reply;
 
@@ -533,8 +533,8 @@ typedef struct ares_addr6ttl {
 } ares_addr6ttl;
 
 typedef struct ares_soa_reply {
-  const char *nsname;
-  const char *hostmaster;
+  char *nsname;
+  char *hostmaster;
   unsigned int serial;
   unsigned int refresh;
   unsigned int retry;

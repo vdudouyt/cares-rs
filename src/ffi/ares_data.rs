@@ -17,7 +17,7 @@ impl IntoAresData<AresTxtReply> for TxtReply<'_> {
         let length = bytes.len();
         bytes.push(0); // NUL terminator (not counted in `length`), matching upstream
         let txt = Box::into_raw(bytes.into_boxed_slice());
-        Some(AresTxtReply { next: std::ptr::null_mut(), txt: txt as *const i8, length })
+        Some(AresTxtReply { next: std::ptr::null_mut(), txt: txt as *mut u8, length })
     }
 }
 
@@ -27,7 +27,7 @@ impl IntoAresData<AresTxtReplyExt> for TxtReplyExt<'_> {
         let length = bytes.len();
         bytes.push(0); // NUL terminator (not counted in `length`), matching upstream
         let txt = Box::into_raw(bytes.into_boxed_slice());
-        Some(AresTxtReplyExt { next: std::ptr::null_mut(), txt: txt as *const i8, length, record_start: self.record_start as c_char })
+        Some(AresTxtReplyExt { next: std::ptr::null_mut(), txt: txt as *mut u8, length, record_start: self.record_start as u8 })
     }
 }
 
@@ -85,32 +85,32 @@ pub struct AresData<T> {
 #[derive(Debug)]
 pub struct AresMxReply {
     next: *mut AresMxReply,
-    pub host: *const c_char,
+    pub host: *mut c_char,
     pub priority: c_ushort,
 }
 
 #[repr(C)]
 pub struct AresTxtReply {
     next: *mut AresTxtReply,
-    pub txt: *const c_char,
+    pub txt: *mut u8,
     pub length: libc::size_t, // null termination excluded
 }
 
 #[repr(C)]
 pub struct AresTxtReplyExt {
     next: *mut AresTxtReplyExt,
-    pub txt: *const c_char,
+    pub txt: *mut u8,
     pub length: libc::size_t, // null termination excluded
-    pub record_start: c_char,
+    pub record_start: u8,
 }
 
 #[repr(C)]
 pub struct AresCaaReply {
     next: *mut AresCaaReply,
     critical: c_int,
-    property: *const c_char,
+    property: *mut u8,
     plength: libc::size_t,
-    value: *const c_char,
+    value: *mut u8,
     length: libc::size_t,
 }
 
@@ -127,9 +127,9 @@ impl IntoAresData<AresCaaReply> for CaaReply<'_> {
         Some(AresCaaReply {
             next: std::ptr::null_mut(),
             critical: self.critical as c_int,
-            property: property.into_raw(),
+            property: property.into_raw() as *mut u8,
             plength,
-            value: value.into_raw(),
+            value: value.into_raw() as *mut u8,
             length,
         })
     }
@@ -148,8 +148,8 @@ impl Drop for AresCaaReply {
 
 #[repr(C)]
 pub struct AresSoaReply {
-    nsname: *const c_char,
-    hostmaster: *const c_char,
+    nsname: *mut c_char,
+    hostmaster: *mut c_char,
     serial: c_uint,
     refresh: c_uint,
     retry: c_uint,
@@ -315,10 +315,10 @@ impl DataType for AresAddrPortNode {
 #[repr(C)]
 pub struct AresNaptrReply {
     next: *mut AresNaptrReply,
-    flags: *const c_char,
-    service: *const c_char,
-    regexp: *const c_char,
-    replacement: *const c_char,
+    flags: *mut u8,
+    service: *mut u8,
+    regexp: *mut u8,
+    replacement: *mut c_char,
     order: u16,
     preference: u16,
 }
@@ -363,9 +363,9 @@ impl IntoAresData<AresNaptrReply> for NaptrReply<'_> {
 
         Some(AresNaptrReply {
             next: std::ptr::null_mut(),
-            flags: flags.into_raw(),
-            service: service.into_raw(),
-            regexp: regexp.into_raw(),
+            flags: flags.into_raw() as *mut u8,
+            service: service.into_raw() as *mut u8,
+            regexp: regexp.into_raw() as *mut u8,
             replacement: replacement.into_raw(),
             order: self.order,
             preference: self.preference,
@@ -376,7 +376,7 @@ impl IntoAresData<AresNaptrReply> for NaptrReply<'_> {
 #[repr(C)]
 pub struct AresSrvReply {
     next: *mut AresSrvReply,
-    host: *const c_char,
+    host: *mut c_char,
     priority: c_ushort,
     weight: c_ushort,
     port: c_ushort,
@@ -399,7 +399,7 @@ pub struct AresUriReply {
     next: *mut AresUriReply,
     priority: c_ushort,
     weight: c_ushort,
-    uri: *const c_char,
+    uri: *mut c_char,
     ttl: c_int,
 }
 

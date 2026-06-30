@@ -35,14 +35,32 @@ void cares_rs_header_smoke(void)
   /* reply linked lists expose ->next */
   struct ares_mx_reply   *mx  = NULL;
   struct ares_txt_reply  *txt = NULL;
+  struct ares_txt_ext    *txx = NULL;
+  struct ares_caa_reply  *caa = NULL;
   struct ares_soa_reply  *soa = NULL;
+  struct ares_naptr_reply *nap = NULL;
   struct ares_srv_reply  *srv = NULL;
   struct ares_uri_reply  *uri = NULL;
   if (mx)  mx  = mx->next;
   if (txt) txt = txt->next;
   if (srv) srv = srv->next;
   if (uri) { unsigned short p = uri->priority; (void)p; uri = uri->next; }
-  (void)soa;
+
+  /* Field qualifiers must match upstream (proves residual #2: signedness +
+     const). These assignments would warn under -Wpointer-sign /
+     -Wdiscarded-qualifiers if our fields were `const char *`. */
+  if (txt && txx && caa && soa && nap && mx) {
+    unsigned char *u_txt  = txt->txt;          /* unsigned char * */
+    unsigned char *u_prop = caa->property;
+    unsigned char *u_val  = caa->value;
+    unsigned char *u_flag = nap->flags;
+    unsigned char  u_rs   = txx->record_start; /* unsigned char   */
+    char          *s_host = mx->host;          /* char *           */
+    char          *s_ns   = soa->nsname;
+    char          *s_repl = nap->replacement;
+    (void)u_txt; (void)u_prop; (void)u_val; (void)u_flag; (void)u_rs;
+    (void)s_host; (void)s_ns; (void)s_repl;
+  }
 
   /* options struct */
   struct ares_options opts;
