@@ -13,6 +13,8 @@
 /debian/libcares-rs2/
 /debian/libcares-rs-dev/
 /debian/tmp/
+# Downstream test build trees (fetched sources + compat shim + build artifacts)
+/downstream-tests/*/build/
 tests/cares-tests/CMakeCache.txt
 tests/cares-tests/CMakeFiles/
 tests/cares-tests/Makefile
