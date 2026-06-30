@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -59,13 +59,6 @@ pub struct Hosts {
 }
 
 impl Hosts {
-    /// Create an empty Hosts
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
     /// Parse hosts file content from a string
     pub fn parse(content: &str) -> Self {
         let mut entries = Vec::new();
@@ -83,17 +76,6 @@ impl Hosts {
     pub fn from_path<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Ok(Self::parse(&content))
-    }
-
-    /// Load from the system default hosts file
-    #[cfg(unix)]
-    pub fn from_system() -> std::io::Result<Self> {
-        Self::from_path("/etc/hosts")
-    }
-
-    #[cfg(windows)]
-    pub fn from_system() -> std::io::Result<Self> {
-        Self::from_path(r"C:\Windows\System32\drivers\etc\hosts")
     }
 
     /// Parse a single line, returning None for comments/empty/malformed lines
@@ -122,11 +104,6 @@ impl Hosts {
             canonical,
             aliases,
         })
-    }
-
-    /// Get all entries
-    pub fn entries(&self) -> &[HostEntry] {
-        &self.entries
     }
 
     /// Lookup a hostname, aggregating results across all matching entries
@@ -207,6 +184,7 @@ impl Hosts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     const SAMPLE_HOSTS: &str = r#"
 # This is a comment
@@ -224,7 +202,7 @@ fd00::10        myserver
     #[test]
     fn test_parse_basic() {
         let hosts = Hosts::parse(SAMPLE_HOSTS);
-        assert_eq!(hosts.entries().len(), 6);
+        assert_eq!(hosts.entries.len(), 6);
     }
 
     #[test]

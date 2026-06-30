@@ -133,7 +133,7 @@ struct SearchState {
     dnstype: u16,
     last_error: c_int,
     had_nodata: bool,
-    attempt_count: usize,
+    _attempt_count: usize,
 }
 
 struct SearchStateDnsRec {
@@ -150,6 +150,9 @@ struct SearchStateDnsRec {
 }
 
 #[derive(Debug)]
+// Variants are named after the c-ares FFI callback typedefs they dispatch to;
+// the shared `Callback` suffix is intentional for that correspondence.
+#[allow(clippy::enum_variant_names)]
 enum Callback {
     AresHostCallback(AresHostCallback),
     AresCallback(AresCallback),
@@ -177,13 +180,8 @@ impl Callback {
                     Self::AresAddrInfoCallback(state_ptr) => unsafe {
                         let state = &mut **state_ptr;
                         state.pending -= 1;
-                        if *status == ARES_EDESTRUCTION {
-                            state.has_cancel = true;
-                            state.last_error = *status;
-                        } else {
-                            state.has_cancel = true;
-                            state.last_error = *status;
-                        }
+                        state.has_cancel = true;
+                        state.last_error = *status;
                         if state.pending == 0 {
                             free_addrinfo_nodes(state.nodes_head);
                             (state.callback)(state.arg, state.last_error, 0, std::ptr::null_mut());
@@ -524,7 +522,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
             libc::AF_INET6 => RECORD_TYPE_AAAA,
             libc::AF_UNSPEC => RECORD_TYPE_AAAA,
             _ => RECORD_TYPE_A,
-        } as u16;
+        };
         let cache_key = (resolved_name.clone(), record_type);
         if let Some((cached_buf, expires_at)) = channeldata.query_cache.get(&cache_key) {
             if Instant::now() < *expires_at {
@@ -537,22 +535,20 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
                     }
                     Ok(parsed_rrs)
                 })();
-                match parsed {
-                    Ok(mut parsed_rrs) => {
-                        if !channeldata.sortlist.is_empty() {
-                            apply_sortlist(&channeldata.sortlist, &mut parsed_rrs.items);
-                        }
-                        let current_family = match family {
-                            libc::AF_INET => libc::AF_INET,
-                            libc::AF_INET6 => libc::AF_INET6,
-                            _ => libc::AF_INET6,
-                        };
-                        let hostent = parsed_rrs.into_raw_hostent(current_family);
-                        unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-                        ares_free_hostent(hostent);
-                        return;
+                // On a cache-hit parse error, fall through to a fresh DNS query.
+                if let Ok(mut parsed_rrs) = parsed {
+                    if !channeldata.sortlist.is_empty() {
+                        apply_sortlist(&channeldata.sortlist, &mut parsed_rrs.items);
                     }
-                    Err(_) => {} // Cache hit but parse error — fall through to DNS
+                    let current_family = match family {
+                        libc::AF_INET => libc::AF_INET,
+                        libc::AF_INET6 => libc::AF_INET6,
+                        _ => libc::AF_INET6,
+                    };
+                    let hostent = parsed_rrs.into_raw_hostent(current_family);
+                    unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
+                    ares_free_hostent(hostent);
+                    return;
                 }
             } else {
                 channeldata.query_cache.remove(&cache_key);
@@ -600,6 +596,8 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     maybe_launch_probe(channeldata, &query_hostname, current_family, first_server, use_tcp);
 }
 
+/// # Safety
+/// `channel` must be a valid channel, `name` a valid NUL-terminated C string, and `host` a writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
     if channel.is_null() { return ARES_ENOTFOUND; }
@@ -618,7 +616,7 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
     };
 
     // Lookup in the hosts file cache
-    let Some(lookup) = channeldata.ares.hosts().lookup(&name_str, family_filter) else {
+    let Some(lookup) = channeldata.ares.hosts().lookup(name_str, family_filter) else {
         unsafe { *host = std::ptr::null_mut() };
         return ARES_ENOTFOUND;
     };
@@ -652,7 +650,7 @@ unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hostent {
     let hostent = libc::hostent {
         h_name: CString::new(lookup.canonical).unwrap_or_default().into_raw(),
         h_aliases: unsafe { cnullterminated::from_vec(aliases) },
-        h_addrtype: h_addrtype,
+        h_addrtype,
         h_length: h_length as c_int,
         h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
     };
@@ -706,10 +704,11 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
     if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
         channeldata.ares.tasks.pop();
         unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
-        return;
     }
 }
 
+/// # Safety
+/// `channel` must be a valid channel and `name` a valid NUL-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: Option<AresCallback>, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
@@ -764,7 +763,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
         dnstype: dnstype as u16,
         last_error: ARES_ENODATA,
         had_nodata: false,
-        attempt_count: 0,
+        _attempt_count: 0,
     }));
 
     let ffidata = FFIData {
@@ -787,6 +786,8 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     }
 }
 
+/// # Safety
+/// `channel` must be a valid channel and `name` a valid NUL-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsclass: c_int, dnstype: c_int, callback: Option<AresCallback>, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
@@ -803,6 +804,8 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     }
 }
 
+/// # Safety
+/// `channel` must be a valid channel and `name` a valid NUL-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn ares_query_dnsrec(
     channel: Channel,
@@ -848,6 +851,8 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     }
 }
 
+/// # Safety
+/// `channel` must be a valid channel and `dnsrec` a valid `ares_dns_record_t` pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_search_dnsrec(
     channel: Channel,
@@ -1030,7 +1035,6 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
             channeldata.ares.tasks.pop();
             unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-            return;
         }
     }
 }
@@ -1038,6 +1042,9 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 /// Format an IP address with scope ID for IPv6 (e.g., "fe80::1%0")
 fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: c_int) -> String {
     match ip {
+        // The scope id is currently appended regardless of the flag/scope_id
+        // check; the branches are intentionally identical for now.
+        #[allow(clippy::if_same_then_else)]
         IpAddr::V6(_) => {
             if flags & ARES_NI_NUMERICSCOPE != 0 || scope_id != 0 {
                 format!("{}%{}", ip, scope_id)
@@ -1116,7 +1123,7 @@ fn get_service_string(services: &Services, port: u16, flags: c_int) -> Option<CS
 
 #[derive(Debug)]
 struct ParsedResponse<'a> {
-    pub transaction_id: u16,
+    pub _transaction_id: u16,
     pub query: DnsQuery<'a>,
     pub answers: Vec<DnsAnswer<'a>>,
 }
@@ -1126,7 +1133,7 @@ struct ParsedRRs<T> {
     items: Vec<T>,
     name: CString,
     aliases: Vec<CString>,
-    limit_ttl: Option<u32>,
+    _limit_ttl: Option<u32>,
     success: usize,
 }
 
@@ -1204,7 +1211,7 @@ impl<'a> ParsedResponse<'a> {
             return Err(ARES_ENODATA);
         }
         Ok(Self {
-            transaction_id: header.transaction_id,
+            _transaction_id: header.transaction_id,
             query,
             answers,
         })
@@ -1258,20 +1265,26 @@ impl<'a> ParsedResponse<'a> {
             success += 1;
             items.push(parsed);
         }
-        Ok(ParsedRRs { items, name, aliases, limit_ttl, success })
+        Ok(ParsedRRs { items, name, aliases, _limit_ttl: limit_ttl, success })
     }
 }
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
 }
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresTxtReply>(abuf, alen, out, RECORD_TYPE_TXT) }
 }
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReplyExt) -> c_int {
     if abuf.is_null() || alen < 0 {
@@ -1385,16 +1398,22 @@ where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
     })
 }
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
 }
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_naptr_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresNaptrReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
 }
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSrvReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
@@ -1415,6 +1434,8 @@ where F: FnOnce() -> Result<*mut T, c_int>
     }
 }
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresUriReply>(abuf, alen, out, RECORD_TYPE_URI) }
@@ -1422,11 +1443,13 @@ pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out:
 
 impl DnsLabel<'_> {
     pub fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
-        Some(CString::new(self.build_string(main_buf)?).ok()?)
+        CString::new(self.build_string(main_buf)?).ok()
     }
 }
 
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0)
@@ -1467,7 +1490,7 @@ fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {
     ret
 }
 
-unsafe fn fill_addrttls<T: AddrTTL>(input: &Vec<AddrRecord>, addrttls: *mut T, naddrttls: usize) -> usize {
+unsafe fn fill_addrttls<T: AddrTTL>(input: &[AddrRecord], addrttls: *mut T, naddrttls: usize) -> usize {
     let mut i = 0;
     for addr_record in input.iter() {
         if i >= naddrttls {
@@ -1513,11 +1536,15 @@ unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u
     }
 }
 
+/// # Safety
+/// `abuf` must be valid for `alen` bytes; `out`, `addrttls`, and `out_naddrttls` must be valid, writable pointers.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
     parse_to_hostent(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET)
 }
 
+/// # Safety
+/// `abuf` must be valid for `alen` bytes; `out`, `addrttls`, and `out_naddrttls` must be valid, writable pointers.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
     parse_to_hostent(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6)
@@ -1527,10 +1554,12 @@ impl RRParser<'_> for CString {
     fn parse_rr(answer: &DnsAnswer<'_>) -> Option<CString> {
         let mut buf = SliceBuf::new(answer.data);
         let name = DnsLabel::parse(&mut buf)?;
-        Some(name.build_cstring(answer.data)?)
+        name.build_cstring(answer.data)
     }
 }
 
+/// # Safety
+/// `abuf` must be valid for `alen` bytes and `addr` for `addrlen` bytes; `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
     ares_fn_wrapper(out, || {
@@ -1553,6 +1582,8 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
     })
 }
 
+/// # Safety
+/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
     let ret = parse_to_singleptr::<AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA);
@@ -1560,6 +1591,8 @@ pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out:
     ret
 }
 
+/// # Safety
+/// `hostent` must be NULL or a pointer previously returned by this library.
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
     unsafe { free_hostent(hostent) };
@@ -1972,11 +2005,7 @@ unsafe fn run_ares_search_callback(res: Result<&[u8], c_int>, state_ptr: *mut Se
             }
         }
         Err(status) => {
-            if status == ARES_ETIMEOUT {
-                state.last_error = status;
-            } else {
-                state.last_error = status;
-            }
+            state.last_error = status;
         }
     }
 
@@ -2126,7 +2155,7 @@ unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, state_ptr: *mu
                     // Success — cache the response under both the query name and base name
                     if channeldata.query_cache_max_ttl > 0 {
                         let ttl = parsed_rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-                        let cache_ttl = std::cmp::min(ttl as u32, channeldata.query_cache_max_ttl);
+                        let cache_ttl = std::cmp::min(ttl, channeldata.query_cache_max_ttl);
                         if cache_ttl > 0 {
                             let expires = Instant::now() + Duration::from_secs(cache_ttl as u64);
                             let cache_key = (state.name.clone(), state.expected_record_type as u16);
@@ -2309,7 +2338,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
         if task.status == Status::Completed { continue; }
         let fd = task.sock.as_raw_fd();
         let fd_readable = unsafe { libc::FD_ISSET(fd, read_fds) };
-        let has_tcp_buffered = task.sock.is_tcp() && channeldata.tcp_recv_buffers.get(&fd).map_or(false, |b| b.len() >= 2);
+        let has_tcp_buffered = task.sock.is_tcp() && channeldata.tcp_recv_buffers.get(&fd).is_some_and(|b| b.len() >= 2);
         if fd_readable || has_tcp_buffered {
             // For TCP shared connections: use per-fd recv buffer with framing
             let read_result = if task.sock.is_tcp() {
@@ -2453,8 +2482,8 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     continue;
                 }
                 // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
-                if channeldata.query_cache_max_ttl > 0 {
-                    if matches!(task.userdata.callback, Callback::AresCallbackDnsRec(_) | Callback::AresSearchCallbackDnsRec(_)) {
+                if channeldata.query_cache_max_ttl > 0
+                    && matches!(task.userdata.callback, Callback::AresCallbackDnsRec(_) | Callback::AresSearchCallbackDnsRec(_)) {
                         // Extract query name and type from the response buffer
                         if let Ok(parsed) = ParsedResponse::from_buf(buf) {
                             let qname = parsed.query.name.join(".");
@@ -2472,7 +2501,6 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                             }
                         }
                     }
-                }
                 (task.userdata.callback).run(Ok(buf), &task.userdata);
             }
         }
@@ -2483,7 +2511,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
     channeldata.ares.tasks = tasks;
 
     // Phase 2: Timeout handling
-    let max_tries = channeldata.ares.config.options.attempts as u32;
+    let max_tries = channeldata.ares.config.options.attempts;
     let mut tasks = std::mem::take(&mut channeldata.ares.tasks);
     for task in &mut tasks {
         if task.is_expired() && task.status != Status::Completed {
@@ -2626,16 +2654,6 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut
     ARES_SUCCESS
 }
 
-fn ipv4_to_in_addr(ip: IpAddr) -> Option<AresAddrUnion> {
-    match ip {
-        IpAddr::V4(v4) => {
-            let addr = u32::from_ne_bytes(v4.octets());
-            Some(AresAddrUnion { addr4: libc::in_addr { s_addr: addr } })
-        }
-        IpAddr::V6(_) => None,
-    }
-}
-
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut AresAddrPortNode) -> c_int {
@@ -2725,6 +2743,8 @@ pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
 pub const ARES_GETSOCK_MAXNUM: usize = 16; // per c-ares headers
 pub const ARES_SOCKET_BAD: ares_socket_t = -1;
 
+/// # Safety
+/// `channel` must be a valid channel and `socks` must point to at least `numsocks` writable slots.
 #[no_mangle]
 pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
     // Upstream: NULL channel or non-positive numsocks -> return 0 (no sockets).
@@ -2764,6 +2784,8 @@ unsafe fn malloc_cstr(bytes: &[u8]) -> *mut c_char {
     p as *mut c_char
 }
 
+/// # Safety
+/// `s` must be NULL or a pointer previously returned by this library.
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
     // All buffers handed to the caller (ares_create_query/mkquery/expand_name/
@@ -2775,17 +2797,17 @@ pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
 
 #[no_mangle]
 pub extern "C" fn ares_set_local_ip4(_channel: Channel, _local_ip: u32) {
-    if _channel.is_null() { return; }
+    if _channel.is_null() {}
 }
 
 #[no_mangle]
 pub extern "C" fn ares_set_local_ip6(_channel: Channel, _local_ip6: *const u8) {
-    if _channel.is_null() { return; }
+    if _channel.is_null() {}
 }
 
 #[no_mangle]
 pub extern "C" fn ares_set_local_dev(_channel: Channel, _local_dev_name: *const c_char) {
-    if _channel.is_null() { return; }
+    if _channel.is_null() {}
 }
 
 #[no_mangle]
@@ -3779,9 +3801,9 @@ pub unsafe extern "C" fn ares_create_query(
     };
 
     // Check if trailing dot is an unescaped separator (not a literal escaped dot)
-    let has_unescaped_trailing_dot = if name_str.ends_with('.') {
+    let has_unescaped_trailing_dot = if let Some(prefix) = name_str.strip_suffix('.') {
         // Count consecutive backslashes before the trailing dot
-        let backslash_count = name_str[..name_str.len() - 1]
+        let backslash_count = prefix
             .as_bytes()
             .iter()
             .rev()

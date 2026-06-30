@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use arrayvec::ArrayVec;
+#[cfg(test)]
 use bytes::BufMut;
 
 /// Max DNS label segments (e.g. "www.example.com" = 3 segments).
@@ -16,6 +17,7 @@ pub struct SliceBuf<'a> {
 impl<'a> SliceBuf<'a> {
     pub fn new(data: &'a [u8]) -> Self { Self { data, pos: 0 } }
     pub fn remaining(&self) -> usize { self.data.len() - self.pos }
+    #[cfg(test)]
     pub fn chunk(&self) -> &'a [u8] { &self.data[self.pos..] }
 
     pub fn get_u8(&mut self) -> Option<u8> {
@@ -77,6 +79,7 @@ impl DnsHeader {
         Some(h)
     }
 
+    #[cfg(test)]
     pub fn write<B: BufMut>(&self, b: &mut B) {
         b.put_u16(self.transaction_id);
         b.put_u16(self.flags);
@@ -109,6 +112,7 @@ impl<'a> DnsQuery<'a> {
         let qclass = buf.get_u16()?;
         Some(DnsQuery { name: label.name, qtype, qclass })
     }
+    #[cfg(test)]
     pub fn write<B: BufMut>(&self, b: &mut B) {
         for label in &self.name {
             b.put_u8(label.len() as u8);
@@ -262,8 +266,9 @@ impl<'a> DnsAnswer<'a> {
     }
 }
 
-/// DnsFrame is kept for tests and general-purpose use.
-/// The hot parse path in ParsedResponse bypasses this.
+/// Test-only helper for building/parsing a whole DNS frame; the hot parse path
+/// in ParsedResponse bypasses this.
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 pub struct DnsFrame<'a> {
     pub transaction_id: u16,
@@ -272,6 +277,7 @@ pub struct DnsFrame<'a> {
     pub answers: Vec<DnsAnswer<'a>>,
 }
 
+#[cfg(test)]
 impl<'a> DnsFrame<'a> {
     pub fn parse(buf: &mut SliceBuf<'a>) -> Option<DnsFrame<'a>> {
         let header = DnsHeader::parse(buf)?;
@@ -531,18 +537,6 @@ impl<'a> RRParser<'a> for UriReply<'a> {
     }
 }
 
-#[derive(Debug)]
-pub struct PtrReply {
-    pub name: String,
-}
-
-impl RRParser<'_> for PtrReply {
-    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<PtrReply> {
-        let mut buf = SliceBuf::new(answer.data);
-        let name = DnsLabel::parse(&mut buf)?;
-        Some(PtrReply { name: name.build_string(answer.data)? })
-    }
-}
 
 #[cfg(test)]
 mod tests {

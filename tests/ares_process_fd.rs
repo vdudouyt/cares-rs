@@ -103,8 +103,8 @@ fn resolves_localhost() {
                 if socks[i] == ARES_SOCKET_BAD {
                     continue;
                 }
-                let r = if libc::FD_ISSET(socks[i], &mut read_fds) { socks[i] } else { ARES_SOCKET_BAD };
-                let w = if libc::FD_ISSET(socks[i], &mut write_fds) { socks[i] } else { ARES_SOCKET_BAD };
+                let r = if libc::FD_ISSET(socks[i], &read_fds) { socks[i] } else { ARES_SOCKET_BAD };
+                let w = if libc::FD_ISSET(socks[i], &write_fds) { socks[i] } else { ARES_SOCKET_BAD };
                 if r != ARES_SOCKET_BAD || w != ARES_SOCKET_BAD {
                     ares_process_fd(channel, r, w);
                 }

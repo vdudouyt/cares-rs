@@ -1,5 +1,5 @@
-/// Keep MSRV below 1.77
-/// This is a subject to be removed in the future
+// Keep MSRV below 1.77
+// This is a subject to be removed in the future
 
 #[macro_export]
 macro_rules! offset_of {
@@ -13,7 +13,6 @@ macro_rules! offset_of {
 #[cfg(test)]
 mod tests {
     use core::mem::{align_of, size_of};
-    use crate::offset_of;
 
     const fn align_up(off: usize, align: usize) -> usize {
         // align is a power of two for Rust types, so this is fine.

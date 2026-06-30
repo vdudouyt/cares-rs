@@ -6,9 +6,13 @@ use std::io;
 use std::io::{Error, ErrorKind};
 use crate::{Channel, ARES_SOCKET_BAD};
 
+#[allow(non_camel_case_types)]
 pub type ares_socket_t = c_int;
+#[allow(non_camel_case_types)]
 pub type ares_ssize_t = isize;
 
+/// # Safety
+/// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
     if channel.is_null() || funcs.is_null() { return }
@@ -31,6 +35,8 @@ pub struct AresSocketFunctionsEx {
     // Additional optional fields omitted — we only use the above
 }
 
+/// # Safety
+/// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *const AresSocketFunctionsEx, user_data: *mut c_void) -> c_int {
     if channel.is_null() || funcs.is_null() { return 0; }

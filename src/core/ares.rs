@@ -22,7 +22,7 @@ pub struct Ares<T> {
     services: Option<Services>,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
-    pub server_failures: Vec<u32>,
+    pub _server_failures: Vec<u32>,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -127,7 +127,7 @@ impl<T> Ares<T> {
             services: None,
             default_udp_port: 53,
             default_tcp_port: 53,
-            server_failures: vec![],
+            _server_failures: vec![],
         }
     }
     pub fn from_sysconfig() -> Self {
@@ -247,9 +247,6 @@ impl<T> Ares<T> {
     }
     pub fn max_wait_time(&self) -> Duration {
         self.tasks.iter().map(Task::time_remaining).min().unwrap()
-    }
-    pub fn remove_completed(&mut self) {
-        self.tasks.retain(|task| !task.is_expired());
     }
 }
 

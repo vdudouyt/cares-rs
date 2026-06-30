@@ -113,7 +113,7 @@ pub const ARES_DATATYPE_ABINP: u16 = 11;
 // ---------------------------------------------------------------------------
 // RR keys — formula: RECORD_TYPE * 100 + index (matches c-ares ares_dns_rr_key_t)
 // A record keys (type=1)
-pub const ARES_RR_A_ADDR: u32 = 1 * 100 + 1;
+pub const ARES_RR_A_ADDR: u32 = 100 + 1;
 // NS record keys (type=2)
 pub const ARES_RR_NS_NSDNAME: u32 = 2 * 100 + 1;
 // CNAME record keys (type=5)
@@ -1122,11 +1122,11 @@ pub unsafe extern "C" fn ares_dns_record_rr_add(
         Err(_) => return ARES_EBADRESP,
     };
     let rec = &mut *dnsrec;
-    let vec = match section_vec_mut(rec, sect as u32) {
+    let vec = match section_vec_mut(rec, sect) {
         Some(v) => v,
         None => return ARES_EBADRESP,
     };
-    vec.push(new_rr(name_str, rtype as u16, rclass as u16, ttl as u32));
+    vec.push(new_rr(name_str, rtype as u16, rclass as u16, ttl));
     if !rr.is_null() {
         *rr = vec.last_mut().unwrap() as *mut ares_dns_rr_t;
     }
@@ -1141,7 +1141,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_cnt(
     if dnsrec.is_null() {
         return 0;
     }
-    match section_vec(&*dnsrec, sect as u32) {
+    match section_vec(&*dnsrec, sect) {
         Some(v) => v.len(),
         None => 0,
     }
@@ -1157,7 +1157,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_get(
         return std::ptr::null_mut();
     }
     let rec = &mut *dnsrec;
-    let vec = match section_vec_mut(rec, sect as u32) {
+    let vec = match section_vec_mut(rec, sect) {
         Some(v) => v,
         None => return std::ptr::null_mut(),
     };
@@ -1177,7 +1177,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_get_const(
         return std::ptr::null();
     }
     let rec = &*dnsrec;
-    let vec = match section_vec(rec, sect as u32) {
+    let vec = match section_vec(rec, sect) {
         Some(v) => v,
         None => return std::ptr::null(),
     };
@@ -1197,7 +1197,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_del(
         return ARES_EBADRESP;
     }
     let rec = &mut *dnsrec;
-    let vec = match section_vec_mut(rec, sect as u32) {
+    let vec = match section_vec_mut(rec, sect) {
         Some(v) => v,
         None => return ARES_EBADRESP,
     };
@@ -1786,7 +1786,7 @@ pub unsafe extern "C" fn ares_dns_write(
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rec_type_tostr(rtype: c_uint) -> *const c_char {
-    match rtype as u32 {
+    match rtype {
         1 => cstr!("A"),
         2 => cstr!("NS"),
         5 => cstr!("CNAME"),
@@ -2022,7 +2022,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_keys(
     if cnt.is_null() {
         return std::ptr::null();
     }
-    let (ptr, len): (*const c_uint, usize) = match rtype as u32 {
+    let (ptr, len): (*const c_uint, usize) = match rtype {
         1 => (KEYS_A.as_ptr(), KEYS_A.len()),
         2 => (KEYS_NS.as_ptr(), KEYS_NS.len()),
         5 => (KEYS_CNAME.as_ptr(), KEYS_CNAME.len()),

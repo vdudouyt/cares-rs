@@ -120,6 +120,8 @@ const ARES_FLAG_PRIMARY: c_int = 1 << 1;
 const ARES_FLAG_NOCHECKRESP: c_int = 1 << 7;
 const ARES_FLAG_EDNS: c_int = 1 << 8;
 
+/// # Safety
+/// `out_channel` must be non-null; `options` must be NULL or a valid `ares_options` consistent with `optmask`.
 #[no_mangle]
 pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
     // The built-in event thread is not supported. Match upstream c-ares on a
