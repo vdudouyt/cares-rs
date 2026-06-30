@@ -1123,7 +1123,6 @@ fn get_service_string(services: &Services, port: u16, flags: c_int) -> Option<CS
 
 #[derive(Debug)]
 struct ParsedResponse<'a> {
-    pub _transaction_id: u16,
     pub query: DnsQuery<'a>,
     pub answers: Vec<DnsAnswer<'a>>,
 }
@@ -1211,7 +1210,6 @@ impl<'a> ParsedResponse<'a> {
             return Err(ARES_ENODATA);
         }
         Ok(Self {
-            _transaction_id: header.transaction_id,
             query,
             answers,
         })
