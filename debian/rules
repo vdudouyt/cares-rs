@@ -1,0 +1,57 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# Force the Debian/OS Rust toolchain — never fall through to a rustup proxy on PATH.
+export PATH := /usr/bin:$(PATH)
+export RUSTC := /usr/bin/rustc
+export CARGO := /usr/bin/cargo
+
+# Resolve crates offline from the system registry populated by the librust-*-dev
+# build-deps; keep all cargo state inside the build tree.
+export CARGO_HOME := $(CURDIR)/debian/cargo_home
+
+# Embed the SONAME on the cdylib (cargo cannot set it directly).
+export RUSTFLAGS := -C link-arg=-Wl,-soname,libcares_rs.so.2
+
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+LIBDIR := usr/lib/$(DEB_HOST_MULTIARCH)
+RT := debian/libcares-rs2
+DEV := debian/libcares-rs-dev
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+	printf '[source.crates-io]\nreplace-with = "debian"\n\n[source.debian]\ndirectory = "/usr/share/cargo/registry"\n' > $(CARGO_HOME)/config.toml
+	# The committed Cargo.lock pins crates.io versions; re-resolve against the
+	# system registry (Cargo.toml is relaxed by debian/patches/relax-deps.patch).
+	rm -f Cargo.lock
+	$(CARGO) generate-lockfile --offline
+
+override_dh_auto_build:
+	$(CARGO) build --release --offline
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(CARGO) test --release --offline --tests
+endif
+
+override_dh_auto_install:
+	# runtime: real SONAME object + SONAME symlink
+	install -d $(RT)/$(LIBDIR)
+	install -m644 target/release/libcares_rs.so $(RT)/$(LIBDIR)/libcares_rs.so.2.0.0
+	ln -sf libcares_rs.so.2.0.0 $(RT)/$(LIBDIR)/libcares_rs.so.2
+	# dev: header (<cares-rs/ares.h>), static lib, dev symlink, pkg-config, cmake
+	install -d $(DEV)/usr/include/cares-rs $(DEV)/$(LIBDIR)/pkgconfig $(DEV)/$(LIBDIR)/cmake/cares-rs
+	install -m644 include/cares.h $(DEV)/usr/include/cares-rs/ares.h
+	install -m644 target/release/libcares_rs.a $(DEV)/$(LIBDIR)/libcares_rs.a
+	ln -sf libcares_rs.so.2 $(DEV)/$(LIBDIR)/libcares_rs.so
+	sed 's|@MULTIARCH@|$(DEB_HOST_MULTIARCH)|g' debian/libcares-rs.pc.in > $(DEV)/$(LIBDIR)/pkgconfig/libcares-rs.pc
+	install -m644 debian/cmake/cares-rs-config.cmake debian/cmake/cares-rs-config-version.cmake $(DEV)/$(LIBDIR)/cmake/cares-rs/
+
+override_dh_auto_clean:
+	$(CARGO) clean || true
+	rm -rf $(CARGO_HOME)
+	git checkout -- Cargo.lock 2>/dev/null || true

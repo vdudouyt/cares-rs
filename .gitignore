@@ -1,5 +1,18 @@
 /target
 /include/cares.h
+
+# Debian build artifacts (quilt + debhelper + cargo registry redirect)
+/.cargo/
+/.pc/
+/debian/.debhelper/
+/debian/cargo_home/
+/debian/files
+/debian/debhelper-build-stamp
+/debian/*.substvars
+/debian/*.debhelper.log
+/debian/libcares-rs2/
+/debian/libcares-rs-dev/
+/debian/tmp/
 tests/cares-tests/CMakeCache.txt
 tests/cares-tests/CMakeFiles/
 tests/cares-tests/Makefile

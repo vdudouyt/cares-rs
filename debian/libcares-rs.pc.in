@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${prefix}/lib/@MULTIARCH@
+includedir=${prefix}/include
+
+Name: cares-rs
+Description: asynchronous DNS resolver library (Rust, c-ares-compatible)
+Version: 0.1.0
+Libs: -L${libdir} -lcares_rs
+Cflags: -I${includedir}/cares-rs
