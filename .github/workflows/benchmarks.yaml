@@ -3,13 +3,18 @@ name: Benchmarks
 on:
   push:
     branches: [ "*" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "*" ]
 
+# Collapse the redundant branch-run and tag-run of the same commit into one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
 
 jobs:
   run_benchmarks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v4
