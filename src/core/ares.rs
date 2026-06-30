@@ -22,7 +22,6 @@ pub struct Ares<T> {
     services: Option<Services>,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
-    pub _server_failures: Vec<u32>,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -127,7 +126,6 @@ impl<T> Ares<T> {
             services: None,
             default_udp_port: 53,
             default_tcp_port: 53,
-            _server_failures: vec![],
         }
     }
     pub fn from_sysconfig() -> Self {
