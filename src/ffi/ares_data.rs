@@ -7,6 +7,24 @@ use crate::core::packets::{ TxtReply, TxtReplyExt, MxReply, CaaReply, NaptrReply
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
 
+// Ownership taxonomy for the `AresData`-managed types below — this is what decides
+// whether a type may carry a chain-walking `Drop`:
+//
+// * Reply types (`AresMxReply`, `AresTxtReply`, `AresSoaReply`, … — the results of
+//   `ares_parse_*_reply`) are allocated ONLY by cares-rs. A consumer never constructs
+//   one, so every value that drops is ours: a chain-walking `Drop` is safe, and is how
+//   they are freed (`ares_free_data` just `drop`s the `AresData` box and the head's
+//   `Drop` walks the chain).
+//
+// * Node types (`ares_addr_node`, `AresAddrPortNode`) are DUAL-ROLE: the caller
+//   constructs them (often on the stack) as INPUT to `ares_set_servers[_ports]`, and
+//   cares-rs also allocates them as the OUTPUT of `ares_get_servers[_ports]`. Because a
+//   Rust `Drop` fires for *every* value of a type, these must have NO `Drop` — one would
+//   also free the caller's own stack instances (the `munmap_chunk` benchmark abort that
+//   this arrangement fixes). Only the cares-rs-allocated (`get_servers`) instances are
+//   freed with `ares_free_data`, which walks + frees their boxed chain explicitly via
+//   `free_boxed_tail` — the same effect as a `Drop`, kept to the one place it is safe.
+
 pub trait IntoAresData<T> {
     /// Convert a parsed record into its C reply struct. Returns `None` when a
     /// field cannot be represented as a C string (e.g. it contains an embedded
@@ -212,6 +230,8 @@ pub union AresAddrUnion {
     pub addr6: crate::ffi::ares_in6_addr,
 }
 
+// Dual-role node type (caller-allocatable input + cares-rs-allocated output) — see the
+// ownership taxonomy at the top of this file: intentionally NO `Drop`.
 #[repr(C)]
 pub struct AresAddrPortNode {
     pub next: *mut AresAddrPortNode,

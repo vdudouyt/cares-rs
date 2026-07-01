@@ -292,6 +292,9 @@ impl ares_in6_addr {
     }
 }
 
+// Dual-role: caller-allocatable input to `ares_set_servers`, and cares-rs-allocated
+// output of `ares_get_servers`. Intentionally NO `Drop` — a chain-walking Drop would
+// free caller-owned stack instances. See the ownership taxonomy in `ffi/ares_data.rs`.
 #[repr(C)]
 pub struct ares_addr_node {
     pub next: *mut ares_addr_node,
