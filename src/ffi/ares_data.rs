@@ -61,6 +61,7 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
         AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
         AresDataType::SrvReply => drop(Box::from_raw(aresdata as *mut AresData<AresSrvReply>)),
         AresDataType::AddrPortNode => drop(Box::from_raw(aresdata as *mut AresData<AresAddrPortNode>)),
+        AresDataType::AddrNode => drop(Box::from_raw(aresdata as *mut AresData<super::ares_addr_node>)),
         AresDataType::UriReply => drop(Box::from_raw(aresdata as *mut AresData<AresUriReply>)),
     }
 }
@@ -76,7 +77,8 @@ pub enum AresDataType {
     SoaReply,
     SrvReply,
     UriReply,
-    AddrPortNode
+    AddrPortNode,
+    AddrNode,
 }
 
 #[repr(C)]
@@ -314,6 +316,25 @@ impl DataType for AresUriReply {
 
 impl DataType for AresAddrPortNode {
     fn datatype() -> AresDataType { AresDataType::AddrPortNode }
+}
+
+// `ares_addr_node` (returned by `ares_get_servers`) is freed with `ares_free_data`
+// too, so it needs the same AresData-chain machinery as AresAddrPortNode.
+impl CLinkedList for super::ares_addr_node {
+    fn next(&mut self) -> &mut *mut Self { &mut self.next }
+}
+
+impl Drop for super::ares_addr_node {
+    fn drop(&mut self) {
+        // No heap-owned fields (addr is an inline union); just walk the chain.
+        if !self.next.is_null() {
+            drop(unsafe { Box::from_raw(self.next) })
+        }
+    }
+}
+
+impl DataType for super::ares_addr_node {
+    fn datatype() -> AresDataType { AresDataType::AddrNode }
 }
 
 #[repr(C)]

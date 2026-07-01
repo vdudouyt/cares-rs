@@ -8,15 +8,14 @@
 //! on both success and error paths, so Miri flags use-after-free, out-of-bounds,
 //! leaks, and allocator mismatches across the whole FFI surface.
 
-use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_void, CStr, CString};
 use std::ptr;
 
-use cares_rs::ares_data::ares_free_data;
-use cares_rs::dns_record::{
-    ares_dns_parse, ares_dns_record_create, ares_dns_record_destroy, ares_dns_record_duplicate,
-    ares_dns_record_query_add, ares_dns_record_rr_add, ares_dns_rr_set_addr, ares_dns_write,
-    ARES_RR_A_ADDR, ARES_SECTION_ANSWER,
-};
+use cares_rs::ares_data::{ares_free_data, AresAddrPortNode};
+use cares_rs::ares_options::{ares_destroy_options, ares_options, ares_save_options};
+use cares_rs::ares_socket::ares_set_socket_functions_ex;
+use cares_rs::dns_record::*;
+use cares_rs::error::ares_strerror;
 use cares_rs::*;
 
 const ARES_SUCCESS: c_int = 0;
@@ -355,5 +354,307 @@ fn truncated_replies_error_cleanly_no_leak() {
             assert_ne!(rc, ARES_SUCCESS);
             assert!(out.is_null());
         }
+    }
+}
+
+// ---------- dns_record get/set accessor matrix (all datatypes) ----------
+
+#[test]
+fn dns_record_accessors_roundtrip() {
+    const T_CAA: u16 = 257;
+    const T_OPT: u16 = 41;
+    unsafe {
+        let mut rec = ptr::null_mut();
+        assert_eq!(ares_dns_record_create(&mut rec, 0x1234, 0, 0, 0), ARES_SUCCESS);
+
+        let apex = CString::new("example.com").unwrap();
+        assert_eq!(ares_dns_record_query_add(rec, apex.as_ptr(), T_A as u32, 1), ARES_SUCCESS);
+
+        // Add one RR per datatype family and set its fields.
+        let mut rr_a = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr_a, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_A as u32, 1, 300), ARES_SUCCESS);
+        let a4 = libc::in_addr { s_addr: u32::from_ne_bytes([10, 0, 0, 7]) };
+        assert_eq!(ares_dns_rr_set_addr(rr_a, ARES_RR_A_ADDR, &a4), ARES_SUCCESS);
+
+        let mut rr_aaaa = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr_aaaa, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_AAAA as u32, 1, 300), ARES_SUCCESS);
+        let v6 = [0x20u8, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        assert_eq!(ares_dns_rr_set_addr6(rr_aaaa, ARES_RR_AAAA_ADDR, v6.as_ptr() as *const _), ARES_SUCCESS);
+
+        let mut rr_mx = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr_mx, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_MX as u32, 1, 300), ARES_SUCCESS);
+        let mx_ex = CString::new("mail.example.com").unwrap();
+        assert_eq!(ares_dns_rr_set_u16(rr_mx, ARES_RR_MX_PREFERENCE, 10), ARES_SUCCESS);
+        assert_eq!(ares_dns_rr_set_str(rr_mx, ARES_RR_MX_EXCHANGE, mx_ex.as_ptr()), ARES_SUCCESS);
+
+        let mut rr_soa = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr_soa, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_SOA as u32, 1, 300), ARES_SUCCESS);
+        let mname = CString::new("ns1.example.com").unwrap();
+        assert_eq!(ares_dns_rr_set_u32(rr_soa, ARES_RR_SOA_SERIAL, 2024), ARES_SUCCESS);
+        assert_eq!(ares_dns_rr_set_str(rr_soa, ARES_RR_SOA_MNAME, mname.as_ptr()), ARES_SUCCESS);
+
+        let mut rr_caa = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr_caa, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_CAA as u32, 1, 300), ARES_SUCCESS);
+        let tag = CString::new("issue").unwrap();
+        assert_eq!(ares_dns_rr_set_u8(rr_caa, ARES_RR_CAA_CRITICAL, 128), ARES_SUCCESS);
+        assert_eq!(ares_dns_rr_set_str(rr_caa, ARES_RR_CAA_TAG, tag.as_ptr()), ARES_SUCCESS);
+        let caa_val = b"ca.example.com";
+        assert_eq!(ares_dns_rr_set_bin(rr_caa, ARES_RR_CAA_VALUE, caa_val.as_ptr(), caa_val.len()), ARES_SUCCESS);
+
+        let mut rr_txt = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr_txt, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_TXT as u32, 1, 300), ARES_SUCCESS);
+        let txt = b"hello";
+        assert_eq!(ares_dns_rr_set_bin(rr_txt, ARES_RR_TXT_DATA, txt.as_ptr(), txt.len()), ARES_SUCCESS);
+
+        let mut rr_opt = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr_opt, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_OPT as u32, 1232, 0), ARES_SUCCESS);
+        let optval = b"optdata";
+        assert_eq!(ares_dns_rr_set_opt(rr_opt, ARES_RR_OPT_OPTIONS, 5, optval.as_ptr(), optval.len()), ARES_SUCCESS);
+
+        // rr_add grows the record's internal RR array, which can reallocate and
+        // invalidate earlier rr pointers (same as upstream c-ares's ares_array), so
+        // re-fetch each RR by index before reading.
+        let rr_a = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 0);
+        let rr_aaaa = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 1);
+        let rr_mx = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 2);
+        let rr_soa = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 3);
+        let rr_caa = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 4);
+        let rr_txt = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 5);
+        let rr_opt = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 6);
+
+        // Getters return borrowed pointers into the record (no freeing).
+        assert!(!ares_dns_rr_get_addr(rr_a, ARES_RR_A_ADDR).is_null());
+        assert!(!ares_dns_rr_get_addr6(rr_aaaa, ARES_RR_AAAA_ADDR).is_null());
+        assert_eq!(ares_dns_rr_get_u16(rr_mx, ARES_RR_MX_PREFERENCE), 10);
+        assert_eq!(CStr::from_ptr(ares_dns_rr_get_str(rr_mx, ARES_RR_MX_EXCHANGE)).to_str().unwrap(), "mail.example.com");
+        assert_eq!(ares_dns_rr_get_u32(rr_soa, ARES_RR_SOA_SERIAL), 2024);
+        assert_eq!(ares_dns_rr_get_u8(rr_caa, ARES_RR_CAA_CRITICAL), 128);
+        let mut blen: libc::size_t = 0;
+        assert!(!ares_dns_rr_get_bin(rr_caa, ARES_RR_CAA_VALUE, &mut blen).is_null());
+        assert!(!ares_dns_rr_get_bin(rr_txt, ARES_RR_TXT_DATA, &mut blen).is_null());
+        if ares_dns_rr_get_abin_cnt(rr_txt, ARES_RR_TXT_DATA) > 0 {
+            let mut alen: libc::size_t = 0;
+            assert!(!ares_dns_rr_get_abin(rr_txt, ARES_RR_TXT_DATA, 0, &mut alen).is_null());
+        }
+        assert!(ares_dns_rr_get_opt_cnt(rr_opt, ARES_RR_OPT_OPTIONS) >= 1);
+        let mut optid: c_uint = 0;
+        let mut oval: *const u8 = ptr::null();
+        let mut olen: libc::size_t = 0;
+        let _ = ares_dns_rr_get_opt(rr_opt, ARES_RR_OPT_OPTIONS, 0, &mut optid, &mut oval, &mut olen);
+        let _ = ares_dns_rr_get_opt_byid(rr_opt, ARES_RR_OPT_OPTIONS, 5, &mut oval, &mut olen);
+        let _ = ares_dns_rr_del_opt_byid(rr_opt, ARES_RR_OPT_OPTIONS, 5);
+
+        // Common per-RR getters.
+        for &rr in &[rr_a, rr_aaaa, rr_mx, rr_soa, rr_caa, rr_txt, rr_opt] {
+            assert!(!ares_dns_rr_get_name(rr).is_null());
+            let _ = ares_dns_rr_get_type(rr);
+            let _ = ares_dns_rr_get_class(rr);
+            let _ = ares_dns_rr_get_ttl(rr);
+        }
+        let mut kcnt: libc::size_t = 0;
+        assert!(!ares_dns_rr_get_keys(T_A as u32, &mut kcnt).is_null());
+        assert!(kcnt >= 1);
+
+        // Record-level getters/setters.
+        assert_eq!(ares_dns_record_get_id(rec), 0x1234);
+        ares_dns_record_set_id(rec, 0x5678);
+        assert_eq!(ares_dns_record_get_id(rec), 0x5678);
+        let _ = ares_dns_record_get_flags(rec);
+        let _ = ares_dns_record_get_opcode(rec);
+        let _ = ares_dns_record_get_rcode(rec);
+        assert_eq!(ares_dns_record_query_cnt(rec), 1);
+        let mut qname: *const c_char = ptr::null();
+        let mut qtype: c_uint = 0;
+        let mut qclass: c_uint = 0;
+        assert_eq!(ares_dns_record_query_get(rec, 0, &mut qname, &mut qtype, &mut qclass), ARES_SUCCESS);
+        let newq = CString::new("other.example.com").unwrap();
+        assert_eq!(ares_dns_record_query_set_name(rec, 0, newq.as_ptr()), ARES_SUCCESS);
+        assert_eq!(ares_dns_record_query_set_type(rec, 0, T_AAAA as u32), ARES_SUCCESS);
+        let n = ares_dns_record_rr_cnt(rec, ARES_SECTION_ANSWER);
+        assert!(n >= 7);
+        assert!(!ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 0).is_null());
+        assert!(!ares_dns_record_rr_get_const(rec, ARES_SECTION_ANSWER, 0).is_null());
+        assert_eq!(ares_dns_record_rr_del(rec, ARES_SECTION_ANSWER, n - 1), ARES_SUCCESS);
+
+        ares_dns_record_destroy(rec);
+    }
+}
+
+// ---------- pure enum/string converters ----------
+
+#[test]
+fn dns_record_converters() {
+    unsafe {
+        assert!(!ares_dns_rec_type_tostr(T_A as u32).is_null());
+        let a = CString::new("A").unwrap();
+        let mut rt: c_uint = 0;
+        assert_ne!(ares_dns_rec_type_fromstr(&mut rt, a.as_ptr()), 0); // ares_bool_t (true)
+        assert_eq!(rt, T_A as u32);
+
+        assert!(!ares_dns_class_tostr(1).is_null());
+        let inc = CString::new("IN").unwrap();
+        let mut cl: c_uint = 0;
+        assert_ne!(ares_dns_class_fromstr(inc.as_ptr(), &mut cl), 0); // ares_bool_t (true)
+
+        assert!(!ares_dns_opcode_tostr(0).is_null());
+        assert!(!ares_dns_rcode_tostr(0).is_null());
+        assert!(!ares_dns_section_tostr(ARES_SECTION_ANSWER).is_null());
+        assert!(!ares_dns_rr_key_tostr(ARES_RR_A_ADDR).is_null());
+        let _ = ares_dns_rr_key_datatype(ARES_RR_A_ADDR);
+        assert_eq!(ares_dns_rr_key_to_rec_type(ARES_RR_A_ADDR), T_A as u32);
+    }
+}
+
+// ---------- globals / library / strerror / mkquery ----------
+
+#[test]
+fn library_globals_and_strerror() {
+    unsafe {
+        let mut v: c_int = 0;
+        assert!(!ares_version(&mut v).is_null());
+        assert!(!ares_version(ptr::null_mut()).is_null());
+        let _ = ares_threadsafety();
+        assert_eq!(ares_library_init(0), ARES_SUCCESS);
+        let _ = ares_library_initialized();
+        ares_library_cleanup();
+        for code in 0..25 {
+            assert!(!ares_strerror(code).is_null());
+        }
+        ares_free(ptr::null_mut()); // no-op
+        let p = libc::malloc(16);
+        ares_free(p); // libc::free of a libc::malloc'd block
+    }
+}
+
+#[test]
+fn mkquery_roundtrip() {
+    let name = CString::new("example.com").unwrap();
+    unsafe {
+        let mut buf: *mut u8 = ptr::null_mut();
+        let mut buflen: c_int = 0;
+        // dnsclass=IN(1), qtype=A(1), id=0x1234, rd=1
+        let rc = ares_mkquery(name.as_ptr(), 1, 1, 0x1234, 1, &mut buf, &mut buflen);
+        assert_eq!(rc, ARES_SUCCESS);
+        assert!(!buf.is_null() && buflen > 12);
+        ares_free_string(buf as *mut c_void);
+    }
+}
+
+// ---------- channel-level config (needs ares_init: a file read, no sockets) ----------
+
+unsafe extern "C" fn ai_capture(arg: *mut c_void, _status: c_int, _t: c_int, res: *mut ares_addrinfo) {
+    (*(arg as *mut *mut ares_addrinfo)) = res; // stash the addrinfo for the caller to free
+}
+
+#[test]
+fn channel_config_smoke() {
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+
+        // server setters: CSV + node-list forms
+        let csv = CString::new("8.8.8.8,1.1.1.1").unwrap();
+        assert_eq!(ares_set_servers_csv(ch, csv.as_ptr()), ARES_SUCCESS);
+        assert_eq!(ares_set_servers_ports_csv(ch, csv.as_ptr()), ARES_SUCCESS);
+
+        let mut node = ares_addr_node {
+            next: ptr::null_mut(),
+            family: AF_INET,
+            addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([8, 8, 4, 4]) } },
+        };
+        assert_eq!(ares_set_servers(ch, &mut node), ARES_SUCCESS);
+
+        let mut pnode = AresAddrPortNode {
+            next: ptr::null_mut(),
+            family: AF_INET,
+            addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([1, 1, 1, 1]) } },
+            udp_port: 53,
+            tcp_port: 53,
+        };
+        assert_eq!(ares_set_servers_ports(ch, &mut pnode), ARES_SUCCESS);
+
+        // server getters (allocate -> free)
+        let mut servers: *mut ares_addr_node = ptr::null_mut();
+        if ares_get_servers(ch, &mut servers) == ARES_SUCCESS && !servers.is_null() {
+            ares_free_data(servers as *mut c_void);
+        }
+        let scsv = ares_get_servers_csv(ch);
+        if !scsv.is_null() {
+            ares_free_string(scsv as *mut c_void);
+        }
+        let mut sp: *mut AresAddrPortNode = ptr::null_mut();
+        if ares_get_servers_ports(ch, &mut sp) == ARES_SUCCESS && !sp.is_null() {
+            ares_free_data(sp as *mut c_void);
+        }
+
+        // misc channel config (all no-op or store-only, no sockets)
+        let sortlist = CString::new("130.155.160.0/255.255.240.0").unwrap();
+        let _ = ares_set_sortlist(ch, sortlist.as_ptr());
+        ares_set_local_ip4(ch, 0x7f000001);
+        let ip6 = [0u8; 16];
+        ares_set_local_ip6(ch, ip6.as_ptr());
+        let dev = CString::new("lo").unwrap();
+        ares_set_local_dev(ch, dev.as_ptr());
+        ares_set_socket_callback(ch, None, ptr::null_mut());
+        ares_set_socket_configure_callback(ch, None, ptr::null_mut());
+        assert_eq!(ares_set_socket_functions_ex(ch, ptr::null(), ptr::null_mut()), 0); // null-guarded
+
+        // save/restore options round-trip (malloc'd arrays -> ares_destroy_options)
+        let mut opts: ares_options = std::mem::zeroed();
+        let mut optmask: c_int = 0;
+        assert_eq!(ares_save_options(ch, &mut opts, &mut optmask), ARES_SUCCESS);
+        ares_destroy_options(&mut opts);
+
+        // dup -> destroy
+        let mut ch2: Channel = ptr::null_mut();
+        assert_eq!(ares_dup(&mut ch2, ch), ARES_SUCCESS);
+        assert!(!ch2.is_null());
+        ares_destroy(ch2);
+
+        let _ = ares_reinit(ch);
+        let _ = ares_queue_active_queries(ch);
+        let _ = ares_queue_wait_empty(ch, 0);
+
+        ares_destroy(ch);
+    }
+}
+
+#[test]
+fn gethostbyname_file_and_free() {
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+        let name = CString::new("localhost").unwrap();
+        let mut he: *mut libc::hostent = ptr::null_mut();
+        // reads /etc/hosts; tolerate not-found, but free on success (no UB/leak either way)
+        let _ = ares_gethostbyname_file(ch, name.as_ptr(), AF_INET, &mut he);
+        if !he.is_null() {
+            ares_free_hostent(he);
+        }
+        ares_destroy(ch);
+    }
+}
+
+#[test]
+fn getaddrinfo_ip_literal_freeaddrinfo() {
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+        // An IP literal resolves synchronously (no socket); the caller owns the result.
+        let mut got: *mut ares_addrinfo = ptr::null_mut();
+        let name = CString::new("127.0.0.1").unwrap();
+        ares_getaddrinfo(
+            ch,
+            name.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            Some(ai_capture),
+            &mut got as *mut _ as *mut c_void,
+        );
+        if !got.is_null() {
+            ares_freeaddrinfo(got);
+        }
+        ares_freeaddrinfo(ptr::null_mut()); // null no-op
+        ares_destroy(ch);
     }
 }

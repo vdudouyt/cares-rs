@@ -3747,33 +3747,27 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
         return ARES_ENODATA;
     }
     let channeldata = unsafe { &mut *channel };
-    let mut head: *mut ares_addr_node = std::ptr::null_mut();
-    let mut tail: *mut ares_addr_node = std::ptr::null_mut();
+    // Build the list the same way as ares_get_servers_ports: an AresData-wrapped
+    // chain so the caller can free it with ares_free_data (the c-ares contract).
+    // (A plain Box chain here corrupted the heap under ares_free_data.)
+    let mut data: Vec<ares_addr_node> = vec![];
     for srv in &channeldata.ares.config.nameservers {
-        let mut node = Box::new(ares_addr_node {
-            next: std::ptr::null_mut(),
-            family: 0,
-            addr: AresAddrUnion { addr4: libc::in_addr { s_addr: 0 } },
-        });
-        match srv.0 {
+        let (family, addr) = match srv.0 {
             IpAddr::V4(v4) => {
-                node.family = libc::AF_INET;
-                node.addr = AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes(v4.octets()) } };
+                let s_addr = u32::from_ne_bytes(v4.octets());
+                (libc::AF_INET, AresAddrUnion { addr4: libc::in_addr { s_addr } })
             }
-            IpAddr::V6(v6) => {
-                node.family = libc::AF_INET6;
-                node.addr = AresAddrUnion { addr6: ares_in6_addr::from_octets(v6.octets()) };
-            }
-        }
-        let node_ptr = Box::into_raw(node);
-        if head.is_null() {
-            head = node_ptr;
-        } else {
-            unsafe { (*tail).next = node_ptr };
-        }
-        tail = node_ptr;
+            IpAddr::V6(v6) => (libc::AF_INET6, AresAddrUnion { addr6: ares_in6_addr::from_octets(v6.octets()) }),
+        };
+        data.push(ares_addr_node { next: std::ptr::null_mut(), family, addr });
     }
-    unsafe { *out = head };
+    let Some(chain) = clinkedlist::chain_nodes(data) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return ARES_ENODATA;
+    };
+    let aresdata: AresData<ares_addr_node> = AresData { data_type: ares_addr_node::datatype(), data: chain };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut (*aresdata).data };
     ARES_SUCCESS
 }
 
