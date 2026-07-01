@@ -746,3 +746,23 @@ fn get_servers_result_is_freed_with_ares_free_data() {
         ares_destroy(ch);
     }
 }
+
+#[test]
+fn parse_multi_record_reply_freed_via_free_chain() {
+    // Two MX records -> a 2-node AresMxReply chain, each node owning a `host` CString.
+    // ares_free_data -> free_chain must walk the tail AND each node's fields-only Drop must
+    // free its own field exactly once (Miri: no leak / no double-free) — the multi-node
+    // reply path that single-record parse tests never exercised.
+    let mut mx1 = vec![0x00u8, 0x0A]; // preference 10
+    mx1.extend(name_bytes("mail1.example.com"));
+    let mut mx2 = vec![0x00u8, 0x14]; // preference 20
+    mx2.extend(name_bytes("mail2.example.com"));
+    let buf = response("example.com", T_MX, &[rr(T_MX, &mx1), rr(T_MX, &mx2)]);
+    unsafe {
+        let mut out: *mut c_void = ptr::null_mut();
+        let rc = ares_parse_mx_reply(buf.as_ptr(), buf.len() as c_int, &mut out as *mut _ as *mut *mut _);
+        assert_eq!(rc, ARES_SUCCESS);
+        assert!(!out.is_null());
+        ares_free_data(out);
+    }
+}

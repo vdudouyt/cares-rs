@@ -7,23 +7,25 @@ use crate::core::packets::{ TxtReply, TxtReplyExt, MxReply, CaaReply, NaptrReply
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
 
-// Ownership taxonomy for the `AresData`-managed types below — this is what decides
-// whether a type may carry a chain-walking `Drop`:
+// Ownership taxonomy for the `AresData`-managed types below.
+//
+// Freeing is uniform: `ares_free_data` frees every chain explicitly via `free_chain`
+// (walk the boxed tail, then drop the inline-head box). NO type auto-walks its `next`
+// chain in `Drop`; a `Drop` frees only that node's own heap fields. So a chain is freed
+// exactly once, only when `ares_free_data` is called.
 //
 // * Reply types (`AresMxReply`, `AresTxtReply`, `AresSoaReply`, … — the results of
-//   `ares_parse_*_reply`) are allocated ONLY by cares-rs. A consumer never constructs
-//   one, so every value that drops is ours: a chain-walking `Drop` is safe, and is how
-//   they are freed (`ares_free_data` just `drop`s the `AresData` box and the head's
-//   `Drop` walks the chain).
+//   `ares_parse_*_reply`) are allocated ONLY by cares-rs; a consumer never constructs
+//   one. They keep a `Drop` — but only to free their own heap fields (`CString`/`Vec`),
+//   not the chain.
 //
 // * Node types (`ares_addr_node`, `AresAddrPortNode`) are DUAL-ROLE: the caller
 //   constructs them (often on the stack) as INPUT to `ares_set_servers[_ports]`, and
 //   cares-rs also allocates them as the OUTPUT of `ares_get_servers[_ports]`. Because a
-//   Rust `Drop` fires for *every* value of a type, these must have NO `Drop` — one would
-//   also free the caller's own stack instances (the `munmap_chunk` benchmark abort that
-//   this arrangement fixes). Only the cares-rs-allocated (`get_servers`) instances are
-//   freed with `ares_free_data`, which walks + frees their boxed chain explicitly via
-//   `free_boxed_tail` — the same effect as a `Drop`, kept to the one place it is safe.
+//   Rust `Drop` fires for *every* value of a type, these must have NO `Drop` at all — one
+//   would also free the caller's own stack instances (the `munmap_chunk` benchmark abort
+//   that this arrangement fixes). They own no heap fields, so they need none; only the
+//   cares-rs-allocated (`get_servers`) instances are freed, via `ares_free_data`.
 
 pub trait IntoAresData<T> {
     /// Convert a parsed record into its C reply struct. Returns `None` when a
@@ -69,41 +71,37 @@ unsafe fn restore_original_ptr(dataptr: *mut c_void) -> *mut c_void {
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     if dataptr.is_null() { return; }
     let aresdata = restore_original_ptr(dataptr) as *mut AresData<*mut c_void>;
+    // Every chained type is freed the same way: `free_chain` frees the boxed tail and
+    // the inline head, and each node's `Drop` (if any) frees only its own fields. A
+    // chain's `next` is therefore freed only here — never auto-freed by a type's `Drop`.
     match (*aresdata).data_type {
-        // Each type's Drop impl frees the node and walks its `next` chain.
-        AresDataType::MxReply => drop(Box::from_raw(aresdata as *mut AresData<AresMxReply>)),
-        AresDataType::CaaReply => drop(Box::from_raw(aresdata as *mut AresData<AresCaaReply>)),
-        AresDataType::TxtReply => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReply>)),
-        AresDataType::TxtReplyExt => drop(Box::from_raw(aresdata as *mut AresData<AresTxtReplyExt>)),
-        AresDataType::NaptrReply => drop(Box::from_raw(aresdata as *mut AresData<AresNaptrReply>)),
+        AresDataType::MxReply => free_chain::<AresMxReply>(aresdata),
+        AresDataType::CaaReply => free_chain::<AresCaaReply>(aresdata),
+        AresDataType::TxtReply => free_chain::<AresTxtReply>(aresdata),
+        AresDataType::TxtReplyExt => free_chain::<AresTxtReplyExt>(aresdata),
+        AresDataType::NaptrReply => free_chain::<AresNaptrReply>(aresdata),
+        AresDataType::SrvReply => free_chain::<AresSrvReply>(aresdata),
+        AresDataType::UriReply => free_chain::<AresUriReply>(aresdata),
+        AresDataType::AddrPortNode => free_chain::<AresAddrPortNode>(aresdata),
+        AresDataType::AddrNode => free_chain::<super::ares_addr_node>(aresdata),
+        // SOA is a single record (no `next` chain), so just free the one box.
         AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
-        AresDataType::SrvReply => drop(Box::from_raw(aresdata as *mut AresData<AresSrvReply>)),
-        // The two node types below are also caller-constructable inputs
-        // (ares_set_servers[_ports]), so they must NOT have a chain-walking Drop
-        // (it would free caller-owned stack nodes). Free their boxed tail here.
-        AresDataType::AddrPortNode => {
-            let ad = aresdata as *mut AresData<AresAddrPortNode>;
-            free_boxed_tail((*ad).data.next);
-            drop(Box::from_raw(ad));
-        }
-        AresDataType::AddrNode => {
-            let ad = aresdata as *mut AresData<super::ares_addr_node>;
-            free_boxed_tail((*ad).data.next);
-            drop(Box::from_raw(ad));
-        }
-        AresDataType::UriReply => drop(Box::from_raw(aresdata as *mut AresData<AresUriReply>)),
     }
 }
 
-/// Free a `Box::into_raw`'d tail chain built by `chain_nodes` (the list head is
-/// stored inline in its `AresData` box and freed with it; only the tail nodes are
-/// individually boxed). Used for the node types that have no `Drop`.
-unsafe fn free_boxed_tail<T: CLinkedList>(mut node: *mut T) {
+/// Free an `AresData`-wrapped node chain. The `chain_nodes`-boxed tail nodes are freed
+/// here, then the box frees the inline head. Each node's `Drop` (if any) frees only its
+/// own fields — never the `next` chain — so a chain is freed exactly once, only from
+/// here, and no `Drop` can walk into caller-owned memory.
+unsafe fn free_chain<T: CLinkedList>(aresdata: *mut AresData<*mut c_void>) {
+    let ad = aresdata as *mut AresData<T>;
+    let mut node = *(*ad).data.next();
     while !node.is_null() {
         let next = *(*node).next();
         drop(Box::from_raw(node));
         node = next;
     }
+    drop(Box::from_raw(ad));
 }
 
 #[repr(C)]
@@ -183,12 +181,9 @@ impl IntoAresData<AresCaaReply> for CaaReply<'_> {
 
 impl Drop for AresCaaReply {
     fn drop(&mut self) {
+        // Own fields only; the `next` chain is freed by ares_free_data's free_chain.
         drop(unsafe { CString::from_raw(self.property as *mut c_char) });
         drop(unsafe { CString::from_raw(self.value as *mut c_char) });
-
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) });
-        }
     }
 }
 
@@ -244,9 +239,6 @@ pub struct AresAddrPortNode {
 impl Drop for AresMxReply {
     fn drop(&mut self) {
         drop(unsafe { CString::from_raw(self.host as *mut c_char) });
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
     }
 }
 
@@ -254,9 +246,6 @@ impl Drop for AresTxtReply {
     fn drop(&mut self) {
         // txt was allocated with length+1 bytes (data + NUL terminator).
         drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length + 1, self.length + 1) });
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
     }
 }
 
@@ -264,18 +253,12 @@ impl Drop for AresTxtReplyExt {
     fn drop(&mut self) {
         // txt was allocated with length+1 bytes (data + NUL terminator).
         drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length + 1, self.length + 1) });
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
     }
 }
 
 impl Drop for AresSrvReply {
     fn drop(&mut self) {
         drop(unsafe { CString::from_raw(self.host as *mut c_char) });
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
     }
 }
 
@@ -312,8 +295,8 @@ impl CLinkedList for AresAddrPortNode {
 }
 
 // NB: no `Drop` for AresAddrPortNode — it is a caller-constructable input to
-// ares_set_servers_ports (callers build chains on the stack). ares_free_data frees
-// our own boxed chains explicitly via free_boxed_tail instead.
+// ares_set_servers_ports (callers build chains on the stack) and owns no heap fields.
+// ares_free_data frees our own boxed chains explicitly via free_chain instead.
 
 pub trait DataType {
     fn datatype() -> AresDataType;
@@ -383,10 +366,6 @@ impl Drop for AresNaptrReply {
         drop(unsafe { CString::from_raw(self.service as *mut c_char) });
         drop(unsafe { CString::from_raw(self.regexp as *mut c_char) });
         drop(unsafe { CString::from_raw(self.replacement as *mut c_char) });
-
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) });
-        }
     }
 }
 
@@ -400,9 +379,6 @@ impl Drop for AresSoaReply {
 impl Drop for AresUriReply {
     fn drop(&mut self) {
         drop(unsafe { CString::from_raw(self.uri as *mut c_char) });
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
     }
 }
 
