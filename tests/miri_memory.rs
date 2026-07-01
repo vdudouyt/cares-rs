@@ -661,10 +661,11 @@ fn getaddrinfo_ip_literal_freeaddrinfo() {
 
 #[test]
 fn set_servers_stack_chain_no_bad_free() {
-    // Regression: ares_addr_node / AresAddrPortNode are caller-constructable and
-    // callers build chains on the stack (as benches/req100k.rs does). They must
-    // have no chain-walking Drop, else dropping the stack head would Box::free a
-    // stack `next` pointer (munmap_chunk: invalid pointer / Miri: invalid free).
+    // The USER-ALLOCATED role of these dual-role node types: the caller builds a
+    // chain (here on the stack, as benches/req100k.rs does) for ares_set_servers
+    // [_ports] and owns/frees it itself — it is NEVER passed to ares_free_data. So
+    // the types must have no chain-walking Drop, else dropping the stack head would
+    // Box::free a stack `next` (munmap_chunk: invalid pointer / Miri: invalid free).
     unsafe {
         let mut ch: Channel = ptr::null_mut();
         assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
@@ -699,5 +700,49 @@ fn set_servers_stack_chain_no_bad_free() {
 
         ares_destroy(ch);
         // n1/n2/p1/p2 drop here as plain stack values — must free nothing.
+    }
+}
+
+#[test]
+fn get_servers_result_is_freed_with_ares_free_data() {
+    // The c-ares-ALLOCATED role of the same dual-role node types: ares_get_servers
+    // [_ports] allocate and return the list, and the caller frees it with
+    // ares_free_data (the documented c-ares contract). Set two servers so the
+    // returned chain is genuinely multi-node — this exercises free_boxed_tail's
+    // tail-walk in ares_free_data (the path the old ares_get_servers heap-corruption
+    // bug lived on); Miri checks it for leak / use-after-free / double-free.
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+        let csv = CString::new("8.8.8.8,1.1.1.1").unwrap();
+        assert_eq!(ares_set_servers_csv(ch, csv.as_ptr()), ARES_SUCCESS);
+
+        // ares_addr_node chain
+        let mut nodes: *mut ares_addr_node = ptr::null_mut();
+        assert_eq!(ares_get_servers(ch, &mut nodes), ARES_SUCCESS);
+        assert!(!nodes.is_null());
+        let mut n = 0;
+        let mut cur = nodes;
+        while !cur.is_null() {
+            n += 1;
+            cur = (*cur).next;
+        }
+        assert!(n >= 2, "multi-node chain so the tail-walk actually runs (got {n})");
+        ares_free_data(nodes as *mut c_void);
+
+        // ares_addr_port_node chain
+        let mut pnodes: *mut AresAddrPortNode = ptr::null_mut();
+        assert_eq!(ares_get_servers_ports(ch, &mut pnodes), ARES_SUCCESS);
+        assert!(!pnodes.is_null());
+        let mut pn = 0;
+        let mut pcur = pnodes;
+        while !pcur.is_null() {
+            pn += 1;
+            pcur = (*pcur).next;
+        }
+        assert!(pn >= 2, "multi-node port chain (got {pn})");
+        ares_free_data(pnodes as *mut c_void);
+
+        ares_destroy(ch);
     }
 }
