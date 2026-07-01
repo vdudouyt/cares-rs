@@ -658,3 +658,46 @@ fn getaddrinfo_ip_literal_freeaddrinfo() {
         ares_destroy(ch);
     }
 }
+
+#[test]
+fn set_servers_stack_chain_no_bad_free() {
+    // Regression: ares_addr_node / AresAddrPortNode are caller-constructable and
+    // callers build chains on the stack (as benches/req100k.rs does). They must
+    // have no chain-walking Drop, else dropping the stack head would Box::free a
+    // stack `next` pointer (munmap_chunk: invalid pointer / Miri: invalid free).
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+
+        let mut n2 = ares_addr_node {
+            next: ptr::null_mut(),
+            family: AF_INET,
+            addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([1, 1, 1, 1]) } },
+        };
+        let mut n1 = ares_addr_node {
+            next: &mut n2,
+            family: AF_INET,
+            addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([8, 8, 8, 8]) } },
+        };
+        assert_eq!(ares_set_servers(ch, &mut n1), ARES_SUCCESS);
+
+        let mut p2 = AresAddrPortNode {
+            next: ptr::null_mut(),
+            family: AF_INET,
+            addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([1, 0, 0, 1]) } },
+            udp_port: 53,
+            tcp_port: 53,
+        };
+        let mut p1 = AresAddrPortNode {
+            next: &mut p2,
+            family: AF_INET,
+            addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([9, 9, 9, 9]) } },
+            udp_port: 53,
+            tcp_port: 53,
+        };
+        assert_eq!(ares_set_servers_ports(ch, &mut p1), ARES_SUCCESS);
+
+        ares_destroy(ch);
+        // n1/n2/p1/p2 drop here as plain stack values — must free nothing.
+    }
+}

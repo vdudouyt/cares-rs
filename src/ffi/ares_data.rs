@@ -60,9 +60,31 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
         AresDataType::NaptrReply => drop(Box::from_raw(aresdata as *mut AresData<AresNaptrReply>)),
         AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
         AresDataType::SrvReply => drop(Box::from_raw(aresdata as *mut AresData<AresSrvReply>)),
-        AresDataType::AddrPortNode => drop(Box::from_raw(aresdata as *mut AresData<AresAddrPortNode>)),
-        AresDataType::AddrNode => drop(Box::from_raw(aresdata as *mut AresData<super::ares_addr_node>)),
+        // The two node types below are also caller-constructable inputs
+        // (ares_set_servers[_ports]), so they must NOT have a chain-walking Drop
+        // (it would free caller-owned stack nodes). Free their boxed tail here.
+        AresDataType::AddrPortNode => {
+            let ad = aresdata as *mut AresData<AresAddrPortNode>;
+            free_boxed_tail((*ad).data.next);
+            drop(Box::from_raw(ad));
+        }
+        AresDataType::AddrNode => {
+            let ad = aresdata as *mut AresData<super::ares_addr_node>;
+            free_boxed_tail((*ad).data.next);
+            drop(Box::from_raw(ad));
+        }
         AresDataType::UriReply => drop(Box::from_raw(aresdata as *mut AresData<AresUriReply>)),
+    }
+}
+
+/// Free a `Box::into_raw`'d tail chain built by `chain_nodes` (the list head is
+/// stored inline in its `AresData` box and freed with it; only the tail nodes are
+/// individually boxed). Used for the node types that have no `Drop`.
+unsafe fn free_boxed_tail<T: CLinkedList>(mut node: *mut T) {
+    while !node.is_null() {
+        let next = *(*node).next();
+        drop(Box::from_raw(node));
+        node = next;
     }
 }
 
@@ -269,14 +291,9 @@ impl CLinkedList for AresAddrPortNode {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
-impl Drop for AresAddrPortNode {
-    fn drop(&mut self) {
-        // No heap-owned fields (addr is an inline union); just walk the chain.
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
-    }
-}
+// NB: no `Drop` for AresAddrPortNode — it is a caller-constructable input to
+// ares_set_servers_ports (callers build chains on the stack). ares_free_data frees
+// our own boxed chains explicitly via free_boxed_tail instead.
 
 pub trait DataType {
     fn datatype() -> AresDataType;
@@ -318,19 +335,11 @@ impl DataType for AresAddrPortNode {
     fn datatype() -> AresDataType { AresDataType::AddrPortNode }
 }
 
-// `ares_addr_node` (returned by `ares_get_servers`) is freed with `ares_free_data`
-// too, so it needs the same AresData-chain machinery as AresAddrPortNode.
+// `ares_addr_node` (returned by `ares_get_servers`, freed with `ares_free_data`)
+// uses the same AresData-chain machinery as AresAddrPortNode. Like it, it has NO
+// `Drop` — it is a caller-constructable input to ares_set_servers.
 impl CLinkedList for super::ares_addr_node {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
-}
-
-impl Drop for super::ares_addr_node {
-    fn drop(&mut self) {
-        // No heap-owned fields (addr is an inline union); just walk the chain.
-        if !self.next.is_null() {
-            drop(unsafe { Box::from_raw(self.next) })
-        }
-    }
 }
 
 impl DataType for super::ares_addr_node {
