@@ -1,67 +1,23 @@
 //! Comprehensive in-memory memory-safety suite, written to run under Miri
 //! (`cargo +nightly miri test`) as well as normal `cargo test`.
 //!
-//! Everything here is hermetic: it builds DNS messages in memory and drives the
-//! C-ABI parse / allocate / free entry points directly — no `ares_init`, no
+//! Everything here is hermetic: it builds DNS messages in memory and calls the
+//! public parse / allocate / free entry points directly — no `ares_init`, no
 //! files, no sockets, no syscalls. The goal is to exercise every alloc/free path
 //! (hostent, `ares_data` linked lists, `libc::malloc`'d buffers, `ares_dns_record`)
 //! on both success and error paths, so Miri flags use-after-free, out-of-bounds,
 //! leaks, and allocator mismatches across the whole FFI surface.
 
-use std::ffi::{c_char, c_int, c_long, c_uint, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
 use std::ptr;
 
+use cares_rs::ares_data::ares_free_data;
+use cares_rs::dns_record::{
+    ares_dns_parse, ares_dns_record_create, ares_dns_record_destroy, ares_dns_record_duplicate,
+    ares_dns_record_query_add, ares_dns_record_rr_add, ares_dns_rr_set_addr, ares_dns_write,
+    ARES_RR_A_ADDR, ARES_SECTION_ANSWER,
+};
 use cares_rs::*;
-
-// The `ares_dns_record` API and `ares_free_data` live in private modules but are
-// exported as `#[no_mangle]` C symbols. Declare the slice we use here, exactly as
-// in the public C header — this also keeps the test honest about the C ABI.
-#[repr(C)]
-struct DnsRecord {
-    _opaque: [u8; 0],
-}
-#[repr(C)]
-struct DnsRr {
-    _opaque: [u8; 0],
-}
-const ARES_SECTION_ANSWER: c_uint = 1;
-const ARES_RR_A_ADDR: c_uint = 101;
-
-extern "C" {
-    fn ares_free_data(dataptr: *mut c_void);
-    fn ares_dns_record_create(
-        dnsrec: *mut *mut DnsRecord,
-        id: c_uint,
-        flags: c_uint,
-        opcode: c_uint,
-        rcode: c_uint,
-    ) -> c_int;
-    fn ares_dns_record_destroy(dnsrec: *mut DnsRecord);
-    fn ares_dns_record_duplicate(dnsrec: *const DnsRecord) -> *mut DnsRecord;
-    fn ares_dns_record_query_add(
-        dnsrec: *mut DnsRecord,
-        name: *const c_char,
-        qtype: c_uint,
-        qclass: c_uint,
-    ) -> c_int;
-    fn ares_dns_record_rr_add(
-        rr: *mut *mut DnsRr,
-        dnsrec: *mut DnsRecord,
-        sect: c_uint,
-        name: *const c_char,
-        rtype: c_uint,
-        rclass: c_uint,
-        ttl: c_uint,
-    ) -> c_int;
-    fn ares_dns_rr_set_addr(rr: *mut DnsRr, key: c_uint, addr: *const libc::in_addr) -> c_int;
-    fn ares_dns_write(dnsrec: *const DnsRecord, buf: *mut *mut u8, buf_len: *mut libc::size_t) -> c_int;
-    fn ares_dns_parse(
-        buf: *const u8,
-        buf_len: libc::size_t,
-        flags: c_uint,
-        dnsrec: *mut *mut DnsRecord,
-    ) -> c_int;
-}
 
 const ARES_SUCCESS: c_int = 0;
 const AF_INET: c_int = libc::AF_INET;
@@ -273,14 +229,14 @@ fn parse_soa_reply_and_free() {
 #[test]
 fn dns_record_create_write_parse_duplicate_free() {
     unsafe {
-        let mut rec: *mut DnsRecord = ptr::null_mut();
+        let mut rec = ptr::null_mut();
         assert_eq!(ares_dns_record_create(&mut rec, 0x1234, 0, 0, 0), ARES_SUCCESS);
         assert!(!rec.is_null());
 
         let qname = CString::new("example.com").unwrap();
         assert_eq!(ares_dns_record_query_add(rec, qname.as_ptr(), T_A as u32, 1), ARES_SUCCESS);
 
-        let mut rr_ptr: *mut DnsRr = ptr::null_mut();
+        let mut rr_ptr = ptr::null_mut();
         assert_eq!(
             ares_dns_record_rr_add(&mut rr_ptr, rec, ARES_SECTION_ANSWER, qname.as_ptr(), T_A as u32, 1, 60),
             ARES_SUCCESS
@@ -295,7 +251,7 @@ fn dns_record_create_write_parse_duplicate_free() {
         assert!(!buf.is_null() && buflen > 12);
 
         // parse it back into a fresh record
-        let mut rec2: *mut DnsRecord = ptr::null_mut();
+        let mut rec2 = ptr::null_mut();
         assert_eq!(ares_dns_parse(buf, buflen, 0, &mut rec2), ARES_SUCCESS);
         assert!(!rec2.is_null());
 

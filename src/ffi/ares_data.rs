@@ -1,3 +1,7 @@
+// Thin c-ares C ABI shims: the safety contract is the documented c-ares API
+// contract, so per-function `# Safety` docs would just be noise.
+#![allow(clippy::missing_safety_doc)]
+
 use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint };
 use crate::core::packets::{ TxtReply, TxtReplyExt, MxReply, CaaReply, NaptrReply, SoaReply, SrvReply, UriReply };
 use crate::ffi::clinkedlist::*;

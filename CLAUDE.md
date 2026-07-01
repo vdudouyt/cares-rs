@@ -12,4 +12,5 @@ IMPORTANT: When porting the tests, make sure to just copy the .c files without m
 
 ### Developing
 
-Make sure that you have no build/clippy warnings when commiting
+Make sure that you have no build/clippy warnings when commiting.
+All functions and structures exported in C should be public.

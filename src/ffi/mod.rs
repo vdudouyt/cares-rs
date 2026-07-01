@@ -1,12 +1,12 @@
-mod ares_data;
+pub mod ares_data;
 mod ares_hostent;
 pub mod ares_options;
 pub mod ares_socket;
 mod cnullterminated;
 mod cstr;
 mod clinkedlist;
-mod dns_record;
-mod error;
+pub mod dns_record;
+pub mod error;
 mod offset_of;
 
 use std::ffi::{ c_int, c_uint, c_void, c_char };

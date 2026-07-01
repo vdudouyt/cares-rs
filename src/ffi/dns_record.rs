@@ -1,4 +1,7 @@
 #![allow(non_camel_case_types, dead_code, unused_variables)]
+// Thin c-ares C ABI shims: the safety contract is the documented c-ares API
+// contract, so per-function `# Safety` docs would just be noise.
+#![allow(clippy::missing_safety_doc)]
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
