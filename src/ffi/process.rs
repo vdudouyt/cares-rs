@@ -97,85 +97,80 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     task.status = Status::Reading;
                     continue;
                 }
-                // Check DNS rcode for server failover (rcode in lower 4 bits of byte 3)
+                // Reactor-level verdict: rcode failover / server-health
+                // bookkeeping / TC retry — decided in core, executed here.
                 let summary = summarize(buf, 0);
-                let is_server_error = matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
-                let nservers = channeldata.server_health.len();
-                let is_addrinfo = matches!(task.userdata.callback, Callback::AddrInfo(_));
-                let is_hostbyname = matches!(task.userdata.callback, Callback::HostByName(_));
-
-                if is_server_error {
-                    // Invoke server_state_callback with failure (skip for callbacks that manage their own)
-                    if !is_addrinfo && !is_hostbyname {
-                        invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp());
+                let (actions, verdict) = on_datagram(
+                    &summary,
+                    task.userdata.callback.kind(),
+                    task.userdata.server_index,
+                    task.sock.is_tcp(),
+                    channeldata.ares.config.options.attempts,
+                    &mut channeldata.server_health,
+                );
+                for action in actions {
+                    match action {
+                        ReactorAction::NotifyServerState { server, ok, tcp } =>
+                            invoke_server_state_callback(channeldata, server, ok, tcp),
                     }
-                    if nservers > 1 && !is_addrinfo && !is_hostbyname {
-                        let si = task.userdata.server_index;
-                        channeldata.server_health.record_failure(si);
-                        let max_attempts = nservers * channeldata.ares.config.options.attempts as usize;
-                        if (si + 1) < max_attempts {
-                            let next_server = channeldata.server_health.pick_next();
-                            let new_ffidata = FFIData {
-                                callback: task.userdata.callback.clone_for_retry(),
-                                arg: task.userdata.arg,
-                                family: task.userdata.family,
-                                expected_record_type: task.userdata.expected_record_type,
-                                ip: task.userdata.ip,
-                                nameinfo_flags: task.userdata.nameinfo_flags,
-                                port: task.userdata.port,
-                                scope_id: task.userdata.scope_id,
-                                server_index: next_server,
-                                timeouts: task.userdata.timeouts,
-                            };
-                            let is_tcp = task.sock.is_tcp();
-                            let payload: &[u8] = if is_tcp && task.writebuf.len() > 2 {
-                                &task.writebuf[2..]
-                            } else {
-                                &task.writebuf[..]
-                            };
-                            let issued = channeldata.ares.enqueue(BytesMut::from(payload), SocketSource::fresh(is_tcp), next_server, new_ffidata).is_ok();
-                            if issued {
-                                let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                                let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                                invoke_sock_callbacks(channeldata, fd, sock_type);
-                            } else {
-                                // Retry socket couldn't be created — deliver the error.
-                                task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
-                            }
-                            task.status = Status::Completed;
-                            continue;
-                        }
-                    }
-                } else {
-                    // Success response - invoke server_state_callback with success, reset failures
-                    if !is_addrinfo {
-                        invoke_server_state_callback(channeldata, task.userdata.server_index, true, task.sock.is_tcp());
-                    }
-                    channeldata.server_health.record_success(task.userdata.server_index);
                 }
-                // Check TC (truncation) flag — retry over TCP if truncated and currently UDP
-                if summary.truncated && !task.sock.is_tcp() && !is_addrinfo && !is_hostbyname {
-                    let si = task.userdata.server_index;
-                    let new_ffidata = FFIData {
-                        callback: task.userdata.callback.clone_for_retry(),
-                        arg: task.userdata.arg,
-                        family: task.userdata.family,
-                        expected_record_type: task.userdata.expected_record_type,
-                        ip: task.userdata.ip,
-                        nameinfo_flags: task.userdata.nameinfo_flags,
-                        port: task.userdata.port,
-                        scope_id: task.userdata.scope_id,
-                        server_index: si,
-                        timeouts: task.userdata.timeouts,
-                    };
-                    if channeldata.ares.enqueue(task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata).is_ok() {
-                        let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                        invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
-                    } else {
-                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
+                match verdict {
+                    TaskVerdict::RetryNextServer { server: next_server } => {
+                        let new_ffidata = FFIData {
+                            callback: task.userdata.callback.clone_for_retry(),
+                            arg: task.userdata.arg,
+                            family: task.userdata.family,
+                            expected_record_type: task.userdata.expected_record_type,
+                            ip: task.userdata.ip,
+                            nameinfo_flags: task.userdata.nameinfo_flags,
+                            port: task.userdata.port,
+                            scope_id: task.userdata.scope_id,
+                            server_index: next_server,
+                            timeouts: task.userdata.timeouts,
+                        };
+                        let is_tcp = task.sock.is_tcp();
+                        // Strip the TCP length prefix; enqueue re-frames for the new transport.
+                        let payload: &[u8] = if is_tcp && task.writebuf.len() > 2 {
+                            &task.writebuf[2..]
+                        } else {
+                            &task.writebuf[..]
+                        };
+                        let issued = channeldata.ares.enqueue(BytesMut::from(payload), SocketSource::fresh(is_tcp), next_server, new_ffidata).is_ok();
+                        if issued {
+                            let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                            let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
+                            invoke_sock_callbacks(channeldata, fd, sock_type);
+                        } else {
+                            // Retry socket couldn't be created — deliver the error.
+                            task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
+                        }
+                        task.status = Status::Completed;
+                        continue;
                     }
-                    task.status = Status::Completed;
-                    continue;
+                    TaskVerdict::RetryTcp => {
+                        let si = task.userdata.server_index;
+                        let new_ffidata = FFIData {
+                            callback: task.userdata.callback.clone_for_retry(),
+                            arg: task.userdata.arg,
+                            family: task.userdata.family,
+                            expected_record_type: task.userdata.expected_record_type,
+                            ip: task.userdata.ip,
+                            nameinfo_flags: task.userdata.nameinfo_flags,
+                            port: task.userdata.port,
+                            scope_id: task.userdata.scope_id,
+                            server_index: si,
+                            timeouts: task.userdata.timeouts,
+                        };
+                        if channeldata.ares.enqueue(task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata).is_ok() {
+                            let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                            invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
+                        } else {
+                            task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
+                        }
+                        task.status = Status::Completed;
+                        continue;
+                    }
+                    TaskVerdict::Deliver => {}
                 }
                 // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
                 let is_dnsrec = match &task.userdata.callback {
@@ -218,20 +213,13 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
             task.tries_remaining += 1;
             // Invoke server_state_callback with failure for timeout
             invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp());
-            if task.tries_remaining < max_tries {
-                let nservers = channeldata.server_health.len();
+            let timeout_verdict = on_timeout(task.tries_remaining, max_tries, task.userdata.server_index, &mut channeldata.server_health);
+            if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
                 let is_tcp = task.sock.is_tcp();
                 let payload = if is_tcp && task.writebuf.len() > 2 {
                     BytesMut::from(&task.writebuf[2..])
                 } else {
                     task.writebuf.clone()
-                };
-                // Pick next server on timeout when there are multiple servers
-                let si = if nservers > 1 {
-                    channeldata.server_health.record_failure(task.userdata.server_index);
-                    channeldata.server_health.pick_next()
-                } else {
-                    task.userdata.server_index
                 };
                 let new_ffidata = FFIData {
                     callback: task.userdata.callback.clone_for_retry(),

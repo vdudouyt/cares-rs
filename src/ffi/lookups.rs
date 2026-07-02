@@ -98,6 +98,16 @@ impl Callback {
             Self::Probe => unsafe { run_probe_callback(buf, channeldata, ffidata) },
         }
     }
+    /// Which reactor-level policies apply to a task carrying this callback.
+    pub(crate) fn kind(&self) -> TaskKind {
+        match self {
+            Self::AddrInfo(_) => TaskKind::AddrInfo,
+            Self::HostByName(_) => TaskKind::HostByName,
+            Self::Search(_) => TaskKind::Search,
+            Self::Probe => TaskKind::Probe,
+            _ => TaskKind::Other,
+        }
+    }
     pub(crate) fn clone_for_retry(&self) -> Self {
         match self {
             Self::AresHostCallback(cb) => Self::AresHostCallback(*cb),
