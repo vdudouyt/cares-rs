@@ -190,9 +190,9 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
                 aliases: vec![],
                 addrs: vec![ip],
             };
-            let hostent = hostent_from_lookup(lookup);
+            let hostent = unsafe { hostent_from_lookup(lookup) };
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-            ares_free_hostent(hostent);
+            unsafe { ares_free_hostent(hostent) };
             return;
         }
     }
@@ -201,9 +201,9 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let hosts_result = channeldata.ares.hosts().lookup(hostname, family_filter);
     if let Some(ref lookup) = hosts_result {
         if !lookup.addrs.is_empty() {
-            let hostent = hostent_from_lookup(lookup.clone());
+            let hostent = unsafe { hostent_from_lookup(lookup.clone()) };
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-            ares_free_hostent(hostent);
+            unsafe { ares_free_hostent(hostent) };
             return;
         }
     }
@@ -224,9 +224,9 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
             aliases: vec![],
             addrs,
         };
-        let hostent = hostent_from_lookup(lookup);
+        let hostent = unsafe { hostent_from_lookup(lookup) };
         unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-        ares_free_hostent(hostent);
+        unsafe { ares_free_hostent(hostent) };
         return;
     }
 
@@ -295,9 +295,9 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
                         libc::AF_INET6 => libc::AF_INET6,
                         _ => libc::AF_INET6,
                     };
-                    let hostent = parsed_rrs.into_raw_hostent(current_family);
+                    let hostent = unsafe { parsed_rrs.into_raw_hostent(current_family) };
                     unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-                    ares_free_hostent(hostent);
+                    unsafe { ares_free_hostent(hostent) };
                     return;
                 }
             } else {
@@ -317,10 +317,10 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 
     let lookup = Rc::new(RefCell::new(HostByNameLookup { sm, callback, arg }));
 
-    launch_hostbyname_query(channeldata, &lookup, &query_hostname, send_family, send_rtype, use_tcp, first_server);
+    unsafe { launch_hostbyname_query(channeldata, &lookup, &query_hostname, send_family, send_rtype, use_tcp, first_server) };
 
     // Server failover probing: if enabled, probe an expired-failure server in parallel
-    maybe_launch_probe(channeldata, &query_hostname, send_family, first_server, use_tcp);
+    unsafe { maybe_launch_probe(channeldata, &query_hostname, send_family, first_server, use_tcp) };
 }
 
 /// # Safety
@@ -381,9 +381,9 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
     };
     // Check hosts file first
     if let Some(lookup) = channeldata.ares.hosts().reverse_lookup(addr) {
-        let hostent = hostent_from_lookup(lookup);
+        let hostent = unsafe { hostent_from_lookup(lookup) };
         unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-        ares_free_hostent(hostent);
+        unsafe { ares_free_hostent(hostent) };
         return;
     }
 
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         return;
     }
     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-    if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
+    if !unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) } {
         channeldata.ares.tasks.pop();
         unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
     }
@@ -505,10 +505,10 @@ pub unsafe extern "C" fn ares_query_dnsrec(
             if Instant::now() < *expires_at {
                 let cached_buf = cached_buf.clone();
                 let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
-                let status = dns_record::ares_dns_parse(cached_buf.as_ptr(), cached_buf.len(), 0, &mut dnsrec);
+                let status = unsafe { dns_record::ares_dns_parse(cached_buf.as_ptr(), cached_buf.len(), 0, &mut dnsrec) };
                 if status == ARES_SUCCESS {
-                    callback(arg, ARES_SUCCESS, 0, dnsrec);
-                    dns_record::ares_dns_record_destroy(dnsrec);
+                    unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
+                    unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
                     return;
                 }
             } else {
@@ -538,11 +538,11 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     let mut name_ptr: *const c_char = std::ptr::null();
     let mut qtype: c_uint = 0;
     let mut qclass: c_uint = 0;
-    if dns_record::ares_dns_record_query_cnt(dnsrec) > 0 {
-        dns_record::ares_dns_record_query_get(dnsrec, 0, &mut name_ptr, &mut qtype, &mut qclass);
+    if unsafe { dns_record::ares_dns_record_query_cnt(dnsrec) } > 0 {
+        unsafe { dns_record::ares_dns_record_query_get(dnsrec, 0, &mut name_ptr, &mut qtype, &mut qclass) };
     }
     if name_ptr.is_null() { return; }
-    let name_str = cstr_lossy(name_ptr);
+    let name_str = unsafe { cstr_lossy(name_ptr) };
 
     if name_str.is_empty() {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
@@ -678,7 +678,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
             return;
         }
         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-        if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
+        if !unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) } {
             channeldata.ares.tasks.pop();
             unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
         }
@@ -892,7 +892,7 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, look
             continue;
         }
         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-        if invoke_sock_callbacks(channeldata, fd, sock_type) {
+        if unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) } {
             // Add to connection pool for reuse
             if use_tcp {
                 if let crate::core::ares::DnsSocket::Tcp(ref rc_sock) = channeldata.ares.tasks.last().unwrap().sock {
@@ -960,7 +960,7 @@ pub(crate) unsafe fn run_ares_search_callback(res: Result<&[u8], c_int>, lookup:
     };
     match action {
         SearchAction::Send(next_name) => {
-            issue_search_query(channeldata, &next_name, dnstype, lookup.clone(), ffidata.timeouts);
+            unsafe { issue_search_query(channeldata, &next_name, dnstype, lookup.clone(), ffidata.timeouts) };
         }
         SearchAction::DeliverSuccess => {
             let buf = res.unwrap_or(&[]); // DeliverSuccess is only emitted for Ok replies
@@ -1042,10 +1042,10 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, loo
     for action in actions {
         match action {
             HostAction::Send { name, family, rtype, tcp, server } => {
-                launch_hostbyname_query(channeldata, lookup, &name, family, rtype, tcp, server);
+                unsafe { launch_hostbyname_query(channeldata, lookup, &name, family, rtype, tcp, server) };
             }
             HostAction::NotifyServerFail { server, tcp } => {
-                invoke_server_state_callback(channeldata, server, false, tcp);
+                unsafe { invoke_server_state_callback(channeldata, server, false, tcp) };
             }
             HostAction::CacheStore { names, rtype } => {
                 if channeldata.query_cache_max_ttl > 0 {
@@ -1066,10 +1066,10 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, loo
                 if !channeldata.sortlist.is_empty() {
                     apply_sortlist(&channeldata.sortlist, &mut rrs.items);
                 }
-                let hostent = rrs.into_raw_hostent(family);
+                let hostent = unsafe { rrs.into_raw_hostent(family) };
                 let (callback, arg) = { let l = lookup.borrow(); (l.callback, l.arg) };
                 unsafe { callback(arg, ARES_SUCCESS, timeouts, hostent) };
-                ares_free_hostent(hostent);
+                unsafe { ares_free_hostent(hostent) };
             }
             HostAction::DeliverFail { status, timeouts } => {
                 let (callback, arg) = { let l = lookup.borrow(); (l.callback, l.arg) };
@@ -1097,7 +1097,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 
     // Resolve service name to port number
     let port: u16 = if !service.is_null() {
-        let svc = cstr_lossy(service);
+        let svc = unsafe { cstr_lossy(service) };
         if let Ok(p) = svc.parse::<u16>() {
             p
         } else {
@@ -1113,10 +1113,10 @@ pub unsafe extern "C" fn ares_getaddrinfo(
                 "imap" => 143,
                 _ => {
                     // Try getservbyname via libc
-                    let c_svc = CStr::from_ptr(service);
-                    let result = libc::getservbyname(c_svc.as_ptr(), std::ptr::null());
+                    let c_svc = unsafe { CStr::from_ptr(service) };
+                    let result = unsafe { libc::getservbyname(c_svc.as_ptr(), std::ptr::null()) };
                     if !result.is_null() {
-                        u16::from_be((*result).s_port as u16)
+                        unsafe { u16::from_be((*result).s_port as u16) }
                     } else {
                         0
                     }
@@ -1195,7 +1195,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
         port,
     }));
     let actions = lookup.borrow_mut().sm.begin_batch(first_server);
-    execute_addrinfo_actions(channeldata, &lookup, actions);
+    unsafe { execute_addrinfo_actions(channeldata, &lookup, actions) };
 }
 
 /// Send executor for the getaddrinfo machine. Executes the actions returned
@@ -1230,7 +1230,7 @@ pub(crate) unsafe fn execute_addrinfo_actions(channeldata: &mut ChannelData, loo
                     true
                 } else if batch {
                     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                    if invoke_sock_callbacks(channeldata, fd, sock_type) {
+                    if unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) } {
                         false
                     } else {
                         // Configure callback failed - mark task as completed with error
@@ -1240,7 +1240,7 @@ pub(crate) unsafe fn execute_addrinfo_actions(channeldata: &mut ChannelData, loo
                 } else {
                     // TC/failover re-send: socket-callback results are ignored
                     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                    invoke_sock_callbacks(channeldata, fd, sock_type);
+                    unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) };
                     false
                 };
                 if failed {
@@ -1315,7 +1315,7 @@ pub(crate) unsafe fn maybe_launch_probe(
     // A probe has no user callback; if its socket can't be created, just skip it.
     if issued {
         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-        invoke_sock_callbacks(channeldata, fd, sock_type);
+        unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) };
     }
 }
 
@@ -1329,12 +1329,12 @@ pub(crate) unsafe fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: 
             if rcode == 0 || rcode == 3 {
                 // Success or NXDOMAIN — server is alive, reset failure state
                 if channeldata.server_health.record_success(si) {
-                    invoke_server_state_callback(channeldata, si, true, false);
+                    unsafe { invoke_server_state_callback(channeldata, si, true, false) };
                 }
             } else {
                 // SERVFAIL/NOTIMP/REFUSED — still failing
                 if channeldata.server_health.record_failure(si) {
-                    invoke_server_state_callback(channeldata, si, false, false);
+                    unsafe { invoke_server_state_callback(channeldata, si, false, false) };
                 }
             }
         }
@@ -1378,7 +1378,7 @@ pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, looku
         let mut l = lookup.borrow_mut();
         l.sm.step(ev, &cfg, &mut channeldata.server_health)
     };
-    execute_addrinfo_actions(channeldata, lookup, actions);
+    unsafe { execute_addrinfo_actions(channeldata, lookup, actions) };
 }
 
 #[no_mangle]

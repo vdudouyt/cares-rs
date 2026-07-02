@@ -111,7 +111,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 for action in actions {
                     match action {
                         ReactorAction::NotifyServerState { server, ok, tcp } =>
-                            invoke_server_state_callback(channeldata, server, ok, tcp),
+                            unsafe { invoke_server_state_callback(channeldata, server, ok, tcp) },
                     }
                 }
                 match verdict {
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                         if issued {
                             let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                             let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                            invoke_sock_callbacks(channeldata, fd, sock_type);
+                            unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) };
                         } else {
                             // Retry socket couldn't be created — deliver the error.
                             task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
@@ -163,7 +163,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                         };
                         if channeldata.ares.enqueue(task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata).is_ok() {
                             let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                            invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
+                            unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM) };
                         } else {
                             task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                         }
@@ -212,7 +212,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
         if task.is_expired() && task.status != Status::Completed {
             task.tries_remaining += 1;
             // Invoke server_state_callback with failure for timeout
-            invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp());
+            unsafe { invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp()) };
             let timeout_verdict = on_timeout(task.tries_remaining, max_tries, task.userdata.server_index, &mut channeldata.server_health);
             if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
                 let is_tcp = task.sock.is_tcp();
@@ -243,7 +243,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     }
                     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                     let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                    invoke_sock_callbacks(channeldata, fd, sock_type);
+                    unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) };
                 } else {
                     // Retry socket couldn't be created — deliver the error.
                     task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
@@ -278,11 +278,11 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
 /// Call socket create + configure callbacks. Returns false if either callback fails.
 pub(crate) unsafe fn invoke_sock_callbacks(channeldata: &ChannelData, fd: c_int, sock_type: c_int) -> bool {
     if let Some(cb) = channeldata.sock_create_callback {
-        let ret = cb(fd, sock_type, channeldata.sock_create_callback_arg);
+        let ret = unsafe { cb(fd, sock_type, channeldata.sock_create_callback_arg) };
         if ret != 0 { return false; }
     }
     if let Some(cb) = channeldata.sock_config_callback {
-        let ret = cb(fd, sock_type, channeldata.sock_config_callback_arg);
+        let ret = unsafe { cb(fd, sock_type, channeldata.sock_config_callback_arg) };
         if ret != 0 { return false; }
     }
     true
@@ -302,6 +302,6 @@ pub(crate) unsafe fn invoke_server_state_callback(channeldata: &ChannelData, ser
         let c_server_str = CString::new(server_str).unwrap_or_default();
         let success_int: c_int = if success { 1 } else { 0 };
         let flags: c_int = if is_tcp { 1 << 1 } else { 1 << 0 }; // ARES_SERV_STATE_TCP=2, UDP=1
-        cb(c_server_str.as_ptr(), success_int, flags, channeldata.server_state_callback_arg);
+        unsafe { cb(c_server_str.as_ptr(), success_int, flags, channeldata.server_state_callback_arg) };
     }
 }

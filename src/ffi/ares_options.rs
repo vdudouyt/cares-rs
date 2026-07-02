@@ -189,9 +189,9 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         }
     }
     if optmask & ARES_OPT_DOMAINS != 0 && !options.domains.is_null() {
-        let domains = std::slice::from_raw_parts(options.domains, options.ndomains as usize);
+        let domains = unsafe { std::slice::from_raw_parts(options.domains, options.ndomains as usize) };
         channeldata.ares.config.search = domains.iter()
-            .map(|&p| CStr::from_ptr(p).to_string_lossy().into_owned())
+            .map(|&p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
             .collect();
     }
     if optmask & ARES_OPT_NOROTATE != 0 {
@@ -204,13 +204,13 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         channeldata.maxtimeout = options.maxtimeout;
     }
     if optmask & ARES_OPT_LOOKUPS != 0 && !options.lookups.is_null() {
-        channeldata.lookups = CStr::from_ptr(options.lookups).to_string_lossy().into_owned();
+        channeldata.lookups = unsafe { CStr::from_ptr(options.lookups) }.to_string_lossy().into_owned();
     }
     if optmask & ARES_OPT_RESOLVCONF != 0 && !options.resolvconf_path.is_null() {
-        channeldata.resolvconf_path = CStr::from_ptr(options.resolvconf_path).to_string_lossy().into_owned();
+        channeldata.resolvconf_path = unsafe { CStr::from_ptr(options.resolvconf_path) }.to_string_lossy().into_owned();
     }
     if optmask & ARES_OPT_HOSTS_FILE != 0 && !options.hosts_path.is_null() {
-        channeldata.hosts_path = CStr::from_ptr(options.hosts_path).to_string_lossy().into_owned();
+        channeldata.hosts_path = unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned();
     }
     if optmask & ARES_OPT_QUERY_CACHE != 0 {
         channeldata.query_cache_max_ttl = options.qcache_max_ttl;

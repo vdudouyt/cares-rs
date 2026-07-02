@@ -17,7 +17,7 @@ pub type ares_ssize_t = libc::ssize_t;
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
     if channel.is_null() || funcs.is_null() { return }
     let channeldata = unsafe { &mut *channel };
-    channeldata.ares.socket_factory = SocketFactory::new((*funcs).clone(), user_data);
+    channeldata.ares.socket_factory = SocketFactory::new((unsafe { &*funcs }).clone(), user_data);
 }
 
 /// Extended socket functions (c-ares 1.34.6 API).
@@ -64,14 +64,14 @@ pub struct AresSocketFunctions {
 }
 
 unsafe extern "C" fn default_asocket(domain: c_int, socket_type: c_int, protocol: c_int, _user_data: *mut c_void) -> ares_socket_t {
-    let sock = socket(domain, socket_type, protocol);
+    let sock = unsafe { socket(domain, socket_type, protocol) };
     if sock == -1 {
         return ARES_SOCKET_BAD;
     }
 
-    let flags = fcntl(sock, F_GETFL);
-    if flags == -1 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1 {
-        close(sock);
+    let flags = unsafe { fcntl(sock, F_GETFL) };
+    if flags == -1 || unsafe { fcntl(sock, F_SETFL, flags | O_NONBLOCK) } == -1 {
+        unsafe { close(sock) };
         return ARES_SOCKET_BAD;
     }
 
@@ -79,19 +79,19 @@ unsafe extern "C" fn default_asocket(domain: c_int, socket_type: c_int, protocol
 }
 
 unsafe extern "C" fn default_aclose(sock: ares_socket_t, _user_data: *mut c_void) -> c_int {
-    close(sock)
+    unsafe { close(sock) }
 }
 
 unsafe extern "C" fn default_aconnect(sock: ares_socket_t, addr: *const sockaddr, addrlen: socklen_t, _user_data: *mut c_void) -> c_int {
-    connect(sock, addr, addrlen)
+    unsafe { connect(sock, addr, addrlen) }
 }
 
 unsafe extern "C" fn default_arecvfrom(sock: ares_socket_t, buf: *mut c_void, len: usize, flags: c_int, addr: *mut sockaddr, addrlen: *mut socklen_t, _user_data: *mut c_void) -> ares_ssize_t {
-    recvfrom(sock, buf, len, flags, addr, addrlen)
+    unsafe { recvfrom(sock, buf, len, flags, addr, addrlen) }
 }
 
 unsafe extern "C" fn default_asendv(sock: ares_socket_t, iov: *const iovec, iovcnt: c_int, _user_data: *mut c_void) -> ares_ssize_t {
-    writev(sock, iov, iovcnt)
+    unsafe { writev(sock, iov, iovcnt) }
 }
 
 fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, socklen_t) {

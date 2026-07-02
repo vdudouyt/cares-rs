@@ -13,7 +13,7 @@ use super::*;
 /// `p` must be a valid NUL-terminated C string (no NULL check — some public
 /// entry points deliberately accept the crash-on-NULL contract of upstream).
 pub(crate) unsafe fn cstr_lossy<'a>(p: *const c_char) -> &'a str {
-    CStr::from_ptr(p).to_str().unwrap_or("")
+    unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
 }
 
 /// C string → `Some(&str)`, `None` on invalid UTF-8 (caller picks the error code).
@@ -21,7 +21,7 @@ pub(crate) unsafe fn cstr_lossy<'a>(p: *const c_char) -> &'a str {
 /// # Safety
 /// `p` must be a valid NUL-terminated C string.
 pub(crate) unsafe fn cstr_opt<'a>(p: *const c_char) -> Option<&'a str> {
-    CStr::from_ptr(p).to_str().ok()
+    unsafe { CStr::from_ptr(p) }.to_str().ok()
 }
 
 /// Copy `bytes` into a fresh `libc::malloc` buffer with a NUL terminator
@@ -32,10 +32,10 @@ pub(crate) unsafe fn cstr_opt<'a>(p: *const c_char) -> Option<&'a str> {
 /// must free with `libc::free`.
 pub(crate) unsafe fn malloc_cstr(bytes: &[u8]) -> *mut c_char {
     let len = bytes.len();
-    let p = libc::malloc(len + 1) as *mut u8;
+    let p = unsafe { libc::malloc(len + 1) as *mut u8 };
     if p.is_null() { return std::ptr::null_mut(); }
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len);
-    *p.add(len) = 0; // NUL terminator
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len) };
+    unsafe { *p.add(len) = 0 }; // NUL terminator
     p as *mut c_char
 }
 

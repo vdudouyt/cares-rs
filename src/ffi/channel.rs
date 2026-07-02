@@ -267,7 +267,7 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
         channeldata.server_health.clear();
         return ARES_SUCCESS;
     }
-    let Some(s) = cstr_opt(servers) else { return ARES_EBADSTR };
+    let Some(s) = (unsafe { cstr_opt(servers) }) else { return ARES_EBADSTR };
     if s.is_empty() {
         channeldata.ares.config.nameservers.clear();
         channeldata.ares.config.tcp_ports.clear();
@@ -289,7 +289,7 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const c_char) -> c_int {
-    ares_set_servers_ports_csv(channel, servers)
+    unsafe { ares_set_servers_ports_csv(channel, servers) }
 }
 
 /// # Safety

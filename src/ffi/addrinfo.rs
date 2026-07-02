@@ -146,15 +146,15 @@ pub(crate) fn build_ares_addrinfo(name: &str, nodes: *mut ares_addrinfo_node) ->
 
 pub(crate) unsafe fn free_addrinfo_nodes(mut node: *mut ares_addrinfo_node) {
     while !node.is_null() {
-        let next = (*node).ai_next;
-        if !(*node).ai_addr.is_null() {
-            match (*node).ai_family {
-                libc::AF_INET => { drop(Box::from_raw((*node).ai_addr as *mut libc::sockaddr_in)); }
-                libc::AF_INET6 => { drop(Box::from_raw((*node).ai_addr as *mut libc::sockaddr_in6)); }
+        let next = (unsafe { &*node }).ai_next;
+        if !(unsafe { &*node }).ai_addr.is_null() {
+            match (unsafe { &*node }).ai_family {
+                libc::AF_INET => { drop(unsafe { Box::from_raw((*node).ai_addr as *mut libc::sockaddr_in) }); }
+                libc::AF_INET6 => { drop(unsafe { Box::from_raw((*node).ai_addr as *mut libc::sockaddr_in6) }); }
                 _ => {}
             }
         }
-        drop(Box::from_raw(node));
+        unsafe { drop(Box::from_raw(node)) };
         node = next;
     }
 }

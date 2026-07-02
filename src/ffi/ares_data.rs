@@ -64,28 +64,30 @@ impl IntoAresData<AresMxReply> for MxReply<'_> {
 }
 
 unsafe fn restore_original_ptr(dataptr: *mut c_void) -> *mut c_void {
-    dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data))
+    unsafe { dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data)) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     if dataptr.is_null() { return; }
-    let aresdata = restore_original_ptr(dataptr) as *mut AresData<*mut c_void>;
+    let aresdata = unsafe { restore_original_ptr(dataptr) as *mut AresData<*mut c_void> };
     // Every chained type is freed the same way: `free_chain` frees the boxed tail and
     // the inline head, and each node's `Drop` (if any) frees only its own fields. A
     // chain's `next` is therefore freed only here — never auto-freed by a type's `Drop`.
-    match (*aresdata).data_type {
-        AresDataType::MxReply => free_chain::<AresMxReply>(aresdata),
-        AresDataType::CaaReply => free_chain::<AresCaaReply>(aresdata),
-        AresDataType::TxtReply => free_chain::<AresTxtReply>(aresdata),
-        AresDataType::TxtReplyExt => free_chain::<AresTxtReplyExt>(aresdata),
-        AresDataType::NaptrReply => free_chain::<AresNaptrReply>(aresdata),
-        AresDataType::SrvReply => free_chain::<AresSrvReply>(aresdata),
-        AresDataType::UriReply => free_chain::<AresUriReply>(aresdata),
-        AresDataType::AddrPortNode => free_chain::<AresAddrPortNode>(aresdata),
-        AresDataType::AddrNode => free_chain::<super::ares_addr_node>(aresdata),
-        // SOA is a single record (no `next` chain), so just free the one box.
-        AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
+    unsafe {
+        match (&*aresdata).data_type {
+            AresDataType::MxReply => free_chain::<AresMxReply>(aresdata),
+            AresDataType::CaaReply => free_chain::<AresCaaReply>(aresdata),
+            AresDataType::TxtReply => free_chain::<AresTxtReply>(aresdata),
+            AresDataType::TxtReplyExt => free_chain::<AresTxtReplyExt>(aresdata),
+            AresDataType::NaptrReply => free_chain::<AresNaptrReply>(aresdata),
+            AresDataType::SrvReply => free_chain::<AresSrvReply>(aresdata),
+            AresDataType::UriReply => free_chain::<AresUriReply>(aresdata),
+            AresDataType::AddrPortNode => free_chain::<AresAddrPortNode>(aresdata),
+            AresDataType::AddrNode => free_chain::<super::ares_addr_node>(aresdata),
+            // SOA is a single record (no `next` chain), so just free the one box.
+            AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
+        }
     }
 }
 
@@ -95,13 +97,13 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
 /// here, and no `Drop` can walk into caller-owned memory.
 unsafe fn free_chain<T: CLinkedList>(aresdata: *mut AresData<*mut c_void>) {
     let ad = aresdata as *mut AresData<T>;
-    let mut node = *(*ad).data.next();
+    let mut node = unsafe { *(*ad).data.next() };
     while !node.is_null() {
-        let next = *(*node).next();
-        drop(Box::from_raw(node));
+        let next = unsafe { *(*node).next() };
+        unsafe { drop(Box::from_raw(node)) };
         node = next;
     }
-    drop(Box::from_raw(ad));
+    unsafe { drop(Box::from_raw(ad)) };
 }
 
 #[repr(C)]

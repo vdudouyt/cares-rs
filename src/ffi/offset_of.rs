@@ -14,6 +14,7 @@ macro_rules! offset_of {
         // SAFETY: we only take the address of the field, never read it; `base`
         // points to a live (uninitialized) allocation, so the projection is in
         // bounds with valid provenance.
+        #[allow(unused_unsafe)]
         let field = unsafe { core::ptr::addr_of!((*base).$field) };
         (field as usize) - (base as usize)
     }};

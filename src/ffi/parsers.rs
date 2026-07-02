@@ -274,7 +274,7 @@ where T1: RRParser<'a> + IntoAresData<T2>, T2: DataType
 pub(crate) unsafe fn parse_to_singleptr<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T2: DataType, for<'a> T2: FromParsedBuf<'a, T2>
 {
-    ares_fn_wrapper(out, || {
+    let build = || {
         if abuf.is_null() || alen < 0 {
             return Err(ARES_EBADRESP);
         }
@@ -286,8 +286,9 @@ where T2: DataType, for<'a> T2: FromParsedBuf<'a, T2>
         let reply = aresreplies.into_iter().next().ok_or(ARES_ENODATA)?;
         let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
         let aresdata = Box::into_raw(Box::new(aresdata));
-        Ok(&mut (*aresdata).data)
-    })
+        unsafe { Ok(&mut (*aresdata).data as *mut _) }
+    };
+    unsafe { ares_fn_wrapper(out, build) }
 }
 
 /// Trait to bridge lifetime-carrying parsed types to the non-lifetime output type.
@@ -325,7 +326,7 @@ impl_from_parsed_buf!(UriReply<'a>, AresUriReply);
 
 pub(crate) unsafe fn parse_to_clinkedlist<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
-    ares_fn_wrapper(out, || {
+    let build = || {
         if abuf.is_null() || alen < 0 {
             return Err(ARES_EBADRESP);
         }
@@ -337,8 +338,9 @@ where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
 
         let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
         let aresdata = Box::into_raw(Box::new(aresdata));
-        Ok(&mut (*aresdata).data)
-    })
+        unsafe { Ok(&mut (*aresdata).data as *mut _) }
+    };
+    unsafe { ares_fn_wrapper(out, build) }
 }
 
 /// # Safety
@@ -380,7 +382,7 @@ impl DnsLabel<'_> {
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0)
+    unsafe { parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0) }
 }
 
 pub(crate) fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {
@@ -403,7 +405,7 @@ pub(crate) unsafe fn fill_addrttls<T: AddrTTL>(input: &[AddrRecord], addrttls: *
         if i >= naddrttls {
             break;
         }
-        if (*addrttls.add(i)).set_addr_ttl(&addr_record.ip, addr_record.ttl).is_some() {
+        if (unsafe { &mut *addrttls.add(i) }).set_addr_ttl(&addr_record.ip, addr_record.ttl).is_some() {
             i += 1;
         }
     }
@@ -425,16 +427,16 @@ pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abu
     };
     let on_success = |res: ParsedRRs<AddrRecord>| -> c_int {
         if !out_addrttls.is_null() && !out_naddrttls.is_null() {
-            *out_naddrttls = fill_addrttls(&res.items, out_addrttls, *out_naddrttls as usize) as c_int;
+            unsafe { *out_naddrttls = fill_addrttls(&res.items, out_addrttls, *out_naddrttls as usize) as c_int; }
         }
         if !out.is_null() {
-            *out = res.into_raw_hostent(family);
+            unsafe { *out = res.into_raw_hostent(family); }
         }
         ARES_SUCCESS
     };
     let on_error = |status: c_int| -> c_int {
-        if !out.is_null() { *out = std::ptr::null_mut(); }
-        if !out_naddrttls.is_null() { *out_naddrttls = 0; }
+        if !out.is_null() { unsafe { *out = std::ptr::null_mut(); } }
+        if !out_naddrttls.is_null() { unsafe { *out_naddrttls = 0; } }
         status
     };
     match try_parse() {
@@ -447,14 +449,14 @@ pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abu
 /// `abuf` must be valid for `alen` bytes; `out`, `addrttls`, and `out_naddrttls` must be valid, writable pointers.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
-    parse_to_hostent(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET)
+    unsafe { parse_to_hostent(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET) }
 }
 
 /// # Safety
 /// `abuf` must be valid for `alen` bytes; `out`, `addrttls`, and `out_naddrttls` must be valid, writable pointers.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
-    parse_to_hostent(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6)
+    unsafe { parse_to_hostent(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6) }
 }
 
 impl RRParser<'_> for CString {
@@ -469,7 +471,7 @@ impl RRParser<'_> for CString {
 /// `abuf` must be valid for `alen` bytes and `addr` for `addrlen` bytes; `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
-    ares_fn_wrapper(out, || {
+    let build = || {
         if abuf.is_null() || alen < 0 {
             return Err(ARES_EBADRESP);
         }
@@ -485,15 +487,16 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
         let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
         let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
         addr_records.items.push(AddrRecord { ip, ttl: 0 });
-        Ok(addr_records.into_raw_hostent(family))
-    })
+        unsafe { Ok(addr_records.into_raw_hostent(family)) }
+    };
+    unsafe { ares_fn_wrapper(out, build) }
 }
 
 /// # Safety
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
-    let ret = parse_to_singleptr::<AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA);
+    let ret = unsafe { parse_to_singleptr::<AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA) };
     if ret == ARES_ENODATA { return ARES_EBADRESP; }
     ret
 }
@@ -512,7 +515,7 @@ pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
     // All buffers handed to the caller (ares_create_query/mkquery/expand_name/
     // expand_string/get_servers_csv) are libc::malloc'd, so free with libc::free.
     if !s.is_null() {
-        libc::free(s);
+        unsafe { libc::free(s) };
     }
 }
 
@@ -819,5 +822,5 @@ pub unsafe extern "C" fn ares_mkquery(
     buf: *mut *mut u8,
     buflen: *mut c_int,
 ) -> c_int {
-    ares_create_query(name, dnsclass, qtype, id, rd, buf, buflen, 0)
+    unsafe { ares_create_query(name, dnsclass, qtype, id, rd, buf, buflen, 0) }
 }

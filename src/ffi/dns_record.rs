@@ -904,14 +904,14 @@ pub unsafe extern "C" fn ares_dns_record_create(
         additional: Vec::new(),
         raw_buf: None,
     });
-    *dnsrec = Box::into_raw(rec);
+    unsafe { *dnsrec = Box::into_raw(rec); }
     ARES_SUCCESS
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_destroy(dnsrec: *mut ares_dns_record_t) {
     if !dnsrec.is_null() {
-        let _ = Box::from_raw(dnsrec);
+        let _ = unsafe { Box::from_raw(dnsrec) };
     }
 }
 
@@ -925,12 +925,12 @@ pub unsafe extern "C" fn ares_dns_record_duplicate(
     }
     let mut buf: *mut u8 = std::ptr::null_mut();
     let mut buf_len: usize = 0;
-    if ares_dns_write(dnsrec as *const _, &mut buf, &mut buf_len) != ARES_SUCCESS {
+    if unsafe { ares_dns_write(dnsrec as *const _, &mut buf, &mut buf_len) } != ARES_SUCCESS {
         return std::ptr::null_mut();
     }
     let mut out: *mut ares_dns_record_t = std::ptr::null_mut();
-    let status = ares_dns_parse(buf, buf_len, 0, &mut out);
-    libc::free(buf as *mut _);
+    let status = unsafe { ares_dns_parse(buf, buf_len, 0, &mut out) };
+    unsafe { libc::free(buf as *mut _) };
     if status != ARES_SUCCESS {
         return std::ptr::null_mut();
     }
@@ -948,7 +948,7 @@ pub unsafe extern "C" fn ares_dns_record_get_id(
     if dnsrec.is_null() {
         return 0;
     }
-    (*dnsrec).id as c_uint
+    unsafe { (*dnsrec).id as c_uint }
 }
 
 #[no_mangle]
@@ -958,7 +958,7 @@ pub unsafe extern "C" fn ares_dns_record_get_flags(
     if dnsrec.is_null() {
         return 0;
     }
-    (*dnsrec).flags as c_uint
+    unsafe { (*dnsrec).flags as c_uint }
 }
 
 #[no_mangle]
@@ -968,7 +968,7 @@ pub unsafe extern "C" fn ares_dns_record_get_opcode(
     if dnsrec.is_null() {
         return 0;
     }
-    (*dnsrec).opcode as c_uint
+    unsafe { (*dnsrec).opcode as c_uint }
 }
 
 #[no_mangle]
@@ -978,7 +978,7 @@ pub unsafe extern "C" fn ares_dns_record_get_rcode(
     if dnsrec.is_null() {
         return 0;
     }
-    (*dnsrec).rcode as c_uint
+    unsafe { (*dnsrec).rcode as c_uint }
 }
 
 #[no_mangle]
@@ -987,7 +987,7 @@ pub unsafe extern "C" fn ares_dns_record_set_id(
     id: c_uint,
 ) {
     if !dnsrec.is_null() {
-        (*dnsrec).id = id as u16;
+        unsafe { (*dnsrec).id = id as u16; }
     }
 }
 
@@ -1005,7 +1005,7 @@ pub unsafe extern "C" fn ares_dns_record_query_add(
     if dnsrec.is_null() || name.is_null() {
         return ARES_EBADRESP;
     }
-    let name_str = match CStr::from_ptr(name).to_str() {
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return ARES_EBADRESP,
     };
@@ -1013,7 +1013,7 @@ pub unsafe extern "C" fn ares_dns_record_query_add(
         Ok(c) => c,
         Err(_) => return ARES_EBADRESP,
     };
-    (*dnsrec).queries.push(DnsRecordQuery {
+    (unsafe { &mut *dnsrec }).queries.push(DnsRecordQuery {
         name: name_str,
         name_c,
         qtype: qtype as u16,
@@ -1029,7 +1029,7 @@ pub unsafe extern "C" fn ares_dns_record_query_cnt(
     if dnsrec.is_null() {
         return 0;
     }
-    (*dnsrec).queries.len()
+    unsafe { (*dnsrec).queries.len() }
 }
 
 #[no_mangle]
@@ -1043,19 +1043,19 @@ pub unsafe extern "C" fn ares_dns_record_query_get(
     if dnsrec.is_null() {
         return ARES_EBADRESP;
     }
-    let rec = &*dnsrec;
+    let rec = unsafe { &*dnsrec };
     if idx >= rec.queries.len() {
         return ARES_EBADRESP;
     }
     let q = &rec.queries[idx];
     if !name.is_null() {
-        *name = q.name_c.as_ptr();
+        unsafe { *name = q.name_c.as_ptr(); }
     }
     if !qtype.is_null() {
-        *qtype = q.qtype as c_uint;
+        unsafe { *qtype = q.qtype as c_uint; }
     }
     if !qclass.is_null() {
-        *qclass = q.qclass as c_uint;
+        unsafe { *qclass = q.qclass as c_uint; }
     }
     ARES_SUCCESS
 }
@@ -1069,11 +1069,11 @@ pub unsafe extern "C" fn ares_dns_record_query_set_name(
     if dnsrec.is_null() || name.is_null() {
         return ARES_EBADRESP;
     }
-    let rec = &mut *dnsrec;
+    let rec = unsafe { &mut *dnsrec };
     if idx >= rec.queries.len() {
         return ARES_EBADRESP;
     }
-    let name_str = match CStr::from_ptr(name).to_str() {
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return ARES_EBADRESP,
     };
@@ -1095,7 +1095,7 @@ pub unsafe extern "C" fn ares_dns_record_query_set_type(
     if dnsrec.is_null() {
         return ARES_EBADRESP;
     }
-    let rec = &mut *dnsrec;
+    let rec = unsafe { &mut *dnsrec };
     if idx >= rec.queries.len() {
         return ARES_EBADRESP;
     }
@@ -1120,18 +1120,18 @@ pub unsafe extern "C" fn ares_dns_record_rr_add(
     if dnsrec.is_null() || name.is_null() {
         return ARES_EBADRESP;
     }
-    let name_str = match CStr::from_ptr(name).to_str() {
+    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
         Ok(s) => s,
         Err(_) => return ARES_EBADRESP,
     };
-    let rec = &mut *dnsrec;
+    let rec = unsafe { &mut *dnsrec };
     let vec = match section_vec_mut(rec, sect) {
         Some(v) => v,
         None => return ARES_EBADRESP,
     };
     vec.push(new_rr(name_str, rtype as u16, rclass as u16, ttl));
     if !rr.is_null() {
-        *rr = vec.last_mut().unwrap() as *mut ares_dns_rr_t;
+        unsafe { *rr = vec.last_mut().unwrap() as *mut ares_dns_rr_t; }
     }
     ARES_SUCCESS
 }
@@ -1144,7 +1144,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_cnt(
     if dnsrec.is_null() {
         return 0;
     }
-    match section_vec(&*dnsrec, sect) {
+    match section_vec(unsafe { &*dnsrec }, sect) {
         Some(v) => v.len(),
         None => 0,
     }
@@ -1159,7 +1159,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_get(
     if dnsrec.is_null() {
         return std::ptr::null_mut();
     }
-    let rec = &mut *dnsrec;
+    let rec = unsafe { &mut *dnsrec };
     let vec = match section_vec_mut(rec, sect) {
         Some(v) => v,
         None => return std::ptr::null_mut(),
@@ -1179,7 +1179,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_get_const(
     if dnsrec.is_null() {
         return std::ptr::null();
     }
-    let rec = &*dnsrec;
+    let rec = unsafe { &*dnsrec };
     let vec = match section_vec(rec, sect) {
         Some(v) => v,
         None => return std::ptr::null(),
@@ -1199,7 +1199,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_del(
     if dnsrec.is_null() {
         return ARES_EBADRESP;
     }
-    let rec = &mut *dnsrec;
+    let rec = unsafe { &mut *dnsrec };
     let vec = match section_vec_mut(rec, sect) {
         Some(v) => v,
         None => return ARES_EBADRESP,
@@ -1222,7 +1222,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_name(
     if rr.is_null() {
         return std::ptr::null();
     }
-    (*rr).name_c.as_ptr()
+    unsafe { (*rr).name_c.as_ptr() }
 }
 
 #[no_mangle]
@@ -1230,7 +1230,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_type(rr: *const ares_dns_rr_t) -> c_uin
     if rr.is_null() {
         return 0;
     }
-    (*rr).rtype as c_uint
+    unsafe { (*rr).rtype as c_uint }
 }
 
 #[no_mangle]
@@ -1238,7 +1238,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_class(rr: *const ares_dns_rr_t) -> c_ui
     if rr.is_null() {
         return 0;
     }
-    (*rr).rclass as c_uint
+    unsafe { (*rr).rclass as c_uint }
 }
 
 #[no_mangle]
@@ -1246,7 +1246,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_ttl(rr: *const ares_dns_rr_t) -> c_uint
     if rr.is_null() {
         return 0;
     }
-    (*rr).ttl as c_uint
+    unsafe { (*rr).ttl as c_uint }
 }
 
 #[no_mangle]
@@ -1258,12 +1258,12 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr(
         return std::ptr::null();
     }
     let rr_mut = rr as *mut ares_dns_rr_t;
-    if let Some(RRValue::Addr(addr)) = (*rr_mut).data.get(&key) {
+    if let Some(RRValue::Addr(addr)) = (unsafe { &*rr_mut }).data.get(&key) {
         let octets = addr.octets();
-        (*rr_mut).cached_in_addr = libc::in_addr {
+        (unsafe { &mut *rr_mut }).cached_in_addr = libc::in_addr {
             s_addr: u32::from_ne_bytes(octets),
         };
-        &(*rr_mut).cached_in_addr as *const libc::in_addr
+        &(unsafe { &*rr_mut }).cached_in_addr as *const libc::in_addr
     } else {
         std::ptr::null()
     }
@@ -1278,9 +1278,9 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr6(
         return std::ptr::null();
     }
     let rr_mut = rr as *mut ares_dns_rr_t;
-    if let Some(RRValue::Addr6(addr)) = (*rr_mut).data.get(&key) {
-        (*rr_mut).cached_in6_addr = crate::ffi::ares_in6_addr::from_octets(addr.octets());
-        &(*rr_mut).cached_in6_addr as *const crate::ffi::ares_in6_addr
+    if let Some(RRValue::Addr6(addr)) = (unsafe { &*rr_mut }).data.get(&key) {
+        unsafe { (*rr_mut).cached_in6_addr = crate::ffi::ares_in6_addr::from_octets(addr.octets()); }
+        &(unsafe { &*rr_mut }).cached_in6_addr as *const crate::ffi::ares_in6_addr
     } else {
         std::ptr::null()
     }
@@ -1294,7 +1294,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_str(
     if rr.is_null() {
         return std::ptr::null();
     }
-    if let Some(RRValue::Str(s)) = (*rr).data.get(&key) {
+    if let Some(RRValue::Str(s)) = (unsafe { &*rr }).data.get(&key) {
         s.as_ptr()
     } else {
         std::ptr::null()
@@ -1309,7 +1309,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u8(
     if rr.is_null() {
         return 0;
     }
-    if let Some(RRValue::U8(v)) = (*rr).data.get(&key) {
+    if let Some(RRValue::U8(v)) = (unsafe { &*rr }).data.get(&key) {
         *v
     } else {
         0
@@ -1324,7 +1324,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u16(
     if rr.is_null() {
         return 0;
     }
-    if let Some(RRValue::U16(v)) = (*rr).data.get(&key) {
+    if let Some(RRValue::U16(v)) = (unsafe { &*rr }).data.get(&key) {
         *v
     } else {
         0
@@ -1339,7 +1339,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u32(
     if rr.is_null() {
         return 0;
     }
-    if let Some(RRValue::U32(v)) = (*rr).data.get(&key) {
+    if let Some(RRValue::U32(v)) = (unsafe { &*rr }).data.get(&key) {
         *v
     } else {
         0
@@ -1353,14 +1353,14 @@ pub unsafe extern "C" fn ares_dns_rr_get_bin(
     len: *mut libc::size_t,
 ) -> *const u8 {
     if rr.is_null() {
-        if !len.is_null() { *len = 0; }
+        if !len.is_null() { unsafe { *len = 0; } }
         return std::ptr::null();
     }
-    if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
+    if let Some(RRValue::Bin(data)) = (unsafe { &*rr }).data.get(&key) {
         // Bin data is null-terminated; logical length excludes the trailing \0
         let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
         if !len.is_null() {
-            *len = logical_len;
+            unsafe { *len = logical_len; }
         }
         if data.is_empty() {
             static EMPTY: u8 = 0;
@@ -1370,7 +1370,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_bin(
         }
     } else {
         if !len.is_null() {
-            *len = 0;
+            unsafe { *len = 0; }
         }
         std::ptr::null()
     }
@@ -1389,9 +1389,9 @@ pub unsafe extern "C" fn ares_dns_rr_set_addr(
     if rr.is_null() || addr.is_null() {
         return ARES_EBADRESP;
     }
-    let octets = (*addr).s_addr.to_ne_bytes();
+    let octets = (unsafe { &*addr }).s_addr.to_ne_bytes();
     let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
-    (*rr).data.insert(key, RRValue::Addr(ip));
+    unsafe { (*rr).data.insert(key, RRValue::Addr(ip)); }
     ARES_SUCCESS
 }
 
@@ -1404,8 +1404,8 @@ pub unsafe extern "C" fn ares_dns_rr_set_addr6(
     if rr.is_null() || addr.is_null() {
         return ARES_EBADRESP;
     }
-    let ip = Ipv6Addr::from((*addr)._S6_un._S6_u8);
-    (*rr).data.insert(key, RRValue::Addr6(ip));
+    let ip = unsafe { Ipv6Addr::from((*addr)._S6_un._S6_u8) };
+    unsafe { (*rr).data.insert(key, RRValue::Addr6(ip)); }
     ARES_SUCCESS
 }
 
@@ -1418,9 +1418,9 @@ pub unsafe extern "C" fn ares_dns_rr_set_str(
     if rr.is_null() || val.is_null() {
         return ARES_EBADRESP;
     }
-    let cstr = CStr::from_ptr(val);
+    let cstr = unsafe { CStr::from_ptr(val) };
     let owned = CString::from(cstr);
-    (*rr).data.insert(key, RRValue::Str(owned));
+    unsafe { (*rr).data.insert(key, RRValue::Str(owned)); }
     ARES_SUCCESS
 }
 
@@ -1433,7 +1433,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u8(
     if rr.is_null() {
         return ARES_EBADRESP;
     }
-    (*rr).data.insert(key, RRValue::U8(val));
+    unsafe { (*rr).data.insert(key, RRValue::U8(val)); }
     ARES_SUCCESS
 }
 
@@ -1446,7 +1446,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u16(
     if rr.is_null() {
         return ARES_EBADRESP;
     }
-    (*rr).data.insert(key, RRValue::U16(val));
+    unsafe { (*rr).data.insert(key, RRValue::U16(val)); }
     ARES_SUCCESS
 }
 
@@ -1459,7 +1459,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u32(
     if rr.is_null() {
         return ARES_EBADRESP;
     }
-    (*rr).data.insert(key, RRValue::U32(val));
+    unsafe { (*rr).data.insert(key, RRValue::U32(val)); }
     ARES_SUCCESS
 }
 
@@ -1476,9 +1476,9 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
     let data = if val.is_null() || len == 0 {
         &[] as &[u8]
     } else {
-        std::slice::from_raw_parts(val, len)
+        unsafe { std::slice::from_raw_parts(val, len) }
     };
-    (*rr).data.insert(key, bin_nul(data));
+    unsafe { (*rr).data.insert(key, bin_nul(data)); }
     ARES_SUCCESS
 }
 
@@ -1500,11 +1500,11 @@ pub unsafe extern "C" fn ares_dns_rr_set_opt(
     let data = if val.is_null() || val_len == 0 {
         Vec::new()
     } else {
-        std::slice::from_raw_parts(val, val_len).to_vec()
+        unsafe { std::slice::from_raw_parts(val, val_len) }.to_vec()
     };
     // Remove existing opt with same code if present, then add
-    (*rr).opts.retain(|(code, _)| *code != opt as u16);
-    (*rr).opts.push((opt as u16, data));
+    unsafe { (*rr).opts.retain(|(code, _)| *code != opt as u16); }
+    unsafe { (*rr).opts.push((opt as u16, data)); }
     ARES_SUCCESS
 }
 
@@ -1516,7 +1516,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt_cnt(
     if rr.is_null() {
         return 0;
     }
-    (*rr).opts.len()
+    unsafe { (*rr).opts.len() }
 }
 
 #[no_mangle]
@@ -1531,18 +1531,18 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt(
     if rr.is_null() {
         return ARES_EBADRESP;
     }
-    if idx >= (*rr).opts.len() {
+    if idx >= (unsafe { &*rr }).opts.len() {
         return ARES_EBADRESP;
     }
-    let (code, data) = &(&(*rr).opts)[idx];
+    let (code, data) = &(&(unsafe { &*rr }).opts)[idx];
     if !opt.is_null() {
-        *opt = *code as c_uint;
+        unsafe { *opt = *code as c_uint; }
     }
     if !val.is_null() {
-        *val = data.as_ptr();
+        unsafe { *val = data.as_ptr(); }
     }
     if !val_len.is_null() {
-        *val_len = data.len();
+        unsafe { *val_len = data.len(); }
     }
     ARES_SUCCESS
 }
@@ -1559,13 +1559,13 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt_byid(
         return ARES_FALSE;
     }
     let opt_u16 = opt as u16;
-    for (code, data) in &(*rr).opts {
+    for (code, data) in &(unsafe { &*rr }).opts {
         if *code == opt_u16 {
             if !val.is_null() {
-                *val = data.as_ptr();
+                unsafe { *val = data.as_ptr(); }
             }
             if !val_len.is_null() {
-                *val_len = data.len();
+                unsafe { *val_len = data.len(); }
             }
             return ARES_TRUE;
         }
@@ -1583,9 +1583,9 @@ pub unsafe extern "C" fn ares_dns_rr_del_opt_byid(
         return ARES_EBADRESP;
     }
     let opt_u16 = opt as u16;
-    let before = (*rr).opts.len();
-    (*rr).opts.retain(|(code, _)| *code != opt_u16);
-    if (*rr).opts.len() < before {
+    let before = (unsafe { &*rr }).opts.len();
+    unsafe { (*rr).opts.retain(|(code, _)| *code != opt_u16); }
+    if (unsafe { &*rr }).opts.len() < before {
         ARES_SUCCESS
     } else {
         ARES_EBADRESP
@@ -1606,7 +1606,7 @@ pub unsafe extern "C" fn ares_dns_parse(
     if buf.is_null() || dnsrec.is_null() || buf_len < 12 {
         return ARES_EBADRESP;
     }
-    let data = std::slice::from_raw_parts(buf, buf_len);
+    let data = unsafe { std::slice::from_raw_parts(buf, buf_len) };
 
     // Parse header (12 bytes)
     let id = ((data[0] as u16) << 8) | data[1] as u16;
@@ -1699,7 +1699,7 @@ pub unsafe extern "C" fn ares_dns_parse(
         }
     }
 
-    *dnsrec = Box::into_raw(rec);
+    unsafe { *dnsrec = Box::into_raw(rec); }
     ARES_SUCCESS
 }
 
@@ -1716,7 +1716,7 @@ pub unsafe extern "C" fn ares_dns_write(
     if dnsrec.is_null() || buf.is_null() || buf_len.is_null() {
         return ARES_EBADRESP;
     }
-    let rec = &*dnsrec;
+    let rec = unsafe { &*dnsrec };
 
     let mut out = Vec::with_capacity(512);
 
@@ -1771,13 +1771,13 @@ pub unsafe extern "C" fn ares_dns_write(
 
     // Allocate with libc::malloc for C interop
     let total_len = out.len();
-    let ptr = libc::malloc(total_len) as *mut u8;
+    let ptr = unsafe { libc::malloc(total_len) as *mut u8 };
     if ptr.is_null() {
         return ARES_ENOMEM;
     }
-    std::ptr::copy_nonoverlapping(out.as_ptr(), ptr, total_len);
-    *buf = ptr;
-    *buf_len = total_len;
+    unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), ptr, total_len) };
+    unsafe { *buf = ptr; }
+    unsafe { *buf_len = total_len; }
     ARES_SUCCESS
 }
 
@@ -1819,7 +1819,7 @@ pub unsafe extern "C" fn ares_dns_rec_type_fromstr(
     if str_ptr.is_null() || rtype.is_null() {
         return ARES_FALSE;
     }
-    let s = match CStr::from_ptr(str_ptr).to_str() {
+    let s = match unsafe { CStr::from_ptr(str_ptr) }.to_str() {
         Ok(s) => s,
         Err(_) => return ARES_FALSE,
     };
@@ -1845,7 +1845,7 @@ pub unsafe extern "C" fn ares_dns_rec_type_fromstr(
         "RAW_RR" => ARES_REC_TYPE_RAW_RR as c_uint,
         _ => return ARES_FALSE,
     };
-    *rtype = val;
+    unsafe { *rtype = val; }
     ARES_TRUE
 }
 
@@ -1869,7 +1869,7 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
     if str_ptr.is_null() || qclass.is_null() {
         return ARES_FALSE;
     }
-    let s = match CStr::from_ptr(str_ptr).to_str() {
+    let s = match unsafe { CStr::from_ptr(str_ptr) }.to_str() {
         Ok(s) => s,
         Err(_) => return ARES_FALSE,
     };
@@ -1881,7 +1881,7 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
         "ANY" => ARES_CLASS_ANY as c_uint,
         _ => return ARES_FALSE,
     };
-    *qclass = val;
+    unsafe { *qclass = val; }
     ARES_TRUE
 }
 
@@ -2043,11 +2043,11 @@ pub unsafe extern "C" fn ares_dns_rr_get_keys(
         257 => (KEYS_CAA.as_ptr(), KEYS_CAA.len()),
         65536 => (KEYS_RAW_RR.as_ptr(), KEYS_RAW_RR.len()),
         _ => {
-            *cnt = 0;
+            unsafe { *cnt = 0; }
             return std::ptr::null();
         }
     };
-    *cnt = len;
+    unsafe { *cnt = len; }
     ptr
 }
 
@@ -2197,7 +2197,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin_cnt(
 ) -> libc::size_t {
     if rr.is_null() { return 0; }
     // We store TXT as a single Bin blob; for abin API, treat as 1 entry if non-empty
-    if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
+    if let Some(RRValue::Bin(data)) = (unsafe { &*rr }).data.get(&key) {
         let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
         if logical_len == 0 { 0 } else { 1 }
     } else {
@@ -2213,10 +2213,10 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
     len: *mut libc::size_t,
 ) -> *const u8 {
     if rr.is_null() || len.is_null() { return std::ptr::null(); }
-    if idx != 0 { *len = 0; return std::ptr::null(); }
-    if let Some(RRValue::Bin(data)) = (*rr).data.get(&key) {
+    if idx != 0 { unsafe { *len = 0; } return std::ptr::null(); }
+    if let Some(RRValue::Bin(data)) = (unsafe { &*rr }).data.get(&key) {
         let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
-        *len = logical_len;
+        unsafe { *len = logical_len; }
         if data.is_empty() {
             static EMPTY: u8 = 0;
             &EMPTY as *const u8
@@ -2224,7 +2224,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
             data.as_ptr()
         }
     } else {
-        *len = 0;
+        unsafe { *len = 0; }
         std::ptr::null()
     }
 }
@@ -2232,7 +2232,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
 #[no_mangle]
 pub unsafe extern "C" fn ares_free(ptr: *mut c_void) {
     if !ptr.is_null() {
-        libc::free(ptr);
+        unsafe { libc::free(ptr) };
     }
 }
 
