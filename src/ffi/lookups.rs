@@ -16,23 +16,15 @@ pub(crate) struct HostByNameLookup {
     pub(crate) arg: *mut c_void,
 }
 
-pub(crate) struct AddrInfoState {
-    callback: AresAddrInfoCallback,
-    arg: *mut c_void,
-    pending: u32,
-    nodes_head: *mut ares_addrinfo_node,
-    nodes_tail: *mut ares_addrinfo_node,
-    has_cancel: bool,
-    last_error: c_int,
-    has_success: bool,
-    name: String,
-    channel: Channel,
-    search_domains: Vec<String>,
-    base_name: String,
-    ai_family: c_int,
-    use_tcp: bool,
-    attempt_count: usize,
-    port: u16,
+/// Live state of an ares_getaddrinfo lookup: the pure state machine plus
+/// what the executor needs to deliver (records are accumulated as safe
+/// AddrRecords in the machine; the C node list is built once, at delivery).
+#[derive(Debug)]
+pub(crate) struct AddrInfoLookup {
+    pub(crate) sm: AddrInfoSm,
+    pub(crate) callback: AresAddrInfoCallback,
+    pub(crate) arg: *mut c_void,
+    pub(crate) port: u16,
 }
 
 /// How a finished search lookup reports back to C: the raw-buffer callback of
@@ -62,7 +54,7 @@ pub(crate) enum Callback {
     AresCallback(AresCallback),
     AresCallbackDnsRec(AresCallbackDnsRec),
     AresNameinfoCallback(AresNameinfoCallback),
-    AresAddrInfoCallback(*mut AddrInfoState),
+    AddrInfo(Rc<RefCell<AddrInfoLookup>>),
     HostByName(Rc<RefCell<HostByNameLookup>>),
     Search(Rc<RefCell<SearchLookup>>),
     Probe, // Server failover probe — no user callback
@@ -77,18 +69,6 @@ impl Callback {
                     Self::HostByName(lookup) => {
                         let (callback, arg) = { let l = lookup.borrow(); (l.callback, l.arg) };
                         unsafe { callback(arg, *status, 0, std::ptr::null_mut()) };
-                        return;
-                    },
-                    Self::AresAddrInfoCallback(state_ptr) => unsafe {
-                        let state = &mut **state_ptr;
-                        state.pending -= 1;
-                        state.has_cancel = true;
-                        state.last_error = *status;
-                        if state.pending == 0 {
-                            free_addrinfo_nodes(state.nodes_head);
-                            (state.callback)(state.arg, state.last_error, 0, std::ptr::null_mut());
-                            drop(Box::from_raw(*state_ptr));
-                        }
                         return;
                     },
                     Self::Search(lookup) => {
@@ -112,7 +92,7 @@ impl Callback {
             Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata),
             Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, ffidata),
             Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, ffidata),
-            Self::AresAddrInfoCallback(state_ptr) => unsafe { run_ares_addrinfo_callback(buf, *state_ptr, ffidata) },
+            Self::AddrInfo(lookup) => unsafe { run_ares_addrinfo_callback(buf, lookup, ffidata, channeldata) },
             Self::HostByName(lookup) => unsafe { run_ares_hostbyname_callback(buf, lookup, ffidata, channeldata) },
             Self::Search(lookup) => unsafe { run_ares_search_callback(buf, lookup, ffidata, channeldata) },
             Self::Probe => unsafe { run_probe_callback(buf, channeldata, ffidata) },
@@ -124,7 +104,7 @@ impl Callback {
             Self::AresCallback(cb) => Self::AresCallback(*cb),
             Self::AresCallbackDnsRec(cb) => Self::AresCallbackDnsRec(*cb),
             Self::AresNameinfoCallback(cb) => Self::AresNameinfoCallback(*cb),
-            Self::AresAddrInfoCallback(ptr) => Self::AresAddrInfoCallback(*ptr),
+            Self::AddrInfo(lookup) => Self::AddrInfo(lookup.clone()),
             Self::HostByName(lookup) => Self::HostByName(lookup.clone()),
             Self::Search(lookup) => Self::Search(lookup.clone()),
             Self::Probe => Self::Probe,
@@ -1192,112 +1172,94 @@ pub unsafe extern "C" fn ares_getaddrinfo(
         return;
     }
 
-    // DNS path: determine search domains
+    // DNS path: build the search plan + state machine and launch the batch
+    let _ = had_trailing_dot; // encoded in the plan (raw name carries the dot)
     let use_tcp = channeldata.ares.config.options.use_vc;
-    let ndots = channeldata.ares.config.options.ndots;
-    let dot_count = hostname.chars().filter(|&c| c == '.').count() as u32;
-    let mut search_domains: Vec<String> = Vec::new();
-    let mut query_hostname = hostname.to_string();
-
-    if !had_trailing_dot && !channeldata.ares.config.search.is_empty() {
-        if dot_count < ndots {
-            // Low dots: try search domains first, bare name as fallback
-            search_domains = channeldata.ares.config.search.clone();
-            let first_domain = search_domains.remove(0);
-            query_hostname = format!("{}.{}", hostname, first_domain);
-        } else {
-            // High dots (>= ndots): bare name first, search domains as fallback
-            search_domains = channeldata.ares.config.search.clone();
-        }
-    }
-
-    // Pick first server using sorted order
+    let plan = SearchPlan::for_search(hostname_raw, channeldata.ares.config.options.ndots, &channeldata.ares.config.search);
     let first_server = channeldata.server_health.pick_next();
 
-    let state = Box::into_raw(Box::new(AddrInfoState {
+    let lookup = Rc::new(RefCell::new(AddrInfoLookup {
+        sm: AddrInfoSm::new(plan, ai_family, use_tcp),
         callback,
         arg,
-        pending: 0,
-        nodes_head: std::ptr::null_mut(),
-        nodes_tail: std::ptr::null_mut(),
-        has_cancel: false,
-        last_error: ARES_ENODATA,
-        has_success: false,
-        name: query_hostname.clone(),
-        channel,
-        search_domains,
-        base_name: hostname.to_string(),
-        ai_family,
-        use_tcp,
-        attempt_count: 0,
         port,
     }));
-
-    launch_addrinfo_queries(channeldata, state, &query_hostname, ai_family, use_tcp, first_server);
+    let actions = lookup.borrow_mut().sm.begin_batch(first_server);
+    execute_addrinfo_actions(channeldata, &lookup, actions);
 }
 
-pub(crate) unsafe fn launch_addrinfo_queries(channeldata: &mut ChannelData, state: *mut AddrInfoState, hostname: &str, ai_family: c_int, use_tcp: bool, server_index: usize) {
-    // Account for the whole batch up front so a per-query failure can't drive
-    // `pending` to 0 prematurely (which would finalize/free the state before the
-    // other query of an AF_UNSPEC pair is launched).
-    unsafe {
-        (*state).pending += match ai_family {
-            libc::AF_INET | libc::AF_INET6 => 1,
-            _ => 2,
-        };
-    }
-    let mut launch_query = |record_type: u16, core_family: Family, family_c: c_int| {
-        let ffidata = FFIData {
-            callback: Callback::AresAddrInfoCallback(state),
-            arg: std::ptr::null_mut(),
-            family: family_c,
-            expected_record_type: record_type as c_int,
-            ip: None,
-            nameinfo_flags: 0,
-            port: 0,
-            scope_id: 0,
-            server_index,
-            timeouts: 0,
-        };
-        let sock_type = if use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-        let issued = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), server_index, ffidata).is_ok();
-        if !issued {
-            // Socket creation failed: this query won't launch. Account for it and,
-            // if it was the last outstanding query, deliver the error now (the same
-            // finalize the Callback::run path does when pending reaches 0).
-            let st = unsafe { &mut *state };
-            st.pending -= 1;
-            st.last_error = ARES_ECONNREFUSED;
-            if st.pending == 0 {
-                free_addrinfo_nodes(st.nodes_head);
-                unsafe { (st.callback)(st.arg, st.last_error, 0, std::ptr::null_mut()) };
-                unsafe { drop(Box::from_raw(state)) };
+/// Send executor for the getaddrinfo machine. Executes the actions returned
+/// by `AddrInfoSm`, feeding send failures back into the machine
+/// (`LaunchFailed` for batch sends — which also run the socket callbacks —
+/// `ResendFailed` for TC/failover re-sends, whose socket-callback results
+/// are ignored, both as historically).
+pub(crate) unsafe fn execute_addrinfo_actions(channeldata: &mut ChannelData, lookup: &Rc<RefCell<AddrInfoLookup>>, actions: Vec<AddrInfoAction>) {
+    let mut queue: std::collections::VecDeque<AddrInfoAction> = actions.into();
+    while let Some(action) = queue.pop_front() {
+        match action {
+            AddrInfoAction::Send { name, family, tcp, server, timeouts, batch } => {
+                let core_family = match family {
+                    libc::AF_INET => Family::Ipv4,
+                    _ => Family::Ipv6,
+                };
+                let ffidata = FFIData {
+                    callback: Callback::AddrInfo(lookup.clone()),
+                    arg: std::ptr::null_mut(),
+                    family,
+                    expected_record_type: (if family == libc::AF_INET { RECORD_TYPE_A } else { RECORD_TYPE_AAAA }) as c_int,
+                    ip: None,
+                    nameinfo_flags: 0,
+                    port: 0,
+                    scope_id: 0,
+                    server_index: server,
+                    timeouts,
+                };
+                let sock_type = if tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
+                let issued = channeldata.ares.enqueue(dns_query_payload(&name, qtype_of(core_family)), SocketSource::fresh(tcp), server, ffidata).is_ok();
+                let failed = if !issued {
+                    true
+                } else if batch {
+                    let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                    if invoke_sock_callbacks(channeldata, fd, sock_type) {
+                        false
+                    } else {
+                        // Configure callback failed - mark task as completed with error
+                        channeldata.ares.tasks.last_mut().unwrap().status = Status::Completed;
+                        true
+                    }
+                } else {
+                    // TC/failover re-send: socket-callback results are ignored
+                    let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+                    invoke_sock_callbacks(channeldata, fd, sock_type);
+                    false
+                };
+                if failed {
+                    let ev = if batch { AddrInfoEvent::LaunchFailed } else { AddrInfoEvent::ResendFailed };
+                    let more = {
+                        let cfg = LookupCfg {
+                            attempts: channeldata.ares.config.options.attempts,
+                            ndots: channeldata.ares.config.options.ndots,
+                            search: &channeldata.ares.config.search,
+                        };
+                        let mut l = lookup.borrow_mut();
+                        l.sm.step(ev, &cfg, &mut channeldata.server_health)
+                    };
+                    queue.extend(more);
+                }
             }
-            return;
-        }
-        let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-        if !invoke_sock_callbacks(channeldata, fd, sock_type) {
-            // Configure callback failed - mark task as completed with error
-            let task = channeldata.ares.tasks.last_mut().unwrap();
-            task.status = Status::Completed;
-            let st = unsafe { &mut *state };
-            st.pending -= 1;
-            st.last_error = ARES_ECONNREFUSED;
-            if st.pending == 0 {
-                free_addrinfo_nodes(st.nodes_head);
-                unsafe { (st.callback)(st.arg, st.last_error, 0, std::ptr::null_mut()) };
-                unsafe { drop(Box::from_raw(state)) };
+            AddrInfoAction::DeliverSuccess { name } => {
+                let (callback, arg, records, port) = {
+                    let mut l = lookup.borrow_mut();
+                    (l.callback, l.arg, std::mem::take(&mut l.sm.addrs), l.port)
+                };
+                let nodes = nodes_from_addr_records(&records, port);
+                let ai = build_ares_addrinfo(&name, nodes);
+                unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
             }
-        }
-    };
-
-    match ai_family {
-        libc::AF_INET => launch_query(RECORD_TYPE_A, Family::Ipv4, libc::AF_INET),
-        libc::AF_INET6 => launch_query(RECORD_TYPE_AAAA, Family::Ipv6, libc::AF_INET6),
-        _ => {
-            // AF_UNSPEC: launch both
-            launch_query(RECORD_TYPE_A, Family::Ipv4, libc::AF_INET);
-            launch_query(RECORD_TYPE_AAAA, Family::Ipv6, libc::AF_INET6);
+            AddrInfoAction::DeliverFail { status } => {
+                let (callback, arg) = { let l = lookup.borrow(); (l.callback, l.arg) };
+                unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+            }
         }
     }
 }
@@ -1373,50 +1335,13 @@ pub(crate) unsafe fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: 
     }
 }
 
-pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state_ptr: *mut AddrInfoState, ffidata: &FFIData) {
-    let state = unsafe { &mut *state_ptr };
-    let channel = state.channel;
-    let channeldata = unsafe { &mut *channel };
-
-    match res {
+/// Executor entry for a settled getaddrinfo task: parse the reply (parsing
+/// stays ffi-side), feed the event to `AddrInfoSm::step` (borrow held for the
+/// decision only), then perform the returned actions borrow-free.
+pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, lookup: &Rc<RefCell<AddrInfoLookup>>, ffidata: &FFIData, channeldata: &mut ChannelData) {
+    let ev = match res {
         Ok(buf) => {
-            // Check TC (truncation) flag — retry over TCP if truncated and not already TCP
-            if is_truncated(buf) && !state.use_tcp {
-                // Retry this query over TCP
-                let core_family = match ffidata.family {
-                    libc::AF_INET => Family::Ipv4,
-                    _ => Family::Ipv6,
-                };
-                let new_ffidata = FFIData {
-                    callback: Callback::AresAddrInfoCallback(state_ptr),
-                    arg: std::ptr::null_mut(),
-                    family: ffidata.family,
-                    expected_record_type: ffidata.expected_record_type,
-                    ip: None,
-                    nameinfo_flags: 0,
-                    port: 0,
-                    scope_id: 0,
-                    server_index: ffidata.server_index,
-                    timeouts: ffidata.timeouts,
-                };
-                if channeldata.ares.enqueue(dns_query_payload(&state.name, qtype_of(core_family)), SocketSource::Tcp, ffidata.server_index, new_ffidata).is_ok() {
-                    let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                    invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
-                } else {
-                    // TCP retry socket couldn't be created — finalize this query with the error.
-                    state.pending -= 1;
-                    if state.pending == 0 {
-                        state.last_error = ARES_ECONNREFUSED;
-                        free_addrinfo_nodes(state.nodes_head);
-                        (state.callback)(state.arg, state.last_error, 0, std::ptr::null_mut());
-                        drop(Box::from_raw(state_ptr));
-                    }
-                }
-                // Don't decrement pending — the new task replaces this one
-                return;
-            }
-
-            let parsed = (|| -> Result<Vec<AddrRecord>, c_int> {
+            let parse = (|| -> Result<Vec<AddrRecord>, c_int> {
                 let response = ParsedResponse::from_buf(buf)?;
                 let parsed_rrs = response.process_answers::<AddrRecord>(buf, ffidata.expected_record_type as u16)?;
                 if parsed_rrs.items.is_empty() {
@@ -1424,167 +1349,26 @@ pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state
                 }
                 Ok(parsed_rrs.items)
             })();
-
-            match parsed {
-                Ok(records) => {
-                    // Server succeeded — reset its failure counter
-                    channeldata.server_health.record_success(ffidata.server_index);
-                    state.attempt_count = 0;
-                    state.has_success = true;
-                    let svc_port = state.port;
-                    for record in &records {
-                        let (ai_family, ai_addrlen, ai_addr): (c_int, libc::socklen_t, *mut libc::sockaddr) = match record.ip {
-                            IpAddr::V4(v4) => {
-                                let sa = Box::new(libc::sockaddr_in {
-                                    sin_family: libc::AF_INET as libc::sa_family_t,
-                                    sin_port: svc_port.to_be(),
-                                    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(v4.octets()) },
-                                    sin_zero: [0; 8],
-                                });
-                                (libc::AF_INET, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                                 Box::into_raw(sa) as *mut libc::sockaddr)
-                            }
-                            IpAddr::V6(v6) => {
-                                let sa = Box::new(libc::sockaddr_in6 {
-                                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                                    sin6_port: svc_port.to_be(),
-                                    sin6_flowinfo: 0,
-                                    sin6_addr: libc::in6_addr { s6_addr: v6.octets() },
-                                    sin6_scope_id: 0,
-                                });
-                                (libc::AF_INET6, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                                 Box::into_raw(sa) as *mut libc::sockaddr)
-                            }
-                        };
-                        let node = Box::into_raw(Box::new(ares_addrinfo_node {
-                            ai_ttl: record.ttl as c_int,
-                            ai_flags: 0,
-                            ai_family,
-                            ai_socktype: 0,
-                            ai_protocol: 0,
-                            ai_addrlen,
-                            ai_addr,
-                            ai_next: std::ptr::null_mut(),
-                        }));
-                        if state.nodes_head.is_null() {
-                            state.nodes_head = node;
-                        } else {
-                            (*state.nodes_tail).ai_next = node;
-                        }
-                        state.nodes_tail = node;
-                    }
-                }
-                Err(e) => {
-                    // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
-                    let nservers = channeldata.server_health.len();
-                    let max_attempts = std::cmp::max(nservers, 1) * channeldata.ares.config.options.attempts as usize;
-                    if (e == ARES_ESERVFAIL || e == ARES_ENOTIMP || e == ARES_EREFUSED)
-                        && nservers >= 1
-                    {
-                        // Increment failure counter for this server
-                        channeldata.server_health.record_failure(ffidata.server_index);
-                        state.attempt_count += 1;
-
-                        if state.attempt_count < max_attempts {
-                            // Re-sort by (failure_count, index) and pick top server
-                            let next_server = channeldata.server_health.pick_next();
-                            let core_family = match ffidata.family {
-                                libc::AF_INET => Family::Ipv4,
-                                _ => Family::Ipv6,
-                            };
-                            let new_ffidata = FFIData {
-                                callback: Callback::AresAddrInfoCallback(state_ptr),
-                                arg: std::ptr::null_mut(),
-                                family: ffidata.family,
-                                expected_record_type: ffidata.expected_record_type,
-                                ip: None,
-                                nameinfo_flags: 0,
-                                port: 0,
-                                scope_id: 0,
-                                server_index: next_server,
-                                timeouts: ffidata.timeouts,
-                            };
-                            let sock_type = if state.use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                            let issued = channeldata.ares.enqueue(dns_query_payload(&state.name, qtype_of(core_family)), SocketSource::fresh(state.use_tcp), next_server, new_ffidata).is_ok();
-                            if issued {
-                                let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                                invoke_sock_callbacks(channeldata, fd, sock_type);
-                                // Success: the new task replaces this one; keep pending as-is.
-                            } else {
-                                // Retry socket couldn't be created — finalize this query with the error.
-                                state.pending -= 1;
-                                if state.pending == 0 {
-                                    state.last_error = ARES_ECONNREFUSED;
-                                    free_addrinfo_nodes(state.nodes_head);
-                                    (state.callback)(state.arg, state.last_error, 0, std::ptr::null_mut());
-                                    drop(Box::from_raw(state_ptr));
-                                }
-                            }
-                            return;
-                        }
-                    }
-                    state.last_error = e;
-                }
+            AddrInfoEvent::Reply {
+                truncated: is_truncated(buf),
+                parse,
+                family: ffidata.family,
+                server: ffidata.server_index,
+                io_timeouts: ffidata.timeouts,
             }
         }
-        Err(status) => {
-            if status == ARES_ECANCELLED || status == ARES_EDESTRUCTION {
-                state.has_cancel = true;
-                state.last_error = status;
-            } else {
-                state.last_error = status;
-            }
-        }
-    }
-
-    state.pending -= 1;
-    if state.pending > 0 {
-        return;
-    }
-
-    // Search domain iteration: on NXDOMAIN/ENODATA/ETIMEOUT/SERVFAIL/NOTIMP/REFUSED, try next search domain or bare name
-    if !state.has_success && !state.has_cancel
-        && (state.last_error == ARES_ENOTFOUND || state.last_error == ARES_ENODATA || state.last_error == ARES_ETIMEOUT
-            || state.last_error == ARES_ESERVFAIL || state.last_error == ARES_ENOTIMP || state.last_error == ARES_EREFUSED)
-    {
-        if !state.search_domains.is_empty() {
-            let next_domain = state.search_domains.remove(0);
-            let new_hostname = format!("{}.{}", state.base_name, next_domain);
-            state.name = new_hostname.clone();
-            state.last_error = ARES_ENODATA;
-            state.attempt_count = 0;
-
-            let first_server = channeldata.server_health.pick_next();
-            launch_addrinfo_queries(channeldata, state_ptr, &new_hostname, state.ai_family, state.use_tcp, first_server);
-            return;
-        } else if state.name != state.base_name && !state.base_name.is_empty() {
-            // All search domains exhausted, try bare name as fallback
-            let bare_name = state.base_name.clone();
-            state.name = bare_name.clone();
-            state.last_error = ARES_ENODATA;
-            state.attempt_count = 0;
-            // Clear base_name so we don't loop forever
-            state.base_name = String::new();
-
-            let first_server = channeldata.server_health.pick_next();
-            launch_addrinfo_queries(channeldata, state_ptr, &bare_name, state.ai_family, state.use_tcp, first_server);
-            return;
-        }
-    }
-
-    // Finalize
-    if state.has_cancel {
-        free_addrinfo_nodes(state.nodes_head);
-        (state.callback)(state.arg, state.last_error, 0, std::ptr::null_mut());
-    } else if state.has_success {
-        let ai = build_ares_addrinfo(&state.name, state.nodes_head);
-        (state.callback)(state.arg, ARES_SUCCESS, 0, ai);
-    } else {
-        free_addrinfo_nodes(state.nodes_head);
-        (state.callback)(state.arg, state.last_error, 0, std::ptr::null_mut());
-    }
-
-    drop(Box::from_raw(state_ptr));
+        Err(status) => AddrInfoEvent::Error { status },
+    };
+    let actions = {
+        let cfg = LookupCfg {
+            attempts: channeldata.ares.config.options.attempts,
+            ndots: channeldata.ares.config.options.ndots,
+            search: &channeldata.ares.config.search,
+        };
+        let mut l = lookup.borrow_mut();
+        l.sm.step(ev, &cfg, &mut channeldata.server_health)
+    };
+    execute_addrinfo_actions(channeldata, lookup, actions);
 }
 
 #[no_mangle]

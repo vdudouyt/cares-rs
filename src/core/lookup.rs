@@ -13,7 +13,8 @@ use std::ffi::c_int;
 use std::time::{Duration, Instant};
 
 use crate::ffi::error::{
-    ARES_ENODATA, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED, ARES_ESERVFAIL, ARES_ETIMEOUT,
+    ARES_ECANCELLED, ARES_ECONNREFUSED, ARES_EDESTRUCTION, ARES_ENODATA, ARES_ENOTFOUND,
+    ARES_ENOTIMP, ARES_EREFUSED, ARES_ESERVFAIL, ARES_ETIMEOUT,
 };
 
 /// Header-level summary of a DNS reply buffer.
@@ -449,6 +450,189 @@ impl HostByNameSm {
         };
         actions.push(HostAction::DeliverFail { status: final_error, timeouts: self.timeouts });
         actions
+    }
+}
+
+/// What the getaddrinfo state machine wants done next.
+#[derive(Debug, PartialEq)]
+pub enum AddrInfoAction {
+    /// Issue one query. `batch` marks the sends of a (re)launched A/AAAA
+    /// batch: on failure the executor feeds back `LaunchFailed` (and checks
+    /// the socket callbacks), while a TC/failover re-send feeds
+    /// `ResendFailed` (and ignores socket-callback results) — preserving the
+    /// two historical failure accounting rules.
+    Send { name: String, family: c_int, tcp: bool, server: usize, timeouts: c_int, batch: bool },
+    /// All queries settled with at least one success: build the ares_addrinfo
+    /// from the accumulated records and deliver.
+    DeliverSuccess { name: String },
+    DeliverFail { status: c_int },
+}
+
+/// Input to the getaddrinfo machine, one per settled task (or failed send).
+pub enum AddrInfoEvent {
+    Reply {
+        truncated: bool,
+        parse: Result<Vec<crate::core::packets::AddrRecord>, c_int>,
+        family: c_int,
+        server: usize,
+        io_timeouts: c_int,
+    },
+    /// I/O-level error, including ECANCELLED/EDESTRUCTION (which set the
+    /// cancel flag and still participate in the pending join).
+    Error { status: c_int },
+    /// A batch launch send failed: always records ECONNREFUSED.
+    LaunchFailed,
+    /// A TC/failover re-send failed: ECONNREFUSED is recorded only if this
+    /// was the last outstanding query.
+    ResendFailed,
+}
+
+/// State machine for ares_getaddrinfo's DNS phase. AF_UNSPEC launches A and
+/// AAAA in parallel; `pending` is pre-credited for the whole batch before any
+/// send so a per-query failure can never finalize the lookup while its
+/// sibling is still being launched. TC and failover re-sends replace their
+/// task without touching `pending`; the search plan only advances (and the
+/// lookup only finalizes) once `pending` reaches zero.
+#[derive(Debug)]
+pub struct AddrInfoSm {
+    pub plan: SearchPlan,
+    pub ai_family: c_int,
+    pub use_tcp: bool,
+    pub pending: u32,
+    pub attempt_count: usize,
+    pub has_success: bool,
+    pub has_cancel: bool,
+    pub last_error: c_int,
+    /// Accumulated A/AAAA answers in arrival order across the parallel
+    /// queries and any relaunches.
+    pub addrs: Vec<crate::core::packets::AddrRecord>,
+}
+
+impl AddrInfoSm {
+    pub fn new(plan: SearchPlan, ai_family: c_int, use_tcp: bool) -> Self {
+        AddrInfoSm {
+            plan,
+            ai_family,
+            use_tcp,
+            pending: 0,
+            attempt_count: 0,
+            has_success: false,
+            has_cancel: false,
+            last_error: ARES_ENODATA,
+            addrs: Vec::new(),
+        }
+    }
+
+    /// Launch a fresh A/AAAA batch for the plan's current name: pre-credit
+    /// `pending` for the whole batch, then emit the sends.
+    pub fn begin_batch(&mut self, server: usize) -> Vec<AddrInfoAction> {
+        let families: &[c_int] = match self.ai_family {
+            AF_INET => &[AF_INET],
+            AF_INET6 => &[AF_INET6],
+            _ => &[AF_INET, AF_INET6], // AF_UNSPEC: launch both
+        };
+        self.pending += families.len() as u32;
+        families.iter().map(|&family| AddrInfoAction::Send {
+            name: self.plan.current.clone(),
+            family,
+            tcp: self.use_tcp,
+            server,
+            timeouts: 0,
+            batch: true,
+        }).collect()
+    }
+
+    pub fn step(&mut self, ev: AddrInfoEvent, cfg: &LookupCfg<'_>, health: &mut ServerHealth) -> Vec<AddrInfoAction> {
+        match ev {
+            AddrInfoEvent::Reply { truncated, parse, family, server, io_timeouts } => {
+                // TC flag — retry this query over TCP; the new task replaces
+                // this one, so pending is untouched.
+                if truncated && !self.use_tcp {
+                    return vec![AddrInfoAction::Send {
+                        name: self.plan.current.clone(),
+                        family,
+                        tcp: true,
+                        server,
+                        timeouts: io_timeouts,
+                        batch: false,
+                    }];
+                }
+                match parse {
+                    Ok(records) => {
+                        // Server succeeded — reset its failure counter
+                        health.record_success(server);
+                        self.attempt_count = 0;
+                        self.has_success = true;
+                        self.addrs.extend(records);
+                    }
+                    Err(e) => {
+                        // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
+                        let nservers = health.len();
+                        let max_attempts = nservers.max(1) * cfg.attempts as usize;
+                        if matches!(e, ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED) && nservers >= 1 {
+                            health.record_failure(server);
+                            self.attempt_count += 1;
+                            if self.attempt_count < max_attempts {
+                                return vec![AddrInfoAction::Send {
+                                    name: self.plan.current.clone(),
+                                    family,
+                                    tcp: self.use_tcp,
+                                    server: health.pick_next(),
+                                    timeouts: io_timeouts,
+                                    batch: false,
+                                }];
+                            }
+                        }
+                        self.last_error = e;
+                    }
+                }
+            }
+            AddrInfoEvent::Error { status } => {
+                if matches!(status, ARES_ECANCELLED | ARES_EDESTRUCTION) {
+                    self.has_cancel = true;
+                }
+                self.last_error = status;
+            }
+            AddrInfoEvent::LaunchFailed => {
+                self.last_error = ARES_ECONNREFUSED;
+            }
+            AddrInfoEvent::ResendFailed => {
+                self.pending -= 1;
+                if self.pending == 0 {
+                    self.last_error = ARES_ECONNREFUSED;
+                    return vec![self.finalize()];
+                }
+                return vec![];
+            }
+        }
+
+        self.pending -= 1;
+        if self.pending > 0 {
+            return vec![];
+        }
+
+        // Search domain iteration: on NXDOMAIN/ENODATA/ETIMEOUT/SERVFAIL/
+        // NOTIMP/REFUSED, try the next search domain or the bare name.
+        if !self.has_success && !self.has_cancel
+            && matches!(self.last_error,
+                ARES_ENOTFOUND | ARES_ENODATA | ARES_ETIMEOUT
+                | ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED)
+            && self.plan.advance().is_some()
+        {
+            self.last_error = ARES_ENODATA;
+            self.attempt_count = 0;
+            return self.begin_batch(health.pick_next());
+        }
+
+        vec![self.finalize()]
+    }
+
+    fn finalize(&mut self) -> AddrInfoAction {
+        if self.has_cancel || !self.has_success {
+            AddrInfoAction::DeliverFail { status: self.last_error }
+        } else {
+            AddrInfoAction::DeliverSuccess { name: self.plan.current.clone() }
+        }
     }
 }
 

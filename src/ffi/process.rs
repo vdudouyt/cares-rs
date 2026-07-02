@@ -101,7 +101,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 let summary = summarize(buf, 0);
                 let is_server_error = matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
                 let nservers = channeldata.server_health.len();
-                let is_addrinfo = matches!(task.userdata.callback, Callback::AresAddrInfoCallback(_));
+                let is_addrinfo = matches!(task.userdata.callback, Callback::AddrInfo(_));
                 let is_hostbyname = matches!(task.userdata.callback, Callback::HostByName(_));
 
                 if is_server_error {
