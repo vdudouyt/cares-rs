@@ -14,7 +14,7 @@ use std::ffi::{ c_int, c_uint, c_void, c_char };
 use std::ffi::{ CString, CStr };
 use std::net::IpAddr;
 use std::cmp::min;
-use std::time::{Instant, Duration};
+use std::time::Instant;
 use bytes::BytesMut;
 use crate::core::packets::*;
 use crate::core::ares::{ Ares, Status, Family, WriteResult, SocketSource, DnsSocket, dns_query_payload, qtype_of, rdns_name };

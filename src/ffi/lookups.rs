@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::*;
+use crate::ffi::kernels::process::cache_store_names;
 use crate::ffi::kernels::lookups::{
     format_ip_with_scope, get_service_string, getaddrinfo_preflight, gethostbyname_preflight,
     cached_reply, gethostbyaddr_preflight, getnameinfo_preflight, hosts_file_lookup, no_servers,
@@ -789,13 +790,7 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, loo
                 if channeldata.query_cache_max_ttl > 0 {
                     if let (Ok(buf), Some(rrs)) = (&res, &parsed_items) {
                         let ttl = rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-                        let cache_ttl = std::cmp::min(ttl, channeldata.query_cache_max_ttl);
-                        if cache_ttl > 0 {
-                            let expires = Instant::now() + Duration::from_secs(cache_ttl as u64);
-                            for name in names {
-                                channeldata.query_cache.insert((name, rtype), (buf.to_vec(), expires));
-                            }
-                        }
+                        cache_store_names(&mut channeldata.query_cache, channeldata.query_cache_max_ttl, names, rtype, ttl, buf, Instant::now());
                     }
                 }
             }

@@ -2,6 +2,9 @@
 //! state notification callbacks it fires.
 
 use super::*;
+use crate::ffi::kernels::process::{
+    cache_reply, retain_pools, server_state_string, tcp_payload, wants_dnsrec_cache,
+};
 
 
 #[no_mangle]
@@ -116,25 +119,10 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 }
                 match verdict {
                     TaskVerdict::RetryNextServer { server: next_server } => {
-                        let new_ffidata = FFIData {
-                            callback: task.userdata.callback.clone(),
-                            arg: task.userdata.arg,
-                            family: task.userdata.family,
-                            expected_record_type: task.userdata.expected_record_type,
-                            ip: task.userdata.ip,
-                            nameinfo_flags: task.userdata.nameinfo_flags,
-                            port: task.userdata.port,
-                            scope_id: task.userdata.scope_id,
-                            server_index: next_server,
-                            timeouts: task.userdata.timeouts,
-                        };
+                        let new_ffidata = task.userdata.retarget(next_server, task.userdata.timeouts);
                         let is_tcp = task.sock.is_tcp();
                         // Strip the TCP length prefix; enqueue re-frames for the new transport.
-                        let payload: &[u8] = if is_tcp && task.writebuf.len() > 2 {
-                            &task.writebuf[2..]
-                        } else {
-                            &task.writebuf[..]
-                        };
+                        let payload = tcp_payload(&task.writebuf, is_tcp);
                         let issued = channeldata.ares.enqueue(BytesMut::from(payload), SocketSource::fresh(is_tcp), next_server, new_ffidata).is_ok();
                         if issued {
                             let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
@@ -149,18 +137,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     }
                     TaskVerdict::RetryTcp => {
                         let si = task.userdata.server_index;
-                        let new_ffidata = FFIData {
-                            callback: task.userdata.callback.clone(),
-                            arg: task.userdata.arg,
-                            family: task.userdata.family,
-                            expected_record_type: task.userdata.expected_record_type,
-                            ip: task.userdata.ip,
-                            nameinfo_flags: task.userdata.nameinfo_flags,
-                            port: task.userdata.port,
-                            scope_id: task.userdata.scope_id,
-                            server_index: si,
-                            timeouts: task.userdata.timeouts,
-                        };
+                        let new_ffidata = task.userdata.retarget(si, task.userdata.timeouts);
                         if channeldata.ares.enqueue(task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata).is_ok() {
                             let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                             unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM) };
@@ -173,28 +150,9 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     TaskVerdict::Deliver => {}
                 }
                 // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
-                let is_dnsrec = match &task.userdata.callback {
-                    Callback::AresCallbackDnsRec(_) => true,
-                    Callback::Search(lookup) => matches!(lookup.borrow().delivery, SearchDelivery::DnsRec { .. }),
-                    _ => false,
-                };
-                if channeldata.query_cache_max_ttl > 0 && is_dnsrec {
-                        // Extract query name and type from the response buffer
-                        if let Ok(parsed) = ParsedResponse::from_buf(buf) {
-                            let qname = parsed.query.name.join(".");
-                            let qtype = parsed.query.qtype;
-                            if summary.ancount > 0 {
-                                // Find minimum TTL from answers
-                                let min_ttl = parsed.answers.iter().map(|a| a.ttl).min().unwrap_or(0);
-                                let cache_ttl = std::cmp::min(min_ttl, channeldata.query_cache_max_ttl);
-                                if cache_ttl > 0 {
-                                    let expires = Instant::now() + Duration::from_secs(cache_ttl as u64);
-                                    let cache_key = (qname, qtype);
-                                    channeldata.query_cache.insert(cache_key, (buf.to_vec(), expires));
-                                }
-                            }
-                        }
-                    }
+                if channeldata.query_cache_max_ttl > 0 && wants_dnsrec_cache(&task.userdata.callback) {
+                    cache_reply(&mut channeldata.query_cache, channeldata.query_cache_max_ttl, buf, Instant::now());
+                }
                 (task.userdata.callback).run(Ok(buf), &task.userdata, channeldata);
             }
         }
@@ -216,23 +174,8 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
             let timeout_verdict = on_timeout(task.tries_remaining, max_tries, task.userdata.server_index, &mut channeldata.server_health);
             if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
                 let is_tcp = task.sock.is_tcp();
-                let payload = if is_tcp && task.writebuf.len() > 2 {
-                    BytesMut::from(&task.writebuf[2..])
-                } else {
-                    task.writebuf.clone()
-                };
-                let new_ffidata = FFIData {
-                    callback: task.userdata.callback.clone(),
-                    arg: task.userdata.arg,
-                    family: task.userdata.family,
-                    expected_record_type: task.userdata.expected_record_type,
-                    ip: task.userdata.ip,
-                    nameinfo_flags: task.userdata.nameinfo_flags,
-                    port: task.userdata.port,
-                    scope_id: task.userdata.scope_id,
-                    server_index: si,
-                    timeouts: task.userdata.timeouts + 1,
-                };
+                let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
+                let new_ffidata = task.userdata.retarget(si, task.userdata.timeouts + 1);
                 task.status = Status::Completed;
                 // Create new task via ares methods
                 let issued = channeldata.ares.enqueue(payload, SocketSource::fresh(is_tcp), si, new_ffidata).is_ok();
@@ -263,16 +206,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
     channeldata.ares.tasks.retain(|task| task.status != Status::Completed);
 
     // Phase 4: Cleanup stale connection pool entries
-    if channeldata.udp_max_queries > 0 {
-        let limit = channeldata.udp_max_queries;
-        channeldata.udp_connections.retain(|(_, rc, count)| {
-            *count < limit || std::rc::Rc::strong_count(rc) > 1
-        });
-    }
-    // Clean up TCP connections where no tasks reference the socket anymore
-    channeldata.tcp_connections.retain(|(_, rc)| {
-        std::rc::Rc::strong_count(rc) > 1
-    });
+    retain_pools(channeldata);
 }
 
 /// Call socket create + configure callbacks. Returns false if either callback fails.
@@ -290,13 +224,7 @@ pub(crate) unsafe fn invoke_sock_callbacks(channeldata: &ChannelData, fd: c_int,
 
 pub(crate) unsafe fn invoke_server_state_callback(channeldata: &ChannelData, server_index: usize, success: bool, is_tcp: bool) {
     if let Some(cb) = channeldata.server_state_callback {
-        let server_str = if let Some((ip, port)) = channeldata.ares.config.nameservers.get(server_index) {
-            let port_val = port.unwrap_or(if is_tcp { channeldata.ares.default_tcp_port } else { channeldata.ares.default_udp_port });
-            match ip {
-                IpAddr::V4(v4) => format!("{}:{}", v4, port_val),
-                IpAddr::V6(v6) => format!("[{}]:{}", v6, port_val),
-            }
-        } else {
+        let Some(server_str) = server_state_string(channeldata, server_index, is_tcp) else {
             return;
         };
         let c_server_str = CString::new(server_str).unwrap_or_default();
