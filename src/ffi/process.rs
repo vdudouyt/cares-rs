@@ -60,15 +60,11 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                             _ => {},
                         }
                     }
-                    if rbuf.len() >= 2 {
-                        let payload_len = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
-                        if rbuf.len() >= 2 + payload_len {
-                            let msg = rbuf[2..2 + payload_len].to_vec();
-                            rbuf.drain(..2 + payload_len);
-                            task.status = Status::Completed;
-                            Some(msg)
-                        } else { None }
-                    } else { None }
+                    let msg = extract_tcp_frame(rbuf);
+                    if msg.is_some() {
+                        task.status = Status::Completed;
+                    }
+                    msg
                 };
                 if let Some(ref msg) = msg_data {
                     channeldata.readbuf[..msg.len()].copy_from_slice(msg);
@@ -88,22 +84,15 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
             if let Some((offset, len)) = read_result {
                 let buf = &channeldata.readbuf[offset..offset+len];
                 // QID matching: verify response transaction ID matches query
-                if buf.len() >= 2 {
-                    let resp_qid = u16::from_be_bytes([buf[0], buf[1]]);
-                    let query_qid_offset = if task.sock.is_tcp() { 2 } else { 0 };
-                    if task.writebuf.len() >= query_qid_offset + 2 {
-                        let query_qid = u16::from_be_bytes([task.writebuf[query_qid_offset], task.writebuf[query_qid_offset + 1]]);
-                        if resp_qid != query_qid {
-                            // QID mismatch — discard response, stay in Reading state
-                            task.status = Status::Reading;
-                            continue;
-                        }
-                    }
+                if !qid_matches(buf, &task.writebuf, task.sock.is_tcp()) {
+                    // QID mismatch — discard response, stay in Reading state
+                    task.status = Status::Reading;
+                    continue;
                 }
                 // Check DNS rcode for server failover (rcode in lower 4 bits of byte 3)
-                let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0 };
-                let is_server_error = rcode == 2 || rcode == 4 || rcode == 5; // SERVFAIL, NOTIMP, REFUSED
-                let nservers = channeldata.server_failures.len();
+                let summary = summarize(buf, 0);
+                let is_server_error = matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
+                let nservers = channeldata.server_health.len();
                 let is_addrinfo = matches!(task.userdata.callback, Callback::AresAddrInfoCallback(_));
                 let is_hostbyname = matches!(task.userdata.callback, Callback::AresHostByNameCallback(_));
 
@@ -114,15 +103,10 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     }
                     if nservers > 1 && !is_addrinfo && !is_hostbyname {
                         let si = task.userdata.server_index;
-                        if si < nservers {
-                            channeldata.server_failures[si] += 1;
-                            if si < channeldata.server_last_failure.len() {
-                                channeldata.server_last_failure[si] = Some(Instant::now());
-                            }
-                        }
+                        channeldata.server_health.record_failure(si);
                         let max_attempts = nservers * channeldata.ares.config.options.attempts as usize;
                         if (si + 1) < max_attempts {
-                            let next_server = pick_next_server(&channeldata.server_failures);
+                            let next_server = channeldata.server_health.pick_next();
                             let new_ffidata = FFIData {
                                 callback: task.userdata.callback.clone_for_retry(),
                                 arg: task.userdata.arg,
@@ -159,15 +143,10 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     if !is_addrinfo {
                         invoke_server_state_callback(channeldata, task.userdata.server_index, true, task.sock.is_tcp());
                     }
-                    if task.userdata.server_index < channeldata.server_failures.len() {
-                        channeldata.server_failures[task.userdata.server_index] = 0;
-                        if task.userdata.server_index < channeldata.server_last_failure.len() {
-                            channeldata.server_last_failure[task.userdata.server_index] = None;
-                        }
-                    }
+                    channeldata.server_health.record_success(task.userdata.server_index);
                 }
                 // Check TC (truncation) flag — retry over TCP if truncated and currently UDP
-                if is_truncated(buf) && !task.sock.is_tcp() && !is_addrinfo && !is_hostbyname {
+                if summary.truncated && !task.sock.is_tcp() && !is_addrinfo && !is_hostbyname {
                     let si = task.userdata.server_index;
                     let new_ffidata = FFIData {
                         callback: task.userdata.callback.clone_for_retry(),
@@ -197,8 +176,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                         if let Ok(parsed) = ParsedResponse::from_buf(buf) {
                             let qname = parsed.query.name.join(".");
                             let qtype = parsed.query.qtype;
-                            let ancount = if buf.len() >= 8 { u16::from_be_bytes([buf[6], buf[7]]) } else { 0 };
-                            if ancount > 0 {
+                            if summary.ancount > 0 {
                                 // Find minimum TTL from answers
                                 let min_ttl = parsed.answers.iter().map(|a| a.ttl).min().unwrap_or(0);
                                 let cache_ttl = std::cmp::min(min_ttl, channeldata.query_cache_max_ttl);
@@ -228,7 +206,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
             // Invoke server_state_callback with failure for timeout
             invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp());
             if task.tries_remaining < max_tries {
-                let nservers = channeldata.server_failures.len();
+                let nservers = channeldata.server_health.len();
                 let is_tcp = task.sock.is_tcp();
                 let payload = if is_tcp && task.writebuf.len() > 2 {
                     BytesMut::from(&task.writebuf[2..])
@@ -237,13 +215,8 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 };
                 // Pick next server on timeout when there are multiple servers
                 let si = if nservers > 1 {
-                    if task.userdata.server_index < channeldata.server_failures.len() {
-                        channeldata.server_failures[task.userdata.server_index] += 1;
-                        if task.userdata.server_index < channeldata.server_last_failure.len() {
-                            channeldata.server_last_failure[task.userdata.server_index] = Some(Instant::now());
-                        }
-                    }
-                    pick_next_server(&channeldata.server_failures)
+                    channeldata.server_health.record_failure(task.userdata.server_index);
+                    channeldata.server_health.pick_next()
                 } else {
                     task.userdata.server_index
                 };

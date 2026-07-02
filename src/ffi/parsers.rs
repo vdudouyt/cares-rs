@@ -8,18 +8,6 @@ pub(crate) trait AddrTTL {
     fn set_addr_ttl(&mut self, ip: &IpAddr, ttl: u32) -> Option<()>;
 }
 
-#[derive(Debug)]
-pub(crate) struct AddrRecord {
-    pub(crate) ip: IpAddr,
-    pub(crate) ttl: u32,
-}
-
-impl RRParser<'_> for AddrRecord {
-    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<Self> {
-        Some(Self { ip: buf_to_ip(answer.data).ok()?, ttl: answer.ttl })
-    }
-}
-
 #[repr(C)]
 pub struct ares_addrttl {
     pub ipaddr: libc::in_addr, // ipv4 (upstream: struct in_addr)
@@ -393,14 +381,6 @@ impl DnsLabel<'_> {
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0)
-}
-
-pub(crate) fn buf_to_ip(buf: &[u8]) -> Result<IpAddr, &'static str> {
-    match buf.len() {
-        4 => Ok(IpAddr::from(<[u8; 4]>::try_from(buf).unwrap())),
-        16 => Ok(IpAddr::from(<[u8; 16]>::try_from(buf).unwrap())),
-        _ => Err("invalid IP byte length"),
-    }
 }
 
 pub(crate) fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {

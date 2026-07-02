@@ -168,14 +168,6 @@ pub(crate) struct FFIData {
     pub(crate) timeouts: c_int,
 }
 
-/// RFC 7686: does `name` name a `.onion` domain? Case-insensitive ASCII suffix
-/// match on bytes (no alloc, no UTF-8 validation, never panics on non-ASCII).
-/// Tolerates a trailing-dot FQDN and a bare "onion". Mirrors upstream c-ares.
-pub(crate) fn is_onion_domain(name: &str) -> bool {
-    let b = name.strip_suffix('.').unwrap_or(name).as_bytes();
-    b.len() >= 6 && b[b.len() - 6..].eq_ignore_ascii_case(b".onion") || b.eq_ignore_ascii_case(b"onion")
-}
-
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: ares_host_callback, arg: *mut c_void) {
@@ -358,7 +350,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         query_hostname = format!("{}.{}", resolved_name, first_domain);
     }
 
-    let first_server = pick_next_server(&channeldata.server_failures);
+    let first_server = channeldata.server_health.pick_next();
 
     let state = Box::into_raw(Box::new(HostByNameState {
         callback,
@@ -951,7 +943,7 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, stat
         _ => Family::Ipv6,
     };
     let max_tries = channeldata.ares.config.options.attempts as usize;
-    let nservers = channeldata.server_failures.len().max(1);
+    let nservers = channeldata.server_health.len().max(1);
     let sock_type = if use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
     let mut si = server_index;
 
@@ -1020,13 +1012,8 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, stat
             // Socket creation failed (e.g. fd exhaustion): treat as a server
             // failure and try the next server, like upstream c-ares.
             if nservers > 1 {
-                if si < channeldata.server_failures.len() {
-                    channeldata.server_failures[si] += 1;
-                    if si < channeldata.server_last_failure.len() {
-                        channeldata.server_last_failure[si] = Some(Instant::now());
-                    }
-                }
-                si = pick_next_server(&channeldata.server_failures);
+                channeldata.server_health.record_failure(si);
+                si = channeldata.server_health.pick_next();
             }
             continue;
         }
@@ -1047,13 +1034,8 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, stat
         // Socket callback failed — close and remove the task, try next server
         channeldata.ares.tasks.pop();
         if nservers > 1 {
-            if si < channeldata.server_failures.len() {
-                channeldata.server_failures[si] += 1;
-                if si < channeldata.server_last_failure.len() {
-                    channeldata.server_last_failure[si] = Some(Instant::now());
-                }
-            }
-            si = pick_next_server(&channeldata.server_failures);
+            channeldata.server_health.record_failure(si);
+            si = channeldata.server_health.pick_next();
         }
     }
     // All retries exhausted
@@ -1297,12 +1279,7 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, sta
                         }
                     }
                     // Success — invoke callback
-                    if ffidata.server_index < channeldata.server_failures.len() {
-                        channeldata.server_failures[ffidata.server_index] = 0;
-                        if ffidata.server_index < channeldata.server_last_failure.len() {
-                            channeldata.server_last_failure[ffidata.server_index] = None;
-                        }
-                    }
+                    channeldata.server_health.record_success(ffidata.server_index);
                     if !channeldata.sortlist.is_empty() {
                         apply_sortlist(&channeldata.sortlist, &mut parsed_rrs.items);
                     }
@@ -1315,20 +1292,15 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, sta
                 }
                 Err(e) => {
                     // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
-                    let nservers = channeldata.server_failures.len().max(1);
+                    let nservers = channeldata.server_health.len().max(1);
                     if e == ARES_ESERVFAIL || e == ARES_ENOTIMP || e == ARES_EREFUSED {
                         invoke_server_state_callback(channeldata, ffidata.server_index, false, state.use_tcp);
-                        if ffidata.server_index < channeldata.server_failures.len() {
-                            channeldata.server_failures[ffidata.server_index] += 1;
-                            if ffidata.server_index < channeldata.server_last_failure.len() {
-                                channeldata.server_last_failure[ffidata.server_index] = Some(Instant::now());
-                            }
-                        }
+                        channeldata.server_health.record_failure(ffidata.server_index);
                         state.attempt_count += 1;
                         let max_attempts = nservers * channeldata.ares.config.options.attempts as usize;
                         if state.attempt_count < max_attempts {
-                            let next_server = if channeldata.server_failures.len() > 1 {
-                                pick_next_server(&channeldata.server_failures)
+                            let next_server = if channeldata.server_health.len() > 1 {
+                                channeldata.server_health.pick_next()
                             } else {
                                 ffidata.server_index
                             };
@@ -1369,7 +1341,7 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, sta
             state.name = new_hostname.clone();
             state.last_error = ARES_ENODATA;
             state.attempt_count = 0;
-            let first_server = pick_next_server(&channeldata.server_failures);
+            let first_server = channeldata.server_health.pick_next();
             launch_hostbyname_query(channeldata, state_ptr, &new_hostname, state.current_family, state.expected_record_type, state.use_tcp, first_server);
             return;
         } else if state.name != state.base_name && !state.base_name.is_empty() {
@@ -1379,7 +1351,7 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, sta
             state.last_error = ARES_ENODATA;
             state.attempt_count = 0;
             state.base_name = String::new();
-            let first_server = pick_next_server(&channeldata.server_failures);
+            let first_server = channeldata.server_health.pick_next();
             launch_hostbyname_query(channeldata, state_ptr, &bare_name, state.current_family, state.expected_record_type, state.use_tcp, first_server);
             return;
         }
@@ -1409,7 +1381,7 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, sta
             query_hostname = state.name.clone();
         }
         state.name = query_hostname.clone();
-        let first_server = pick_next_server(&channeldata.server_failures);
+        let first_server = channeldata.server_health.pick_next();
         launch_hostbyname_query(channeldata, state_ptr, &query_hostname, libc::AF_INET, RECORD_TYPE_A as c_int, state.use_tcp, first_server);
         return;
     }
@@ -1547,7 +1519,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     }
 
     // Pick first server using sorted order
-    let first_server = pick_next_server(&channeldata.server_failures);
+    let first_server = channeldata.server_health.pick_next();
 
     let state = Box::into_raw(Box::new(AddrInfoState {
         callback,
@@ -1637,64 +1609,6 @@ pub(crate) unsafe fn launch_addrinfo_queries(channeldata: &mut ChannelData, stat
     }
 }
 
-pub(crate) fn is_truncated(buf: &[u8]) -> bool {
-    buf.len() >= 4 && (buf[2] & 0x02) != 0
-}
-
-/// RFC 6761 section 6.3: "localhost" or any name under ".localhost"
-pub(crate) fn is_localhost(name: &str) -> bool {
-    name.eq_ignore_ascii_case("localhost")
-        || (name.len() >= 10 && name[name.len()-10..].eq_ignore_ascii_case(".localhost"))
-}
-
-/// Pick the best server to try next based on failure counts.
-/// Returns the server index with lowest (failure_count, original_index).
-pub(crate) fn pick_next_server(server_failures: &[u32]) -> usize {
-    let mut best: Option<(u32, usize)> = None;
-    for (i, &failures) in server_failures.iter().enumerate() {
-        match best {
-            None => best = Some((failures, i)),
-            Some((best_f, best_i)) => {
-                if failures < best_f || (failures == best_f && i < best_i) {
-                    best = Some((failures, i));
-                }
-            }
-        }
-    }
-    best.map(|(_, i)| i).unwrap_or(0)
-}
-
-/// Pick a server eligible for probing: has failures, failure timestamp expired past retry_delay.
-/// Returns the server with lowest (failure_count, index) among eligible, excluding `exclude_server`.
-pub(crate) fn pick_probe_server(
-    server_failures: &[u32],
-    server_last_failure: &[Option<Instant>],
-    retry_delay_ms: u64,
-    exclude_server: usize,
-) -> Option<usize> {
-    let now = Instant::now();
-    let retry_delay = Duration::from_millis(retry_delay_ms);
-    let mut best: Option<(u32, usize)> = None;
-    for (i, &failures) in server_failures.iter().enumerate() {
-        if failures == 0 || i == exclude_server {
-            continue;
-        }
-        let Some(Some(last_fail)) = server_last_failure.get(i) else { continue };
-        if now.duration_since(*last_fail) < retry_delay {
-            continue; // Not yet expired
-        }
-        match best {
-            None => best = Some((failures, i)),
-            Some((bf, bi)) => {
-                if failures < bf || (failures == bf && i < bi) {
-                    best = Some((failures, i));
-                }
-            }
-        }
-    }
-    best.map(|(_, i)| i)
-}
-
 /// Launch a probe query to an expired-failure server in parallel with the primary query.
 pub(crate) unsafe fn maybe_launch_probe(
     channeldata: &mut ChannelData,
@@ -1706,9 +1620,7 @@ pub(crate) unsafe fn maybe_launch_probe(
     if channeldata.server_failover_retry_chance == 0 {
         return;
     }
-    let probe_server = match pick_probe_server(
-        &channeldata.server_failures,
-        &channeldata.server_last_failure,
+    let probe_server = match channeldata.server_health.pick_probe(
         channeldata.server_failover_retry_delay,
         primary_server,
     ) {
@@ -1753,29 +1665,19 @@ pub(crate) unsafe fn run_probe_callback(res: Result<&[u8], c_int>, channel: Chan
             let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0xff };
             if rcode == 0 || rcode == 3 {
                 // Success or NXDOMAIN — server is alive, reset failure state
-                if si < channeldata.server_failures.len() {
-                    channeldata.server_failures[si] = 0;
-                    if si < channeldata.server_last_failure.len() {
-                        channeldata.server_last_failure[si] = None;
-                    }
+                if channeldata.server_health.record_success(si) {
                     invoke_server_state_callback(channeldata, si, true, false);
                 }
             } else {
                 // SERVFAIL/NOTIMP/REFUSED — still failing
-                if si < channeldata.server_failures.len() {
-                    channeldata.server_failures[si] += 1;
-                    if si < channeldata.server_last_failure.len() {
-                        channeldata.server_last_failure[si] = Some(Instant::now());
-                    }
+                if channeldata.server_health.record_failure(si) {
                     invoke_server_state_callback(channeldata, si, false, false);
                 }
             }
         }
         Err(_) => {
             // Timeout or other error — update failure timestamp
-            if si < channeldata.server_last_failure.len() {
-                channeldata.server_last_failure[si] = Some(Instant::now());
-            }
+            channeldata.server_health.record_failure_time(si);
         }
     }
 }
@@ -1835,12 +1737,7 @@ pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state
             match parsed {
                 Ok(records) => {
                     // Server succeeded — reset its failure counter
-                    if ffidata.server_index < channeldata.server_failures.len() {
-                        channeldata.server_failures[ffidata.server_index] = 0;
-                        if ffidata.server_index < channeldata.server_last_failure.len() {
-                            channeldata.server_last_failure[ffidata.server_index] = None;
-                        }
-                    }
+                    channeldata.server_health.record_success(ffidata.server_index);
                     state.attempt_count = 0;
                     state.has_success = true;
                     let svc_port = state.port;
@@ -1888,23 +1785,18 @@ pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state
                 }
                 Err(e) => {
                     // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
-                    let nservers = channeldata.server_failures.len();
+                    let nservers = channeldata.server_health.len();
                     let max_attempts = std::cmp::max(nservers, 1) * channeldata.ares.config.options.attempts as usize;
                     if (e == ARES_ESERVFAIL || e == ARES_ENOTIMP || e == ARES_EREFUSED)
                         && nservers >= 1
                     {
                         // Increment failure counter for this server
-                        if ffidata.server_index < nservers {
-                            channeldata.server_failures[ffidata.server_index] += 1;
-                            if ffidata.server_index < channeldata.server_last_failure.len() {
-                                channeldata.server_last_failure[ffidata.server_index] = Some(Instant::now());
-                            }
-                        }
+                        channeldata.server_health.record_failure(ffidata.server_index);
                         state.attempt_count += 1;
 
                         if state.attempt_count < max_attempts {
                             // Re-sort by (failure_count, index) and pick top server
-                            let next_server = pick_next_server(&channeldata.server_failures);
+                            let next_server = channeldata.server_health.pick_next();
                             let core_family = match ffidata.family {
                                 libc::AF_INET => Family::Ipv4,
                                 _ => Family::Ipv6,
@@ -1971,7 +1863,7 @@ pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state
             state.last_error = ARES_ENODATA;
             state.attempt_count = 0;
 
-            let first_server = pick_next_server(&channeldata.server_failures);
+            let first_server = channeldata.server_health.pick_next();
             launch_addrinfo_queries(channeldata, state_ptr, &new_hostname, state.ai_family, state.use_tcp, first_server);
             return;
         } else if state.name != state.base_name && !state.base_name.is_empty() {
@@ -1983,7 +1875,7 @@ pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, state
             // Clear base_name so we don't loop forever
             state.base_name = String::new();
 
-            let first_server = pick_next_server(&channeldata.server_failures);
+            let first_server = channeldata.server_health.pick_next();
             launch_addrinfo_queries(channeldata, state_ptr, &bare_name, state.ai_family, state.use_tcp, first_server);
             return;
         }
@@ -2039,34 +1931,3 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     }
 }
 
-#[cfg(test)]
-mod onion_tests {
-    use super::is_onion_domain;
-
-    #[test]
-    fn matches_onion_domains() {
-        assert!(is_onion_domain("dontleak.onion"));
-        assert!(is_onion_domain("DontLeak.ONION"));   // case-insensitive
-        assert!(is_onion_domain("x.onion."));          // trailing-dot FQDN form
-        assert!(is_onion_domain("onion"));             // bare single label
-    }
-
-    #[test]
-    fn rejects_non_onion_domains() {
-        assert!(!is_onion_domain("example.com"));
-        assert!(!is_onion_domain("notonion"));          // suffix without the dot
-        assert!(!is_onion_domain("onion.example.com")); // .onion not at the end
-        assert!(!is_onion_domain(""));
-    }
-
-    #[test]
-    fn non_ascii_names_do_not_panic() {
-        // These byte sequences are exactly what made the old `name[len-6..]`
-        // slice panic (len-6 lands inside a multibyte UTF-8 code point).
-        assert!(!is_onion_domain("😀😀"));
-        assert!(!is_onion_domain("café"));
-        assert!(!is_onion_domain("日本語.example"));
-        // A non-ASCII name that still ends in .onion is matched without panic.
-        assert!(is_onion_domain("café.onion"));
-    }
-}

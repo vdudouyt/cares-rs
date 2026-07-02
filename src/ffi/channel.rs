@@ -13,7 +13,7 @@ pub struct ChannelData {
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
     pub(crate) readbuf: Vec<u8>,
-    pub(crate) server_failures: Vec<u32>,
+    pub(crate) server_health: ServerHealth,
     pub(crate) sortlist: Vec<SortlistEntry>,
     pub flags: i32,
     pub maxtimeout: i32,
@@ -28,14 +28,13 @@ pub struct ChannelData {
     pub(crate) tcp_recv_buffers: std::collections::HashMap<i32, Vec<u8>>, // fd -> accumulated TCP receive data
     pub(crate) server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub(crate) server_failover_retry_delay: u64,  // milliseconds
-    pub(crate) server_last_failure: Vec<Option<Instant>>, // per-server last failure timestamp
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
     let ares = Ares::from_sysconfig();
-    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![] };
+    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_health: ServerHealth::default(), sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0 };
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -59,7 +58,10 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
         server_state_callback: src.server_state_callback,
         server_state_callback_arg: src.server_state_callback_arg,
         readbuf: vec![0u8; 65_535],
-        server_failures: src.server_failures.clone(),
+        server_health: ServerHealth {
+            failures: src.server_health.failures.clone(),
+            last_failure: vec![None; src.server_health.last_failure.len()],
+        },
         sortlist: src.sortlist.clone(),
         flags: src.flags,
         maxtimeout: src.maxtimeout,
@@ -74,7 +76,6 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
         tcp_recv_buffers: std::collections::HashMap::new(),
         server_failover_retry_chance: src.server_failover_retry_chance,
         server_failover_retry_delay: src.server_failover_retry_delay,
-        server_last_failure: vec![None; src.server_last_failure.len()],
     };
     unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
     ARES_SUCCESS
@@ -182,8 +183,7 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
         }
         head = unsafe { (*head).next };
     }
-    channeldata.server_failures = vec![0; channeldata.ares.config.nameservers.len()];
-    channeldata.server_last_failure = vec![None; channeldata.ares.config.nameservers.len()];
+    channeldata.server_health.reset(channeldata.ares.config.nameservers.len());
     ARES_SUCCESS
 }
 
@@ -215,8 +215,7 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut
         }
         head = node.next;
     }
-    channeldata.server_failures = vec![0; channeldata.ares.config.nameservers.len()];
-    channeldata.server_last_failure = vec![None; channeldata.ares.config.nameservers.len()];
+    channeldata.server_health.reset(channeldata.ares.config.nameservers.len());
     ARES_SUCCESS
 }
 
@@ -263,24 +262,21 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
     if servers.is_null() {
         channeldata.ares.config.nameservers.clear();
         channeldata.ares.config.tcp_ports.clear();
-        channeldata.server_failures.clear();
-        channeldata.server_last_failure.clear();
+        channeldata.server_health.clear();
         return ARES_SUCCESS;
     }
     let Some(s) = cstr_opt(servers) else { return ARES_EBADSTR };
     if s.is_empty() {
         channeldata.ares.config.nameservers.clear();
         channeldata.ares.config.tcp_ports.clear();
-        channeldata.server_failures.clear();
-        channeldata.server_last_failure.clear();
+        channeldata.server_health.clear();
         return ARES_SUCCESS;
     }
     let mut cursor = Cursor::new(s);
     match servers_csv::parse_from_reader(&mut cursor) {
         Some(ns) => {
             channeldata.ares.config.tcp_ports = vec![None; ns.len()];
-            channeldata.server_failures = vec![0; ns.len()];
-            channeldata.server_last_failure = vec![None; ns.len()];
+            channeldata.server_health.reset(ns.len());
             channeldata.ares.config.nameservers = ns;
             ARES_SUCCESS
         }

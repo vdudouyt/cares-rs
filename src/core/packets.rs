@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use arrayvec::ArrayVec;
+use std::net::IpAddr;
 #[cfg(test)]
 use bytes::BufMut;
 
@@ -537,6 +538,29 @@ impl<'a> RRParser<'a> for UriReply<'a> {
     }
 }
 
+
+
+/// A single A/AAAA answer: address + TTL. The RR payload every address lookup
+/// flow accumulates and sorts.
+#[derive(Debug)]
+pub struct AddrRecord {
+    pub ip: IpAddr,
+    pub ttl: u32,
+}
+
+impl RRParser<'_> for AddrRecord {
+    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<Self> {
+        Some(Self { ip: buf_to_ip(answer.data).ok()?, ttl: answer.ttl })
+    }
+}
+
+pub fn buf_to_ip(buf: &[u8]) -> Result<IpAddr, &'static str> {
+    match buf.len() {
+        4 => Ok(IpAddr::from(<[u8; 4]>::try_from(buf).unwrap())),
+        16 => Ok(IpAddr::from(<[u8; 16]>::try_from(buf).unwrap())),
+        _ => Err("invalid IP byte length"),
+    }
+}
 
 #[cfg(test)]
 mod tests {

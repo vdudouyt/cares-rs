@@ -7,6 +7,7 @@ use crate::ChannelData;
 use std::net::{ IpAddr, Ipv4Addr };
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
+use crate::core::lookup::ServerHealth;
 use crate::ares_socket_t;
 
 #[repr(C)]
@@ -135,7 +136,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         return ARES_ENODATA;
     }
     let ares = Ares::from_sysconfig();
-    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_failures: vec![], sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0, server_last_failure: vec![] };
+    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_health: ServerHealth::default(), sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0 };
 
     // options may be NULL here only when optmask == 0 (checked above); bind a
     // zeroed default in that case so no field is ever read through a NULL pointer.
@@ -221,8 +222,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         channeldata.server_failover_retry_chance = options.server_failover_opts.retry_chance;
         channeldata.server_failover_retry_delay = options.server_failover_opts.retry_delay as u64;
     }
-    channeldata.server_failures = vec![0; channeldata.ares.config.nameservers.len()];
-    channeldata.server_last_failure = vec![None; channeldata.ares.config.nameservers.len()];
+    channeldata.server_health.reset(channeldata.ares.config.nameservers.len());
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
