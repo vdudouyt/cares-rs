@@ -9,7 +9,12 @@
 //! is safe pure Rust — the FFI layer only converts C arguments and executes
 //! the decisions made here.
 
+use std::ffi::c_int;
 use std::time::{Duration, Instant};
+
+use crate::ffi::error::{
+    ARES_ENODATA, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED, ARES_ESERVFAIL, ARES_ETIMEOUT,
+};
 
 /// Header-level summary of a DNS reply buffer.
 pub struct ReplySummary {
@@ -79,6 +84,158 @@ pub fn is_localhost(name: &str) -> bool {
 pub fn is_onion_domain(name: &str) -> bool {
     let b = name.strip_suffix('.').unwrap_or(name).as_bytes();
     b.len() >= 6 && b[b.len() - 6..].eq_ignore_ascii_case(b".onion") || b.eq_ignore_ascii_case(b"onion")
+}
+
+/// The sequence of names a lookup tries: the current query name, the search
+/// domains still to append, and a final bare-name fallback. This is the one
+/// implementation of the domain-iteration logic that used to be duplicated
+/// across the search/gethostbyname/getaddrinfo callbacks.
+#[derive(Debug, Clone)]
+pub struct SearchPlan {
+    pub base_name: String,
+    pub current: String,
+    pub domains: Vec<String>,
+}
+
+impl SearchPlan {
+    /// ares_search / ares_search_dnsrec style plan: a trailing dot suppresses
+    /// search entirely; at or above `ndots` the bare name is tried first with
+    /// the search domains as fallback; below `ndots` the first search domain
+    /// is appended up front and the bare name becomes the last resort.
+    pub fn for_search(name_str: &str, ndots: u32, search: &[String]) -> Self {
+        let has_trailing_dot = name_str.ends_with('.');
+        let name_clean = name_str.strip_suffix('.').unwrap_or(name_str);
+        let dot_count = name_clean.chars().filter(|&c| c == '.').count() as u32;
+
+        let mut domains: Vec<String> = Vec::new();
+        let mut current = name_clean.to_string();
+
+        if !has_trailing_dot && !search.is_empty() {
+            if dot_count >= ndots {
+                // High dots: try bare name first, then search domains as fallback
+                domains = search.to_vec();
+            } else {
+                // Low dots: try search domains first, then bare name as fallback
+                domains = search.to_vec();
+                let first_domain = domains.remove(0);
+                current = format!("{}.{}", name_clean, first_domain);
+            }
+        }
+
+        SearchPlan { base_name: name_clean.to_string(), current, domains }
+    }
+
+    /// Move to the next name to try: the next search domain appended to the
+    /// base name, then — exactly once — the bare base name, then exhaustion.
+    pub fn advance(&mut self) -> Option<String> {
+        if !self.domains.is_empty() {
+            let next_domain = self.domains.remove(0);
+            let new_hostname = format!("{}.{}", self.base_name, next_domain);
+            self.current = new_hostname.clone();
+            Some(new_hostname)
+        } else if self.current != self.base_name && !self.base_name.is_empty() {
+            // Try bare name as fallback
+            let bare_name = self.base_name.clone();
+            self.current = bare_name.clone();
+            self.base_name = String::new(); // Prevent infinite recursion
+            Some(bare_name)
+        } else {
+            None
+        }
+    }
+}
+
+/// Input to a lookup state machine: a raw DNS reply or an I/O-level error
+/// status (timeout, refused connection, cancellation...).
+pub enum LookupEvent<'a> {
+    Reply(&'a [u8]),
+    Error(c_int),
+}
+
+/// What the search state machine wants done next. The FFI executor performs
+/// the action (enqueue a query / call the C callback) — the machine only
+/// decides.
+#[derive(Debug, PartialEq)]
+pub enum SearchAction {
+    /// Issue the same query for this name.
+    Send(String),
+    /// Deliver the current reply buffer to the caller as success.
+    DeliverSuccess,
+    /// Deliver failure with this status.
+    DeliverFail(c_int),
+}
+
+/// State machine for ares_search / ares_search_dnsrec: iterate the search
+/// plan on NXDOMAIN/NODATA/timeout (and, for the dnsrec flavor only, on
+/// SERVFAIL/NOTIMP/REFUSED), deliver otherwise. NXDOMAIN after an earlier
+/// empty answer is reported as ENODATA, matching upstream.
+#[derive(Debug)]
+pub struct SearchSm {
+    pub plan: SearchPlan,
+    pub last_error: c_int,
+    pub had_nodata: bool,
+    /// dnsrec flavor also walks the search plan on server errors.
+    pub retry_server_error: bool,
+}
+
+impl SearchSm {
+    pub fn new(plan: SearchPlan, retry_server_error: bool) -> Self {
+        SearchSm { plan, last_error: ARES_ENODATA, had_nodata: false, retry_server_error }
+    }
+
+    pub fn step(&mut self, ev: LookupEvent<'_>) -> SearchAction {
+        match ev {
+            LookupEvent::Reply(buf) => {
+                let summary = summarize(buf, 0);
+                match summary.rcode {
+                    3 => { // NXDOMAIN
+                        self.last_error = ARES_ENOTFOUND;
+                    }
+                    2 | 4 | 5 => { // SERVFAIL, NOTIMP, REFUSED
+                        self.last_error = match summary.rcode {
+                            2 => ARES_ESERVFAIL,
+                            4 => ARES_ENOTIMP,
+                            _ => ARES_EREFUSED,
+                        };
+                    }
+                    0 => {
+                        if summary.ancount == 0 {
+                            self.had_nodata = true;
+                            self.last_error = ARES_ENODATA;
+                        } else {
+                            // Success — deliver the raw response
+                            return SearchAction::DeliverSuccess;
+                        }
+                    }
+                    _ => {
+                        self.had_nodata = true;
+                        self.last_error = ARES_ENODATA;
+                    }
+                }
+            }
+            LookupEvent::Error(status) => {
+                self.last_error = status;
+            }
+        }
+
+        // Search domain iteration: on NXDOMAIN/ENODATA/ETIMEOUT — and for the
+        // dnsrec flavor also on server errors — try the next name in the plan.
+        let iterate = matches!(self.last_error, ARES_ENOTFOUND | ARES_ENODATA | ARES_ETIMEOUT)
+            || (self.retry_server_error
+                && matches!(self.last_error, ARES_ESERVFAIL | ARES_EREFUSED | ARES_ENOTIMP));
+        if iterate {
+            if let Some(next_name) = self.plan.advance() {
+                return SearchAction::Send(next_name);
+            }
+        }
+
+        // Finalize
+        let mut status = self.last_error;
+        if self.had_nodata && status == ARES_ENOTFOUND {
+            status = ARES_ENODATA;
+        }
+        SearchAction::DeliverFail(status)
+    }
 }
 
 /// Per-server failure bookkeeping and server selection for failover/probing.
@@ -230,6 +387,66 @@ mod tests {
         rbuf.extend_from_slice(&[9, 8]);
         assert_eq!(extract_tcp_frame(&mut rbuf), Some(vec![9, 8]));
         assert!(rbuf.is_empty());
+    }
+
+    fn reply(rcode: u8, ancount: u16) -> Vec<u8> {
+        vec![0, 0, 0x80, rcode, 0, 1, (ancount >> 8) as u8, ancount as u8]
+    }
+
+    #[test]
+    fn search_plan_low_dots_appends_first_domain() {
+        let search = vec!["a.com".to_string(), "b.com".to_string()];
+        let mut p = SearchPlan::for_search("www", 1, &search);
+        assert_eq!(p.current, "www.a.com");
+        assert_eq!(p.advance(), Some("www.b.com".to_string()));
+        assert_eq!(p.advance(), Some("www".to_string())); // bare-name fallback
+        assert_eq!(p.advance(), None);
+    }
+
+    #[test]
+    fn search_plan_high_dots_tries_bare_first() {
+        let search = vec!["a.com".to_string()];
+        let mut p = SearchPlan::for_search("x.y", 1, &search);
+        assert_eq!(p.current, "x.y");
+        assert_eq!(p.advance(), Some("x.y.a.com".to_string()));
+        // current != base ("x.y.a.com" vs "x.y") -> bare fallback fires once
+        assert_eq!(p.advance(), Some("x.y".to_string()));
+        assert_eq!(p.advance(), None);
+    }
+
+    #[test]
+    fn search_plan_trailing_dot_suppresses_search() {
+        let search = vec!["a.com".to_string()];
+        let mut p = SearchPlan::for_search("www.example.", 1, &search);
+        assert_eq!(p.current, "www.example");
+        assert_eq!(p.advance(), None);
+    }
+
+    #[test]
+    fn search_sm_iterates_then_enodata_rewrite() {
+        let search = vec!["a.com".to_string()];
+        let mut sm = SearchSm::new(SearchPlan::for_search("www", 1, &search), false);
+        // empty answer -> NODATA -> bare-name fallback
+        assert_eq!(sm.step(LookupEvent::Reply(&reply(0, 0))), SearchAction::Send("www".into()));
+        // NXDOMAIN after a NODATA earlier in the walk finalizes as ENODATA
+        assert_eq!(sm.step(LookupEvent::Reply(&reply(3, 0))), SearchAction::DeliverFail(ARES_ENODATA));
+    }
+
+    #[test]
+    fn search_sm_server_error_only_iterates_for_dnsrec() {
+        let search = vec!["a.com".to_string()];
+        let plan = SearchPlan::for_search("www", 1, &search);
+        let mut plain = SearchSm::new(plan.clone(), false);
+        assert_eq!(plain.step(LookupEvent::Reply(&reply(2, 0))), SearchAction::DeliverFail(ARES_ESERVFAIL));
+        let mut dnsrec = SearchSm::new(plan, true);
+        assert_eq!(dnsrec.step(LookupEvent::Reply(&reply(2, 0))), SearchAction::Send("www".into()));
+    }
+
+    #[test]
+    fn search_sm_success_and_timeout() {
+        let mut sm = SearchSm::new(SearchPlan::for_search("www.example.", 1, &[]), false);
+        assert_eq!(sm.step(LookupEvent::Reply(&reply(0, 1))), SearchAction::DeliverSuccess);
+        assert_eq!(sm.step(LookupEvent::Error(ARES_ETIMEOUT)), SearchAction::DeliverFail(ARES_ETIMEOUT));
     }
 
     #[test]

@@ -29,7 +29,15 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
 
-    // Phase 1: I/O (write + read) processing
+    // Phase 1: I/O (write + read) processing.
+    // The receive buffer is taken out of the channel for the duration of the
+    // phase so a reply slice borrowed from it can coexist with the &mut
+    // ChannelData the callback dispatch needs. (A reentrant ares_process from
+    // a user callback simply allocates a fresh buffer.)
+    let mut readbuf = std::mem::take(&mut channeldata.readbuf);
+    if readbuf.len() < 65_535 {
+        readbuf.resize(65_535, 0);
+    }
     let mut tasks = std::mem::take(&mut channeldata.ares.tasks);
     for task in &mut tasks {
         if task.status == Status::Completed { continue; }
@@ -37,7 +45,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
             match channeldata.ares.write_impl(task) {
                 WriteResult::Ok => {},
                 WriteResult::Failed => {
-                    task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata);
+                    task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                 },
                 WriteResult::TryAgain => {
                     // Leave in Writing status for next select cycle
@@ -67,22 +75,22 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     msg
                 };
                 if let Some(ref msg) = msg_data {
-                    channeldata.readbuf[..msg.len()].copy_from_slice(msg);
+                    readbuf[..msg.len()].copy_from_slice(msg);
                     Some((0, msg.len()))
                 } else { None }
             } else {
                 // UDP: use existing read_impl
-                match Ares::read_impl(task, &mut channeldata.readbuf) {
+                match Ares::read_impl(task, &mut readbuf) {
                     Ok(v) => v,
                     Err(()) => {
                         // recv failed (e.g. ECONNREFUSED) — fire callback
-                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata);
+                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                         continue;
                     }
                 }
             };
             if let Some((offset, len)) = read_result {
-                let buf = &channeldata.readbuf[offset..offset+len];
+                let buf = &readbuf[offset..offset+len];
                 // QID matching: verify response transaction ID matches query
                 if !qid_matches(buf, &task.writebuf, task.sock.is_tcp()) {
                     // QID mismatch — discard response, stay in Reading state
@@ -132,7 +140,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                                 invoke_sock_callbacks(channeldata, fd, sock_type);
                             } else {
                                 // Retry socket couldn't be created — deliver the error.
-                                task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata);
+                                task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                             }
                             task.status = Status::Completed;
                             continue;
@@ -164,14 +172,18 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                         invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
                     } else {
-                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata);
+                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                     }
                     task.status = Status::Completed;
                     continue;
                 }
                 // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
-                if channeldata.query_cache_max_ttl > 0
-                    && matches!(task.userdata.callback, Callback::AresCallbackDnsRec(_) | Callback::AresSearchCallbackDnsRec(_)) {
+                let is_dnsrec = match &task.userdata.callback {
+                    Callback::AresCallbackDnsRec(_) => true,
+                    Callback::Search(lookup) => matches!(lookup.borrow().delivery, SearchDelivery::DnsRec { .. }),
+                    _ => false,
+                };
+                if channeldata.query_cache_max_ttl > 0 && is_dnsrec {
                         // Extract query name and type from the response buffer
                         if let Ok(parsed) = ParsedResponse::from_buf(buf) {
                             let qname = parsed.query.name.join(".");
@@ -188,10 +200,11 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                             }
                         }
                     }
-                (task.userdata.callback).run(Ok(buf), &task.userdata);
+                (task.userdata.callback).run(Ok(buf), &task.userdata, channeldata);
             }
         }
     }
+    channeldata.readbuf = readbuf;
     // Merge: new tasks from read/write callbacks + processed tasks
     let mut new_tasks = std::mem::take(&mut channeldata.ares.tasks);
     tasks.append(&mut new_tasks);
@@ -245,10 +258,10 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     invoke_sock_callbacks(channeldata, fd, sock_type);
                 } else {
                     // Retry socket couldn't be created — deliver the error.
-                    task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata);
+                    task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                 }
             } else {
-                task.userdata.callback.run(Err(ARES_ETIMEOUT), &task.userdata);
+                task.userdata.callback.run(Err(ARES_ETIMEOUT), &task.userdata, channeldata);
                 task.status = Status::Completed;
             }
         }

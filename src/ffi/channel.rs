@@ -86,9 +86,10 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
-    for task in channeldata.ares.tasks.drain(..) {
+    let tasks: Vec<_> = channeldata.ares.tasks.drain(..).collect();
+    for task in tasks {
         if task.status != Status::Completed {
-            task.userdata.callback.run(Err(ARES_ECANCELLED), &task.userdata);
+            task.userdata.callback.run(Err(ARES_ECANCELLED), &task.userdata, channeldata);
         }
     }
     // Clear connection pools so stale sockets don't linger
@@ -103,9 +104,10 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     if !channel.is_null() {
         // Fire callbacks with ARES_EDESTRUCTION for all pending tasks
         let channeldata = unsafe { &mut *channel };
-        for task in channeldata.ares.tasks.drain(..) {
+        let tasks: Vec<_> = channeldata.ares.tasks.drain(..).collect();
+        for task in tasks {
             if task.status != Status::Completed {
-                task.userdata.callback.run(Err(ARES_EDESTRUCTION), &task.userdata);
+                task.userdata.callback.run(Err(ARES_EDESTRUCTION), &task.userdata, channeldata);
             }
         }
         unsafe { drop(Box::from_raw(channel)); }
