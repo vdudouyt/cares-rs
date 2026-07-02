@@ -3,11 +3,10 @@
 
 use libc::{in_addr};
 use crate::ffi::{ Channel, Ares };
-use crate::ChannelData;
-use std::net::{ IpAddr, Ipv4Addr };
+use std::net::Ipv4Addr;
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
-use crate::core::lookup::ServerHealth;
+use crate::ffi::kernels::options::{apply_options, new_channel_data, saved_options, DecodedOptions};
 use crate::ares_socket_t;
 
 #[repr(C)]
@@ -116,10 +115,10 @@ pub const ARES_OPT_QUERY_CACHE    : c_int = 1 << 21;
 pub const ARES_OPT_EVENT_THREAD   : c_int = 1 << 22;
 pub const ARES_OPT_SERVER_FAILOVER: c_int = 1 << 23;
 
-const ARES_FLAG_USEVC: c_int = 1 << 0;
-const ARES_FLAG_PRIMARY: c_int = 1 << 1;
-const ARES_FLAG_NOCHECKRESP: c_int = 1 << 7;
-const ARES_FLAG_EDNS: c_int = 1 << 8;
+pub(crate) const ARES_FLAG_USEVC: c_int = 1 << 0;
+pub(crate) const ARES_FLAG_PRIMARY: c_int = 1 << 1;
+pub(crate) const ARES_FLAG_NOCHECKRESP: c_int = 1 << 7;
+pub(crate) const ARES_FLAG_EDNS: c_int = 1 << 8;
 
 /// # Safety
 /// `out_channel` must be non-null; `options` must be NULL or a valid `ares_options` consistent with `optmask`.
@@ -135,9 +134,6 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     if options.is_null() && optmask != 0 {
         return ARES_ENODATA;
     }
-    let ares = Ares::from_sysconfig();
-    let mut channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_health: ServerHealth::default(), sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0 };
-
     // options may be NULL here only when optmask == 0 (checked above); bind a
     // zeroed default in that case so no field is ever read through a NULL pointer.
     let default_opts;
@@ -147,82 +143,49 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     } else {
         unsafe { & *options }
     };
-    if optmask & ARES_OPT_SERVERS != 0 {
-        // Clear sysconfig servers when user explicitly provides servers
-        channeldata.ares.config.nameservers.clear();
-        channeldata.ares.config.tcp_ports.clear();
-        if !options.servers.is_null() {
-            let servers = unsafe { std::slice::from_raw_parts(options.servers, options.nservers as usize) };
-            for server in servers {
-                let ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(server.s_addr)));
-                channeldata.ares.config.nameservers.push((ip, None));
-                channeldata.ares.config.tcp_ports.push(None);
-            }
-        }
-    }
-    if optmask & ARES_OPT_UDP_PORT != 0 {
-        channeldata.ares.default_udp_port = options.udp_port;
-    }
-    if optmask & ARES_OPT_TCP_PORT != 0 {
-        channeldata.ares.default_tcp_port = options.tcp_port;
-    }
-    if optmask & ARES_OPT_TIMEOUTMS != 0 {
-        channeldata.ares.config.options.timeout_ms = std::cmp::max(1, options.timeout as u32);
-    }
-    if optmask & ARES_OPT_TIMEOUT != 0 {
-        channeldata.ares.config.options.timeout_ms = options.timeout as u32 * 1000;
-    }
-    if optmask & ARES_OPT_TRIES != 0 {
-        channeldata.ares.config.options.attempts = options.tries as u32;
-    }
-    if optmask & ARES_OPT_NDOTS != 0 {
-        channeldata.ares.config.options.ndots = options.ndots as u32;
-    }
-    if optmask & ARES_OPT_FLAGS != 0 {
-        channeldata.flags = options.flags;
-        channeldata.ares.config.options.use_vc = (options.flags & ARES_FLAG_USEVC) != 0;
-        channeldata.ares.config.options.edns0 = (options.flags & ARES_FLAG_EDNS) != 0;
-        // ARES_FLAG_PRIMARY: truncate to first server only
-        if (options.flags & ARES_FLAG_PRIMARY) != 0 {
-            channeldata.ares.config.nameservers.truncate(1);
-            channeldata.ares.config.tcp_ports.truncate(1);
-        }
-    }
-    if optmask & ARES_OPT_DOMAINS != 0 && !options.domains.is_null() {
-        let domains = unsafe { std::slice::from_raw_parts(options.domains, options.ndomains as usize) };
-        channeldata.ares.config.search = domains.iter()
-            .map(|&p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-            .collect();
-    }
-    if optmask & ARES_OPT_NOROTATE != 0 {
-        channeldata.ares.config.options.rotate = false;
-    }
-    if optmask & ARES_OPT_ROTATE != 0 {
-        channeldata.ares.config.options.rotate = true;
-    }
-    if optmask & ARES_OPT_MAXTIMEOUTMS != 0 {
-        channeldata.maxtimeout = options.maxtimeout;
-    }
-    if optmask & ARES_OPT_LOOKUPS != 0 && !options.lookups.is_null() {
-        channeldata.lookups = unsafe { CStr::from_ptr(options.lookups) }.to_string_lossy().into_owned();
-    }
-    if optmask & ARES_OPT_RESOLVCONF != 0 && !options.resolvconf_path.is_null() {
-        channeldata.resolvconf_path = unsafe { CStr::from_ptr(options.resolvconf_path) }.to_string_lossy().into_owned();
-    }
-    if optmask & ARES_OPT_HOSTS_FILE != 0 && !options.hosts_path.is_null() {
-        channeldata.hosts_path = unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned();
-    }
-    if optmask & ARES_OPT_QUERY_CACHE != 0 {
-        channeldata.query_cache_max_ttl = options.qcache_max_ttl;
-    }
-    if optmask & ARES_OPT_UDP_MAX_QUERIES != 0 {
-        channeldata.udp_max_queries = options.udp_max_queries as u32;
-    }
-    if optmask & ARES_OPT_SERVER_FAILOVER != 0 {
-        channeldata.server_failover_retry_chance = options.server_failover_opts.retry_chance;
-        channeldata.server_failover_retry_delay = options.server_failover_opts.retry_delay as u64;
-    }
-    channeldata.server_health.reset(channeldata.ares.config.nameservers.len());
+
+    // Marshal every C field into an owned mirror before any logic runs.
+    let decoded = DecodedOptions {
+        flags: options.flags,
+        timeout: options.timeout,
+        tries: options.tries,
+        ndots: options.ndots,
+        udp_port: options.udp_port,
+        tcp_port: options.tcp_port,
+        servers: if optmask & ARES_OPT_SERVERS != 0 && !options.servers.is_null() {
+            unsafe { std::slice::from_raw_parts(options.servers, options.nservers as usize) }
+                .iter()
+                .map(|server| Ipv4Addr::from(u32::from_be(server.s_addr)))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        domains: if optmask & ARES_OPT_DOMAINS != 0 && !options.domains.is_null() {
+            let domains = unsafe { std::slice::from_raw_parts(options.domains, options.ndomains as usize) };
+            Some(
+                domains
+                    .iter()
+                    .map(|&p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+                    .collect(),
+            )
+        } else {
+            None
+        },
+        lookups: (!options.lookups.is_null())
+            .then(|| unsafe { CStr::from_ptr(options.lookups) }.to_string_lossy().into_owned()),
+        resolvconf_path: (!options.resolvconf_path.is_null())
+            .then(|| unsafe { CStr::from_ptr(options.resolvconf_path) }.to_string_lossy().into_owned()),
+        hosts_path: (!options.hosts_path.is_null())
+            .then(|| unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned()),
+        udp_max_queries: options.udp_max_queries,
+        maxtimeout: options.maxtimeout,
+        qcache_max_ttl: options.qcache_max_ttl,
+        failover_retry_chance: options.server_failover_opts.retry_chance,
+        failover_retry_delay: options.server_failover_opts.retry_delay as u64,
+    };
+
+    let mut channeldata = new_channel_data(Ares::from_sysconfig());
+    apply_options(&mut channeldata, optmask, decoded);
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -235,63 +198,36 @@ pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_
         return ARES_ENODATA;
     }
     let channeldata = unsafe { &*channel };
-    let config = &channeldata.ares.config;
-    let opts = &config.options;
+    let saved = saved_options(channeldata);
 
     let out = unsafe { &mut *options };
     *out = ares_options::default();
+    let mut mask = saved.base_mask;
 
-    let mut mask: c_int = 0;
+    out.flags = saved.flags;
+    out.timeout = saved.timeout;
+    out.tries = saved.tries;
+    out.ndots = saved.ndots;
+    out.udp_port = saved.udp_port;
+    out.tcp_port = saved.tcp_port;
 
-    // flags -- restore the raw flags that were passed in at init time
-    out.flags = channeldata.flags;
-    mask |= ARES_OPT_FLAGS;
-
-    // timeout (in milliseconds)
-    out.timeout = opts.timeout_ms as c_int;
-    mask |= ARES_OPT_TIMEOUTMS;
-
-    // tries
-    out.tries = opts.attempts as c_int;
-    mask |= ARES_OPT_TRIES;
-
-    // ndots
-    out.ndots = opts.ndots as c_int;
-    mask |= ARES_OPT_NDOTS;
-
-    // udp/tcp ports
-    out.udp_port = channeldata.ares.default_udp_port;
-    mask |= ARES_OPT_UDP_PORT;
-    out.tcp_port = channeldata.ares.default_tcp_port;
-    mask |= ARES_OPT_TCP_PORT;
-
-    // servers (IPv4 only in ares_options)
-    let v4_servers: Vec<in_addr> = config.nameservers.iter().filter_map(|(ip, _)| {
-        match ip {
-            IpAddr::V4(v4) => {
-                Some(in_addr { s_addr: u32::from(*v4).to_be() })
-            }
-            _ => None,
-        }
-    }).collect();
-    if !v4_servers.is_empty() {
-        let count = v4_servers.len();
+    // servers / domains transfer through libc::malloc; their mask bits are
+    // reported only when the allocation lands (matches the historical shape).
+    if !saved.v4_servers.is_empty() {
+        let count = saved.v4_servers.len();
         let ptr = unsafe { libc::malloc(count * std::mem::size_of::<in_addr>()) as *mut in_addr };
         if !ptr.is_null() {
-            unsafe { std::ptr::copy_nonoverlapping(v4_servers.as_ptr(), ptr, count) };
+            unsafe { std::ptr::copy_nonoverlapping(saved.v4_servers.as_ptr(), ptr, count) };
             out.servers = ptr;
             out.nservers = count as c_int;
             mask |= ARES_OPT_SERVERS;
         }
     }
-
-    // domains
-    if !config.search.is_empty() {
-        let count = config.search.len();
+    if !saved.domains.is_empty() {
+        let count = saved.domains.len();
         let arr = unsafe { libc::malloc(count * std::mem::size_of::<*mut c_char>()) as *mut *mut c_char };
         if !arr.is_null() {
-            for (i, domain) in config.search.iter().enumerate() {
-                let cstr = std::ffi::CString::new(domain.as_str()).unwrap_or_default();
+            for (i, cstr) in saved.domains.into_iter().enumerate() {
                 unsafe { *arr.add(i) = cstr.into_raw() };
             }
             out.domains = arr;
@@ -300,43 +236,17 @@ pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_
         }
     }
 
-    // rotate
-    if opts.rotate {
-        mask |= ARES_OPT_ROTATE;
-    } else {
-        mask |= ARES_OPT_NOROTATE;
+    if let Some(maxtimeout) = saved.maxtimeout {
+        out.maxtimeout = maxtimeout;
     }
-
-    // sortlist
-    if !channeldata.sortlist.is_empty() {
-        mask |= ARES_OPT_SORTLIST;
+    if let Some(lookups) = saved.lookups {
+        out.lookups = lookups.into_raw();
     }
-
-    // maxtimeout
-    if channeldata.maxtimeout != 0 {
-        out.maxtimeout = channeldata.maxtimeout;
-        mask |= ARES_OPT_MAXTIMEOUTMS;
+    if let Some(path) = saved.resolvconf_path {
+        out.resolvconf_path = path.into_raw();
     }
-
-    // lookups
-    if !channeldata.lookups.is_empty() {
-        let cstr = std::ffi::CString::new(channeldata.lookups.as_str()).unwrap_or_default();
-        out.lookups = cstr.into_raw();
-        mask |= ARES_OPT_LOOKUPS;
-    }
-
-    // resolvconf_path
-    if !channeldata.resolvconf_path.is_empty() {
-        let cstr = std::ffi::CString::new(channeldata.resolvconf_path.as_str()).unwrap_or_default();
-        out.resolvconf_path = cstr.into_raw();
-        mask |= ARES_OPT_RESOLVCONF;
-    }
-
-    // hosts_path
-    if !channeldata.hosts_path.is_empty() {
-        let cstr = std::ffi::CString::new(channeldata.hosts_path.as_str()).unwrap_or_default();
-        out.hosts_path = cstr.into_raw();
-        mask |= ARES_OPT_HOSTS_FILE;
+    if let Some(path) = saved.hosts_path {
+        out.hosts_path = path.into_raw();
     }
 
     unsafe { *optmask = mask };

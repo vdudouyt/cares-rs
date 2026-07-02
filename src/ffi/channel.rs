@@ -2,6 +2,8 @@
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
 
 use super::*;
+use crate::ffi::kernels::channel::dup_channel;
+use crate::ffi::kernels::options::new_channel_data;
 
 
 pub struct ChannelData {
@@ -33,8 +35,7 @@ pub struct ChannelData {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
-    let ares = Ares::from_sysconfig();
-    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut(), sock_config_callback: None, sock_config_callback_arg: std::ptr::null_mut(), server_state_callback: None, server_state_callback_arg: std::ptr::null_mut(), readbuf: vec![0u8; 65_535], server_health: ServerHealth::default(), sortlist: vec![], flags: 0, maxtimeout: 0, lookups: String::new(), resolvconf_path: String::new(), hosts_path: String::new(), query_cache: std::collections::HashMap::new(), query_cache_max_ttl: 0, udp_max_queries: 0, udp_connections: vec![], tcp_connections: vec![], tcp_recv_buffers: std::collections::HashMap::new(), server_failover_retry_chance: 0, server_failover_retry_delay: 0 };
+    let channeldata = new_channel_data(Ares::from_sysconfig());
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -45,38 +46,7 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int {
     if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
     let src = unsafe { &*source };
-    let mut ares = Ares::new(src.ares.config.clone());
-    ares.socket_factory = src.ares.socket_factory.clone();
-    ares.default_udp_port = src.ares.default_udp_port;
-    ares.default_tcp_port = src.ares.default_tcp_port;
-    let channeldata = ChannelData {
-        ares,
-        sock_create_callback: src.sock_create_callback,
-        sock_create_callback_arg: src.sock_create_callback_arg,
-        sock_config_callback: src.sock_config_callback,
-        sock_config_callback_arg: src.sock_config_callback_arg,
-        server_state_callback: src.server_state_callback,
-        server_state_callback_arg: src.server_state_callback_arg,
-        readbuf: vec![0u8; 65_535],
-        server_health: ServerHealth {
-            failures: src.server_health.failures.clone(),
-            last_failure: vec![None; src.server_health.last_failure.len()],
-        },
-        sortlist: src.sortlist.clone(),
-        flags: src.flags,
-        maxtimeout: src.maxtimeout,
-        lookups: src.lookups.clone(),
-        resolvconf_path: src.resolvconf_path.clone(),
-        hosts_path: src.hosts_path.clone(),
-        query_cache: std::collections::HashMap::new(),
-        query_cache_max_ttl: src.query_cache_max_ttl,
-        udp_max_queries: src.udp_max_queries,
-        udp_connections: vec![],
-        tcp_connections: vec![],
-        tcp_recv_buffers: std::collections::HashMap::new(),
-        server_failover_retry_chance: src.server_failover_retry_chance,
-        server_failover_retry_delay: src.server_failover_retry_delay,
-    };
+    let channeldata = dup_channel(src);
     unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
     ARES_SUCCESS
 }
