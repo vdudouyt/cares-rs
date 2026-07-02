@@ -29,7 +29,7 @@ use crate::ffi::clinkedlist::*;
 use crate::ffi::error::*;
 use crate::cstr;
 pub use crate::ffi::ares_socket::{SocketFactory, AresSocketFunctions};
-use crate::core::hostfile::{AddressFamily, HostLookup};
+use crate::core::hostfile::HostLookup;
 use crate::core::lookup::*;
 use crate::core::sortlist::*;
 use std::io::Cursor;

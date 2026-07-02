@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use crate::core::hostfile::{AddressFamily, HostLookup};
-use crate::core::lookup::{is_localhost, is_onion_domain, HostByNameSm, SearchPlan};
+use crate::core::lookup::{is_localhost, is_onion_domain, AddrInfoSm, HostByNameSm, SearchPlan};
 use crate::core::packets::AddrRecord;
 use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::sortlist::apply_sortlist;
@@ -219,4 +219,104 @@ pub(crate) fn hosts_file_lookup(
         return Err(ARES_ENOTFOUND);
     }
     Ok(lookup)
+}
+
+/// The verdict of ares_getaddrinfo's pre-DNS phase.
+pub(crate) enum AddrInfoPreflight {
+    /// Deliver `status` with a NULL result.
+    Fail(c_int),
+    /// IP-literal or hosts-file hit: the shim builds family-filtered nodes
+    /// from these addresses under `canonical` and delivers ARES_SUCCESS.
+    DeliverAddrs { addrs: Vec<IpAddr>, canonical: String },
+    /// No short-circuit applies — the shim begins the parallel A+AAAA batch.
+    StartDns { sm: AddrInfoSm, first_server: usize },
+}
+
+/// The well-known service table ares_getaddrinfo consults before falling
+/// back to libc::getservbyname (which stays in the shim).
+pub(crate) fn well_known_port(svc: &str) -> Option<u16> {
+    Some(match svc {
+        "http" => 80,
+        "https" => 443,
+        "ftp" => 21,
+        "ssh" => 22,
+        "smtp" => 25,
+        "dns" => 53,
+        "pop3" => 110,
+        "imap" => 143,
+        _ => return None,
+    })
+}
+
+/// Check order is behavior: empty-name -> onion -> IP literal (family
+/// mismatch fails, no fall-through) -> hosts file -> no-servers -> StartDns.
+/// The raw name keeps its trailing dot for the SearchPlan; checks and the
+/// delivered canonical name use the stripped form.
+pub(crate) fn getaddrinfo_preflight(
+    channeldata: &mut ChannelData,
+    hostname_raw: &str,
+    ai_family: c_int,
+) -> AddrInfoPreflight {
+    let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
+
+    if hostname.is_empty() {
+        return AddrInfoPreflight::Fail(ARES_ENOTFOUND);
+    }
+
+    // Reject .onion domains immediately (RFC 7686)
+    if is_onion_domain(hostname) {
+        return AddrInfoPreflight::Fail(ARES_ENOTFOUND);
+    }
+
+    // IP literal check
+    if let Ok(ip) = hostname.parse::<IpAddr>() {
+        let matches = match ai_family {
+            libc::AF_INET => ip.is_ipv4(),
+            libc::AF_INET6 => ip.is_ipv6(),
+            libc::AF_UNSPEC => true,
+            _ => false,
+        };
+        if matches {
+            return AddrInfoPreflight::DeliverAddrs {
+                addrs: vec![ip],
+                canonical: hostname.to_string(),
+            };
+        } else {
+            return AddrInfoPreflight::Fail(ARES_ENOTFOUND);
+        }
+    }
+
+    // Hosts file check
+    let family_filter = match ai_family {
+        libc::AF_INET => AddressFamily::Ipv4,
+        libc::AF_INET6 => AddressFamily::Ipv6,
+        _ => AddressFamily::Any,
+    };
+    if let Some(lookup) = channeldata.ares.hosts().lookup(hostname, family_filter) {
+        if !lookup.addrs.is_empty() {
+            return AddrInfoPreflight::DeliverAddrs {
+                addrs: lookup.addrs,
+                canonical: hostname.to_string(),
+            };
+        }
+    }
+
+    // No servers configured
+    if channeldata.ares.config.nameservers.is_empty() {
+        return AddrInfoPreflight::Fail(ARES_ENOSERVER);
+    }
+
+    // DNS path: build the search plan + state machine
+    // (the raw name carries the trailing dot the plan needs to see)
+    let use_tcp = channeldata.ares.config.options.use_vc;
+    let plan = SearchPlan::for_search(
+        hostname_raw,
+        channeldata.ares.config.options.ndots,
+        &channeldata.ares.config.search,
+    );
+    let first_server = channeldata.server_health.pick_next();
+    AddrInfoPreflight::StartDns {
+        sm: AddrInfoSm::new(plan, ai_family, use_tcp),
+        first_server,
+    }
 }

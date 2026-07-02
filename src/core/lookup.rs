@@ -30,10 +30,11 @@
 //! - [`on_datagram`] → [`TaskVerdict`] (failover / TC retry / deliver)
 //! - [`on_timeout`] → [`TimeoutVerdict`] (retry / expire)
 //!
-//! Deliberately *not* here: pre-DNS short-circuits (IP literals, hosts file,
-//! localhost, HOSTALIASES, cache probes) stay in the FFI entry points, and
-//! the socket-launch retry loops live with the executors — their failure
-//! accounting calls back into [`ServerHealth`].
+//! The pre-DNS short-circuits (IP literals, hosts file, localhost,
+//! HOSTALIASES, cache probes) live in `src/ffi/kernels/lookups.rs` as
+//! verdict-returning preflight kernels — safe like this module, but coupled
+//! to `ChannelData`. The socket-launch retry loops live with the executors —
+//! their failure accounting calls back into [`ServerHealth`].
 
 use std::ffi::c_int;
 use std::time::{Duration, Instant};

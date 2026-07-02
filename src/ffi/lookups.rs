@@ -5,7 +5,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::*;
-use crate::ffi::kernels::lookups::{gethostbyname_preflight, hosts_file_lookup, HostPreflight};
+use crate::ffi::kernels::lookups::{
+    getaddrinfo_preflight, gethostbyname_preflight, hosts_file_lookup, well_known_port,
+    AddrInfoPreflight, HostPreflight,
+};
 
 
 /// Live state of an ares_gethostbyname lookup: the pure state machine plus
@@ -919,32 +922,21 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 
     let ai_family = if hints.is_null() { libc::AF_UNSPEC } else { unsafe { (*hints).ai_family } };
 
-    // Resolve service name to port number
+    // Resolve service name to port number (table in the kernel; the
+    // libc::getservbyname fallback is inherently a C call, so it stays here)
     let port: u16 = if !service.is_null() {
         let svc = unsafe { cstr_lossy(service) };
         if let Ok(p) = svc.parse::<u16>() {
             p
+        } else if let Some(p) = well_known_port(svc) {
+            p
         } else {
-            // Look up well-known service names
-            match svc {
-                "http" => 80,
-                "https" => 443,
-                "ftp" => 21,
-                "ssh" => 22,
-                "smtp" => 25,
-                "dns" => 53,
-                "pop3" => 110,
-                "imap" => 143,
-                _ => {
-                    // Try getservbyname via libc
-                    let c_svc = unsafe { CStr::from_ptr(service) };
-                    let result = unsafe { libc::getservbyname(c_svc.as_ptr(), std::ptr::null()) };
-                    if !result.is_null() {
-                        unsafe { u16::from_be((*result).s_port as u16) }
-                    } else {
-                        0
-                    }
-                }
+            let c_svc = unsafe { CStr::from_ptr(service) };
+            let result = unsafe { libc::getservbyname(c_svc.as_ptr(), std::ptr::null()) };
+            if !result.is_null() {
+                unsafe { u16::from_be((*result).s_port as u16) }
+            } else {
+                0
             }
         }
     } else {
@@ -952,73 +944,22 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     };
 
     let hostname_raw = unsafe { cstr_lossy(name) };
-    let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
 
-    if hostname.is_empty() {
-        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
-        return;
-    }
-
-    // Reject .onion domains immediately (RFC 7686)
-    if is_onion_domain(hostname) {
-        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
-        return;
-    }
-
-    // IP literal check
-    if let Ok(ip) = hostname.parse::<IpAddr>() {
-        let matches = match ai_family {
-            libc::AF_INET => ip.is_ipv4(),
-            libc::AF_INET6 => ip.is_ipv6(),
-            libc::AF_UNSPEC => true,
-            _ => false,
-        };
-        if matches {
-            let nodes = addrinfo_nodes_from_addrs_port(&[ip], ai_family, port);
-            let ai = build_ares_addrinfo(hostname, nodes);
+    match getaddrinfo_preflight(channeldata, hostname_raw, ai_family) {
+        AddrInfoPreflight::Fail(status) => {
+            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+        }
+        AddrInfoPreflight::DeliverAddrs { addrs, canonical } => {
+            let nodes = addrinfo_nodes_from_addrs_port(&addrs, ai_family, port);
+            let ai = build_ares_addrinfo(&canonical, nodes);
             unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
-            return;
-        } else {
-            unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
-            return;
+        }
+        AddrInfoPreflight::StartDns { sm, first_server } => {
+            let lookup = Rc::new(RefCell::new(AddrInfoLookup { sm, callback, arg, port }));
+            let actions = lookup.borrow_mut().sm.begin_batch(first_server);
+            unsafe { execute_addrinfo_actions(channeldata, &lookup, actions) };
         }
     }
-
-    // Hosts file check
-    let family_filter = match ai_family {
-        libc::AF_INET => AddressFamily::Ipv4,
-        libc::AF_INET6 => AddressFamily::Ipv6,
-        _ => AddressFamily::Any,
-    };
-    if let Some(lookup) = channeldata.ares.hosts().lookup(hostname, family_filter) {
-        if !lookup.addrs.is_empty() {
-            let nodes = addrinfo_nodes_from_addrs_port(&lookup.addrs, ai_family, port);
-            let ai = build_ares_addrinfo(hostname, nodes);
-            unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
-            return;
-        }
-    }
-
-    // No servers configured
-    if channeldata.ares.config.nameservers.is_empty() {
-        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
-        return;
-    }
-
-    // DNS path: build the search plan + state machine and launch the batch
-    // (the raw name carries the trailing dot the plan needs to see)
-    let use_tcp = channeldata.ares.config.options.use_vc;
-    let plan = SearchPlan::for_search(hostname_raw, channeldata.ares.config.options.ndots, &channeldata.ares.config.search);
-    let first_server = channeldata.server_health.pick_next();
-
-    let lookup = Rc::new(RefCell::new(AddrInfoLookup {
-        sm: AddrInfoSm::new(plan, ai_family, use_tcp),
-        callback,
-        arg,
-        port,
-    }));
-    let actions = lookup.borrow_mut().sm.begin_batch(first_server);
-    unsafe { execute_addrinfo_actions(channeldata, &lookup, actions) };
 }
 
 /// Send executor for the getaddrinfo machine. Executes the actions returned
