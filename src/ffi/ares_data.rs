@@ -67,7 +67,8 @@ unsafe fn restore_original_ptr(dataptr: *mut c_void) -> *mut c_void {
     unsafe { dataptr.byte_sub(offset_of!(AresData<*mut c_void>, data)) }
 }
 
-pub(crate) unsafe fn free_data(dataptr: *mut c_void) {
+#[no_mangle]
+pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     if dataptr.is_null() { return; }
     let aresdata = unsafe { restore_original_ptr(dataptr) as *mut AresData<*mut c_void> };
     // Every chained type is freed the same way: `free_chain` frees the boxed tail and
