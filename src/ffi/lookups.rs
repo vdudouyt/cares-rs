@@ -99,10 +99,10 @@ impl Callback {
             Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata),
             Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, ffidata),
             Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, ffidata),
-            Self::AddrInfo(lookup) => unsafe { run_ares_addrinfo_callback(buf, lookup, ffidata, channeldata) },
-            Self::HostByName(lookup) => unsafe { run_ares_hostbyname_callback(buf, lookup, ffidata, channeldata) },
-            Self::Search(lookup) => unsafe { run_ares_search_callback(buf, lookup, ffidata, channeldata) },
-            Self::Probe => unsafe { run_probe_callback(buf, channeldata, ffidata) },
+            Self::AddrInfo(lookup) => run_ares_addrinfo_callback(buf, lookup, ffidata, channeldata),
+            Self::HostByName(lookup) => run_ares_hostbyname_callback(buf, lookup, ffidata, channeldata),
+            Self::Search(lookup) => run_ares_search_callback(buf, lookup, ffidata, channeldata),
+            Self::Probe => run_probe_callback(buf, channeldata, ffidata),
         }
     }
     /// Which reactor-level policies apply to a task carrying this callback.
@@ -160,9 +160,9 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         HostPreflight::StartDns { sm, query_hostname, first_server, use_tcp } => {
             let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
             let lookup = Rc::new(RefCell::new(HostByNameLookup { sm, callback, arg }));
-            unsafe { launch_hostbyname_query(channeldata, &lookup, &query_hostname, send_family, send_rtype, use_tcp, first_server) };
+            launch_hostbyname_query(channeldata, &lookup, &query_hostname, send_family, send_rtype, use_tcp, first_server);
             // Server failover probing: if enabled, probe an expired-failure server in parallel
-            unsafe { maybe_launch_probe(channeldata, &query_hostname, send_family, first_server, use_tcp) };
+            maybe_launch_probe(channeldata, &query_hostname, send_family, first_server, use_tcp);
         }
     }
 }
@@ -221,7 +221,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         return;
     }
     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-    if !unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) } {
+    if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
         channeldata.ares.tasks.pop();
         unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut()) };
     }
@@ -455,7 +455,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
                 return;
             }
             let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-            if !unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) } {
+            if !invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) {
                 channeldata.ares.tasks.pop();
                 unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
             }
@@ -574,7 +574,7 @@ pub(crate) fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: Ar
 /// or sock-callback failure (the failure accounting itself is ServerHealth's,
 /// i.e. core, logic). Exhaustion delivers ECONNREFUSED; the lookup state is
 /// freed when its last Rc drops.
-pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, lookup: &Rc<RefCell<HostByNameLookup>>, hostname: &str, current_family: c_int, expected_record_type: u16, use_tcp: bool, server_index: usize) {
+pub(crate) fn launch_hostbyname_query(channeldata: &mut ChannelData, lookup: &Rc<RefCell<HostByNameLookup>>, hostname: &str, current_family: c_int, expected_record_type: u16, use_tcp: bool, server_index: usize) {
     let core_family = match current_family {
         libc::AF_INET => Family::Ipv4,
         _ => Family::Ipv6,
@@ -631,7 +631,7 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, look
             continue;
         }
         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-        if unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) } {
+        if invoke_sock_callbacks(channeldata, fd, sock_type) {
             // Add to connection pool for reuse
             if use_tcp {
                 if let crate::core::ares::DnsSocket::Tcp(ref rc_sock) = channeldata.ares.tasks.last().unwrap().sock {
@@ -666,7 +666,7 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, look
 /// Re-issue a search query for the next name in the plan. On socket-creation
 /// failure, deliver ECONNREFUSED directly (the lookup's remaining Rcs drop
 /// naturally — no manual free).
-pub(crate) unsafe fn issue_search_query(channeldata: &mut ChannelData, hostname: &str, dnstype: u16, lookup: Rc<RefCell<SearchLookup>>, timeouts: c_int) {
+pub(crate) fn issue_search_query(channeldata: &mut ChannelData, hostname: &str, dnstype: u16, lookup: Rc<RefCell<SearchLookup>>, timeouts: c_int) {
     let delivery = lookup.borrow().delivery;
     let new_ffidata = FFIData {
         callback: Callback::Search(lookup),
@@ -688,7 +688,7 @@ pub(crate) unsafe fn issue_search_query(channeldata: &mut ChannelData, hostname:
 /// Executor for the search state machine: feed the event to `SearchSm::step`
 /// (borrow held for the decision only), then perform the returned action —
 /// re-issue the query or call the C callback — with all borrows dropped.
-pub(crate) unsafe fn run_ares_search_callback(res: Result<&[u8], c_int>, lookup: &Rc<RefCell<SearchLookup>>, ffidata: &FFIData, channeldata: &mut ChannelData) {
+pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, lookup: &Rc<RefCell<SearchLookup>>, ffidata: &FFIData, channeldata: &mut ChannelData) {
     let ev = match res {
         Ok(buf) => LookupEvent::Reply(buf),
         Err(status) => LookupEvent::Error(status),
@@ -699,7 +699,7 @@ pub(crate) unsafe fn run_ares_search_callback(res: Result<&[u8], c_int>, lookup:
     };
     match action {
         SearchAction::Send(next_name) => {
-            unsafe { issue_search_query(channeldata, &next_name, dnstype, lookup.clone(), ffidata.timeouts) };
+            issue_search_query(channeldata, &next_name, dnstype, lookup.clone(), ffidata.timeouts);
         }
         SearchAction::DeliverSuccess => {
             let buf = res.unwrap_or(&[]); // DeliverSuccess is only emitted for Ok replies
@@ -737,7 +737,7 @@ pub(crate) unsafe fn run_ares_search_callback(res: Result<&[u8], c_int>, lookup:
 /// Executor for the gethostbyname state machine: parse the reply (parsing and
 /// hostent building stay ffi-side), feed the event to `HostByNameSm::step`
 /// (borrow held for the decision only), then perform the returned actions.
-pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, lookup: &Rc<RefCell<HostByNameLookup>>, ffidata: &FFIData, channeldata: &mut ChannelData) {
+pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, lookup: &Rc<RefCell<HostByNameLookup>>, ffidata: &FFIData, channeldata: &mut ChannelData) {
     // Parse outside the machine; the machine sees only the outcome.
     let mut parsed_items: Option<ParsedRRs<AddrRecord>> = None;
     let ev = match res {
@@ -781,10 +781,10 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, loo
     for action in actions {
         match action {
             HostAction::Send { name, family, rtype, tcp, server } => {
-                unsafe { launch_hostbyname_query(channeldata, lookup, &name, family, rtype, tcp, server) };
+                launch_hostbyname_query(channeldata, lookup, &name, family, rtype, tcp, server);
             }
             HostAction::NotifyServerFail { server, tcp } => {
-                unsafe { invoke_server_state_callback(channeldata, server, false, tcp) };
+                invoke_server_state_callback(channeldata, server, false, tcp);
             }
             HostAction::CacheStore { names, rtype } => {
                 if channeldata.query_cache_max_ttl > 0 {
@@ -863,7 +863,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
         AddrInfoPreflight::StartDns { sm, first_server } => {
             let lookup = Rc::new(RefCell::new(AddrInfoLookup { sm, callback, arg, port }));
             let actions = lookup.borrow_mut().sm.begin_batch(first_server);
-            unsafe { execute_addrinfo_actions(channeldata, &lookup, actions) };
+            execute_addrinfo_actions(channeldata, &lookup, actions);
         }
     }
 }
@@ -873,7 +873,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 /// (`LaunchFailed` for batch sends — which also run the socket callbacks —
 /// `ResendFailed` for TC/failover re-sends, whose socket-callback results
 /// are ignored, both as historically).
-pub(crate) unsafe fn execute_addrinfo_actions(channeldata: &mut ChannelData, lookup: &Rc<RefCell<AddrInfoLookup>>, actions: Vec<AddrInfoAction>) {
+pub(crate) fn execute_addrinfo_actions(channeldata: &mut ChannelData, lookup: &Rc<RefCell<AddrInfoLookup>>, actions: Vec<AddrInfoAction>) {
     let mut queue: std::collections::VecDeque<AddrInfoAction> = actions.into();
     while let Some(action) = queue.pop_front() {
         match action {
@@ -900,7 +900,7 @@ pub(crate) unsafe fn execute_addrinfo_actions(channeldata: &mut ChannelData, loo
                     true
                 } else if batch {
                     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                    if unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) } {
+                    if invoke_sock_callbacks(channeldata, fd, sock_type) {
                         false
                     } else {
                         // Configure callback failed - mark task as completed with error
@@ -910,7 +910,7 @@ pub(crate) unsafe fn execute_addrinfo_actions(channeldata: &mut ChannelData, loo
                 } else {
                     // TC/failover re-send: socket-callback results are ignored
                     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                    unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) };
+                    invoke_sock_callbacks(channeldata, fd, sock_type);
                     false
                 };
                 if failed {
@@ -945,7 +945,7 @@ pub(crate) unsafe fn execute_addrinfo_actions(channeldata: &mut ChannelData, loo
 }
 
 /// Launch a probe query to an expired-failure server in parallel with the primary query.
-pub(crate) unsafe fn maybe_launch_probe(
+pub(crate) fn maybe_launch_probe(
     channeldata: &mut ChannelData,
     hostname: &str,
     family: c_int,
@@ -985,12 +985,12 @@ pub(crate) unsafe fn maybe_launch_probe(
     // A probe has no user callback; if its socket can't be created, just skip it.
     if issued {
         let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-        unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) };
+        invoke_sock_callbacks(channeldata, fd, sock_type);
     }
 }
 
 /// Callback for server failover probe queries — updates server state, no user callback.
-pub(crate) unsafe fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: &mut ChannelData, ffidata: &FFIData) {
+pub(crate) fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: &mut ChannelData, ffidata: &FFIData) {
     let si = ffidata.server_index;
     match res {
         Ok(buf) => {
@@ -999,12 +999,12 @@ pub(crate) unsafe fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: 
             if rcode == 0 || rcode == 3 {
                 // Success or NXDOMAIN — server is alive, reset failure state
                 if channeldata.server_health.record_success(si) {
-                    unsafe { invoke_server_state_callback(channeldata, si, true, false) };
+                    invoke_server_state_callback(channeldata, si, true, false);
                 }
             } else {
                 // SERVFAIL/NOTIMP/REFUSED — still failing
                 if channeldata.server_health.record_failure(si) {
-                    unsafe { invoke_server_state_callback(channeldata, si, false, false) };
+                    invoke_server_state_callback(channeldata, si, false, false);
                 }
             }
         }
@@ -1018,7 +1018,7 @@ pub(crate) unsafe fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: 
 /// Executor entry for a settled getaddrinfo task: parse the reply (parsing
 /// stays ffi-side), feed the event to `AddrInfoSm::step` (borrow held for the
 /// decision only), then perform the returned actions borrow-free.
-pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, lookup: &Rc<RefCell<AddrInfoLookup>>, ffidata: &FFIData, channeldata: &mut ChannelData) {
+pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, lookup: &Rc<RefCell<AddrInfoLookup>>, ffidata: &FFIData, channeldata: &mut ChannelData) {
     let ev = match res {
         Ok(buf) => {
             let parse = (|| -> Result<Vec<AddrRecord>, c_int> {
@@ -1048,7 +1048,7 @@ pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, looku
         let mut l = lookup.borrow_mut();
         l.sm.step(ev, &cfg, &mut channeldata.server_health)
     };
-    unsafe { execute_addrinfo_actions(channeldata, lookup, actions) };
+    execute_addrinfo_actions(channeldata, lookup, actions);
 }
 
 #[no_mangle]

@@ -31,7 +31,14 @@ pub unsafe extern "C" fn ares_process_fd(channel: Channel, read_fd: c_int, write
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
+    process_channel(channeldata, read_fds, write_fds);
+}
 
+/// The 4-phase reactor loop (I/O, timeouts, task cleanup, pool cleanup) as a
+/// safe fn — the only unsafe left inside is the FD_ISSET macro and the
+/// C-callback invokers it drives; every decision is a core verdict or a
+/// kernel call.
+pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     // Phase 1: I/O (write + read) processing.
     // The receive buffer is taken out of the channel for the duration of the
     // phase so a reply slice borrowed from it can coexist with the &mut
@@ -114,7 +121,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 for action in actions {
                     match action {
                         ReactorAction::NotifyServerState { server, ok, tcp } =>
-                            unsafe { invoke_server_state_callback(channeldata, server, ok, tcp) },
+                            invoke_server_state_callback(channeldata, server, ok, tcp),
                     }
                 }
                 match verdict {
@@ -127,7 +134,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                         if issued {
                             let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                             let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                            unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) };
+                            invoke_sock_callbacks(channeldata, fd, sock_type);
                         } else {
                             // Retry socket couldn't be created — deliver the error.
                             task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
@@ -140,7 +147,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                         let new_ffidata = task.userdata.retarget(si, task.userdata.timeouts);
                         if channeldata.ares.enqueue(task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata).is_ok() {
                             let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-                            unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM) };
+                            invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
                         } else {
                             task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                         }
@@ -170,7 +177,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
         if task.is_expired() && task.status != Status::Completed {
             task.tries_remaining += 1;
             // Invoke server_state_callback with failure for timeout
-            unsafe { invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp()) };
+            invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp());
             let timeout_verdict = on_timeout(task.tries_remaining, max_tries, task.userdata.server_index, &mut channeldata.server_health);
             if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
                 let is_tcp = task.sock.is_tcp();
@@ -186,7 +193,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     }
                     let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
                     let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                    unsafe { invoke_sock_callbacks(channeldata, fd, sock_type) };
+                    invoke_sock_callbacks(channeldata, fd, sock_type);
                 } else {
                     // Retry socket couldn't be created — deliver the error.
                     task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
@@ -210,7 +217,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
 }
 
 /// Call socket create + configure callbacks. Returns false if either callback fails.
-pub(crate) unsafe fn invoke_sock_callbacks(channeldata: &ChannelData, fd: c_int, sock_type: c_int) -> bool {
+pub(crate) fn invoke_sock_callbacks(channeldata: &ChannelData, fd: c_int, sock_type: c_int) -> bool {
     if let Some(cb) = channeldata.sock_create_callback {
         let ret = unsafe { cb(fd, sock_type, channeldata.sock_create_callback_arg) };
         if ret != 0 { return false; }
@@ -222,7 +229,7 @@ pub(crate) unsafe fn invoke_sock_callbacks(channeldata: &ChannelData, fd: c_int,
     true
 }
 
-pub(crate) unsafe fn invoke_server_state_callback(channeldata: &ChannelData, server_index: usize, success: bool, is_tcp: bool) {
+pub(crate) fn invoke_server_state_callback(channeldata: &ChannelData, server_index: usize, success: bool, is_tcp: bool) {
     if let Some(cb) = channeldata.server_state_callback {
         let Some(server_str) = server_state_string(channeldata, server_index, is_tcp) else {
             return;
