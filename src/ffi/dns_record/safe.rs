@@ -996,7 +996,7 @@ impl ares_dns_record_t {
 }
 
 /// Decode a whole DNS message (header, questions, all three RR sections).
-pub(super) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, c_int> {
+pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, c_int> {
     let buf_len = data.len();
     if buf_len < 12 {
         return Err(ARES_EBADRESP);

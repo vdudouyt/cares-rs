@@ -12,6 +12,7 @@ use crate::ffi::error::{ARES_EBADRESP, ARES_ENOMEM, ARES_SUCCESS};
 
 mod safe;
 use safe::*;
+pub(crate) use safe::parse_record;
 
 // ---------------------------------------------------------------------------
 // ARES_TRUE / ARES_FALSE

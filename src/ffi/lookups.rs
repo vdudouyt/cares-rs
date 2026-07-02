@@ -7,8 +7,9 @@ use std::rc::Rc;
 use super::*;
 use crate::ffi::kernels::lookups::{
     format_ip_with_scope, get_service_string, getaddrinfo_preflight, gethostbyname_preflight,
-    getnameinfo_preflight, hosts_file_lookup, search_name_check, search_start, well_known_port,
-    AddrInfoPreflight, HostPreflight, NameinfoPreflight,
+    cached_reply, gethostbyaddr_preflight, getnameinfo_preflight, hosts_file_lookup, no_servers,
+    search_name_check, search_start, well_known_port, AddrInfoPreflight, AddrPreflight,
+    HostPreflight, NameinfoPreflight,
 };
 
 
@@ -191,35 +192,26 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
     let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
-    if family != libc::AF_INET && family != libc::AF_INET6 {
-        unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
-        return;
-    }
+    // NULL/negative-length buffers report the same ENOTIMP the family check
+    // does, so guarding here first is observably identical.
     if addr.is_null() || addrlen < 0 {
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
         return;
     }
     let addrbuf = unsafe { std::slice::from_raw_parts(addr as *mut u8, addrlen as usize) };
-    let addr = match buf_to_ip(addrbuf) {
-        Ok(ip) => ip,
-        Err(_) => {
-            unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
+    let addr = match gethostbyaddr_preflight(channeldata, addrbuf, family) {
+        AddrPreflight::Fail(status) => {
+            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
             return;
         }
+        AddrPreflight::DeliverHost(lookup) => {
+            let hostent = unsafe { hostent_from_lookup(lookup) };
+            unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
+            unsafe { ares_free_hostent(hostent) };
+            return;
+        }
+        AddrPreflight::StartPtr(addr) => addr,
     };
-    // Check hosts file first
-    if let Some(lookup) = channeldata.ares.hosts().reverse_lookup(addr) {
-        let hostent = unsafe { hostent_from_lookup(lookup) };
-        unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-        unsafe { ares_free_hostent(hostent) };
-        return;
-    }
-
-    // No servers configured
-    if channeldata.ares.config.nameservers.is_empty() {
-        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
-        return;
-    }
 
     // Fall through to DNS
     let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(addr), nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts: 0 };
@@ -287,7 +279,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
-    if channeldata.ares.config.nameservers.is_empty() {
+    if no_servers(channeldata) {
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut(), 0) };
         return;
     }
@@ -313,29 +305,21 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
-    if channeldata.ares.config.nameservers.is_empty() {
+    if no_servers(channeldata) {
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
         return;
     }
     let name = unsafe { cstr_lossy(name) };
     let name_clean = name.strip_suffix('.').unwrap_or(name);
 
-    // Check query cache
-    if channeldata.query_cache_max_ttl > 0 {
-        let cache_key = (name_clean.to_string(), dnstype as u16);
-        if let Some((cached_buf, expires_at)) = channeldata.query_cache.get(&cache_key) {
-            if Instant::now() < *expires_at {
-                let cached_buf = cached_buf.clone();
-                let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
-                let status = unsafe { dns_record::ares_dns_parse(cached_buf.as_ptr(), cached_buf.len(), 0, &mut dnsrec) };
-                if status == ARES_SUCCESS {
-                    unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
-                    unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
-                    return;
-                }
-            } else {
-                channeldata.query_cache.remove(&cache_key);
-            }
+    // Query-cache probe; a cached reply that fails to parse falls through
+    // to a fresh DNS query (same as before the kernel split).
+    if let Some(cached_buf) = cached_reply(channeldata, name_clean, dnstype as u16, Instant::now()) {
+        if let Ok(rec) = dns_record::parse_record(&cached_buf) {
+            let dnsrec = Box::into_raw(Box::new(rec));
+            unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
+            unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
+            return;
         }
     }
 
@@ -1081,7 +1065,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
         return;
     }
     let channeldata = unsafe { &mut *channel };
-    if channeldata.ares.config.nameservers.is_empty() {
+    if no_servers(channeldata) {
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut(), 0) };
         return;
     }

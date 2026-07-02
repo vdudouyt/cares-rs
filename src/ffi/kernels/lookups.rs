@@ -12,7 +12,7 @@ use std::ffi::CString;
 use crate::core::hostfile::{AddressFamily, HostLookup};
 use crate::core::services::Services;
 use crate::core::lookup::{is_localhost, is_onion_domain, AddrInfoSm, HostByNameSm, SearchPlan, SearchSm};
-use crate::core::packets::AddrRecord;
+use crate::core::packets::{buf_to_ip, AddrRecord};
 use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::sortlist::apply_sortlist;
 use crate::ffi::channel::ChannelData;
@@ -457,4 +457,65 @@ pub(crate) fn search_start(
     );
     let query_hostname = plan.current.clone();
     Ok((SearchSm::new(plan, retry_server_error), query_hostname))
+}
+
+/// ENOSERVER guard shared by ares_query / ares_query_dnsrec / ares_send.
+pub(crate) fn no_servers(channeldata: &ChannelData) -> bool {
+    channeldata.ares.config.nameservers.is_empty()
+}
+
+/// The ares_query_dnsrec cache probe: a fresh cached reply for
+/// (name, qtype), evicting an expired entry on the way.
+pub(crate) fn cached_reply(
+    channeldata: &mut ChannelData,
+    name_clean: &str,
+    qtype: u16,
+    now: Instant,
+) -> Option<Vec<u8>> {
+    if channeldata.query_cache_max_ttl == 0 {
+        return None;
+    }
+    let cache_key = (name_clean.to_string(), qtype);
+    if let Some((cached_buf, expires_at)) = channeldata.query_cache.get(&cache_key) {
+        if now < *expires_at {
+            return Some(cached_buf.clone());
+        } else {
+            channeldata.query_cache.remove(&cache_key);
+        }
+    }
+    None
+}
+
+/// The verdict of ares_gethostbyaddr's pre-DNS phase.
+pub(crate) enum AddrPreflight {
+    /// Deliver `status` with a NULL hostent.
+    Fail(c_int),
+    /// Hosts-file reverse hit: deliver a hostent from this lookup, then free.
+    DeliverHost(HostLookup),
+    /// Issue the PTR query for this address.
+    StartPtr(IpAddr),
+}
+
+/// family-validate -> buf_to_ip -> hosts reverse lookup -> no-servers -> PTR.
+pub(crate) fn gethostbyaddr_preflight(
+    channeldata: &mut ChannelData,
+    addrbuf: &[u8],
+    family: c_int,
+) -> AddrPreflight {
+    if family != libc::AF_INET && family != libc::AF_INET6 {
+        return AddrPreflight::Fail(ARES_ENOTIMP);
+    }
+    let addr = match buf_to_ip(addrbuf) {
+        Ok(ip) => ip,
+        Err(_) => return AddrPreflight::Fail(ARES_ENOTIMP),
+    };
+    // Check hosts file first
+    if let Some(lookup) = channeldata.ares.hosts().reverse_lookup(addr) {
+        return AddrPreflight::DeliverHost(lookup);
+    }
+    // No servers configured
+    if channeldata.ares.config.nameservers.is_empty() {
+        return AddrPreflight::Fail(ARES_ENOSERVER);
+    }
+    AddrPreflight::StartPtr(addr)
 }
