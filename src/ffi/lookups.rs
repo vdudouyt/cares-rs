@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::*;
+use crate::ffi::kernels::lookups::{gethostbyname_preflight, hosts_file_lookup, HostPreflight};
 
 
 /// Live state of an ares_gethostbyname lookup: the pure state machine plus
@@ -136,177 +137,28 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { cstr_lossy(hostname) };
 
-    // Reject non-ASCII names
-    if !hostname.is_ascii() {
-        unsafe { callback(arg, ARES_EBADNAME, 0, std::ptr::null_mut()) };
-        return;
-    }
-
-    // Reject .onion domains immediately (RFC 7686)
-    if is_onion_domain(hostname) {
-        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
-        return;
-    }
-
-    // Family validation; the A/AAAA mapping itself lives in HostByNameSm::new.
-    match family {
-        libc::AF_INET | libc::AF_INET6 | libc::AF_UNSPEC => {}
-        _ => {
-            unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
-            return;
+    match gethostbyname_preflight(channeldata, hostname, family, Instant::now()) {
+        HostPreflight::Fail(status) => {
+            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
-    }
-
-    let family_filter = match family {
-        libc::AF_INET => AddressFamily::Ipv4,
-        libc::AF_INET6 => AddressFamily::Ipv6,
-        libc::AF_UNSPEC => AddressFamily::Any,
-        _ => AddressFamily::Any,
-    };
-
-    // Check IP literal first
-    if let Ok(ip) = hostname.parse::<IpAddr>() {
-        let matches = match family_filter {
-            AddressFamily::Ipv4 => ip.is_ipv4(),
-            AddressFamily::Ipv6 => ip.is_ipv6(),
-            AddressFamily::Any => true,
-        };
-        if matches {
-            let lookup = HostLookup {
-                canonical: hostname.to_string(),
-                aliases: vec![],
-                addrs: vec![ip],
-            };
+        HostPreflight::DeliverHost(lookup) => {
             let hostent = unsafe { hostent_from_lookup(lookup) };
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
             unsafe { ares_free_hostent(hostent) };
-            return;
         }
-    }
-
-    // Check hosts file
-    let hosts_result = channeldata.ares.hosts().lookup(hostname, family_filter);
-    if let Some(ref lookup) = hosts_result {
-        if !lookup.addrs.is_empty() {
-            let hostent = unsafe { hostent_from_lookup(lookup.clone()) };
+        HostPreflight::DeliverParsed(parsed_rrs, hostent_family) => {
+            let hostent = unsafe { parsed_rrs.into_raw_hostent(hostent_family) };
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
             unsafe { ares_free_hostent(hostent) };
-            return;
+        }
+        HostPreflight::StartDns { sm, query_hostname, first_server, use_tcp } => {
+            let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
+            let lookup = Rc::new(RefCell::new(HostByNameLookup { sm, callback, arg }));
+            unsafe { launch_hostbyname_query(channeldata, &lookup, &query_hostname, send_family, send_rtype, use_tcp, first_server) };
+            // Server failover probing: if enabled, probe an expired-failure server in parallel
+            unsafe { maybe_launch_probe(channeldata, &query_hostname, send_family, first_server, use_tcp) };
         }
     }
-
-    // RFC 6761 section 6.3: recognize "localhost" and any name under ".localhost"
-    // as special and always return the loopback address.
-    if is_localhost(hostname) {
-        let addrs = match family_filter {
-            AddressFamily::Ipv4 => vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
-            AddressFamily::Ipv6 => vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
-            AddressFamily::Any => vec![
-                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            ],
-        };
-        let lookup = HostLookup {
-            canonical: hostname.to_string(),
-            aliases: vec![],
-            addrs,
-        };
-        let hostent = unsafe { hostent_from_lookup(lookup) };
-        unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-        unsafe { ares_free_hostent(hostent) };
-        return;
-    }
-
-    // Check HOSTALIASES env var for single-label names
-    let hostname_str = hostname.to_string();
-    let resolved_name = if !hostname.contains('.') {
-        if let Ok(aliases_path) = std::env::var("HOSTALIASES") {
-            match std::fs::read_to_string(&aliases_path) {
-                Ok(content) => {
-                    let mut alias_found = None;
-                    for line in content.lines() {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2 && parts[0].eq_ignore_ascii_case(hostname) {
-                            alias_found = Some(parts[1].to_string());
-                            break;
-                        }
-                    }
-                    alias_found.unwrap_or_else(|| hostname_str.clone())
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    unsafe { callback(arg, ARES_EFILE, 0, std::ptr::null_mut()) };
-                    return;
-                }
-                Err(_) => hostname_str.clone(),
-            }
-        } else {
-            hostname_str.clone()
-        }
-    } else {
-        hostname_str.clone()
-    };
-
-    // No servers configured — return ENOSERVER immediately
-    if channeldata.ares.config.nameservers.is_empty() {
-        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
-        return;
-    }
-
-    // Check query cache
-    if channeldata.query_cache_max_ttl > 0 {
-        let record_type = match family {
-            libc::AF_INET => RECORD_TYPE_A,
-            libc::AF_INET6 => RECORD_TYPE_AAAA,
-            libc::AF_UNSPEC => RECORD_TYPE_AAAA,
-            _ => RECORD_TYPE_A,
-        };
-        let cache_key = (resolved_name.clone(), record_type);
-        if let Some((cached_buf, expires_at)) = channeldata.query_cache.get(&cache_key) {
-            if Instant::now() < *expires_at {
-                let cached_buf = cached_buf.clone();
-                let parsed = (|| -> Result<ParsedRRs<AddrRecord>, c_int> {
-                    let response = ParsedResponse::from_buf(&cached_buf)?;
-                    let parsed_rrs = response.process_answers::<AddrRecord>(&cached_buf, record_type)?;
-                    if parsed_rrs.items.is_empty() {
-                        return Err(ARES_ENODATA);
-                    }
-                    Ok(parsed_rrs)
-                })();
-                // On a cache-hit parse error, fall through to a fresh DNS query.
-                if let Ok(mut parsed_rrs) = parsed {
-                    if !channeldata.sortlist.is_empty() {
-                        apply_sortlist(&channeldata.sortlist, &mut parsed_rrs.items);
-                    }
-                    let current_family = match family {
-                        libc::AF_INET => libc::AF_INET,
-                        libc::AF_INET6 => libc::AF_INET6,
-                        _ => libc::AF_INET6,
-                    };
-                    let hostent = unsafe { parsed_rrs.into_raw_hostent(current_family) };
-                    unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-                    unsafe { ares_free_hostent(hostent) };
-                    return;
-                }
-            } else {
-                channeldata.query_cache.remove(&cache_key);
-            }
-        }
-    }
-
-    // Build the search plan + state machine and launch the first query
-    let use_tcp = channeldata.ares.config.options.use_vc;
-    let plan = SearchPlan::for_gethostbyname(&resolved_name, channeldata.ares.config.options.ndots, &channeldata.ares.config.search);
-    let query_hostname = plan.current.clone();
-    let sm = HostByNameSm::new(plan, family, use_tcp);
-    let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
-    let first_server = channeldata.server_health.pick_next();
-
-    let lookup = Rc::new(RefCell::new(HostByNameLookup { sm, callback, arg }));
-
-    unsafe { launch_hostbyname_query(channeldata, &lookup, &query_hostname, send_family, send_rtype, use_tcp, first_server) };
-
-    // Server failover probing: if enabled, probe an expired-failure server in parallel
-    unsafe { maybe_launch_probe(channeldata, &query_hostname, send_family, first_server, use_tcp) };
 }
 
 /// # Safety
@@ -317,30 +169,16 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
     let channeldata = unsafe { &mut *channel };
     let name_str = unsafe { cstr_lossy(name) };
 
-    // Convert C family constant to our Family enum
-    let family_filter = match family {
-        libc::AF_INET => AddressFamily::Ipv4,
-        libc::AF_INET6 => AddressFamily::Ipv6,
-        libc::AF_UNSPEC => AddressFamily::Any,
-        _ => {
-            unsafe { *host = std::ptr::null_mut() };
-            return ARES_ENOTFOUND;
+    match hosts_file_lookup(channeldata, name_str, family) {
+        Ok(lookup) => {
+            unsafe { *host = hostent_from_lookup(lookup) };
+            ARES_SUCCESS
         }
-    };
-
-    // Lookup in the hosts file cache
-    let Some(lookup) = channeldata.ares.hosts().lookup(name_str, family_filter) else {
-        unsafe { *host = std::ptr::null_mut() };
-        return ARES_ENOTFOUND;
-    };
-
-    if lookup.addrs.is_empty() {
-        unsafe { *host = std::ptr::null_mut() };
-        return ARES_ENOTFOUND;
+        Err(status) => {
+            unsafe { *host = std::ptr::null_mut() };
+            status
+        }
     }
-
-    unsafe { *host = hostent_from_lookup(lookup) };
-    ARES_SUCCESS
 }
 
 #[no_mangle]

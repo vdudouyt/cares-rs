@@ -6,4 +6,5 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod channel;
+pub(crate) mod lookups;
 pub(crate) mod options;
