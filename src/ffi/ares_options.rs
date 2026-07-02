@@ -121,10 +121,7 @@ const ARES_FLAG_PRIMARY: c_int = 1 << 1;
 const ARES_FLAG_NOCHECKRESP: c_int = 1 << 7;
 const ARES_FLAG_EDNS: c_int = 1 << 8;
 
-/// # Safety
-/// `out_channel` must be non-null; `options` must be NULL or a valid `ares_options` consistent with `optmask`.
-#[no_mangle]
-pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
+pub(crate) unsafe fn init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
     // The built-in event thread is not supported. Match upstream c-ares on a
     // non-threaded build: report ARES_ENOTIMP and leave *out_channel untouched.
     if optmask & ARES_OPT_EVENT_THREAD != 0 {
@@ -228,9 +225,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     ARES_SUCCESS
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_options, optmask: *mut c_int) -> c_int {
+pub(crate) unsafe fn save_options(channel: Channel, options: *mut ares_options, optmask: *mut c_int) -> c_int {
     if channel.is_null() || options.is_null() || optmask.is_null() {
         return ARES_ENODATA;
     }
@@ -343,9 +338,7 @@ pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_
     ARES_SUCCESS
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_destroy_options(options: *mut ares_options) {
+pub(crate) unsafe fn destroy_options(options: *mut ares_options) {
     if options.is_null() { return; }
     let opts = unsafe { &mut *options };
 

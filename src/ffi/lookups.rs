@@ -125,9 +125,7 @@ pub(crate) struct FFIData {
     pub(crate) timeouts: c_int,
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: ares_host_callback, arg: *mut c_void) {
+pub(crate) unsafe fn gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: ares_host_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     if channel.is_null() || hostname.is_null() {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
@@ -309,10 +307,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     unsafe { maybe_launch_probe(channeldata, &query_hostname, send_family, first_server, use_tcp) };
 }
 
-/// # Safety
-/// `channel` must be a valid channel, `name` a valid NUL-terminated C string, and `host` a writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
+pub(crate) unsafe fn gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
     if channel.is_null() { return ARES_ENOTFOUND; }
     let channeldata = unsafe { &mut *channel };
     let name_str = unsafe { cstr_lossy(name) };
@@ -343,9 +338,7 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
     ARES_SUCCESS
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: ares_host_callback, arg: *mut c_void) {
+pub(crate) unsafe fn gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: ares_host_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
@@ -392,10 +385,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
     }
 }
 
-/// # Safety
-/// `channel` must be a valid channel and `name` a valid NUL-terminated C string.
-#[no_mangle]
-pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
+pub(crate) unsafe fn search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     let name_str = unsafe { cstr_lossy(name) };
     if name_str.is_empty() {
@@ -444,10 +434,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     }
 }
 
-/// # Safety
-/// `channel` must be a valid channel and `name` a valid NUL-terminated C string.
-#[no_mangle]
-pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
+pub(crate) unsafe fn query(channel: Channel, name: *const c_char, _dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
@@ -462,10 +449,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     }
 }
 
-/// # Safety
-/// `channel` must be a valid channel and `name` a valid NUL-terminated C string.
-#[no_mangle]
-pub unsafe extern "C" fn ares_query_dnsrec(
+pub(crate) unsafe fn query_dnsrec(
     channel: Channel,
     name: *const c_char,
     _dnsclass: c_int,
@@ -491,10 +475,10 @@ pub unsafe extern "C" fn ares_query_dnsrec(
             if Instant::now() < *expires_at {
                 let cached_buf = cached_buf.clone();
                 let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
-                let status = unsafe { dns_record::ares_dns_parse(cached_buf.as_ptr(), cached_buf.len(), 0, &mut dnsrec) };
+                let status = unsafe { dns_record::dns_parse(cached_buf.as_ptr(), cached_buf.len(), 0, &mut dnsrec) };
                 if status == ARES_SUCCESS {
                     unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
-                    unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
+                    unsafe { dns_record::dns_record_destroy(dnsrec) };
                     return;
                 }
             } else {
@@ -509,10 +493,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     }
 }
 
-/// # Safety
-/// `channel` must be a valid channel and `dnsrec` a valid `ares_dns_record_t` pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_search_dnsrec(
+pub(crate) unsafe fn search_dnsrec(
     channel: Channel,
     dnsrec: *mut dns_record::ares_dns_record_t,
     callback: ares_callback_dnsrec,
@@ -524,8 +505,8 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     let mut name_ptr: *const c_char = std::ptr::null();
     let mut qtype: c_uint = 0;
     let mut qclass: c_uint = 0;
-    if unsafe { dns_record::ares_dns_record_query_cnt(dnsrec) } > 0 {
-        unsafe { dns_record::ares_dns_record_query_get(dnsrec, 0, &mut name_ptr, &mut qtype, &mut qclass) };
+    if unsafe { dns_record::dns_record_query_cnt(dnsrec) } > 0 {
+        unsafe { dns_record::dns_record_query_get(dnsrec, 0, &mut name_ptr, &mut qtype, &mut qclass) };
     }
     if name_ptr.is_null() { return; }
     let name_str = unsafe { cstr_lossy(name_ptr) };
@@ -576,21 +557,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     }
 }
 
-/// Looks up the node name and service name for a socket address.
-///
-/// This is the async equivalent of getnameinfo(3). It performs a reverse DNS lookup
-/// (PTR record) to get the hostname, and looks up the service name from /etc/services.
-///
-/// # Arguments
-/// * `channel` - The c-ares channel
-/// * `sa` - Pointer to a sockaddr structure (sockaddr_in or sockaddr_in6)
-/// * `salen` - Size of the sockaddr structure
-/// * `flags` - Flags controlling the lookup behavior (ARES_NI_*)
-/// * `callback` - Function to call with results
-/// * `arg` - User data passed to callback
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: ares_nameinfo_callback, arg: *mut c_void) {
+pub(crate) unsafe fn getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: ares_nameinfo_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
@@ -748,10 +715,10 @@ pub(crate) fn run_ares_callback_dnsrec(res: Result<&[u8], c_int>, callback: Ares
     match res {
         Ok(buf) => {
             let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
-            let status = unsafe { dns_record::ares_dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec) };
+            let status = unsafe { dns_record::dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec) };
             if status == ARES_SUCCESS {
                 unsafe { callback(ffidata.arg, ARES_SUCCESS, ffidata.timeouts as usize, dnsrec) };
-                unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
+                unsafe { dns_record::dns_record_destroy(dnsrec) };
             } else {
                 unsafe { callback(ffidata.arg, status, ffidata.timeouts as usize, std::ptr::null_mut()) };
             }
@@ -958,11 +925,11 @@ pub(crate) unsafe fn run_ares_search_callback(res: Result<&[u8], c_int>, lookup:
                 SearchDelivery::DnsRec { callback, arg } => {
                     // Parse and deliver as dns record
                     let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
-                    let parse_status = unsafe { dns_record::ares_dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec) };
+                    let parse_status = unsafe { dns_record::dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec) };
                     if parse_status == ARES_SUCCESS {
                         unsafe {
                             callback(arg, ARES_SUCCESS, ffidata.timeouts as usize, dnsrec);
-                            dns_record::ares_dns_record_destroy(dnsrec);
+                            dns_record::dns_record_destroy(dnsrec);
                         }
                     } else {
                         unsafe { callback(arg, parse_status, ffidata.timeouts as usize, std::ptr::null_mut()) };
@@ -1065,9 +1032,7 @@ pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, loo
     }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_getaddrinfo(
+pub(crate) unsafe fn getaddrinfo(
     channel: Channel,
     name: *const c_char,
     service: *const c_char,
@@ -1366,9 +1331,7 @@ pub(crate) unsafe fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, looku
     unsafe { execute_addrinfo_actions(channeldata, lookup, actions) };
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: ares_callback, arg: *mut c_void) {
+pub(crate) unsafe fn send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     if qbuf.is_null() || qlen < 12 {
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut(), 0) };

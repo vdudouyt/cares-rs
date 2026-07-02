@@ -159,9 +159,7 @@ pub(crate) unsafe fn free_addrinfo_nodes(mut node: *mut ares_addrinfo_node) {
     }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_freeaddrinfo(ai: *mut ares_addrinfo) {
+pub(crate) unsafe fn freeaddrinfo(ai: *mut ares_addrinfo) {
     if ai.is_null() { return; }
     let ai = unsafe { Box::from_raw(ai) };
 

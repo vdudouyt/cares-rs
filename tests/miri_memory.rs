@@ -11,12 +11,14 @@
 use std::ffi::{c_char, c_int, c_long, c_uint, c_void, CStr, CString};
 use std::ptr;
 
-use cares_rs::ares_data::{ares_free_data, AresAddrPortNode};
-use cares_rs::ares_options::{ares_destroy_options, ares_options, ares_save_options};
-use cares_rs::ares_socket::ares_set_socket_functions_ex;
-use cares_rs::dns_record::*;
-use cares_rs::error::ares_strerror;
+use cares_rs::ares_free_data;
+use cares_rs::ares_data::AresAddrPortNode;
+use cares_rs::{ares_destroy_options, ares_save_options};
+use cares_rs::ares_options::ares_options;
+use cares_rs::ares_set_socket_functions_ex;
 use cares_rs::*;
+use cares_rs::dns_record::*;
+use cares_rs::ares_strerror;
 
 const ARES_SUCCESS: c_int = 0;
 const AF_INET: c_int = libc::AF_INET;

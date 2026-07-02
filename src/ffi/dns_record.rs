@@ -882,8 +882,7 @@ fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) {
 // Record lifecycle
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_create(
+pub(crate) unsafe fn dns_record_create(
     dnsrec: *mut *mut ares_dns_record_t,
     id: c_uint,
     flags: c_uint,
@@ -908,16 +907,13 @@ pub unsafe extern "C" fn ares_dns_record_create(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_destroy(dnsrec: *mut ares_dns_record_t) {
+pub(crate) unsafe fn dns_record_destroy(dnsrec: *mut ares_dns_record_t) {
     if !dnsrec.is_null() {
         let _ = unsafe { Box::from_raw(dnsrec) };
     }
 }
 
-/// Duplicate a DNS record via serialize/parse round-trip.
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_duplicate(
+pub(crate) unsafe fn dns_record_duplicate(
     dnsrec: *const ares_dns_record_t,
 ) -> *mut ares_dns_record_t {
     if dnsrec.is_null() {
@@ -925,11 +921,11 @@ pub unsafe extern "C" fn ares_dns_record_duplicate(
     }
     let mut buf: *mut u8 = std::ptr::null_mut();
     let mut buf_len: usize = 0;
-    if unsafe { ares_dns_write(dnsrec as *const _, &mut buf, &mut buf_len) } != ARES_SUCCESS {
+    if unsafe { dns_write(dnsrec as *const _, &mut buf, &mut buf_len) } != ARES_SUCCESS {
         return std::ptr::null_mut();
     }
     let mut out: *mut ares_dns_record_t = std::ptr::null_mut();
-    let status = unsafe { ares_dns_parse(buf, buf_len, 0, &mut out) };
+    let status = unsafe { dns_parse(buf, buf_len, 0, &mut out) };
     unsafe { libc::free(buf as *mut _) };
     if status != ARES_SUCCESS {
         return std::ptr::null_mut();
@@ -941,8 +937,7 @@ pub unsafe extern "C" fn ares_dns_record_duplicate(
 // Record header
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_get_id(
+pub(crate) unsafe fn dns_record_get_id(
     dnsrec: *const ares_dns_record_t,
 ) -> c_uint {
     if dnsrec.is_null() {
@@ -951,8 +946,7 @@ pub unsafe extern "C" fn ares_dns_record_get_id(
     unsafe { (*dnsrec).id as c_uint }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_get_flags(
+pub(crate) unsafe fn dns_record_get_flags(
     dnsrec: *const ares_dns_record_t,
 ) -> c_uint {
     if dnsrec.is_null() {
@@ -961,8 +955,7 @@ pub unsafe extern "C" fn ares_dns_record_get_flags(
     unsafe { (*dnsrec).flags as c_uint }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_get_opcode(
+pub(crate) unsafe fn dns_record_get_opcode(
     dnsrec: *const ares_dns_record_t,
 ) -> c_uint {
     if dnsrec.is_null() {
@@ -971,8 +964,7 @@ pub unsafe extern "C" fn ares_dns_record_get_opcode(
     unsafe { (*dnsrec).opcode as c_uint }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_get_rcode(
+pub(crate) unsafe fn dns_record_get_rcode(
     dnsrec: *const ares_dns_record_t,
 ) -> c_uint {
     if dnsrec.is_null() {
@@ -981,8 +973,7 @@ pub unsafe extern "C" fn ares_dns_record_get_rcode(
     unsafe { (*dnsrec).rcode as c_uint }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_set_id(
+pub(crate) unsafe fn dns_record_set_id(
     dnsrec: *mut ares_dns_record_t,
     id: c_uint,
 ) {
@@ -995,8 +986,7 @@ pub unsafe extern "C" fn ares_dns_record_set_id(
 // Query section
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_query_add(
+pub(crate) unsafe fn dns_record_query_add(
     dnsrec: *mut ares_dns_record_t,
     name: *const c_char,
     qtype: c_uint,
@@ -1022,8 +1012,7 @@ pub unsafe extern "C" fn ares_dns_record_query_add(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_query_cnt(
+pub(crate) unsafe fn dns_record_query_cnt(
     dnsrec: *const ares_dns_record_t,
 ) -> libc::size_t {
     if dnsrec.is_null() {
@@ -1032,8 +1021,7 @@ pub unsafe extern "C" fn ares_dns_record_query_cnt(
     unsafe { (*dnsrec).queries.len() }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_query_get(
+pub(crate) unsafe fn dns_record_query_get(
     dnsrec: *const ares_dns_record_t,
     idx: libc::size_t,
     name: *mut *const c_char,
@@ -1060,8 +1048,7 @@ pub unsafe extern "C" fn ares_dns_record_query_get(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_query_set_name(
+pub(crate) unsafe fn dns_record_query_set_name(
     dnsrec: *mut ares_dns_record_t,
     idx: libc::size_t,
     name: *const c_char,
@@ -1086,8 +1073,7 @@ pub unsafe extern "C" fn ares_dns_record_query_set_name(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_query_set_type(
+pub(crate) unsafe fn dns_record_query_set_type(
     dnsrec: *mut ares_dns_record_t,
     idx: libc::size_t,
     qtype: c_uint,
@@ -1107,8 +1093,7 @@ pub unsafe extern "C" fn ares_dns_record_query_set_type(
 // RR management
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_rr_add(
+pub(crate) unsafe fn dns_record_rr_add(
     rr: *mut *mut ares_dns_rr_t,
     dnsrec: *mut ares_dns_record_t,
     sect: c_uint,
@@ -1136,8 +1121,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_add(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_rr_cnt(
+pub(crate) unsafe fn dns_record_rr_cnt(
     dnsrec: *const ares_dns_record_t,
     sect: c_uint,
 ) -> libc::size_t {
@@ -1150,8 +1134,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_cnt(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_rr_get(
+pub(crate) unsafe fn dns_record_rr_get(
     dnsrec: *mut ares_dns_record_t,
     sect: c_uint,
     idx: libc::size_t,
@@ -1170,8 +1153,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_get(
     &mut vec[idx] as *mut ares_dns_rr_t
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_rr_get_const(
+pub(crate) unsafe fn dns_record_rr_get_const(
     dnsrec: *const ares_dns_record_t,
     sect: c_uint,
     idx: libc::size_t,
@@ -1190,8 +1172,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_get_const(
     &vec[idx] as *const ares_dns_rr_t
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_record_rr_del(
+pub(crate) unsafe fn dns_record_rr_del(
     dnsrec: *mut ares_dns_record_t,
     sect: c_uint,
     idx: libc::size_t,
@@ -1215,8 +1196,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_del(
 // RR getters
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_name(
+pub(crate) unsafe fn dns_rr_get_name(
     rr: *const ares_dns_rr_t,
 ) -> *const c_char {
     if rr.is_null() {
@@ -1225,32 +1205,28 @@ pub unsafe extern "C" fn ares_dns_rr_get_name(
     unsafe { (*rr).name_c.as_ptr() }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_type(rr: *const ares_dns_rr_t) -> c_uint {
+pub(crate) unsafe fn dns_rr_get_type(rr: *const ares_dns_rr_t) -> c_uint {
     if rr.is_null() {
         return 0;
     }
     unsafe { (*rr).rtype as c_uint }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_class(rr: *const ares_dns_rr_t) -> c_uint {
+pub(crate) unsafe fn dns_rr_get_class(rr: *const ares_dns_rr_t) -> c_uint {
     if rr.is_null() {
         return 0;
     }
     unsafe { (*rr).rclass as c_uint }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_ttl(rr: *const ares_dns_rr_t) -> c_uint {
+pub(crate) unsafe fn dns_rr_get_ttl(rr: *const ares_dns_rr_t) -> c_uint {
     if rr.is_null() {
         return 0;
     }
     unsafe { (*rr).ttl as c_uint }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_addr(
+pub(crate) unsafe fn dns_rr_get_addr(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> *const libc::in_addr {
@@ -1269,8 +1245,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_addr6(
+pub(crate) unsafe fn dns_rr_get_addr6(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> *const crate::ffi::ares_in6_addr {
@@ -1286,8 +1261,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr6(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_str(
+pub(crate) unsafe fn dns_rr_get_str(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> *const c_char {
@@ -1301,8 +1275,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_str(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_u8(
+pub(crate) unsafe fn dns_rr_get_u8(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> u8 {
@@ -1316,8 +1289,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u8(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_u16(
+pub(crate) unsafe fn dns_rr_get_u16(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> u16 {
@@ -1331,8 +1303,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u16(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_u32(
+pub(crate) unsafe fn dns_rr_get_u32(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> u32 {
@@ -1346,8 +1317,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_u32(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_bin(
+pub(crate) unsafe fn dns_rr_get_bin(
     rr: *const ares_dns_rr_t,
     key: c_uint,
     len: *mut libc::size_t,
@@ -1380,8 +1350,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_bin(
 // RR setters
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_set_addr(
+pub(crate) unsafe fn dns_rr_set_addr(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     addr: *const libc::in_addr,
@@ -1395,8 +1364,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_addr(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_set_addr6(
+pub(crate) unsafe fn dns_rr_set_addr6(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     addr: *const crate::ffi::ares_in6_addr,
@@ -1409,8 +1377,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_addr6(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_set_str(
+pub(crate) unsafe fn dns_rr_set_str(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     val: *const c_char,
@@ -1424,8 +1391,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_str(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_set_u8(
+pub(crate) unsafe fn dns_rr_set_u8(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     val: u8,
@@ -1437,8 +1403,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u8(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_set_u16(
+pub(crate) unsafe fn dns_rr_set_u16(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     val: u16,
@@ -1450,8 +1415,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u16(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_set_u32(
+pub(crate) unsafe fn dns_rr_set_u32(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     val: u32,
@@ -1463,8 +1427,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_u32(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_set_bin(
+pub(crate) unsafe fn dns_rr_set_bin(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     val: *const u8,
@@ -1486,8 +1449,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
 // OPT handling
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_set_opt(
+pub(crate) unsafe fn dns_rr_set_opt(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     opt: c_uint,
@@ -1508,8 +1470,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_opt(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_opt_cnt(
+pub(crate) unsafe fn dns_rr_get_opt_cnt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> libc::size_t {
@@ -1519,8 +1480,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt_cnt(
     unsafe { (*rr).opts.len() }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_opt(
+pub(crate) unsafe fn dns_rr_get_opt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
     idx: libc::size_t,
@@ -1547,8 +1507,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_opt_byid(
+pub(crate) unsafe fn dns_rr_get_opt_byid(
     rr: *const ares_dns_rr_t,
     key: c_uint,
     opt: c_uint,
@@ -1573,8 +1532,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt_byid(
     ARES_FALSE
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_del_opt_byid(
+pub(crate) unsafe fn dns_rr_del_opt_byid(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     opt: c_uint,
@@ -1596,8 +1554,7 @@ pub unsafe extern "C" fn ares_dns_rr_del_opt_byid(
 // Serialization: ares_dns_parse
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_parse(
+pub(crate) unsafe fn dns_parse(
     buf: *const u8,
     buf_len: libc::size_t,
     flags: c_uint,
@@ -1707,8 +1664,7 @@ pub unsafe extern "C" fn ares_dns_parse(
 // Serialization: ares_dns_write
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_write(
+pub(crate) unsafe fn dns_write(
     dnsrec: *const ares_dns_record_t,
     buf: *mut *mut u8,
     buf_len: *mut libc::size_t,
@@ -1785,8 +1741,7 @@ pub unsafe extern "C" fn ares_dns_write(
 // Metadata / string functions
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rec_type_tostr(rtype: c_uint) -> *const c_char {
+pub(crate) unsafe fn dns_rec_type_tostr(rtype: c_uint) -> *const c_char {
     match rtype {
         1 => cstr!("A"),
         2 => cstr!("NS"),
@@ -1811,8 +1766,7 @@ pub unsafe extern "C" fn ares_dns_rec_type_tostr(rtype: c_uint) -> *const c_char
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rec_type_fromstr(
+pub(crate) unsafe fn dns_rec_type_fromstr(
     rtype: *mut c_uint,
     str_ptr: *const c_char,
 ) -> c_int {
@@ -1849,8 +1803,7 @@ pub unsafe extern "C" fn ares_dns_rec_type_fromstr(
     ARES_TRUE
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_class_tostr(qclass: c_uint) -> *const c_char {
+pub(crate) unsafe fn dns_class_tostr(qclass: c_uint) -> *const c_char {
     match qclass as u16 {
         ARES_CLASS_IN => cstr!("IN"),
         ARES_CLASS_CHAOS => cstr!("CH"),
@@ -1861,8 +1814,7 @@ pub unsafe extern "C" fn ares_dns_class_tostr(qclass: c_uint) -> *const c_char {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_class_fromstr(
+pub(crate) unsafe fn dns_class_fromstr(
     str_ptr: *const c_char,
     qclass: *mut c_uint,
 ) -> c_int {
@@ -1885,8 +1837,7 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
     ARES_TRUE
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_key_tostr(key: c_uint) -> *const c_char {
+pub(crate) unsafe fn dns_rr_key_tostr(key: c_uint) -> *const c_char {
     match key {
         ARES_RR_A_ADDR => cstr!("A.ADDR"),
         ARES_RR_NS_NSDNAME => cstr!("NS.NSDNAME"),
@@ -2015,8 +1966,7 @@ static KEYS_CAA: [c_uint; 3] = [
 static KEYS_RAW_RR: [c_uint; 2] =
     [ARES_RR_RAW_RR_TYPE as c_uint, ARES_RR_RAW_RR_DATA as c_uint];
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_keys(
+pub(crate) unsafe fn dns_rr_get_keys(
     rtype: c_uint,
     cnt: *mut libc::size_t,
 ) -> *const c_uint {
@@ -2051,8 +2001,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_keys(
     ptr
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_key_datatype(key: c_uint) -> c_uint {
+pub(crate) unsafe fn dns_rr_key_datatype(key: c_uint) -> c_uint {
     match key {
         ARES_RR_A_ADDR => ARES_DATATYPE_INADDR as c_uint,
         ARES_RR_NS_NSDNAME => ARES_DATATYPE_NAME as c_uint,
@@ -2107,8 +2056,7 @@ pub unsafe extern "C" fn ares_dns_rr_key_datatype(key: c_uint) -> c_uint {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_key_to_rec_type(key: c_uint) -> c_uint {
+pub(crate) unsafe fn dns_rr_key_to_rec_type(key: c_uint) -> c_uint {
     match key {
         ARES_RR_A_ADDR => ARES_REC_TYPE_A as c_uint,
         ARES_RR_NS_NSDNAME => ARES_REC_TYPE_NS as c_uint,
@@ -2147,8 +2095,7 @@ pub unsafe extern "C" fn ares_dns_rr_key_to_rec_type(key: c_uint) -> c_uint {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn ares_dns_opcode_tostr(opcode: c_uint) -> *const c_char {
+pub(crate) fn dns_opcode_tostr(opcode: c_uint) -> *const c_char {
     let s: &[u8] = match opcode {
         0 => b"QUERY\0",
         1 => b"IQUERY\0",
@@ -2160,8 +2107,7 @@ pub extern "C" fn ares_dns_opcode_tostr(opcode: c_uint) -> *const c_char {
     s.as_ptr() as *const c_char
 }
 
-#[no_mangle]
-pub extern "C" fn ares_dns_rcode_tostr(rcode: c_uint) -> *const c_char {
+pub(crate) fn dns_rcode_tostr(rcode: c_uint) -> *const c_char {
     let s: &[u8] = match rcode {
         0 => b"NOERROR\0",
         1 => b"FORMERR\0",
@@ -2179,8 +2125,7 @@ pub extern "C" fn ares_dns_rcode_tostr(rcode: c_uint) -> *const c_char {
     s.as_ptr() as *const c_char
 }
 
-#[no_mangle]
-pub extern "C" fn ares_dns_section_tostr(section: c_uint) -> *const c_char {
+pub(crate) fn dns_section_tostr(section: c_uint) -> *const c_char {
     let s: &[u8] = match section {
         1 => b"ANSWER\0",
         2 => b"AUTHORITY\0",
@@ -2190,8 +2135,7 @@ pub extern "C" fn ares_dns_section_tostr(section: c_uint) -> *const c_char {
     s.as_ptr() as *const c_char
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_abin_cnt(
+pub(crate) unsafe fn dns_rr_get_abin_cnt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> libc::size_t {
@@ -2205,8 +2149,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin_cnt(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_rr_get_abin(
+pub(crate) unsafe fn dns_rr_get_abin(
     rr: *const ares_dns_rr_t,
     key: c_uint,
     idx: libc::size_t,
@@ -2229,8 +2172,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_free(ptr: *mut c_void) {
+pub(crate) unsafe fn free(ptr: *mut c_void) {
     if !ptr.is_null() {
         unsafe { libc::free(ptr) };
     }

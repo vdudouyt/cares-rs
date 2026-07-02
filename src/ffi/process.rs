@@ -4,9 +4,7 @@
 use super::*;
 
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_process_fd(channel: Channel, read_fd: c_int, write_fd: c_int) {
+pub(crate) unsafe fn process_fd(channel: Channel, read_fd: c_int, write_fd: c_int) {
     if channel.is_null() { return; }
     unsafe {
         let mut read_fds: libc::fd_set = std::mem::zeroed();
@@ -23,9 +21,7 @@ pub unsafe extern "C" fn ares_process_fd(channel: Channel, read_fd: c_int, write
     }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
+pub(crate) unsafe fn process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
 

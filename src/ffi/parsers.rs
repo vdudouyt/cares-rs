@@ -212,24 +212,15 @@ impl<'a> ParsedResponse<'a> {
     }
 }
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
+pub(crate) unsafe fn parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
 }
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
+pub(crate) unsafe fn parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresTxtReply>(abuf, alen, out, RECORD_TYPE_TXT) }
 }
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReplyExt) -> c_int {
+pub(crate) unsafe fn parse_txt_reply_ext(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReplyExt) -> c_int {
     if abuf.is_null() || alen < 0 {
         return ARES_EBADRESP;
     }
@@ -343,31 +334,19 @@ where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
     unsafe { ares_fn_wrapper(out, build) }
 }
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
+pub(crate) unsafe fn parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
 }
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_naptr_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresNaptrReply) -> c_int {
+pub(crate) unsafe fn parse_naptr_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresNaptrReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
 }
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSrvReply) -> c_int {
+pub(crate) unsafe fn parse_srv_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSrvReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
 }
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> c_int {
+pub(crate) unsafe fn parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> c_int {
     unsafe { parse_to_clinkedlist::<AresUriReply>(abuf, alen, out, RECORD_TYPE_URI) }
 }
 
@@ -378,10 +357,7 @@ impl DnsLabel<'_> {
 }
 
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
+pub(crate) unsafe fn parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     unsafe { parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0) }
 }
 
@@ -445,17 +421,11 @@ pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abu
     }
 }
 
-/// # Safety
-/// `abuf` must be valid for `alen` bytes; `out`, `addrttls`, and `out_naddrttls` must be valid, writable pointers.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
+pub(crate) unsafe fn parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addrttl, out_naddrttls: *mut c_int) -> c_int {
     unsafe { parse_to_hostent(RECORD_TYPE_A, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET) }
 }
 
-/// # Safety
-/// `abuf` must be valid for `alen` bytes; `out`, `addrttls`, and `out_naddrttls` must be valid, writable pointers.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
+pub(crate) unsafe fn parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, addrttls: *mut ares_addr6ttl, out_naddrttls: *mut c_int) -> c_int {
     unsafe { parse_to_hostent(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6) }
 }
 
@@ -467,10 +437,7 @@ impl RRParser<'_> for CString {
     }
 }
 
-/// # Safety
-/// `abuf` must be valid for `alen` bytes and `addr` for `addrlen` bytes; `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
+pub(crate) unsafe fn parse_ptr_reply(abuf: *const u8, alen: c_int, addr: *const c_void, addrlen: c_int, family: c_int, out: *mut *mut libc::hostent) -> c_int {
     let build = || {
         if abuf.is_null() || alen < 0 {
             return Err(ARES_EBADRESP);
@@ -492,26 +459,17 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
     unsafe { ares_fn_wrapper(out, build) }
 }
 
-/// # Safety
-/// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
+pub(crate) unsafe fn parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
     let ret = unsafe { parse_to_singleptr::<AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA) };
     if ret == ARES_ENODATA { return ARES_EBADRESP; }
     ret
 }
 
-/// # Safety
-/// `hostent` must be NULL or a pointer previously returned by this library.
-#[no_mangle]
-pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
-    unsafe { free_hostent(hostent) };
+pub(crate) unsafe fn free_hostent(hostent: *mut libc::hostent) {
+    unsafe { ares_hostent::free_hostent(hostent) };
 }
 
-/// # Safety
-/// `s` must be NULL or a pointer previously returned by this library.
-#[no_mangle]
-pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
+pub(crate) unsafe fn free_string(s: *mut libc::c_void) {
     // All buffers handed to the caller (ares_create_query/mkquery/expand_name/
     // expand_string/get_servers_csv) are libc::malloc'd, so free with libc::free.
     if !s.is_null() {
@@ -519,9 +477,7 @@ pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
     }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_inet_pton(af: c_int, src: *const c_char, dst: *mut c_void) -> c_int {
+pub(crate) unsafe fn inet_pton(af: c_int, src: *const c_char, dst: *mut c_void) -> c_int {
     let Some(s) = (unsafe { cstr_opt(src) }) else { return 0 };
     match af {
         libc::AF_INET => {
@@ -538,9 +494,7 @@ pub unsafe extern "C" fn ares_inet_pton(af: c_int, src: *const c_char, dst: *mut
     }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_expand_name(
+pub(crate) unsafe fn expand_name(
     encoded: *const u8,
     abuf: *const u8,
     alen: c_int,
@@ -578,9 +532,7 @@ pub unsafe extern "C" fn ares_expand_name(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_inet_ntop(af: c_int, src: *const c_void, dst: *mut c_char, size: libc::socklen_t) -> *const c_char {
+pub(crate) unsafe fn inet_ntop(af: c_int, src: *const c_void, dst: *mut c_char, size: libc::socklen_t) -> *const c_char {
     if src.is_null() || dst.is_null() { return std::ptr::null(); }
     match af {
         libc::AF_INET => {
@@ -606,9 +558,7 @@ pub unsafe extern "C" fn ares_inet_ntop(af: c_int, src: *const c_void, dst: *mut
     }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_expand_string(
+pub(crate) unsafe fn expand_string(
     encoded: *const u8,
     abuf: *const u8,
     alen: c_int,
@@ -648,9 +598,8 @@ pub unsafe extern "C" fn ares_expand_string(
     ARES_SUCCESS
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_create_query(
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn create_query(
     name: *const c_char,
     dnsclass: c_int,
     qtype: c_int,
@@ -811,9 +760,7 @@ pub(crate) fn unescape_label(label: &str) -> Vec<u8> {
     result
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_mkquery(
+pub(crate) unsafe fn mkquery(
     name: *const c_char,
     dnsclass: c_int,
     qtype: c_int,
