@@ -49,8 +49,8 @@ pub(super) fn new_rr(name: &str, rtype: u16, rclass: u16, ttl: u32) -> ares_dns_
         ttl,
         data: HashMap::new(),
         opts: Vec::new(),
-        cached_in_addr: libc::in_addr { s_addr: 0 },
-        cached_in6_addr: crate::ffi::ares_in6_addr::from_octets([0u8; 16]),
+        cached_in_addr: std::cell::Cell::new(libc::in_addr { s_addr: 0 }),
+        cached_in6_addr: std::cell::Cell::new(crate::ffi::ares_in6_addr::from_octets([0u8; 16])),
     }
 }
 
@@ -724,6 +724,257 @@ pub(super) static KEYS_CAA: [c_uint; 3] = [
 ];
 pub(super) static KEYS_RAW_RR: [c_uint; 2] =
     [ARES_RR_RAW_RR_TYPE as c_uint, ARES_RR_RAW_RR_DATA as c_uint];
+
+// ---------------------------------------------------------------------------
+// Record/RR accessor kernels — the shims in mod.rs never touch the model
+// fields or RRValue directly; every read and mutation goes through these.
+// ---------------------------------------------------------------------------
+
+impl ares_dns_record_t {
+    pub(super) fn id(&self) -> u16 {
+        self.id
+    }
+
+    pub(super) fn flags(&self) -> u16 {
+        self.flags
+    }
+
+    pub(super) fn opcode(&self) -> u16 {
+        self.opcode
+    }
+
+    pub(super) fn rcode(&self) -> u16 {
+        self.rcode
+    }
+
+    pub(super) fn set_id(&mut self, id: u16) {
+        self.id = id;
+    }
+
+    pub(super) fn query_add(&mut self, name: &str, qtype: u16, qclass: u16) -> Result<(), c_int> {
+        let name_c = match CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return Err(ARES_EBADRESP),
+        };
+        self.queries.push(DnsRecordQuery {
+            name: name.to_string(),
+            name_c,
+            qtype,
+            qclass,
+        });
+        Ok(())
+    }
+
+    pub(super) fn query_cnt(&self) -> usize {
+        self.queries.len()
+    }
+
+    /// (name pointer, qtype, qclass) — the pointer aliases the query's cached
+    /// CString and stays valid until the query's name is rewritten.
+    pub(super) fn query_at(&self, idx: usize) -> Option<(*const c_char, u16, u16)> {
+        let q = self.queries.get(idx)?;
+        Some((q.name_c.as_ptr(), q.qtype, q.qclass))
+    }
+
+    pub(super) fn query_set_name(&mut self, idx: usize, name: &str) -> Result<(), c_int> {
+        if idx >= self.queries.len() {
+            return Err(ARES_EBADRESP);
+        }
+        let name_c = match CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return Err(ARES_EBADRESP),
+        };
+        self.queries[idx].name = name.to_string();
+        self.queries[idx].name_c = name_c;
+        Ok(())
+    }
+
+    pub(super) fn query_set_type(&mut self, idx: usize, qtype: u16) -> Result<(), c_int> {
+        if idx >= self.queries.len() {
+            return Err(ARES_EBADRESP);
+        }
+        self.queries[idx].qtype = qtype;
+        Ok(())
+    }
+
+    pub(super) fn rr_add(
+        &mut self,
+        sect: u32,
+        name: &str,
+        rtype: u16,
+        rclass: u16,
+        ttl: u32,
+    ) -> Result<&mut ares_dns_rr_t, c_int> {
+        let vec = section_vec_mut(self, sect).ok_or(ARES_EBADRESP)?;
+        vec.push(new_rr(name, rtype, rclass, ttl));
+        Ok(vec.last_mut().unwrap())
+    }
+
+    pub(super) fn rr_cnt(&self, sect: u32) -> usize {
+        match section_vec(self, sect) {
+            Some(v) => v.len(),
+            None => 0,
+        }
+    }
+
+    pub(super) fn rr_at_mut(&mut self, sect: u32, idx: usize) -> Option<&mut ares_dns_rr_t> {
+        section_vec_mut(self, sect)?.get_mut(idx)
+    }
+
+    pub(super) fn rr_at(&self, sect: u32, idx: usize) -> Option<&ares_dns_rr_t> {
+        section_vec(self, sect)?.get(idx)
+    }
+
+    pub(super) fn rr_del(&mut self, sect: u32, idx: usize) -> Result<(), c_int> {
+        let vec = section_vec_mut(self, sect).ok_or(ARES_EBADRESP)?;
+        if idx >= vec.len() {
+            return Err(ARES_EBADRESP);
+        }
+        vec.remove(idx);
+        Ok(())
+    }
+}
+
+impl ares_dns_rr_t {
+    /// Pointer into the RR's cached CString; valid while the RR is alive.
+    pub(super) fn name_ptr(&self) -> *const c_char {
+        self.name_c.as_ptr()
+    }
+
+    pub(super) fn rtype(&self) -> u16 {
+        self.rtype
+    }
+
+    pub(super) fn rclass(&self) -> u16 {
+        self.rclass
+    }
+
+    pub(super) fn ttl(&self) -> u32 {
+        self.ttl
+    }
+
+    /// Refresh the cached in_addr and return a pointer to it (upstream
+    /// contract: valid while the RR is alive). Cell keeps this a purely
+    /// safe interior mutation on a shared reference.
+    pub(super) fn addr_cached(&self, key: u32) -> Option<*const libc::in_addr> {
+        if let Some(RRValue::Addr(addr)) = self.data.get(&key) {
+            self.cached_in_addr.set(libc::in_addr {
+                s_addr: u32::from_ne_bytes(addr.octets()),
+            });
+            Some(self.cached_in_addr.as_ptr() as *const libc::in_addr)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn addr6_cached(&self, key: u32) -> Option<*const crate::ffi::ares_in6_addr> {
+        if let Some(RRValue::Addr6(addr)) = self.data.get(&key) {
+            self.cached_in6_addr
+                .set(crate::ffi::ares_in6_addr::from_octets(addr.octets()));
+            Some(self.cached_in6_addr.as_ptr() as *const crate::ffi::ares_in6_addr)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn str_ptr(&self, key: u32) -> Option<*const c_char> {
+        if let Some(RRValue::Str(s)) = self.data.get(&key) {
+            Some(s.as_ptr())
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn u8_val(&self, key: u32) -> Option<u8> {
+        if let Some(RRValue::U8(v)) = self.data.get(&key) {
+            Some(*v)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn u16_val(&self, key: u32) -> Option<u16> {
+        if let Some(RRValue::U16(v)) = self.data.get(&key) {
+            Some(*v)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn u32_val(&self, key: u32) -> Option<u32> {
+        if let Some(RRValue::U32(v)) = self.data.get(&key) {
+            Some(*v)
+        } else {
+            None
+        }
+    }
+
+    /// (full stored buffer incl. trailing NUL, logical length without it).
+    pub(super) fn bin_val(&self, key: u32) -> Option<(&[u8], usize)> {
+        if let Some(RRValue::Bin(data)) = self.data.get(&key) {
+            // Bin data is null-terminated; logical length excludes the trailing \0
+            let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
+            Some((data.as_slice(), logical_len))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn set_addr(&mut self, key: u32, ip: Ipv4Addr) {
+        self.data.insert(key, RRValue::Addr(ip));
+    }
+
+    pub(super) fn set_addr6(&mut self, key: u32, ip: Ipv6Addr) {
+        self.data.insert(key, RRValue::Addr6(ip));
+    }
+
+    pub(super) fn set_str(&mut self, key: u32, val: CString) {
+        self.data.insert(key, RRValue::Str(val));
+    }
+
+    pub(super) fn set_u8(&mut self, key: u32, val: u8) {
+        self.data.insert(key, RRValue::U8(val));
+    }
+
+    pub(super) fn set_u16(&mut self, key: u32, val: u16) {
+        self.data.insert(key, RRValue::U16(val));
+    }
+
+    pub(super) fn set_u32(&mut self, key: u32, val: u32) {
+        self.data.insert(key, RRValue::U32(val));
+    }
+
+    pub(super) fn set_bin(&mut self, key: u32, data: &[u8]) {
+        self.data.insert(key, bin_nul(data));
+    }
+
+    pub(super) fn set_opt(&mut self, opt: u16, data: Vec<u8>) {
+        // Remove existing opt with same code if present, then add
+        self.opts.retain(|(code, _)| *code != opt);
+        self.opts.push((opt, data));
+    }
+
+    pub(super) fn opt_cnt(&self) -> usize {
+        self.opts.len()
+    }
+
+    pub(super) fn opt_at(&self, idx: usize) -> Option<(u16, &[u8])> {
+        self.opts.get(idx).map(|(code, data)| (*code, data.as_slice()))
+    }
+
+    pub(super) fn opt_by_id(&self, opt: u16) -> Option<&[u8]> {
+        self.opts
+            .iter()
+            .find(|(code, _)| *code == opt)
+            .map(|(_, data)| data.as_slice())
+    }
+
+    pub(super) fn del_opt_by_id(&mut self, opt: u16) -> bool {
+        let before = self.opts.len();
+        self.opts.retain(|(code, _)| *code != opt);
+        self.opts.len() < before
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Metadata string/table kernels (the pure bodies of the ares_dns_* metadata
