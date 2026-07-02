@@ -39,6 +39,21 @@ pub(crate) unsafe fn malloc_cstr(bytes: &[u8]) -> *mut c_char {
     p as *mut c_char
 }
 
+/// Copy `bytes` into a fresh `libc::malloc` buffer with no NUL terminator —
+/// the length travels separately (callers hand these to C to be released via
+/// `ares_free`/`ares_free_string`).
+///
+/// # Safety
+/// Only that the returned pointer is either NULL or a heap buffer of
+/// `bytes.len()` the caller must free with `libc::free`.
+pub(crate) unsafe fn malloc_bytes(bytes: &[u8]) -> *mut u8 {
+    let len = bytes.len();
+    let p = unsafe { libc::malloc(len) as *mut u8 };
+    if p.is_null() { return std::ptr::null_mut(); }
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len) };
+    p
+}
+
 /// Run `f` and store its result through the C out-pointer (NULL out → ENOMEM).
 ///
 /// # Safety

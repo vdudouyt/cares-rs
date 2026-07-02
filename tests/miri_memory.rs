@@ -766,3 +766,74 @@ fn parse_multi_record_reply_freed_via_free_chain() {
         ares_free_data(out);
     }
 }
+
+/// The cached in_addr/in6_addr getters must hand out a stable pointer whose
+/// pointee stays readable across consecutive calls (upstream contract: valid
+/// while the RR is alive). Guards the Cell-backed refresh in dns_record/safe.rs.
+#[test]
+fn dns_record_cached_addr_pointer_stability() {
+    const T_AAAA: u16 = 28;
+    unsafe {
+        let mut rec = ptr::null_mut();
+        assert_eq!(ares_dns_record_create(&mut rec, 1, 0, 0, 0), ARES_SUCCESS);
+        let apex = CString::new("example.com").unwrap();
+
+        let mut rr = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_A as u32, 1, 300), ARES_SUCCESS);
+        let mut rr6 = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut rr6, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_AAAA as u32, 1, 300), ARES_SUCCESS);
+
+        // The second rr_add may have reallocated the section; re-fetch by index.
+        let rr = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 0);
+        let rr6 = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 1);
+
+        let a4 = libc::in_addr { s_addr: u32::from_ne_bytes([192, 0, 2, 1]) };
+        assert_eq!(ares_dns_rr_set_addr(rr, ARES_RR_A_ADDR, &a4), ARES_SUCCESS);
+        let v6 = [0x20u8, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(ares_dns_rr_set_addr6(rr6, ARES_RR_AAAA_ADDR, v6.as_ptr() as *const _), ARES_SUCCESS);
+
+        let p1 = ares_dns_rr_get_addr(rr, ARES_RR_A_ADDR);
+        let p2 = ares_dns_rr_get_addr(rr, ARES_RR_A_ADDR);
+        assert!(!p1.is_null());
+        assert_eq!(p1, p2);
+        assert_eq!((*p1).s_addr, a4.s_addr);
+        assert_eq!((*p2).s_addr, a4.s_addr);
+
+        let q1 = ares_dns_rr_get_addr6(rr6, ARES_RR_AAAA_ADDR);
+        let q2 = ares_dns_rr_get_addr6(rr6, ARES_RR_AAAA_ADDR);
+        assert!(!q1.is_null());
+        assert_eq!(q1, q2);
+
+        ares_dns_record_destroy(rec);
+    }
+}
+
+/// rr_add -> rr_get -> rr_del over a growing/shrinking section: counts stay
+/// consistent, survivors shift down (Vec::remove semantics), out-of-range
+/// accesses fail cleanly instead of dangling.
+#[test]
+fn dns_record_rr_add_get_del_sequence() {
+    unsafe {
+        let mut rec = ptr::null_mut();
+        assert_eq!(ares_dns_record_create(&mut rec, 7, 0, 0, 0), ARES_SUCCESS);
+        let apex = CString::new("example.com").unwrap();
+
+        for i in 0..4 {
+            let mut rr = ptr::null_mut();
+            assert_eq!(ares_dns_record_rr_add(&mut rr, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_A as u32, 1, 100 + i), ARES_SUCCESS);
+            assert!(!rr.is_null());
+        }
+        assert_eq!(ares_dns_record_rr_cnt(rec, ARES_SECTION_ANSWER), 4);
+
+        assert_eq!(ares_dns_record_rr_del(rec, ARES_SECTION_ANSWER, 1), ARES_SUCCESS);
+        assert_eq!(ares_dns_record_rr_cnt(rec, ARES_SECTION_ANSWER), 3);
+        let rr = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 1);
+        assert!(!rr.is_null());
+        assert_eq!(ares_dns_rr_get_ttl(rr), 102);
+
+        assert_ne!(ares_dns_record_rr_del(rec, ARES_SECTION_ANSWER, 9), ARES_SUCCESS);
+        assert!(ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 9).is_null());
+
+        ares_dns_record_destroy(rec);
+    }
+}

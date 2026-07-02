@@ -977,6 +977,181 @@ impl ares_dns_rr_t {
 }
 
 // ---------------------------------------------------------------------------
+// Whole-message codec kernels (the pure bodies of ares_dns_parse/write)
+// ---------------------------------------------------------------------------
+
+impl ares_dns_record_t {
+    pub(super) fn new(id: u16, flags: u16, opcode: u16, rcode: u16) -> Self {
+        ares_dns_record_t {
+            id,
+            flags,
+            opcode,
+            rcode,
+            queries: Vec::new(),
+            answers: Vec::new(),
+            authority: Vec::new(),
+            additional: Vec::new(),
+        }
+    }
+}
+
+/// Decode a whole DNS message (header, questions, all three RR sections).
+pub(super) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, c_int> {
+    let buf_len = data.len();
+    if buf_len < 12 {
+        return Err(ARES_EBADRESP);
+    }
+
+    // Parse header (12 bytes)
+    let id = ((data[0] as u16) << 8) | data[1] as u16;
+    let flags_val = ((data[2] as u16) << 8) | data[3] as u16;
+    let qdcount = ((data[4] as u16) << 8) | data[5] as u16;
+    let ancount = ((data[6] as u16) << 8) | data[7] as u16;
+    let nscount = ((data[8] as u16) << 8) | data[9] as u16;
+    let arcount = ((data[10] as u16) << 8) | data[11] as u16;
+
+    let opcode = (flags_val >> 11) & 0x0F;
+    let rcode = flags_val & 0x0F;
+
+    let mut rec = ares_dns_record_t {
+        id,
+        flags: flags_val,
+        opcode,
+        rcode,
+        queries: Vec::new(),
+        answers: Vec::new(),
+        authority: Vec::new(),
+        additional: Vec::new(),
+    };
+
+    let mut pos = 12usize;
+
+    // Parse questions
+    for _ in 0..qdcount {
+        let name = match parse_dns_name(data, &mut pos) {
+            Some(n) => n,
+            None => return Err(ARES_EBADRESP),
+        };
+        if pos + 4 > buf_len {
+            return Err(ARES_EBADRESP);
+        }
+        let qtype = ((data[pos] as u16) << 8) | data[pos + 1] as u16;
+        let qclass = ((data[pos + 2] as u16) << 8) | data[pos + 3] as u16;
+        pos += 4;
+        let name_c = CString::new(name.clone()).unwrap_or_default();
+        rec.queries.push(DnsRecordQuery {
+            name,
+            name_c,
+            qtype,
+            qclass,
+        });
+    }
+
+    // Parse RR sections: answers, authority, additional
+    let section_counts = [
+        (ancount, ARES_SECTION_ANSWER),
+        (nscount, ARES_SECTION_AUTHORITY),
+        (arcount, ARES_SECTION_ADDITIONAL),
+    ];
+
+    for (count, section) in &section_counts {
+        for _ in 0..*count {
+            let rr_name = match parse_dns_name(data, &mut pos) {
+                Some(n) => n,
+                None => return Err(ARES_EBADRESP),
+            };
+            if pos + 10 > buf_len {
+                return Err(ARES_EBADRESP);
+            }
+            let rtype = ((data[pos] as u16) << 8) | data[pos + 1] as u16;
+            let rclass = ((data[pos + 2] as u16) << 8) | data[pos + 3] as u16;
+            let ttl = u32::from_be_bytes([
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]);
+            let rdlength = ((data[pos + 8] as u16) << 8) | data[pos + 9] as u16;
+            pos += 10;
+
+            let rdata_start = pos;
+            if pos + rdlength as usize > buf_len {
+                return Err(ARES_EBADRESP);
+            }
+            let rdata = &data[pos..pos + rdlength as usize];
+            pos += rdlength as usize;
+
+            let mut rr = new_rr(&rr_name, rtype, rclass, ttl);
+            parse_rdata(rtype, rdata, data, rdata_start, &mut rr);
+
+            let vec = match section_vec_mut(&mut rec, *section) {
+                Some(v) => v,
+                None => return Err(ARES_EBADRESP),
+            };
+            vec.push(rr);
+        }
+    }
+
+    Ok(rec)
+}
+
+/// Encode a whole DNS message to wire format.
+pub(super) fn write_record(rec: &ares_dns_record_t) -> Vec<u8> {
+    let mut out = Vec::with_capacity(512);
+
+    // Write header
+    out.push((rec.id >> 8) as u8);
+    out.push(rec.id as u8);
+    out.push((rec.flags >> 8) as u8);
+    out.push(rec.flags as u8);
+    let qdcount = rec.queries.len() as u16;
+    out.push((qdcount >> 8) as u8);
+    out.push(qdcount as u8);
+    let ancount = rec.answers.len() as u16;
+    out.push((ancount >> 8) as u8);
+    out.push(ancount as u8);
+    let nscount = rec.authority.len() as u16;
+    out.push((nscount >> 8) as u8);
+    out.push(nscount as u8);
+    let arcount = rec.additional.len() as u16;
+    out.push((arcount >> 8) as u8);
+    out.push(arcount as u8);
+
+    // Write questions
+    for q in &rec.queries {
+        write_dns_name(&q.name, &mut out);
+        out.push((q.qtype >> 8) as u8);
+        out.push(q.qtype as u8);
+        out.push((q.qclass >> 8) as u8);
+        out.push(q.qclass as u8);
+    }
+
+    // Write RR sections
+    let sections: [&Vec<ares_dns_rr_t>; 3] =
+        [&rec.answers, &rec.authority, &rec.additional];
+    for section in &sections {
+        for rr in *section {
+            write_dns_name(&rr.name, &mut out);
+            out.push((rr.rtype >> 8) as u8);
+            out.push(rr.rtype as u8);
+            out.push((rr.rclass >> 8) as u8);
+            out.push(rr.rclass as u8);
+            out.extend_from_slice(&rr.ttl.to_be_bytes());
+
+            // Serialize rdata to a temporary buffer to get rdlength
+            let mut rdata_buf = Vec::new();
+            write_rdata(rr, &mut rdata_buf);
+            let rdlength = rdata_buf.len() as u16;
+            out.push((rdlength >> 8) as u8);
+            out.push(rdlength as u8);
+            out.extend_from_slice(&rdata_buf);
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Metadata string/table kernels (the pure bodies of the ares_dns_* metadata
 // shims — each shim is one call into here)
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::ffi::convert::malloc_bytes;
 use crate::ffi::error::{ARES_EBADRESP, ARES_ENOMEM, ARES_SUCCESS};
 
 mod safe;
@@ -252,17 +253,8 @@ pub unsafe extern "C" fn ares_dns_record_create(
     if dnsrec.is_null() {
         return ARES_EBADRESP;
     }
-    let rec = Box::new(ares_dns_record_t {
-        id: id as u16,
-        flags: flags as u16,
-        opcode: opcode as u16,
-        rcode: rcode as u16,
-        queries: Vec::new(),
-        answers: Vec::new(),
-        authority: Vec::new(),
-        additional: Vec::new(),
-    });
-    unsafe { *dnsrec = Box::into_raw(rec); }
+    let rec = ares_dns_record_t::new(id as u16, flags as u16, opcode as u16, rcode as u16);
+    unsafe { *dnsrec = Box::into_raw(Box::new(rec)); }
     ARES_SUCCESS
 }
 
@@ -281,18 +273,11 @@ pub unsafe extern "C" fn ares_dns_record_duplicate(
     if dnsrec.is_null() {
         return std::ptr::null_mut();
     }
-    let mut buf: *mut u8 = std::ptr::null_mut();
-    let mut buf_len: usize = 0;
-    if unsafe { ares_dns_write(dnsrec as *const _, &mut buf, &mut buf_len) } != ARES_SUCCESS {
-        return std::ptr::null_mut();
+    let buf = write_record(unsafe { &*dnsrec });
+    match parse_record(&buf) {
+        Ok(rec) => Box::into_raw(Box::new(rec)),
+        Err(_) => std::ptr::null_mut(),
     }
-    let mut out: *mut ares_dns_record_t = std::ptr::null_mut();
-    let status = unsafe { ares_dns_parse(buf, buf_len, 0, &mut out) };
-    unsafe { libc::free(buf as *mut _) };
-    if status != ARES_SUCCESS {
-        return std::ptr::null_mut();
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -893,99 +878,13 @@ pub unsafe extern "C" fn ares_dns_parse(
         return ARES_EBADRESP;
     }
     let data = unsafe { std::slice::from_raw_parts(buf, buf_len) };
-
-    // Parse header (12 bytes)
-    let id = ((data[0] as u16) << 8) | data[1] as u16;
-    let flags_val = ((data[2] as u16) << 8) | data[3] as u16;
-    let qdcount = ((data[4] as u16) << 8) | data[5] as u16;
-    let ancount = ((data[6] as u16) << 8) | data[7] as u16;
-    let nscount = ((data[8] as u16) << 8) | data[9] as u16;
-    let arcount = ((data[10] as u16) << 8) | data[11] as u16;
-
-    let opcode = (flags_val >> 11) & 0x0F;
-    let rcode = flags_val & 0x0F;
-
-    let mut rec = Box::new(ares_dns_record_t {
-        id,
-        flags: flags_val,
-        opcode,
-        rcode,
-        queries: Vec::new(),
-        answers: Vec::new(),
-        authority: Vec::new(),
-        additional: Vec::new(),
-    });
-
-    let mut pos = 12usize;
-
-    // Parse questions
-    for _ in 0..qdcount {
-        let name = match parse_dns_name(data, &mut pos) {
-            Some(n) => n,
-            None => return ARES_EBADRESP,
-        };
-        if pos + 4 > buf_len {
-            return ARES_EBADRESP;
+    match parse_record(data) {
+        Ok(rec) => {
+            unsafe { *dnsrec = Box::into_raw(Box::new(rec)); }
+            ARES_SUCCESS
         }
-        let qtype = ((data[pos] as u16) << 8) | data[pos + 1] as u16;
-        let qclass = ((data[pos + 2] as u16) << 8) | data[pos + 3] as u16;
-        pos += 4;
-        let name_c = CString::new(name.clone()).unwrap_or_default();
-        rec.queries.push(DnsRecordQuery {
-            name,
-            name_c,
-            qtype,
-            qclass,
-        });
+        Err(e) => e,
     }
-
-    // Parse RR sections: answers, authority, additional
-    let section_counts = [
-        (ancount, ARES_SECTION_ANSWER),
-        (nscount, ARES_SECTION_AUTHORITY),
-        (arcount, ARES_SECTION_ADDITIONAL),
-    ];
-
-    for (count, section) in &section_counts {
-        for _ in 0..*count {
-            let rr_name = match parse_dns_name(data, &mut pos) {
-                Some(n) => n,
-                None => return ARES_EBADRESP,
-            };
-            if pos + 10 > buf_len {
-                return ARES_EBADRESP;
-            }
-            let rtype = ((data[pos] as u16) << 8) | data[pos + 1] as u16;
-            let rclass = ((data[pos + 2] as u16) << 8) | data[pos + 3] as u16;
-            let ttl = u32::from_be_bytes([
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]);
-            let rdlength = ((data[pos + 8] as u16) << 8) | data[pos + 9] as u16;
-            pos += 10;
-
-            let rdata_start = pos;
-            if pos + rdlength as usize > buf_len {
-                return ARES_EBADRESP;
-            }
-            let rdata = &data[pos..pos + rdlength as usize];
-            pos += rdlength as usize;
-
-            let mut rr = new_rr(&rr_name, rtype, rclass, ttl);
-            parse_rdata(rtype, rdata, data, rdata_start, &mut rr);
-
-            let vec = match section_vec_mut(&mut rec, *section) {
-                Some(v) => v,
-                None => return ARES_EBADRESP,
-            };
-            vec.push(rr);
-        }
-    }
-
-    unsafe { *dnsrec = Box::into_raw(rec); }
-    ARES_SUCCESS
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,68 +900,13 @@ pub unsafe extern "C" fn ares_dns_write(
     if dnsrec.is_null() || buf.is_null() || buf_len.is_null() {
         return ARES_EBADRESP;
     }
-    let rec = unsafe { &*dnsrec };
-
-    let mut out = Vec::with_capacity(512);
-
-    // Write header
-    out.push((rec.id >> 8) as u8);
-    out.push(rec.id as u8);
-    out.push((rec.flags >> 8) as u8);
-    out.push(rec.flags as u8);
-    let qdcount = rec.queries.len() as u16;
-    out.push((qdcount >> 8) as u8);
-    out.push(qdcount as u8);
-    let ancount = rec.answers.len() as u16;
-    out.push((ancount >> 8) as u8);
-    out.push(ancount as u8);
-    let nscount = rec.authority.len() as u16;
-    out.push((nscount >> 8) as u8);
-    out.push(nscount as u8);
-    let arcount = rec.additional.len() as u16;
-    out.push((arcount >> 8) as u8);
-    out.push(arcount as u8);
-
-    // Write questions
-    for q in &rec.queries {
-        write_dns_name(&q.name, &mut out);
-        out.push((q.qtype >> 8) as u8);
-        out.push(q.qtype as u8);
-        out.push((q.qclass >> 8) as u8);
-        out.push(q.qclass as u8);
-    }
-
-    // Write RR sections
-    let sections: [&Vec<ares_dns_rr_t>; 3] =
-        [&rec.answers, &rec.authority, &rec.additional];
-    for section in &sections {
-        for rr in *section {
-            write_dns_name(&rr.name, &mut out);
-            out.push((rr.rtype >> 8) as u8);
-            out.push(rr.rtype as u8);
-            out.push((rr.rclass >> 8) as u8);
-            out.push(rr.rclass as u8);
-            out.extend_from_slice(&rr.ttl.to_be_bytes());
-
-            // Serialize rdata to a temporary buffer to get rdlength
-            let mut rdata_buf = Vec::new();
-            write_rdata(rr, &mut rdata_buf);
-            let rdlength = rdata_buf.len() as u16;
-            out.push((rdlength >> 8) as u8);
-            out.push(rdlength as u8);
-            out.extend_from_slice(&rdata_buf);
-        }
-    }
-
-    // Allocate with libc::malloc for C interop
-    let total_len = out.len();
-    let ptr = unsafe { libc::malloc(total_len) as *mut u8 };
+    let out = write_record(unsafe { &*dnsrec });
+    let ptr = unsafe { malloc_bytes(&out) };
     if ptr.is_null() {
         return ARES_ENOMEM;
     }
-    unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), ptr, total_len) };
     unsafe { *buf = ptr; }
-    unsafe { *buf_len = total_len; }
+    unsafe { *buf_len = out.len(); }
     ARES_SUCCESS
 }
 
@@ -1179,11 +1023,9 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin_cnt(
 ) -> libc::size_t {
     if rr.is_null() { return 0; }
     // We store TXT as a single Bin blob; for abin API, treat as 1 entry if non-empty
-    if let Some(RRValue::Bin(data)) = (unsafe { &*rr }).data.get(&key) {
-        let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
-        if logical_len == 0 { 0 } else { 1 }
-    } else {
-        0
+    match (unsafe { &*rr }).bin_val(key) {
+        Some((_, logical_len)) if logical_len > 0 => 1,
+        _ => 0,
     }
 }
 
@@ -1196,18 +1038,20 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
 ) -> *const u8 {
     if rr.is_null() || len.is_null() { return std::ptr::null(); }
     if idx != 0 { unsafe { *len = 0; } return std::ptr::null(); }
-    if let Some(RRValue::Bin(data)) = (unsafe { &*rr }).data.get(&key) {
-        let logical_len = if data.last() == Some(&0) { data.len() - 1 } else { data.len() };
-        unsafe { *len = logical_len; }
-        if data.is_empty() {
-            static EMPTY: u8 = 0;
-            &EMPTY as *const u8
-        } else {
-            data.as_ptr()
+    match (unsafe { &*rr }).bin_val(key) {
+        Some((data, logical_len)) => {
+            unsafe { *len = logical_len; }
+            if data.is_empty() {
+                static EMPTY: u8 = 0;
+                &EMPTY as *const u8
+            } else {
+                data.as_ptr()
+            }
         }
-    } else {
-        unsafe { *len = 0; }
-        std::ptr::null()
+        None => {
+            unsafe { *len = 0; }
+            std::ptr::null()
+        }
     }
 }
 
