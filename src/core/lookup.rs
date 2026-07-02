@@ -1,13 +1,39 @@
-//! Pure query-lifecycle logic shared by every lookup flow.
+//! The query-lifecycle state machine: every retry/failover/iteration decision
+//! the resolver makes lives in this one file, as safe pure Rust. The FFI
+//! layer only converts C arguments, performs I/O, and executes the decisions
+//! made here.
 //!
-//! This module is the single home for the DNS query state-machine building
-//! blocks: reply classification ([`summarize`], [`qid_matches`],
-//! [`extract_tcp_frame`]), name classification ([`is_localhost`],
-//! [`is_onion_domain`]), and per-server failure tracking / server selection
-//! ([`ServerHealth`]). The per-flow state machines (search, gethostbyname,
-//! getaddrinfo) build on these and live here too. Everything in this module
-//! is safe pure Rust — the FFI layer only converts C arguments and executes
-//! the decisions made here.
+//! # Map
+//!
+//! Shared building blocks:
+//! - [`summarize`] / [`qid_matches`] / [`extract_tcp_frame`] — DNS reply
+//!   header classification, transaction-ID matching, TCP reassembly
+//! - [`is_localhost`] / [`is_onion_domain`] — special-name classification
+//! - [`SearchPlan`] — the single implementation of search-domain iteration
+//!   (ndots threshold, bare-name fallback), with the [`SearchPlan::for_search`]
+//!   and [`SearchPlan::for_gethostbyname`] flavors
+//! - [`ServerHealth`] — per-server failure accounting and the
+//!   lowest-failures-first server selection for failover and probing
+//!
+//! Per-flow machines — each consumes events (a parsed reply or an I/O error)
+//! and returns actions (send a query, notify, cache, deliver) that the
+//! executors in `src/ffi/lookups.rs` perform:
+//! - [`SearchSm`] — ares_search / ares_search_dnsrec
+//! - [`HostByNameSm`] — ares_gethostbyname's DNS phase (TC retry, failover,
+//!   search iteration, the AF_UNSPEC AAAA→A switch)
+//! - [`AddrInfoSm`] — ares_getaddrinfo's parallel A+AAAA batch with the
+//!   `pending` join counter
+//!
+//! Reactor-level policy for tasks without their own machine (plain
+//! ares_query/ares_send and the process-level TC/failover/timeout rules),
+//! driven by `src/ffi/process.rs`:
+//! - [`on_datagram`] → [`TaskVerdict`] (failover / TC retry / deliver)
+//! - [`on_timeout`] → [`TimeoutVerdict`] (retry / expire)
+//!
+//! Deliberately *not* here: pre-DNS short-circuits (IP literals, hosts file,
+//! localhost, HOSTALIASES, cache probes) stay in the FFI entry points, and
+//! the socket-launch retry loops live with the executors — their failure
+//! accounting calls back into [`ServerHealth`].
 
 use std::ffi::c_int;
 use std::time::{Duration, Instant};

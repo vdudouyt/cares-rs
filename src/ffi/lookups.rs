@@ -45,7 +45,7 @@ pub(crate) struct SearchLookup {
     pub(crate) delivery: SearchDelivery,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 // Variants are named after the c-ares FFI callback typedefs they dispatch to;
 // the shared `Callback` suffix is intentional for that correspondence.
 #[allow(clippy::enum_variant_names)]
@@ -108,18 +108,6 @@ impl Callback {
             _ => TaskKind::Other,
         }
     }
-    pub(crate) fn clone_for_retry(&self) -> Self {
-        match self {
-            Self::AresHostCallback(cb) => Self::AresHostCallback(*cb),
-            Self::AresCallback(cb) => Self::AresCallback(*cb),
-            Self::AresCallbackDnsRec(cb) => Self::AresCallbackDnsRec(*cb),
-            Self::AresNameinfoCallback(cb) => Self::AresNameinfoCallback(*cb),
-            Self::AddrInfo(lookup) => Self::AddrInfo(lookup.clone()),
-            Self::HostByName(lookup) => Self::HostByName(lookup.clone()),
-            Self::Search(lookup) => Self::Search(lookup.clone()),
-            Self::Probe => Self::Probe,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -160,15 +148,14 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         return;
     }
 
-    let (expected_record_type, current_family) = match family {
-        libc::AF_INET => (RECORD_TYPE_A as c_int, libc::AF_INET),
-        libc::AF_INET6 => (RECORD_TYPE_AAAA as c_int, libc::AF_INET6),
-        libc::AF_UNSPEC => (RECORD_TYPE_AAAA as c_int, libc::AF_INET6), // AAAA first
+    // Family validation; the A/AAAA mapping itself lives in HostByNameSm::new.
+    match family {
+        libc::AF_INET | libc::AF_INET6 | libc::AF_UNSPEC => {}
         _ => {
             unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
             return;
         }
-    };
+    }
 
     let family_filter = match family {
         libc::AF_INET => AddressFamily::Ipv4,
@@ -307,7 +294,6 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
 
     // Build the search plan + state machine and launch the first query
-    let _ = (expected_record_type, current_family); // family mapping now lives in HostByNameSm::new
     let use_tcp = channeldata.ares.config.options.use_vc;
     let plan = SearchPlan::for_gethostbyname(&resolved_name, channeldata.ares.config.options.ndots, &channeldata.ares.config.search);
     let query_hostname = plan.current.clone();
@@ -1128,7 +1114,6 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     };
 
     let hostname_raw = unsafe { cstr_lossy(name) };
-    let had_trailing_dot = hostname_raw.ends_with('.');
     let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
 
     if hostname.is_empty() {
@@ -1183,7 +1168,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     }
 
     // DNS path: build the search plan + state machine and launch the batch
-    let _ = had_trailing_dot; // encoded in the plan (raw name carries the dot)
+    // (the raw name carries the trailing dot the plan needs to see)
     let use_tcp = channeldata.ares.config.options.use_vc;
     let plan = SearchPlan::for_search(hostname_raw, channeldata.ares.config.options.ndots, &channeldata.ares.config.search);
     let first_server = channeldata.server_health.pick_next();

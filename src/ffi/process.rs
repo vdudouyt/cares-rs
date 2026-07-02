@@ -117,7 +117,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                 match verdict {
                     TaskVerdict::RetryNextServer { server: next_server } => {
                         let new_ffidata = FFIData {
-                            callback: task.userdata.callback.clone_for_retry(),
+                            callback: task.userdata.callback.clone(),
                             arg: task.userdata.arg,
                             family: task.userdata.family,
                             expected_record_type: task.userdata.expected_record_type,
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     TaskVerdict::RetryTcp => {
                         let si = task.userdata.server_index;
                         let new_ffidata = FFIData {
-                            callback: task.userdata.callback.clone_for_retry(),
+                            callback: task.userdata.callback.clone(),
                             arg: task.userdata.arg,
                             family: task.userdata.family,
                             expected_record_type: task.userdata.expected_record_type,
@@ -222,7 +222,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
                     task.writebuf.clone()
                 };
                 let new_ffidata = FFIData {
-                    callback: task.userdata.callback.clone_for_retry(),
+                    callback: task.userdata.callback.clone(),
                     arg: task.userdata.arg,
                     family: task.userdata.family,
                     expected_record_type: task.userdata.expected_record_type,
