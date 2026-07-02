@@ -38,3 +38,16 @@ jobs:
       # Run tests
       - name: Run tests
         run: cargo test
+
+      # ABI + unsafe-surface gates:
+      #  - the cbindgen-generated header must match the committed baseline
+      #  - the .so's ares_* export set must match the committed baseline
+      #  - unsafe-context lines must not grow past the ratchet baseline
+      #    (logic belongs in forbid(unsafe_code) kernels; see tools/unsafe_lines.py)
+      - name: ABI + unsafe-ratchet gates
+        run: |
+          diff ci-data/cares.h.baseline include/cares.h
+          nm -D --defined-only target/debug/libcares_rs.so \
+            | awk '$2=="T" && $3 ~ /^ares_/ {print $3}' | sort \
+            | diff ci-data/exports.baseline -
+          python3 tools/unsafe_lines.py --check tools/unsafe_baseline.json

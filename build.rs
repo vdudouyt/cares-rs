@@ -9,6 +9,9 @@ fn main() {
     let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     println!("cargo:rerun-if-changed=src/ffi");
+    // cbindgen parses the whole crate, and core defines types/logic the ffi
+    // signatures reference — regenerate on core edits too.
+    println!("cargo:rerun-if-changed=src/core");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     println!("cargo:rerun-if-changed=build.rs");
     // Watch the output too, so deleting/tampering with the header re-triggers
