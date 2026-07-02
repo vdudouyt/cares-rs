@@ -7,23 +7,13 @@ use std::rc::Rc;
 use super::*;
 
 
-pub(crate) struct HostByNameState {
-    callback: AresHostCallback,
-    arg: *mut c_void,
-    has_cancel: bool,
-    last_error: c_int,
-    name: String,
-    channel: Channel,
-    search_domains: Vec<String>,
-    base_name: String,
-    family: c_int,         // Original requested family
-    current_family: c_int, // Currently querying family
-    expected_record_type: c_int,
-    use_tcp: bool,
-    attempt_count: usize,
-    had_nodata: bool,
-    tried_aaaa: bool,
-    timeouts: c_int,
+/// Live state of an ares_gethostbyname lookup: the pure state machine plus
+/// the C callback to deliver to.
+#[derive(Debug)]
+pub(crate) struct HostByNameLookup {
+    pub(crate) sm: HostByNameSm,
+    pub(crate) callback: AresHostCallback,
+    pub(crate) arg: *mut c_void,
 }
 
 pub(crate) struct AddrInfoState {
@@ -73,7 +63,7 @@ pub(crate) enum Callback {
     AresCallbackDnsRec(AresCallbackDnsRec),
     AresNameinfoCallback(AresNameinfoCallback),
     AresAddrInfoCallback(*mut AddrInfoState),
-    AresHostByNameCallback(*mut HostByNameState),
+    HostByName(Rc<RefCell<HostByNameLookup>>),
     Search(Rc<RefCell<SearchLookup>>),
     Probe, // Server failover probe — no user callback
 }
@@ -84,10 +74,9 @@ impl Callback {
         if let Err(status) = &buf {
             if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED {
                 match self {
-                    Self::AresHostByNameCallback(state_ptr) => unsafe {
-                        let state = &mut **state_ptr;
-                        (state.callback)(state.arg, *status, 0, std::ptr::null_mut());
-                        drop(Box::from_raw(*state_ptr));
+                    Self::HostByName(lookup) => {
+                        let (callback, arg) = { let l = lookup.borrow(); (l.callback, l.arg) };
+                        unsafe { callback(arg, *status, 0, std::ptr::null_mut()) };
                         return;
                     },
                     Self::AresAddrInfoCallback(state_ptr) => unsafe {
@@ -124,7 +113,7 @@ impl Callback {
             Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, ffidata),
             Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, ffidata),
             Self::AresAddrInfoCallback(state_ptr) => unsafe { run_ares_addrinfo_callback(buf, *state_ptr, ffidata) },
-            Self::AresHostByNameCallback(state_ptr) => unsafe { run_ares_hostbyname_callback(buf, *state_ptr, ffidata) },
+            Self::HostByName(lookup) => unsafe { run_ares_hostbyname_callback(buf, lookup, ffidata, channeldata) },
             Self::Search(lookup) => unsafe { run_ares_search_callback(buf, lookup, ffidata, channeldata) },
             Self::Probe => unsafe { run_probe_callback(buf, channeldata, ffidata) },
         }
@@ -136,7 +125,7 @@ impl Callback {
             Self::AresCallbackDnsRec(cb) => Self::AresCallbackDnsRec(*cb),
             Self::AresNameinfoCallback(cb) => Self::AresNameinfoCallback(*cb),
             Self::AresAddrInfoCallback(ptr) => Self::AresAddrInfoCallback(*ptr),
-            Self::AresHostByNameCallback(ptr) => Self::AresHostByNameCallback(*ptr),
+            Self::HostByName(lookup) => Self::HostByName(lookup.clone()),
             Self::Search(lookup) => Self::Search(lookup.clone()),
             Self::Probe => Self::Probe,
         }
@@ -327,44 +316,21 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         }
     }
 
-    // Determine search domains
+    // Build the search plan + state machine and launch the first query
+    let _ = (expected_record_type, current_family); // family mapping now lives in HostByNameSm::new
     let use_tcp = channeldata.ares.config.options.use_vc;
-    let ndots = channeldata.ares.config.options.ndots;
-    let dot_count = resolved_name.chars().filter(|&c| c == '.').count() as u32;
-    let mut search_domains: Vec<String> = Vec::new();
-    let mut query_hostname = resolved_name.clone();
-
-    if dot_count < ndots && !channeldata.ares.config.search.is_empty() {
-        search_domains = channeldata.ares.config.search.clone();
-        let first_domain = search_domains.remove(0);
-        query_hostname = format!("{}.{}", resolved_name, first_domain);
-    }
-
+    let plan = SearchPlan::for_gethostbyname(&resolved_name, channeldata.ares.config.options.ndots, &channeldata.ares.config.search);
+    let query_hostname = plan.current.clone();
+    let sm = HostByNameSm::new(plan, family, use_tcp);
+    let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
     let first_server = channeldata.server_health.pick_next();
 
-    let state = Box::into_raw(Box::new(HostByNameState {
-        callback,
-        arg,
-        has_cancel: false,
-        last_error: ARES_ENODATA,
-        name: query_hostname.clone(),
-        channel,
-        search_domains,
-        base_name: resolved_name,
-        family,
-        current_family,
-        expected_record_type,
-        use_tcp,
-        attempt_count: 0,
-        had_nodata: false,
-        tried_aaaa: family == libc::AF_UNSPEC,
-        timeouts: 0,
-    }));
+    let lookup = Rc::new(RefCell::new(HostByNameLookup { sm, callback, arg }));
 
-    launch_hostbyname_query(channeldata, state, &query_hostname, current_family, expected_record_type, use_tcp, first_server);
+    launch_hostbyname_query(channeldata, &lookup, &query_hostname, send_family, send_rtype, use_tcp, first_server);
 
     // Server failover probing: if enabled, probe an expired-failure server in parallel
-    maybe_launch_probe(channeldata, &query_hostname, current_family, first_server, use_tcp);
+    maybe_launch_probe(channeldata, &query_hostname, send_family, first_server, use_tcp);
 }
 
 /// # Safety
@@ -874,7 +840,12 @@ pub(crate) fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: Ar
     unsafe { callback(ffidata.arg, status, ffidata.timeouts, hostname_ptr, service_ptr) };
 }
 
-pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, state: *mut HostByNameState, hostname: &str, current_family: c_int, expected_record_type: c_int, use_tcp: bool, server_index: usize) {
+/// Send executor for the gethostbyname machine: reuse a pooled socket when
+/// possible, otherwise create one — retrying across servers on socket-creation
+/// or sock-callback failure (the failure accounting itself is ServerHealth's,
+/// i.e. core, logic). Exhaustion delivers ECONNREFUSED; the lookup state is
+/// freed when its last Rc drops.
+pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, lookup: &Rc<RefCell<HostByNameLookup>>, hostname: &str, current_family: c_int, expected_record_type: u16, use_tcp: bool, server_index: usize) {
     let core_family = match current_family {
         libc::AF_INET => Family::Ipv4,
         _ => Family::Ipv6,
@@ -883,24 +854,24 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, stat
     let nservers = channeldata.server_health.len().max(1);
     let sock_type = if use_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
     let mut si = server_index;
+    let make_ffidata = |si: usize| FFIData {
+        callback: Callback::HostByName(lookup.clone()),
+        arg: std::ptr::null_mut(),
+        family: current_family,
+        expected_record_type: expected_record_type as c_int,
+        ip: None,
+        nameinfo_flags: 0,
+        port: 0,
+        scope_id: 0,
+        server_index: si,
+        timeouts: 0,
+    };
 
     // TCP connection sharing: reuse existing TCP connection to same server
     if use_tcp {
         if let Some(idx) = channeldata.tcp_connections.iter().position(|(s, _)| *s == si) {
             let shared_sock = channeldata.tcp_connections[idx].1.clone();
-            let ffidata = FFIData {
-                callback: Callback::AresHostByNameCallback(state),
-                arg: std::ptr::null_mut(),
-                family: current_family,
-                expected_record_type,
-                ip: None,
-                nameinfo_flags: 0,
-                port: 0,
-                scope_id: 0,
-                server_index: si,
-                timeouts: 0,
-            };
-            let _ = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(DnsSocket::Tcp(shared_sock)), si, ffidata);
+            let _ = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(DnsSocket::Tcp(shared_sock)), si, make_ffidata(si));
             return;
         }
         // No existing TCP connection — fall through to create one
@@ -913,38 +884,14 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, stat
         if let Some(idx) = channeldata.udp_connections.iter().position(|(s, _, c)| *s == si && *c < limit) {
             let shared_sock = channeldata.udp_connections[idx].1.clone();
             channeldata.udp_connections[idx].2 += 1;
-            let ffidata = FFIData {
-                callback: Callback::AresHostByNameCallback(state),
-                arg: std::ptr::null_mut(),
-                family: current_family,
-                expected_record_type,
-                ip: None,
-                nameinfo_flags: 0,
-                port: 0,
-                scope_id: 0,
-                server_index: si,
-                timeouts: 0,
-            };
-            let _ = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(DnsSocket::Udp(shared_sock)), si, ffidata);
+            let _ = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(DnsSocket::Udp(shared_sock)), si, make_ffidata(si));
             return;
         }
         // No reusable connection — fall through to create a new one, then add to pool
     }
 
     for _try in 0..max_tries {
-        let ffidata = FFIData {
-            callback: Callback::AresHostByNameCallback(state),
-            arg: std::ptr::null_mut(),
-            family: current_family,
-            expected_record_type,
-            ip: None,
-            nameinfo_flags: 0,
-            port: 0,
-            scope_id: 0,
-            server_index: si,
-            timeouts: 0,
-        };
-        let issued = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, ffidata).is_ok();
+        let issued = channeldata.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, make_ffidata(si)).is_ok();
         if !issued {
             // Socket creation failed (e.g. fd exhaustion): treat as a server
             // failure and try the next server, like upstream c-ares.
@@ -976,10 +923,12 @@ pub(crate) unsafe fn launch_hostbyname_query(channeldata: &mut ChannelData, stat
         }
     }
     // All retries exhausted
-    let st = unsafe { &mut *state };
-    st.last_error = ARES_ECONNREFUSED;
-    unsafe { (st.callback)(st.arg, ARES_ECONNREFUSED, st.timeouts, std::ptr::null_mut()) };
-    drop(Box::from_raw(state));
+    let (callback, arg, timeouts) = {
+        let mut l = lookup.borrow_mut();
+        l.sm.last_error = ARES_ECONNREFUSED;
+        (l.callback, l.arg, l.sm.timeouts)
+    };
+    unsafe { callback(arg, ARES_ECONNREFUSED, timeouts, std::ptr::null_mut()) };
 }
 
 /// Issue the next search-domain query for an `ares_search`. On socket-creation
@@ -1056,162 +1005,88 @@ pub(crate) unsafe fn run_ares_search_callback(res: Result<&[u8], c_int>, lookup:
     }
 }
 
-pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, state_ptr: *mut HostByNameState, ffidata: &FFIData) {
-    let state = unsafe { &mut *state_ptr };
-    let channel = state.channel;
-    let channeldata = unsafe { &mut *channel };
-
-    match res {
+/// Executor for the gethostbyname state machine: parse the reply (parsing and
+/// hostent building stay ffi-side), feed the event to `HostByNameSm::step`
+/// (borrow held for the decision only), then perform the returned actions.
+pub(crate) unsafe fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, lookup: &Rc<RefCell<HostByNameLookup>>, ffidata: &FFIData, channeldata: &mut ChannelData) {
+    // Parse outside the machine; the machine sees only the outcome.
+    let mut parsed_items: Option<ParsedRRs<AddrRecord>> = None;
+    let ev = match res {
         Ok(buf) => {
-            // Check TC (truncation) flag — retry over TCP if truncated and not already TCP
-            if is_truncated(buf) && !state.use_tcp {
-                let new_hostname = state.name.clone();
-                launch_hostbyname_query(channeldata, state_ptr, &new_hostname, state.current_family, state.expected_record_type, true, ffidata.server_index);
-                return;
-            }
-
-            let parsed = (|| -> Result<ParsedRRs<AddrRecord>, c_int> {
+            let expected_rtype = lookup.borrow().sm.expected_rtype;
+            let parse = (|| -> Result<ParsedRRs<AddrRecord>, c_int> {
                 let response = ParsedResponse::from_buf(buf)?;
-                let parsed_rrs = response.process_answers::<AddrRecord>(buf, state.expected_record_type as u16)?;
+                let parsed_rrs = response.process_answers::<AddrRecord>(buf, expected_rtype)?;
                 if parsed_rrs.items.is_empty() {
                     return Err(ARES_ENODATA);
                 }
                 Ok(parsed_rrs)
             })();
+            let outcome = match parse {
+                Ok(rrs) => {
+                    parsed_items = Some(rrs);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            HostEvent::Reply {
+                truncated: is_truncated(buf),
+                parse: outcome,
+                io_timeouts: ffidata.timeouts,
+                server: ffidata.server_index,
+            }
+        }
+        Err(status) => HostEvent::Error { status },
+    };
 
-            match parsed {
-                Ok(mut parsed_rrs) => {
-                    // Success — cache the response under both the query name and base name
-                    if channeldata.query_cache_max_ttl > 0 {
-                        let ttl = parsed_rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
+    let actions = {
+        let cfg = LookupCfg {
+            attempts: channeldata.ares.config.options.attempts,
+            ndots: channeldata.ares.config.options.ndots,
+            search: &channeldata.ares.config.search,
+        };
+        let mut l = lookup.borrow_mut();
+        l.sm.step(ev, &cfg, &mut channeldata.server_health)
+    };
+
+    for action in actions {
+        match action {
+            HostAction::Send { name, family, rtype, tcp, server } => {
+                launch_hostbyname_query(channeldata, lookup, &name, family, rtype, tcp, server);
+            }
+            HostAction::NotifyServerFail { server, tcp } => {
+                invoke_server_state_callback(channeldata, server, false, tcp);
+            }
+            HostAction::CacheStore { names, rtype } => {
+                if channeldata.query_cache_max_ttl > 0 {
+                    if let (Ok(buf), Some(rrs)) = (&res, &parsed_items) {
+                        let ttl = rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
                         let cache_ttl = std::cmp::min(ttl, channeldata.query_cache_max_ttl);
                         if cache_ttl > 0 {
                             let expires = Instant::now() + Duration::from_secs(cache_ttl as u64);
-                            let cache_key = (state.name.clone(), state.expected_record_type as u16);
-                            channeldata.query_cache.insert(cache_key, (buf.to_vec(), expires));
-                            // Also cache under the base name (pre-search-domain) so repeat lookups hit cache
-                            if !state.base_name.is_empty() && state.base_name != state.name {
-                                let base_key = (state.base_name.clone(), state.expected_record_type as u16);
-                                channeldata.query_cache.insert(base_key, (buf.to_vec(), expires));
+                            for name in names {
+                                channeldata.query_cache.insert((name, rtype), (buf.to_vec(), expires));
                             }
                         }
                     }
-                    // Success — invoke callback
-                    channeldata.server_health.record_success(ffidata.server_index);
-                    if !channeldata.sortlist.is_empty() {
-                        apply_sortlist(&channeldata.sortlist, &mut parsed_rrs.items);
-                    }
-                    let hostent = parsed_rrs.into_raw_hostent(state.current_family);
-                    let total_timeouts = state.timeouts + ffidata.timeouts;
-                    (state.callback)(state.arg, ARES_SUCCESS, total_timeouts, hostent);
-                    ares_free_hostent(hostent);
-                    drop(Box::from_raw(state_ptr));
-                    return;
-                }
-                Err(e) => {
-                    // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
-                    let nservers = channeldata.server_health.len().max(1);
-                    if e == ARES_ESERVFAIL || e == ARES_ENOTIMP || e == ARES_EREFUSED {
-                        invoke_server_state_callback(channeldata, ffidata.server_index, false, state.use_tcp);
-                        channeldata.server_health.record_failure(ffidata.server_index);
-                        state.attempt_count += 1;
-                        let max_attempts = nservers * channeldata.ares.config.options.attempts as usize;
-                        if state.attempt_count < max_attempts {
-                            let next_server = if channeldata.server_health.len() > 1 {
-                                channeldata.server_health.pick_next()
-                            } else {
-                                ffidata.server_index
-                            };
-                            let new_hostname = state.name.clone();
-                            launch_hostbyname_query(channeldata, state_ptr, &new_hostname, state.current_family, state.expected_record_type, state.use_tcp, next_server);
-                            return;
-                        }
-                    }
-                    if e == ARES_ENODATA {
-                        state.had_nodata = true;
-                    }
-                    state.last_error = e;
                 }
             }
-        }
-        Err(status) => {
-            if status == ARES_ECANCELLED || status == ARES_EDESTRUCTION {
-                state.has_cancel = true;
-                (state.callback)(state.arg, status, 0, std::ptr::null_mut());
-                drop(Box::from_raw(state_ptr));
-                return;
+            HostAction::DeliverSuccess { family, timeouts } => {
+                let Some(mut rrs) = parsed_items.take() else { continue };
+                if !channeldata.sortlist.is_empty() {
+                    apply_sortlist(&channeldata.sortlist, &mut rrs.items);
+                }
+                let hostent = rrs.into_raw_hostent(family);
+                let (callback, arg) = { let l = lookup.borrow(); (l.callback, l.arg) };
+                unsafe { callback(arg, ARES_SUCCESS, timeouts, hostent) };
+                ares_free_hostent(hostent);
             }
-            if status == ARES_ETIMEOUT {
-                state.timeouts += 1; // Count as one query timeout event
-                // For AF_UNSPEC AAAA timeout, fall through to try A
-                state.last_error = status;
-            } else {
-                state.last_error = status;
+            HostAction::DeliverFail { status, timeouts } => {
+                let (callback, arg) = { let l = lookup.borrow(); (l.callback, l.arg) };
+                unsafe { callback(arg, status, timeouts, std::ptr::null_mut()) };
             }
         }
     }
-
-    // Search domain iteration: on NXDOMAIN/ENODATA, try next search domain or bare name
-    if state.last_error == ARES_ENOTFOUND || state.last_error == ARES_ENODATA {
-        if !state.search_domains.is_empty() {
-            let next_domain = state.search_domains.remove(0);
-            let new_hostname = format!("{}.{}", state.base_name, next_domain);
-            state.name = new_hostname.clone();
-            state.last_error = ARES_ENODATA;
-            state.attempt_count = 0;
-            let first_server = channeldata.server_health.pick_next();
-            launch_hostbyname_query(channeldata, state_ptr, &new_hostname, state.current_family, state.expected_record_type, state.use_tcp, first_server);
-            return;
-        } else if state.name != state.base_name && !state.base_name.is_empty() {
-            // All search domains exhausted, try bare name as fallback
-            let bare_name = state.base_name.clone();
-            state.name = bare_name.clone();
-            state.last_error = ARES_ENODATA;
-            state.attempt_count = 0;
-            state.base_name = String::new();
-            let first_server = channeldata.server_health.pick_next();
-            launch_hostbyname_query(channeldata, state_ptr, &bare_name, state.current_family, state.expected_record_type, state.use_tcp, first_server);
-            return;
-        }
-    }
-
-    // AF_UNSPEC: if we tried AAAA and failed, switch to A
-    if state.family == libc::AF_UNSPEC && state.tried_aaaa && state.current_family == libc::AF_INET6 {
-        state.current_family = libc::AF_INET;
-        state.expected_record_type = RECORD_TYPE_A as c_int;
-        state.tried_aaaa = false;
-        state.last_error = ARES_ENODATA;
-        state.attempt_count = 0;
-        // Restore search domains for A query
-        let ndots = channeldata.ares.config.options.ndots;
-        let dot_count = state.base_name.chars().filter(|&c| c == '.').count() as u32;
-        let query_hostname;
-        if !state.base_name.is_empty() {
-            if dot_count < ndots && !channeldata.ares.config.search.is_empty() {
-                state.search_domains = channeldata.ares.config.search.clone();
-                let first_domain = state.search_domains.remove(0);
-                query_hostname = format!("{}.{}", state.base_name, first_domain);
-            } else {
-                query_hostname = state.base_name.clone();
-                state.search_domains.clear();
-            }
-        } else {
-            query_hostname = state.name.clone();
-        }
-        state.name = query_hostname.clone();
-        let first_server = channeldata.server_health.pick_next();
-        launch_hostbyname_query(channeldata, state_ptr, &query_hostname, libc::AF_INET, RECORD_TYPE_A as c_int, state.use_tcp, first_server);
-        return;
-    }
-
-    // Finalize
-    let final_error = if state.had_nodata && state.last_error == ARES_ENOTFOUND {
-        ARES_ENODATA
-    } else {
-        state.last_error
-    };
-    (state.callback)(state.arg, final_error, state.timeouts, std::ptr::null_mut());
-    drop(Box::from_raw(state_ptr));
 }
 
 #[no_mangle]
