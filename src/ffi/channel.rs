@@ -2,7 +2,11 @@
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
 
 use super::*;
-use crate::ffi::kernels::channel::dup_channel;
+use crate::ffi::kernels::channel::{
+    active_query_count, clear_servers, dup_channel, getsock_mask, install_csv_servers,
+    normalize_port, poll_fds, server_list, servers_csv_string, set_servers, timeout_millis,
+    ServerSpec,
+};
 use crate::ffi::kernels::options::new_channel_data;
 
 
@@ -93,13 +97,12 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
     unsafe { libc::FD_ZERO(read_fds) };
 
     let mut nfds = 0;
-    for task in &channeldata.ares.tasks {
-        let fd = task.sock.as_raw_fd();
-        match task.status {
-            Status::Writing => unsafe { libc::FD_SET(fd, write_fds) },
-            Status::Reading => unsafe { libc::FD_SET(fd, read_fds) },
-            Status::Completed => continue,
-        };
+    for (fd, wants_write) in poll_fds(channeldata) {
+        if wants_write {
+            unsafe { libc::FD_SET(fd, write_fds) };
+        } else {
+            unsafe { libc::FD_SET(fd, read_fds) };
+        }
         if nfds <= fd { nfds = fd + 1 }
     }
     nfds
@@ -113,11 +116,10 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
         return std::ptr::null_mut();
     }
     let channeldata = unsafe { &mut *channel };
-    if channeldata.ares.tasks.is_empty() {
+    let Some(max_wait_time) = timeout_millis(channeldata) else {
         if maxtv.is_null() { return std::ptr::null_mut(); }
         return maxtv;
-    }
-    let max_wait_time = channeldata.ares.max_wait_time().as_millis();
+    };
     unsafe {
         (*tv).tv_sec = (max_wait_time / 1000) as i64;
         (*tv).tv_usec = 1000 * (max_wait_time % 1000) as i64;
@@ -136,26 +138,23 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
 pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) -> c_int {
     if channel.is_null() { return ARES_ENODATA; }
     let channeldata = unsafe { &mut *channel };
-    channeldata.ares.config.nameservers.clear();
-    channeldata.ares.config.tcp_ports.clear();
+    let mut servers = Vec::new();
     while !head.is_null() {
         let node = unsafe { &(*head) };
         match node.family {
             libc::AF_INET => {
                 let oct4 = unsafe { node.addr.addr4 }.s_addr.to_ne_bytes();
-                channeldata.ares.config.nameservers.push((IpAddr::from(oct4), None));
-                channeldata.ares.config.tcp_ports.push(None);
+                servers.push(ServerSpec { ip: IpAddr::from(oct4), udp_port: None, tcp_port: None });
             }
             libc::AF_INET6 => {
                 let oct16 = unsafe { node.addr.addr6._S6_un._S6_u8 };
-                channeldata.ares.config.nameservers.push((IpAddr::from(oct16), None));
-                channeldata.ares.config.tcp_ports.push(None);
+                servers.push(ServerSpec { ip: IpAddr::from(oct16), udp_port: None, tcp_port: None });
             }
             _ => {}
         }
         head = unsafe { (*head).next };
     }
-    channeldata.server_health.reset(channeldata.ares.config.nameservers.len());
+    set_servers(channeldata, servers);
     ARES_SUCCESS
 }
 
@@ -164,30 +163,25 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
 pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut AresAddrPortNode) -> c_int {
     if channel.is_null() { return ARES_ENODATA; }
     let channeldata = unsafe { &mut *channel };
-    channeldata.ares.config.nameservers.clear();
-    channeldata.ares.config.tcp_ports.clear();
+    let mut servers = Vec::new();
     while !head.is_null() {
         let node = unsafe { &*head };
-        let udp_port = node.udp_port as u16;
-        let udp_port = if udp_port == 0 || udp_port == 53 { None } else { Some(udp_port) };
-        let tcp_port = node.tcp_port as u16;
-        let tcp_port = if tcp_port == 0 || tcp_port == 53 { None } else { Some(tcp_port) };
+        let udp_port = normalize_port(node.udp_port as u16);
+        let tcp_port = normalize_port(node.tcp_port as u16);
         match node.family {
             libc::AF_INET => {
                 let octets = unsafe { node.addr.addr4.s_addr.to_ne_bytes() };
-                channeldata.ares.config.nameservers.push((IpAddr::from(octets), udp_port));
-                channeldata.ares.config.tcp_ports.push(tcp_port);
+                servers.push(ServerSpec { ip: IpAddr::from(octets), udp_port, tcp_port });
             }
             libc::AF_INET6 => {
                 let octets = unsafe { node.addr.addr6._S6_un._S6_u8 };
-                channeldata.ares.config.nameservers.push((IpAddr::from(octets), udp_port));
-                channeldata.ares.config.tcp_ports.push(tcp_port);
+                servers.push(ServerSpec { ip: IpAddr::from(octets), udp_port, tcp_port });
             }
             _ => {}
         }
         head = node.next;
     }
-    channeldata.server_health.reset(channeldata.ares.config.nameservers.len());
+    set_servers(channeldata, servers);
     ARES_SUCCESS
 }
 
@@ -197,8 +191,8 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut
     if channel.is_null() { return ARES_ENODATA; }
     let channeldata = unsafe { &mut *channel };
     let mut data: Vec<AresAddrPortNode> = vec![];
-    for srv in &channeldata.ares.config.nameservers {
-        let (family, addr) = match srv.0 {
+    for (ip, udp_port, tcp_port) in server_list(channeldata) {
+        let (family, addr) = match ip {
             IpAddr::V4(v4) => {
                 let s_addr = u32::from_ne_bytes(v4.octets());
                 (libc::AF_INET, AresAddrUnion { addr4: libc::in_addr { s_addr } })
@@ -211,8 +205,8 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut
             next: std::ptr::null_mut(),
             family,
             addr,
-            udp_port: srv.1.unwrap_or(channeldata.ares.default_udp_port) as c_int,
-            tcp_port: srv.1.unwrap_or(channeldata.ares.default_tcp_port) as c_int,
+            udp_port: udp_port as c_int,
+            tcp_port: tcp_port as c_int,
         });
     }
     let Some(replies) = clinkedlist::chain_nodes(data) else {
@@ -232,24 +226,18 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
     let channeldata = unsafe { &mut *channel };
     // NULL or empty string clears servers
     if servers.is_null() {
-        channeldata.ares.config.nameservers.clear();
-        channeldata.ares.config.tcp_ports.clear();
-        channeldata.server_health.clear();
+        clear_servers(channeldata);
         return ARES_SUCCESS;
     }
     let Some(s) = (unsafe { cstr_opt(servers) }) else { return ARES_EBADSTR };
     if s.is_empty() {
-        channeldata.ares.config.nameservers.clear();
-        channeldata.ares.config.tcp_ports.clear();
-        channeldata.server_health.clear();
+        clear_servers(channeldata);
         return ARES_SUCCESS;
     }
     let mut cursor = Cursor::new(s);
     match servers_csv::parse_from_reader(&mut cursor) {
         Some(ns) => {
-            channeldata.ares.config.tcp_ports = vec![None; ns.len()];
-            channeldata.server_health.reset(ns.len());
-            channeldata.ares.config.nameservers = ns;
+            install_csv_servers(channeldata, ns);
             ARES_SUCCESS
         }
         None => ARES_EBADSTR,
@@ -273,23 +261,12 @@ pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_
     let channeldata = unsafe { &mut *channel };
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
 
-    let mut mask: c_int = 0;
-    let active_tasks: Vec<_> = channeldata.ares.tasks.iter()
-        .filter(|t| t.status != Status::Completed)
-        .collect();
+    let fds = poll_fds(channeldata);
     for i in 0..n {
-        let maybe_task = active_tasks.get(i);
-        unsafe { std::ptr::write(socks.add(i), maybe_task.map(|x| x.sock.as_raw_fd()).unwrap_or(ARES_SOCKET_BAD)) };
-
-        if let Some(task) = maybe_task {
-            if task.status == Status::Writing {
-                mask |= 1 << (i + 16); // writable
-            }
-            mask |= 1 << i; // readable
-        }
+        let fd = fds.get(i).map(|(fd, _)| *fd).unwrap_or(ARES_SOCKET_BAD);
+        unsafe { std::ptr::write(socks.add(i), fd) };
     }
-
-    mask
+    getsock_mask(&fds, n)
 }
 
 #[no_mangle]
@@ -327,8 +304,8 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
     // chain so the caller can free it with ares_free_data (the c-ares contract).
     // (A plain Box chain here corrupted the heap under ares_free_data.)
     let mut data: Vec<ares_addr_node> = vec![];
-    for srv in &channeldata.ares.config.nameservers {
-        let (family, addr) = match srv.0 {
+    for (ip, _, _) in server_list(channeldata) {
+        let (family, addr) = match ip {
             IpAddr::V4(v4) => {
                 let s_addr = u32::from_ne_bytes(v4.octets());
                 (libc::AF_INET, AresAddrUnion { addr4: libc::in_addr { s_addr } })
@@ -352,17 +329,7 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
 pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
     if channel.is_null() { return std::ptr::null_mut(); }
     let channeldata = unsafe { &*channel };
-    let default_port = channeldata.ares.default_udp_port;
-    let csv: String = channeldata.ares.config.nameservers.iter()
-        .map(|(ip, port_opt)| {
-            let port = port_opt.unwrap_or(default_port);
-            match ip {
-                IpAddr::V6(_) => format!("[{}]:{}", ip, port),
-                _ => format!("{}:{}", ip, port),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",");
+    let csv = servers_csv_string(channeldata);
     // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
     unsafe { malloc_cstr(csv.as_bytes()) }
 }
@@ -419,9 +386,7 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
     if channel.is_null() { return 0; }
     let channeldata = unsafe { &*channel };
-    channeldata.ares.tasks.iter()
-        .filter(|t| t.status != Status::Completed)
-        .count() as c_int
+    active_query_count(channeldata) as c_int
 }
 
 #[no_mangle]
