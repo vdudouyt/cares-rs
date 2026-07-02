@@ -7,8 +7,8 @@ use std::rc::Rc;
 use super::*;
 use crate::ffi::kernels::lookups::{
     format_ip_with_scope, get_service_string, getaddrinfo_preflight, gethostbyname_preflight,
-    getnameinfo_preflight, hosts_file_lookup, well_known_port, AddrInfoPreflight, HostPreflight,
-    NameinfoPreflight,
+    getnameinfo_preflight, hosts_file_lookup, search_name_check, search_start, well_known_port,
+    AddrInfoPreflight, HostPreflight, NameinfoPreflight,
 };
 
 
@@ -240,29 +240,23 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     let name_str = unsafe { cstr_lossy(name) };
-    if name_str.is_empty() {
-        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
-        return;
-    }
-
-    // Reject .onion domains immediately (RFC 7686)
-    if is_onion_domain(name_str) {
-        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
+    if let Some(status) = search_name_check(name_str) {
+        unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
         return;
     }
 
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
-    if channeldata.ares.config.nameservers.is_empty() {
-        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut(), 0) };
-        return;
-    }
-
     let _ = dnsclass;
-    let plan = SearchPlan::for_search(name_str, channeldata.ares.config.options.ndots, &channeldata.ares.config.search);
-    let query_hostname = plan.current.clone();
+    let (sm, query_hostname) = match search_start(channeldata, name_str, false) {
+        Ok(seed) => seed,
+        Err(status) => {
+            unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
+            return;
+        }
+    };
     let lookup = Rc::new(RefCell::new(SearchLookup {
-        sm: SearchSm::new(plan, false),
+        sm,
         dnstype: dnstype as u16,
         delivery: SearchDelivery::Raw { callback, arg },
     }));
@@ -363,38 +357,35 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     let Some(callback) = callback else { return; };
     // Extract the query name and type from the dns record
     if dnsrec.is_null() { return; }
+    // Extract the first query's name/type through the record's safe accessors.
+    let rec = unsafe { &*dnsrec };
     let mut name_ptr: *const c_char = std::ptr::null();
     let mut qtype: c_uint = 0;
-    let mut qclass: c_uint = 0;
-    if unsafe { dns_record::ares_dns_record_query_cnt(dnsrec) } > 0 {
-        unsafe { dns_record::ares_dns_record_query_get(dnsrec, 0, &mut name_ptr, &mut qtype, &mut qclass) };
+    if rec.query_cnt() > 0 {
+        if let Some((q_name, q_type, _qclass)) = rec.query_at(0) {
+            name_ptr = q_name;
+            qtype = q_type as c_uint;
+        }
     }
     if name_ptr.is_null() { return; }
     let name_str = unsafe { cstr_lossy(name_ptr) };
 
-    if name_str.is_empty() {
-        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
-        return;
-    }
-
-    // Reject .onion domains (RFC 7686)
-    if is_onion_domain(name_str) {
-        unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
+    if let Some(status) = search_name_check(name_str) {
+        unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         return;
     }
 
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
-    if channeldata.ares.config.nameservers.is_empty() {
-        unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
-        return;
-    }
-
-    let _ = qclass;
-    let plan = SearchPlan::for_search(name_str, channeldata.ares.config.options.ndots, &channeldata.ares.config.search);
-    let query_hostname = plan.current.clone();
+    let (sm, query_hostname) = match search_start(channeldata, name_str, true) {
+        Ok(seed) => seed,
+        Err(status) => {
+            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+            return;
+        }
+    };
     let lookup = Rc::new(RefCell::new(SearchLookup {
-        sm: SearchSm::new(plan, true),
+        sm,
         dnstype: qtype as u16,
         delivery: SearchDelivery::DnsRec { callback, arg },
     }));

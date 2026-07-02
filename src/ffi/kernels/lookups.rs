@@ -11,7 +11,7 @@ use std::ffi::CString;
 
 use crate::core::hostfile::{AddressFamily, HostLookup};
 use crate::core::services::Services;
-use crate::core::lookup::{is_localhost, is_onion_domain, AddrInfoSm, HostByNameSm, SearchPlan};
+use crate::core::lookup::{is_localhost, is_onion_domain, AddrInfoSm, HostByNameSm, SearchPlan, SearchSm};
 use crate::core::packets::AddrRecord;
 use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::sortlist::apply_sortlist;
@@ -424,4 +424,37 @@ pub(crate) fn get_service_string(services: &Services, port: u16, flags: c_int) -
         // Fall back to numeric port
         Some(CString::new(port.to_string()).unwrap())
     }
+}
+
+/// Empty/onion rejection shared by ares_search and ares_search_dnsrec —
+/// checked before the channel is even dereferenced (order is behavior:
+/// these fire even on a NULL channel).
+pub(crate) fn search_name_check(name_str: &str) -> Option<c_int> {
+    if name_str.is_empty() {
+        return Some(ARES_ENOTFOUND);
+    }
+    // Reject .onion domains immediately (RFC 7686)
+    if is_onion_domain(name_str) {
+        return Some(ARES_ENOTFOUND);
+    }
+    None
+}
+
+/// Seed a search-domain iteration (ares_search / ares_search_dnsrec):
+/// no-servers guard, then the SearchPlan + machine.
+pub(crate) fn search_start(
+    channeldata: &mut ChannelData,
+    name_str: &str,
+    retry_server_error: bool,
+) -> Result<(SearchSm, String), c_int> {
+    if channeldata.ares.config.nameservers.is_empty() {
+        return Err(ARES_ENOSERVER);
+    }
+    let plan = SearchPlan::for_search(
+        name_str,
+        channeldata.ares.config.options.ndots,
+        &channeldata.ares.config.search,
+    );
+    let query_hostname = plan.current.clone();
+    Ok((SearchSm::new(plan, retry_server_error), query_hostname))
 }

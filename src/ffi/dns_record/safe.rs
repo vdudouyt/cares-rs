@@ -765,13 +765,13 @@ impl ares_dns_record_t {
         Ok(())
     }
 
-    pub(super) fn query_cnt(&self) -> usize {
+    pub(crate) fn query_cnt(&self) -> usize {
         self.queries.len()
     }
 
     /// (name pointer, qtype, qclass) — the pointer aliases the query's cached
     /// CString and stays valid until the query's name is rewritten.
-    pub(super) fn query_at(&self, idx: usize) -> Option<(*const c_char, u16, u16)> {
+    pub(crate) fn query_at(&self, idx: usize) -> Option<(*const c_char, u16, u16)> {
         let q = self.queries.get(idx)?;
         Some((q.name_c.as_ptr(), q.qtype, q.qclass))
     }
