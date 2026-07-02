@@ -6,8 +6,9 @@ use std::rc::Rc;
 
 use super::*;
 use crate::ffi::kernels::lookups::{
-    getaddrinfo_preflight, gethostbyname_preflight, hosts_file_lookup, well_known_port,
-    AddrInfoPreflight, HostPreflight,
+    format_ip_with_scope, get_service_string, getaddrinfo_preflight, gethostbyname_preflight,
+    getnameinfo_preflight, hosts_file_lookup, well_known_port, AddrInfoPreflight, HostPreflight,
+    NameinfoPreflight,
 };
 
 
@@ -446,111 +447,46 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         }
     };
 
-    // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
-    let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
-        flags | ARES_NI_LOOKUPHOST
-    } else {
-        flags
-    };
-
-    let want_host = (flags & ARES_NI_LOOKUPHOST) != 0;
-    let want_service = (flags & ARES_NI_LOOKUPSERVICE) != 0;
-
-    // If only service lookup requested (no host), return immediately
-    if want_service && !want_host {
-        let service = get_service_string(channeldata.ares.services(), addr_info.port, flags);
-        let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
-        unsafe { callback(arg, ARES_SUCCESS, 0, std::ptr::null_mut(), service_ptr) };
-        return;
-    }
-
-    // Host lookup requested
-    if want_host {
-        // Numeric host can be handled without DNS
-        if (flags & ARES_NI_NUMERICHOST) != 0 {
-            // ARES_NI_NUMERICHOST + ARES_NI_NAMEREQD is illegal (contradiction)
-            if (flags & ARES_NI_NAMEREQD) != 0 {
-                unsafe { callback(arg, ARES_EBADFLAGS, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-                return;
-            }
-
-            let node = CString::new(format_ip_with_scope(&addr_info.ip, addr_info.scope_id, flags)).unwrap();
-            let service = if want_service {
-                get_service_string(channeldata.ares.services(), addr_info.port, flags)
-            } else {
-                None
-            };
+    match getnameinfo_preflight(channeldata, &addr_info, flags) {
+        NameinfoPreflight::Fail(status) => {
+            unsafe { callback(arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+        }
+        NameinfoPreflight::DeliverService(service) => {
+            let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
+            unsafe { callback(arg, ARES_SUCCESS, 0, std::ptr::null_mut(), service_ptr) };
+        }
+        NameinfoPreflight::DeliverNumeric { node, service } => {
             let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
             unsafe { callback(arg, ARES_SUCCESS, 0, node.into_raw(), service_ptr) };
-            return;
         }
+        NameinfoPreflight::StartPtr { flags } => {
+            let ffidata = FFIData {
+                callback: Callback::AresNameinfoCallback(callback),
+                arg,
+                family: addr_info.family,
+                expected_record_type: RECORD_TYPE_PTR as c_int,
+                ip: Some(addr_info.ip),
+                nameinfo_flags: flags,
+                port: addr_info.port,
+                scope_id: addr_info.scope_id,
+                server_index: 0,
+                timeouts: 0,
+            };
 
-        // DNS lookup is necessary
-        let ffidata = FFIData {
-            callback: Callback::AresNameinfoCallback(callback),
-            arg,
-            family: addr_info.family,
-            expected_record_type: RECORD_TYPE_PTR as c_int,
-            ip: Some(addr_info.ip),
-            nameinfo_flags: flags,
-            port: addr_info.port,
-            scope_id: addr_info.scope_id,
-            server_index: 0,
-            timeouts: 0,
-        };
-
-        // Start the PTR lookup
-        if channeldata.ares.enqueue(dns_query_payload(&rdns_name(addr_info.ip), RECORD_TYPE_PTR), SocketSource::Udp, 0, ffidata).is_err() {
-            unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-            return;
-        }
-        let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
-        if !unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) } {
-            channeldata.ares.tasks.pop();
-            unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-        }
-    }
-}
-
-/// Format an IP address with scope ID for IPv6 (e.g., "fe80::1%0")
-pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: c_int) -> String {
-    match ip {
-        // The scope id is currently appended regardless of the flag/scope_id
-        // check; the branches are intentionally identical for now.
-        #[allow(clippy::if_same_then_else)]
-        IpAddr::V6(_) => {
-            if flags & ARES_NI_NUMERICSCOPE != 0 || scope_id != 0 {
-                format!("{}%{}", ip, scope_id)
-            } else {
-                format!("{}%{}", ip, scope_id)
+            // Start the PTR lookup
+            if channeldata.ares.enqueue(dns_query_payload(&rdns_name(addr_info.ip), RECORD_TYPE_PTR), SocketSource::Udp, 0, ffidata).is_err() {
+                unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+                return;
+            }
+            let fd = channeldata.ares.tasks.last().unwrap().sock.as_raw_fd();
+            if !unsafe { invoke_sock_callbacks(channeldata, fd, libc::SOCK_DGRAM) } {
+                channeldata.ares.tasks.pop();
+                unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
             }
         }
-        IpAddr::V4(_) => ip.to_string(),
     }
 }
 
-/// Get the service string based on flags
-pub(crate) fn get_service_string(services: &Services, port: u16, flags: c_int) -> Option<CString> {
-    if port == 0 {
-        return None;
-    }
-
-    if flags & ARES_NI_NUMERICSERV != 0 {
-        // Return numeric port
-        return Some(CString::new(port.to_string()).unwrap());
-    }
-
-    // Determine protocol preference based on flags
-    let prefer_udp = (flags & ARES_NI_DGRAM) != 0;
-
-    // Try to look up the service name
-    if let Some(name) = services.lookup_any(port, prefer_udp) {
-        Some(CString::new(name).unwrap())
-    } else {
-        // Fall back to numeric port
-        Some(CString::new(port.to_string()).unwrap())
-    }
-}
 
 pub(crate) fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHostCallback, ffidata: &FFIData) {
     let res = (|| {

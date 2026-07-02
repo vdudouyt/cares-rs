@@ -7,7 +7,10 @@ use std::ffi::c_int;
 use std::net::IpAddr;
 use std::time::Instant;
 
+use std::ffi::CString;
+
 use crate::core::hostfile::{AddressFamily, HostLookup};
+use crate::core::services::Services;
 use crate::core::lookup::{is_localhost, is_onion_domain, AddrInfoSm, HostByNameSm, SearchPlan};
 use crate::core::packets::AddrRecord;
 use crate::core::response::{ParsedRRs, ParsedResponse};
@@ -16,7 +19,13 @@ use crate::ffi::channel::ChannelData;
 use crate::ffi::error::{
     ARES_EBADNAME, ARES_EFILE, ARES_ENODATA, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP,
 };
-use crate::ffi::{RECORD_TYPE_A, RECORD_TYPE_AAAA};
+use crate::ffi::convert::AddrInfo;
+use crate::ffi::error::ARES_EBADFLAGS;
+use crate::ffi::{
+    ARES_NI_DGRAM, ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD,
+    ARES_NI_NUMERICHOST, ARES_NI_NUMERICSCOPE, ARES_NI_NUMERICSERV, RECORD_TYPE_A,
+    RECORD_TYPE_AAAA,
+};
 
 /// The verdict of ares_gethostbyname's pre-DNS phase.
 pub(crate) enum HostPreflight {
@@ -318,5 +327,101 @@ pub(crate) fn getaddrinfo_preflight(
     AddrInfoPreflight::StartDns {
         sm: AddrInfoSm::new(plan, ai_family, use_tcp),
         first_server,
+    }
+}
+
+/// The verdict of ares_getnameinfo's pre-DNS phase.
+pub(crate) enum NameinfoPreflight {
+    /// Deliver `status` with NULL node and service.
+    Fail(c_int),
+    /// Service-only lookup: deliver (NULL node, service).
+    DeliverService(Option<CString>),
+    /// Numeric-host path: deliver both without DNS.
+    DeliverNumeric { node: CString, service: Option<CString> },
+    /// PTR lookup required; `flags` carries the defaulted flag set.
+    StartPtr { flags: c_int },
+}
+
+/// Flag defaulting and the service-only / numeric-host short-circuits.
+pub(crate) fn getnameinfo_preflight(
+    channeldata: &mut ChannelData,
+    addr: &AddrInfo,
+    flags: c_int,
+) -> NameinfoPreflight {
+    // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
+    let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
+        flags | ARES_NI_LOOKUPHOST
+    } else {
+        flags
+    };
+
+    let want_host = (flags & ARES_NI_LOOKUPHOST) != 0;
+    let want_service = (flags & ARES_NI_LOOKUPSERVICE) != 0;
+
+    // If only service lookup requested (no host), deliver immediately
+    if want_service && !want_host {
+        return NameinfoPreflight::DeliverService(get_service_string(
+            channeldata.ares.services(),
+            addr.port,
+            flags,
+        ));
+    }
+
+    // Host lookup requested (guaranteed by the defaulting above).
+    // Numeric host can be handled without DNS
+    if (flags & ARES_NI_NUMERICHOST) != 0 {
+        // ARES_NI_NUMERICHOST + ARES_NI_NAMEREQD is illegal (contradiction)
+        if (flags & ARES_NI_NAMEREQD) != 0 {
+            return NameinfoPreflight::Fail(ARES_EBADFLAGS);
+        }
+        let node = CString::new(format_ip_with_scope(&addr.ip, addr.scope_id, flags)).unwrap();
+        let service = if want_service {
+            get_service_string(channeldata.ares.services(), addr.port, flags)
+        } else {
+            None
+        };
+        return NameinfoPreflight::DeliverNumeric { node, service };
+    }
+
+    NameinfoPreflight::StartPtr { flags }
+}
+
+/// Format an IP address with scope ID for IPv6 (e.g., "fe80::1%0")
+pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: c_int) -> String {
+    match ip {
+        // The scope id is currently appended regardless of the flag/scope_id
+        // check; the branches are intentionally identical for now.
+        #[allow(clippy::if_same_then_else)]
+        IpAddr::V6(_) => {
+            if flags & ARES_NI_NUMERICSCOPE != 0 || scope_id != 0 {
+                format!("{}%{}", ip, scope_id)
+            } else {
+                format!("{}%{}", ip, scope_id)
+            }
+        }
+        IpAddr::V4(_) => ip.to_string(),
+    }
+}
+
+/// Get the service string based on flags
+pub(crate) fn get_service_string(services: &Services, port: u16, flags: c_int) -> Option<CString> {
+    if port == 0 {
+        return None;
+    }
+
+    if flags & ARES_NI_NUMERICSERV != 0 {
+        // Return numeric port
+        return Some(CString::new(port.to_string()).unwrap());
+    }
+
+    // Determine protocol preference based on flags
+    let prefer_udp = (flags & ARES_NI_DGRAM) != 0;
+
+    // Try to look up the service name
+    if let Some(name) = services.lookup_any(port, prefer_udp) {
+        Some(CString::new(name).unwrap())
+    } else {
+        // Fall back to numeric port
+        Some(CString::new(port.to_string()).unwrap())
     }
 }
