@@ -67,6 +67,9 @@ pub(crate) unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hoste
 }
 
 pub use crate::core::response::{ParsedRRs, ParsedResponse};
+use crate::core::query_builder::build_query;
+use crate::core::response::{expand_name_at, expand_string_at};
+use crate::ffi::convert::malloc_bytes;
 
 
 impl ParsedRRs<AddrRecord> {
@@ -445,19 +448,8 @@ pub unsafe extern "C" fn ares_expand_name(
     if offset < 0 || offset as usize >= full_buf.len() {
         return ARES_EBADNAME;
     }
-    let start = offset as usize;
-    let local_buf = &full_buf[start..];
-    let mut sbuf = SliceBuf::new(local_buf);
-    let Some(label) = DnsLabel::parse(&mut sbuf) else {
+    let Some((cname, consumed)) = expand_name_at(full_buf, offset as usize) else {
         return ARES_EBADNAME;
-    };
-    let consumed = sbuf.pos;
-    let Some(name_str) = label.build_string(full_buf) else {
-        return ARES_EBADNAME;
-    };
-    let cname = match CString::new(name_str) {
-        Ok(c) => c,
-        Err(_) => return ARES_EBADNAME,
     };
     let out = unsafe { malloc_cstr(cname.as_bytes()) };
     if out.is_null() { return ARES_ENOMEM; }
@@ -513,27 +505,14 @@ pub unsafe extern "C" fn ares_expand_string(
     if offset < 0 || offset as usize >= full_buf.len() {
         return ARES_EBADSTR;
     }
-    let start = offset as usize;
-    let remaining = &full_buf[start..];
-    if remaining.is_empty() {
+    let Some((str_data, encoded_len)) = expand_string_at(full_buf, offset as usize) else {
         return ARES_EBADSTR;
-    }
-    let str_len = remaining[0] as usize;
-    if str_len + 1 > remaining.len() {
-        return ARES_EBADSTR;
-    }
-    let str_data = &remaining[1..1 + str_len];
-    // The string body comes from the (untrusted) buffer and may contain an
-    // embedded NUL; reject it (can't be represented as a C string) instead of
-    // returning a buffer a strlen-based consumer would silently truncate.
-    if str_data.contains(&0) {
-        return ARES_EBADSTR;
-    }
+    };
     let out = unsafe { malloc_cstr(str_data) };
     if out.is_null() { return ARES_ENOMEM; }
     unsafe {
         *s = out as *mut u8;
-        *enclen = (str_len + 1) as libc::c_long; // length byte + string bytes
+        *enclen = encoded_len as libc::c_long; // length byte + string bytes
     }
     ARES_SUCCESS
 }
@@ -558,147 +537,19 @@ pub unsafe extern "C" fn ares_create_query(
     }
     let Some(name_str) = (unsafe { cstr_opt(name) }) else { return ARES_EBADNAME };
 
-    // Check if trailing dot is an unescaped separator (not a literal escaped dot)
-    let has_unescaped_trailing_dot = if let Some(prefix) = name_str.strip_suffix('.') {
-        // Count consecutive backslashes before the trailing dot
-        let backslash_count = prefix
-            .as_bytes()
-            .iter()
-            .rev()
-            .take_while(|&&b| b == b'\\')
-            .count();
-        // Even number of backslashes means dot is unescaped (separator)
-        backslash_count % 2 == 0
-    } else {
-        false
+    // A non-positive max_udp_size means "no EDNS" (the kernel gates on > 0).
+    let max_udp = if max_udp_size > 0 { max_udp_size as u16 } else { 0 };
+    let packet = match build_query(name_str, dnsclass as u16, qtype as u16, id as u16, rd != 0, max_udp) {
+        Ok(p) => p,
+        Err(e) => return e,
     };
-
-    // Reject .onion domains
-    let lower = name_str.to_lowercase();
-    let check = if has_unescaped_trailing_dot {
-        lower.strip_suffix('.').unwrap_or(&lower)
-    } else {
-        &lower
-    };
-    if check.ends_with(".onion") || check == "onion" {
-        return ARES_ENOTFOUND;
-    }
-
-    // Validate name length
-    let clean_name = if has_unescaped_trailing_dot {
-        name_str.strip_suffix('.').unwrap_or(name_str)
-    } else {
-        name_str
-    };
-    if clean_name.len() > 253 {
-        return ARES_EBADNAME;
-    }
-
-    // Check for escaped dots and handle them
-    let labels: Vec<&str> = if clean_name.is_empty() {
-        vec![] // root query
-    } else {
-        // Handle escaped dots: split only on unescaped dots
-        let mut result = Vec::new();
-        let mut current_start = 0;
-        let bytes = clean_name.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2; // skip escaped char
-            } else if bytes[i] == b'.' {
-                result.push(&clean_name[current_start..i]);
-                current_start = i + 1;
-                i += 1;
-            } else {
-                i += 1;
-            }
-        }
-        if current_start <= bytes.len() {
-            let last = &clean_name[current_start..];
-            if !last.is_empty() {
-                result.push(last);
-            }
-        }
-        result
-    };
-
-    // Validate label lengths and reject empty labels
-    for label in &labels {
-        let unescaped = unescape_label(label);
-        if unescaped.is_empty() {
-            return ARES_EBADNAME;
-        }
-        if unescaped.len() > 63 {
-            return ARES_EBADNAME;
-        }
-    }
-
-    // Build DNS packet
-    let flags: u16 = if rd != 0 { 0x0100 } else { 0x0000 }; // RD flag
-    let mut packet = Vec::with_capacity(512);
-    // Header
-    packet.extend_from_slice(&(id as u16).to_be_bytes());
-    packet.extend_from_slice(&flags.to_be_bytes());
-    packet.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-    packet.extend_from_slice(&0u16.to_be_bytes()); // ancount
-    packet.extend_from_slice(&0u16.to_be_bytes()); // nscount
-    let arcount: u16 = if max_udp_size > 0 { 1 } else { 0 };
-    packet.extend_from_slice(&arcount.to_be_bytes()); // arcount
-
-    // Question: encode labels
-    for label in &labels {
-        let unescaped = unescape_label(label);
-        if unescaped.len() > 63 { return ARES_EBADNAME; }
-        packet.push(unescaped.len() as u8);
-        packet.extend_from_slice(&unescaped);
-    }
-    packet.push(0); // root label
-    packet.extend_from_slice(&(qtype as u16).to_be_bytes());
-    packet.extend_from_slice(&(dnsclass as u16).to_be_bytes());
-
-    // OPT pseudo-RR for EDNS if max_udp_size > 0
-    if max_udp_size > 0 {
-        packet.push(0); // root name
-        packet.extend_from_slice(&41u16.to_be_bytes()); // type OPT
-        packet.extend_from_slice(&(max_udp_size as u16).to_be_bytes()); // class = UDP payload size
-        packet.extend_from_slice(&0u32.to_be_bytes()); // TTL (extended RCODE + flags)
-        packet.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH
-    }
-
-    let len = packet.len();
-    // Use raw allocation since DNS packets can contain null bytes
-    let ptr = unsafe { libc::malloc(len) as *mut u8 };
+    let ptr = unsafe { malloc_bytes(&packet) };
     if ptr.is_null() { return ARES_ENOMEM; }
     unsafe {
-        std::ptr::copy_nonoverlapping(packet.as_ptr(), ptr, len);
         *buf = ptr;
-        *buflen = len as c_int;
+        *buflen = packet.len() as c_int;
     }
     ARES_SUCCESS
-}
-
-pub(crate) fn unescape_label(label: &str) -> Vec<u8> {
-    let mut result = Vec::with_capacity(label.len());
-    let bytes = label.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            // Check for numeric escape \DDD
-            if i + 3 < bytes.len() && bytes[i+1].is_ascii_digit() && bytes[i+2].is_ascii_digit() && bytes[i+3].is_ascii_digit() {
-                let val = (bytes[i+1] - b'0') as u16 * 100 + (bytes[i+2] - b'0') as u16 * 10 + (bytes[i+3] - b'0') as u16;
-                result.push(val as u8);
-                i += 4;
-            } else {
-                result.push(bytes[i+1]);
-                i += 2;
-            }
-        } else {
-            result.push(bytes[i]);
-            i += 1;
-        }
-    }
-    result
 }
 
 #[no_mangle]

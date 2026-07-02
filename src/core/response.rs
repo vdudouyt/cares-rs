@@ -14,6 +14,38 @@ use crate::ffi::{
     RECORD_TYPE_A, RECORD_TYPE_AAAA, RECORD_TYPE_CNAME, RECORD_TYPE_NS, RECORD_TYPE_PTR,
 };
 
+/// Expand a compressed DNS name that starts at `start` within `full_buf`.
+/// Returns the dotted name and the number of bytes the encoding occupies at
+/// `start` (the pure body of ares_expand_name).
+pub fn expand_name_at(full_buf: &[u8], start: usize) -> Option<(CString, usize)> {
+    let local_buf = &full_buf[start..];
+    let mut sbuf = SliceBuf::new(local_buf);
+    let label = DnsLabel::parse(&mut sbuf)?;
+    let consumed = sbuf.pos;
+    let name_str = label.build_string(full_buf)?;
+    CString::new(name_str).ok().map(|c| (c, consumed))
+}
+
+/// Expand a length-prefixed DNS character-string at `start` within `full_buf`.
+/// Returns the string bytes and the encoded length (length byte + body); a
+/// body with an embedded NUL is rejected, since a strlen-based C consumer
+/// would silently truncate it (the pure body of ares_expand_string).
+pub fn expand_string_at(full_buf: &[u8], start: usize) -> Option<(&[u8], usize)> {
+    let remaining = &full_buf[start..];
+    if remaining.is_empty() {
+        return None;
+    }
+    let str_len = remaining[0] as usize;
+    if str_len + 1 > remaining.len() {
+        return None;
+    }
+    let str_data = &remaining[1..1 + str_len];
+    if str_data.contains(&0) {
+        return None;
+    }
+    Some((str_data, str_len + 1))
+}
+
 #[derive(Debug)]
 pub struct ParsedResponse<'a> {
     pub query: DnsQuery<'a>,

@@ -6,6 +6,7 @@
 pub mod ares;
 pub mod lookup;
 pub mod packets;
+pub mod query_builder;
 pub mod response;
 pub mod sortlist;
 pub mod sysconfig;
