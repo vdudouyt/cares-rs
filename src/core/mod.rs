@@ -6,6 +6,7 @@
 pub mod ares;
 pub mod lookup;
 pub mod packets;
+pub mod response;
 pub mod sortlist;
 pub mod sysconfig;
 pub mod servers_csv;

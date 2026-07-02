@@ -1,0 +1,129 @@
+//! Parsed-reply engine shared by the legacy ares_parse_* API and the lookup
+//! callbacks: classify a raw DNS reply by header rcode, walk the answer
+//! section, follow CNAME chains, and collect typed records. Pure safe code —
+//! the C-facing hostent/linked-list emission stays in src/ffi.
+
+use std::ffi::{c_int, CString};
+
+use crate::core::packets::{DnsAnswer, DnsHeader, DnsLabel, DnsQuery, RRParser, SliceBuf};
+use crate::ffi::error::{
+    ARES_EBADRESP, ARES_EFORMERR, ARES_ENODATA, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED,
+    ARES_ESERVFAIL,
+};
+use crate::ffi::{
+    RECORD_TYPE_A, RECORD_TYPE_AAAA, RECORD_TYPE_CNAME, RECORD_TYPE_NS, RECORD_TYPE_PTR,
+};
+
+#[derive(Debug)]
+pub struct ParsedResponse<'a> {
+    pub query: DnsQuery<'a>,
+    pub answers: Vec<DnsAnswer<'a>>,
+}
+
+#[derive(Debug)]
+pub struct ParsedRRs<T> {
+    pub items: Vec<T>,
+    pub name: CString,
+    pub aliases: Vec<CString>,
+    pub _limit_ttl: Option<u32>,
+    pub success: usize,
+}
+
+impl<'a> ParsedResponse<'a> {
+    pub fn from_buf(buf: &'a [u8]) -> Result<Self, c_int> {
+        let mut sbuf = SliceBuf::new(buf);
+        let Some(header) = DnsHeader::parse(&mut sbuf) else {
+            return Err(ARES_EBADRESP);
+        };
+        match header.flags & 0x0f {
+            0 => {},
+            1 => return Err(ARES_EFORMERR),
+            2 => return Err(ARES_ESERVFAIL),
+            3 => return Err(ARES_ENOTFOUND),
+            4 => return Err(ARES_ENOTIMP),
+            5 => return Err(ARES_EREFUSED),
+            _ => return Err(ARES_ENODATA),
+        };
+        if header.qdcount != 1 {
+            return Err(ARES_EBADRESP);
+        }
+        let Some(query) = DnsQuery::parse(&mut sbuf) else {
+            return Err(ARES_EBADRESP);
+        };
+        let answer_count = header.ancount as usize;
+        if answer_count == 0 {
+            return Err(ARES_ENODATA);
+        }
+        // Grow on demand rather than pre-allocating `answer_count` (ancount is
+        // attacker-controlled, up to 65535, and DnsAnswer is large, so a tiny
+        // response could otherwise reserve tens of MB). The loop is self-bounding:
+        // each DnsAnswer::parse consumes >= 11 bytes, so it stops when the buffer
+        // is exhausted regardless of the claimed ancount.
+        let mut answers = Vec::new();
+        // Only parse answer section (ancount); authority and additional sections are skipped
+        for _ in 0..answer_count {
+            let Some(answer) = DnsAnswer::parse(&mut sbuf) else {
+                return Err(ARES_EBADRESP);
+            };
+            answers.push(answer);
+        }
+        if answers.is_empty() {
+            return Err(ARES_ENODATA);
+        }
+        Ok(Self {
+            query,
+            answers,
+        })
+    }
+
+    pub fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, c_int> {
+        // The echoed question name comes from the (untrusted) response and may
+        // contain an embedded NUL byte; fail gracefully instead of panicking.
+        let mut name = CString::new(self.query.name.join(".")).map_err(|_| ARES_EBADRESP)?;
+        let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
+        let mut success = 0;
+        let mut aliases: Vec<CString> = vec![];
+        let mut limit_ttl: Option<u32> = None;
+        for mut answer in self.answers {
+            if answer.record_type == RECORD_TYPE_CNAME {
+                let mut cname_buf = SliceBuf::new(answer.data);
+                let alias_of = DnsLabel::parse(&mut cname_buf).ok_or(ARES_EBADRESP)?;
+                let alias_of = alias_of.build_cstring(buf).ok_or(ARES_EBADRESP)?;
+                if expected_record_type != RECORD_TYPE_PTR {
+                    aliases.push(name);
+                    name = alias_of;
+                    limit_ttl = Some(answer.ttl);
+                }
+            }
+
+            if answer.record_type != expected_record_type {
+                success += 1;
+                continue;
+            }
+
+            if answer.record_type == RECORD_TYPE_PTR || answer.record_type == RECORD_TYPE_NS {
+                let mut ptr_buf = SliceBuf::new(answer.data);
+                let alias_of = DnsLabel::parse(&mut ptr_buf).ok_or(ARES_EBADRESP)?;
+                let alias_of = alias_of.build_cstring(buf).ok_or(ARES_EBADRESP)?;
+                aliases.push(alias_of.clone());
+                if answer.record_type == RECORD_TYPE_PTR { name = alias_of; }
+                continue;
+            }
+
+            if expected_record_type == RECORD_TYPE_A || expected_record_type == RECORD_TYPE_AAAA {
+                if let Some(limit_ttl) = limit_ttl {
+                    if answer.ttl > limit_ttl {
+                        answer.ttl = limit_ttl;
+                    }
+                }
+            }
+
+            let Some(parsed) = T::parse_rr(&answer) else {
+                continue;
+            };
+            success += 1;
+            items.push(parsed);
+        }
+        Ok(ParsedRRs { items, name, aliases, _limit_ttl: limit_ttl, success })
+    }
+}
