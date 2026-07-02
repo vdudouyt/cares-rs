@@ -374,21 +374,6 @@ pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out:
     unsafe { parse_to_clinkedlist::<AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
 }
 
-pub(crate) unsafe fn ares_fn_wrapper<T, F>(out: *mut *mut T, f: F) -> c_int
-where F: FnOnce() -> Result<*mut T, c_int>
-{
-    if out.is_null() {
-        return ARES_ENOMEM;
-    }
-    match f() {
-        Ok(res) => {
-            unsafe { *out = res };
-            ARES_SUCCESS
-        },
-        Err(err) => err,
-    }
-}
-
 /// # Safety
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
@@ -540,17 +525,6 @@ pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
     unsafe { free_hostent(hostent) };
 }
 
-/// Copy `bytes` into a libc::malloc'd buffer with a trailing NUL, so the caller
-/// frees it with ares_free_string (libc::free). Returns null on allocation failure.
-pub(crate) unsafe fn malloc_cstr(bytes: &[u8]) -> *mut c_char {
-    let len = bytes.len();
-    let p = libc::malloc(len + 1) as *mut u8;
-    if p.is_null() { return std::ptr::null_mut(); }
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len);
-    *p.add(len) = 0; // NUL terminator
-    p as *mut c_char
-}
-
 /// # Safety
 /// `s` must be NULL or a pointer previously returned by this library.
 #[no_mangle]
@@ -565,10 +539,7 @@ pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_inet_pton(af: c_int, src: *const c_char, dst: *mut c_void) -> c_int {
-    let s = match unsafe { CStr::from_ptr(src) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+    let Some(s) = (unsafe { cstr_opt(src) }) else { return 0 };
     match af {
         libc::AF_INET => {
             let Ok(addr) = s.parse::<std::net::Ipv4Addr>() else { return 0 };
@@ -712,10 +683,7 @@ pub unsafe extern "C" fn ares_create_query(
     if buf.is_null() || buflen.is_null() {
         return ARES_EFORMERR;
     }
-    let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return ARES_EBADNAME,
-    };
+    let Some(name_str) = (unsafe { cstr_opt(name) }) else { return ARES_EBADNAME };
 
     // Check if trailing dot is an unescaped separator (not a literal escaped dot)
     let has_unescaped_trailing_dot = if let Some(prefix) = name_str.strip_suffix('.') {

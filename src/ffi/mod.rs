@@ -32,11 +32,13 @@ use crate::core::hostfile::{AddressFamily, HostLookup};
 use std::io::Cursor;
 
 mod addrinfo;
+mod convert;
 mod channel;
 mod lookups;
 mod parsers;
 mod process;
 pub use addrinfo::*;
+pub(crate) use convert::*;
 pub use channel::*;
 pub use lookups::*;
 pub use parsers::*;

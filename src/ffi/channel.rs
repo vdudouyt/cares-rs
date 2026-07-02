@@ -267,10 +267,7 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
         channeldata.server_last_failure.clear();
         return ARES_SUCCESS;
     }
-    let s = match CStr::from_ptr(servers).to_str() {
-        Ok(s) => s,
-        Err(_) => return ARES_EBADSTR,
-    };
+    let Some(s) = cstr_opt(servers) else { return ARES_EBADSTR };
     if s.is_empty() {
         channeldata.ares.config.nameservers.clear();
         channeldata.ares.config.tcp_ports.clear();
@@ -411,10 +408,7 @@ pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_c
         channeldata.sortlist.clear();
         return ARES_SUCCESS;
     }
-    let s = match unsafe { CStr::from_ptr(sortstr) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return ARES_EBADSTR,
-    };
+    let Some(s) = (unsafe { cstr_opt(sortstr) }) else { return ARES_EBADSTR };
     match parse_sortlist(s) {
         Ok(entries) => {
             channeldata.sortlist = entries;

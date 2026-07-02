@@ -185,7 +185,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         return;
     }
     let channeldata = unsafe { &mut *channel };
-    let hostname = unsafe { CStr::from_ptr(hostname).to_str().unwrap_or("") };
+    let hostname = unsafe { cstr_lossy(hostname) };
 
     // Reject non-ASCII names
     if !hostname.is_ascii() {
@@ -391,7 +391,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
     if channel.is_null() { return ARES_ENOTFOUND; }
     let channeldata = unsafe { &mut *channel };
-    let name_str = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
+    let name_str = unsafe { cstr_lossy(name) };
 
     // Convert C family constant to our Family enum
     let family_filter = match family {
@@ -473,7 +473,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
 #[no_mangle]
 pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    let name_str = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
+    let name_str = unsafe { cstr_lossy(name) };
     if name_str.is_empty() {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut(), 0) };
         return;
@@ -558,7 +558,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut(), 0) };
         return;
     }
-    let name = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
+    let name = unsafe { cstr_lossy(name) };
     let ffidata = FFIData { callback: Callback::AresCallback(callback), arg, family: 0, expected_record_type: 0, ip: None, nameinfo_flags: 0, port: 0, scope_id: 0, server_index: 0, timeouts: 0 };
     if channeldata.ares.enqueue(dns_query_payload(name, dnstype as u16), SocketSource::Udp, 0, ffidata).is_err() {
         unsafe { callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), 0) };
@@ -584,7 +584,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
         unsafe { callback(arg, ARES_ENOSERVER, 0, std::ptr::null_mut()) };
         return;
     }
-    let name = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
+    let name = unsafe { cstr_lossy(name) };
     let name_clean = name.strip_suffix('.').unwrap_or(name);
 
     // Check query cache
@@ -631,7 +631,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
         dns_record::ares_dns_record_query_get(dnsrec, 0, &mut name_ptr, &mut qtype, &mut qclass);
     }
     if name_ptr.is_null() { return; }
-    let name_str = CStr::from_ptr(name_ptr).to_str().unwrap_or("");
+    let name_str = cstr_lossy(name_ptr);
 
     if name_str.is_empty() {
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
@@ -814,48 +814,6 @@ pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: c_int) -> 
             }
         }
         IpAddr::V4(_) => ip.to_string(),
-    }
-}
-
-/// Extracted address info from sockaddr
-pub(crate) struct AddrInfo {
-    ip: IpAddr,
-    port: u16,
-    family: c_int,
-    scope_id: u32, // Only meaningful for IPv6
-}
-
-/// Extract IP address and port from a sockaddr structure
-pub(crate) fn extract_addr_port(sa: *const libc::sockaddr, salen: libc::socklen_t) -> Result<AddrInfo, c_int> {
-    if sa.is_null() {
-        return Err(ARES_ENOMEM);
-    }
-
-    let family = unsafe { (*sa).sa_family as c_int };
-
-    match family {
-        libc::AF_INET => {
-            if (salen as usize) < std::mem::size_of::<libc::sockaddr_in>() {
-                return Err(ARES_ENOMEM);
-            }
-            let sa_in = sa as *const libc::sockaddr_in;
-            let addr_bytes = unsafe { (*sa_in).sin_addr.s_addr.to_ne_bytes() };
-            let ip = IpAddr::from(addr_bytes);
-            let port = unsafe { u16::from_be((*sa_in).sin_port) };
-            Ok(AddrInfo { ip, port, family: libc::AF_INET, scope_id: 0 })
-        }
-        libc::AF_INET6 => {
-            if (salen as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
-                return Err(ARES_ENOMEM);
-            }
-            let sa_in6 = sa as *const libc::sockaddr_in6;
-            let addr_bytes = unsafe { (*sa_in6).sin6_addr.s6_addr };
-            let ip = IpAddr::from(addr_bytes);
-            let port = unsafe { u16::from_be((*sa_in6).sin6_port) };
-            let scope_id = unsafe { (*sa_in6).sin6_scope_id };
-            Ok(AddrInfo { ip, port, family: libc::AF_INET6, scope_id })
-        }
-        _ => Err(ARES_ENOTIMP),
     }
 }
 
@@ -1484,7 +1442,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 
     // Resolve service name to port number
     let port: u16 = if !service.is_null() {
-        let svc = CStr::from_ptr(service).to_str().unwrap_or("");
+        let svc = cstr_lossy(service);
         if let Ok(p) = svc.parse::<u16>() {
             p
         } else {
@@ -1514,7 +1472,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
         0
     };
 
-    let hostname_raw = unsafe { CStr::from_ptr(name).to_str().unwrap_or("") };
+    let hostname_raw = unsafe { cstr_lossy(name) };
     let had_trailing_dot = hostname_raw.ends_with('.');
     let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
 
