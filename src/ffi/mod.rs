@@ -16,7 +16,7 @@ use std::cmp::min;
 use std::time::Instant;
 use bytes::BytesMut;
 use crate::core::packets::*;
-use crate::core::ares::{ Ares, Status, Family, WriteResult, SocketSource, DnsSocket, dns_query_payload, qtype_of, rdns_name };
+use crate::core::ares::{ Ares, Status, Family, WriteResult, SocketSource, DnsSocket, dns_query_payload, qtype_of };
 use crate::core::servers_csv;
 use crate::core::services::Services;
 use crate::ffi::ares_hostent::*;

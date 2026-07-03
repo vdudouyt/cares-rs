@@ -3,8 +3,10 @@
 //! everything that talks to raw pointers or the C ABI lives under `src/ffi/`.
 #![forbid(unsafe_code)]
 
+pub mod api;
 pub mod ares;
 pub mod channel;
+pub mod launch;
 pub mod lookup;
 pub mod transport;
 pub mod packets;

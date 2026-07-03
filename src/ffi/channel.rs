@@ -104,16 +104,15 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
     unsafe { libc::FD_ZERO(write_fds) };
     unsafe { libc::FD_ZERO(read_fds) };
 
-    let mut nfds = 0;
-    for (fd, wants_write) in channeldata.state.poll_fds() {
-        if wants_write {
-            unsafe { libc::FD_SET(fd, write_fds) };
+    let fds = channeldata.state.poll_fds();
+    for (fd, wants_write) in &fds {
+        if *wants_write {
+            unsafe { libc::FD_SET(*fd, write_fds) };
         } else {
-            unsafe { libc::FD_SET(fd, read_fds) };
+            unsafe { libc::FD_SET(*fd, read_fds) };
         }
-        if nfds <= fd { nfds = fd + 1 }
     }
-    nfds
+    crate::core::api::nfds(&fds)
 }
 
 #[no_mangle]
@@ -124,21 +123,21 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
         return std::ptr::null_mut();
     }
     let channeldata = unsafe { &mut *channel };
-    let Some(max_wait_time) = channeldata.state.timeout_millis() else {
-        if maxtv.is_null() { return std::ptr::null_mut(); }
-        return maxtv;
-    };
-    unsafe {
-        (*tv).tv_sec = (max_wait_time / 1000) as i64;
-        (*tv).tv_usec = 1000 * (max_wait_time % 1000) as i64;
-    };
-    if !maxtv.is_null() {
-        let maxtv_ms = unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 };
-        if maxtv_ms < max_wait_time {
-            return maxtv;
+    let maxtv_ms = (!maxtv.is_null())
+        .then(|| unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 });
+    match crate::core::api::clamp_timeout(channeldata.state.timeout_millis(), maxtv_ms) {
+        crate::core::api::TimeoutChoice::NoTasks => {
+            if maxtv.is_null() { return std::ptr::null_mut(); }
+            maxtv
+        }
+        crate::core::api::TimeoutChoice::Wait { ms, use_max } => {
+            unsafe {
+                (*tv).tv_sec = (ms / 1000) as i64;
+                (*tv).tv_usec = 1000 * (ms % 1000) as i64;
+            };
+            if use_max { maxtv } else { tv }
         }
     }
-    tv
 }
 
 #[no_mangle]

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::core::channel::{cache_reply, tcp_payload};
+use crate::core::launch::reissue;
 
 
 
@@ -128,13 +129,9 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                         let new_ffidata = task.userdata.retarget(next_server, task.userdata.timeouts);
                         let is_tcp = task.sock.is_tcp();
                         // Strip the TCP length prefix; enqueue re-frames for the new transport.
-                        let payload = tcp_payload(&task.writebuf, is_tcp);
-                        let issued = channeldata.state.ares.enqueue(BytesMut::from(payload), SocketSource::fresh(is_tcp), next_server, new_ffidata).is_ok();
-                        if issued {
-                            let fd = channeldata.state.ares.tasks.last().unwrap().sock.as_raw_fd();
-                            let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                            invoke_sock_callbacks(channeldata, fd, sock_type);
-                        } else {
+                        let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
+                        let mut consent = sock_consent(channeldata);
+                        if !reissue(&mut channeldata.state, payload, SocketSource::fresh(is_tcp), next_server, new_ffidata, 0, &mut consent) {
                             // Retry socket couldn't be created — deliver the error.
                             task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                         }
@@ -144,10 +141,8 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                     TaskVerdict::RetryTcp => {
                         let si = task.userdata.server_index;
                         let new_ffidata = task.userdata.retarget(si, task.userdata.timeouts);
-                        if channeldata.state.ares.enqueue(task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata).is_ok() {
-                            let fd = channeldata.state.ares.tasks.last().unwrap().sock.as_raw_fd();
-                            invoke_sock_callbacks(channeldata, fd, libc::SOCK_STREAM);
-                        } else {
+                        let mut consent = sock_consent(channeldata);
+                        if !reissue(&mut channeldata.state, task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata, 0, &mut consent) {
                             task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                         }
                         task.status = Status::Completed;
@@ -183,17 +178,9 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                 let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
                 let new_ffidata = task.userdata.retarget(si, task.userdata.timeouts + 1);
                 task.status = Status::Completed;
-                // Create new task via ares methods
-                let issued = channeldata.state.ares.enqueue(payload, SocketSource::fresh(is_tcp), si, new_ffidata).is_ok();
-                if issued {
-                    // Set tries_remaining on the new task
-                    if let Some(new_task) = channeldata.state.ares.tasks.last_mut() {
-                        new_task.tries_remaining = task.tries_remaining;
-                    }
-                    let fd = channeldata.state.ares.tasks.last().unwrap().sock.as_raw_fd();
-                    let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
-                    invoke_sock_callbacks(channeldata, fd, sock_type);
-                } else {
+                let mut consent = sock_consent(channeldata);
+                // The retry task inherits this task's expiry count.
+                if !reissue(&mut channeldata.state, payload, SocketSource::fresh(is_tcp), si, new_ffidata, task.tries_remaining, &mut consent) {
                     // Retry socket couldn't be created — deliver the error.
                     task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
                 }
@@ -226,6 +213,27 @@ pub(crate) fn invoke_sock_callbacks(channeldata: &ChannelData, fd: c_int, sock_t
         if ret != 0 { return false; }
     }
     true
+}
+
+/// The channel's socket callbacks as a core-consumable consent closure: it
+/// captures only the Copy fn pointers + args, so it stays valid while
+/// `channeldata.state` is mutably borrowed inside a core launch/retry call.
+/// Must never capture a RefCell borrow (core runs it mid-launch).
+pub(crate) fn sock_consent(channeldata: &ChannelData) -> impl FnMut(i32, bool) -> bool {
+    let create = channeldata.sock_create_callback;
+    let create_arg = channeldata.sock_create_callback_arg;
+    let config = channeldata.sock_config_callback;
+    let config_arg = channeldata.sock_config_callback_arg;
+    move |fd, is_tcp| {
+        let sock_type = if is_tcp { libc::SOCK_STREAM } else { libc::SOCK_DGRAM };
+        if let Some(cb) = create {
+            if unsafe { cb(fd, sock_type, create_arg) } != 0 { return false; }
+        }
+        if let Some(cb) = config {
+            if unsafe { cb(fd, sock_type, config_arg) } != 0 { return false; }
+        }
+        true
+    }
 }
 
 pub(crate) fn invoke_server_state_callback(channeldata: &ChannelData, server_index: usize, success: bool, is_tcp: bool) {
