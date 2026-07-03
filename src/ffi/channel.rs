@@ -29,8 +29,8 @@ pub struct ChannelData {
     pub(crate) query_cache: std::collections::HashMap<(String, u16), (Vec<u8>, Instant)>,
     pub(crate) query_cache_max_ttl: u32, // 0 = disabled
     pub(crate) udp_max_queries: u32, // 0 = unlimited
-    pub(crate) udp_connections: Vec<(usize, std::rc::Rc<crate::ffi::ares_socket::UdpSocket>, u32)>, // (server_index, shared_socket, query_count)
-    pub(crate) tcp_connections: Vec<(usize, std::rc::Rc<crate::ffi::ares_socket::TcpSocket>)>, // (server_index, shared_socket)
+    pub(crate) udp_connections: Vec<(usize, std::rc::Rc<dyn crate::core::transport::Transport>, u32)>, // (server_index, shared_socket, query_count)
+    pub(crate) tcp_connections: Vec<(usize, std::rc::Rc<dyn crate::core::transport::Transport>)>, // (server_index, shared_socket)
     pub(crate) tcp_recv_buffers: std::collections::HashMap<i32, Vec<u8>>, // fd -> accumulated TCP receive data
     pub(crate) server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub(crate) server_failover_retry_delay: u64,  // milliseconds
@@ -39,7 +39,7 @@ pub struct ChannelData {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
-    let channeldata = new_channel_data(Ares::from_sysconfig());
+    let channeldata = new_channel_data(Ares::from_sysconfig(std::rc::Rc::new(SocketFactory::default())));
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS

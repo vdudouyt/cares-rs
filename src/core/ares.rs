@@ -7,8 +7,7 @@ use std::rc::Rc;
 use crate::core::sysconfig::SysConfig;
 use crate::core::hostfile::Hosts;
 use crate::core::services::Services;
-use crate::ffi::SocketFactory;
-use crate::ffi::ares_socket;
+use crate::core::transport::{Transport, TransportFactory};
 
 const BIND_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 const BIND_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
@@ -16,7 +15,7 @@ const BIND_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIE
 /* TODO: reconcile ChannelData here */
 pub struct Ares<T> {
     pub config: SysConfig,
-    pub socket_factory: Rc<SocketFactory>,
+    pub socket_factory: Rc<dyn TransportFactory>,
     pub tasks: Vec<Task<T>>,
     hosts: Option<Hosts>,
     services: Option<Services>,
@@ -28,12 +27,12 @@ pub struct Ares<T> {
 pub enum Family { Ipv4, Ipv6 }
 
 pub enum DnsSocket {
-    Udp(Rc<ares_socket::UdpSocket>),
-    Tcp(Rc<ares_socket::TcpSocket>),
+    Udp(Rc<dyn Transport>),
+    Tcp(Rc<dyn Transport>),
 }
 
 impl DnsSocket {
-    pub fn as_raw_fd(&self) -> std::ffi::c_int {
+    pub fn as_raw_fd(&self) -> i32 {
         match self { Self::Udp(s) => s.as_raw_fd(), Self::Tcp(s) => s.as_raw_fd() }
     }
     pub fn connect(&self, addr: SocketAddr) -> std::io::Result<()> {
@@ -117,10 +116,10 @@ pub enum WriteResult {
 }
 
 impl<T> Ares<T> {
-    pub fn new(config: SysConfig) -> Self {
+    pub fn new(config: SysConfig, transports: Rc<dyn TransportFactory>) -> Self {
         Ares {
             config,
-            socket_factory: Rc::new(SocketFactory::default()),
+            socket_factory: transports,
             tasks: vec![],
             hosts: None,
             services: None,
@@ -128,8 +127,8 @@ impl<T> Ares<T> {
             default_tcp_port: 53,
         }
     }
-    pub fn from_sysconfig() -> Self {
-        Ares::new(build_sysconfig())
+    pub fn from_sysconfig(transports: Rc<dyn TransportFactory>) -> Self {
+        Ares::new(build_sysconfig(), transports)
     }
     pub fn hosts(&mut self) -> &Hosts {
         self.hosts.get_or_insert_with(|| Hosts::from_path("/etc/hosts").unwrap_or_default())
@@ -172,9 +171,9 @@ impl<T> Ares<T> {
     fn make_socket(&self, is_tcp: bool, server_index: usize) -> std::io::Result<DnsSocket> {
         let bind = self.bind_addr_for_server(server_index);
         Ok(if is_tcp {
-            DnsSocket::Tcp(Rc::new(self.socket_factory.create_tcp(bind)?))
+            DnsSocket::Tcp(self.socket_factory.create_tcp(bind)?)
         } else {
-            DnsSocket::Udp(Rc::new(self.socket_factory.create_udp(bind)?))
+            DnsSocket::Udp(self.socket_factory.create_udp(bind)?)
         })
     }
     /// Connect a freshly-created TCP socket to the given server's address.
@@ -293,13 +292,12 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg_attr(miri, ignore = "enqueue() creates a real UDP socket (libc::socket); Miri can't run syscalls")]
     fn write_impl_stale_server_index_fails_gracefully() {
         // Issue a query (pushes a task bound to server 0), then shrink the server
         // list out from under the in-flight task — write_impl must fail gracefully
         // (WriteResult::Failed) rather than index nameservers out of bounds.
         let config = "nameserver 1.1.1.1\n".parse::<SysConfig>().unwrap();
-        let mut ares: Ares<()> = Ares::new(config);
+        let mut ares: Ares<()> = Ares::new(config, Rc::new(crate::core::transport::mock::MockFactory));
         ares.enqueue(dns_query_payload("example.com", qtype_of(Family::Ipv4)), SocketSource::Udp, 0, ()).unwrap();
         let mut task = ares.tasks.pop().expect("a task was pushed");
         ares.config.nameservers.clear(); // server list shrank under the in-flight task

@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
 use crate::ffi::kernels::options::{apply_options, new_channel_data, saved_options, DecodedOptions};
+use crate::ffi::ares_socket::SocketFactory;
 use crate::ares_socket_t;
 
 #[repr(C)]
@@ -184,7 +185,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         failover_retry_delay: options.server_failover_opts.retry_delay as u64,
     };
 
-    let mut channeldata = new_channel_data(Ares::from_sysconfig());
+    let mut channeldata = new_channel_data(Ares::from_sysconfig(std::rc::Rc::new(SocketFactory::default())));
     apply_options(&mut channeldata, optmask, decoded);
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };

@@ -5,6 +5,7 @@
 
 pub mod ares;
 pub mod lookup;
+pub mod transport;
 pub mod packets;
 pub mod query_builder;
 pub mod response;

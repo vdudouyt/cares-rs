@@ -14,8 +14,7 @@ use crate::ffi::channel::ChannelData;
 /// a fresh reactor state (empty query cache, no pooled connections, cleared
 /// failure timestamps).
 pub(crate) fn dup_channel(src: &ChannelData) -> ChannelData {
-    let mut ares = Ares::new(src.ares.config.clone());
-    ares.socket_factory = src.ares.socket_factory.clone();
+    let mut ares = Ares::new(src.ares.config.clone(), src.ares.socket_factory.clone());
     ares.default_udp_port = src.ares.default_udp_port;
     ares.default_tcp_port = src.ares.default_tcp_port;
     ChannelData {

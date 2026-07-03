@@ -148,7 +148,9 @@ fn raw_to_socket_addr(storage: &libc::sockaddr_storage, len: socklen_t) -> Optio
     }
 }
 
-// SocketFactory impl
+/// The channel's socket source: the (user-replaceable) C function table.
+/// Implements the core `TransportFactory` trait, so the engine never sees
+/// the table or the user_data pointer.
 pub struct SocketFactory {
     funcs: AresSocketFunctions,
     user_data: *mut c_void,
@@ -160,98 +162,25 @@ impl Default for SocketFactory {
     }
 }
 
-pub struct UdpSocket {
+/// One socket created from a snapshot of the factory's function table. The
+/// snapshot (instead of a factory back-reference) keeps a replaced table
+/// alive for sockets that outlive an ares_set_socket_functions() swap —
+/// the same semantics the old per-socket Rc<SocketFactory> provided.
+struct CSocket {
     fd: ares_socket_t,
-    factory: Rc<SocketFactory>,
+    funcs: AresSocketFunctions,
+    user_data: *mut c_void,
 }
 
-impl UdpSocket {
-    pub fn as_raw_fd(&self) -> ares_socket_t {
+impl crate::core::transport::Transport for CSocket {
+    fn as_raw_fd(&self) -> i32 {
         self.fd
     }
 
-    pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        self.factory.aconnect(self.fd, addr)
-    }
-
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
-        self.factory.arecvfrom(self.fd, buf)
-    }
-
-    pub fn send(&self, data: &[u8]) -> io::Result<usize> {
-        self.factory.asendv(self.fd, &[data])
-    }
-}
-
-impl Drop for UdpSocket {
-    fn drop(&mut self) {
-        self.factory.aclose(self.fd);
-    }
-}
-
-pub struct TcpSocket {
-    fd: ares_socket_t,
-    factory: Rc<SocketFactory>,
-}
-
-impl TcpSocket {
-    pub fn as_raw_fd(&self) -> ares_socket_t {
-        self.fd
-    }
-
-    pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        self.factory.aconnect(self.fd, addr)
-    }
-
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
-        self.factory.arecvfrom(self.fd, buf)
-    }
-
-    pub fn send(&self, data: &[u8]) -> io::Result<usize> {
-        self.factory.asendv(self.fd, &[data])
-    }
-}
-
-impl Drop for TcpSocket {
-    fn drop(&mut self) {
-        self.factory.aclose(self.fd);
-    }
-}
-
-impl SocketFactory {
-    pub fn new(funcs: AresSocketFunctions, user_data: *mut c_void) -> Rc<Self> {
-        Rc::new(Self { funcs, user_data })
-    }
-
-    pub fn create_udp(self: &Rc<Self>, addr: SocketAddr) -> io::Result<UdpSocket> {
-        let domain = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
-        let asocket = self.funcs.asocket.unwrap_or(default_asocket);
-        let fd = unsafe { asocket(domain, SOCK_DGRAM, 0, self.user_data) };
-        if fd == ARES_SOCKET_BAD {
-            return Err(Error::last_os_error());
-        }
-        Ok(UdpSocket { fd, factory: Rc::clone(self) })
-    }
-
-    pub fn create_tcp(self: &Rc<Self>, addr: SocketAddr) -> io::Result<TcpSocket> {
-        let domain = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
-        let asocket = self.funcs.asocket.unwrap_or(default_asocket);
-        let fd = unsafe { asocket(domain, SOCK_STREAM, 0, self.user_data) };
-        if fd == ARES_SOCKET_BAD {
-            return Err(Error::last_os_error());
-        }
-        Ok(TcpSocket { fd, factory: Rc::clone(self) })
-    }
-
-    fn aclose(&self, fd: ares_socket_t) -> c_int {
-        let aclose = self.funcs.aclose.unwrap_or(default_aclose);
-        unsafe { aclose(fd, self.user_data) }
-    }
-
-    fn aconnect(&self, fd: ares_socket_t, addr: SocketAddr) -> io::Result<()> {
+    fn connect(&self, addr: SocketAddr) -> io::Result<()> {
         let aconnect = self.funcs.aconnect.unwrap_or(default_aconnect);
         let (sockaddr, len) = socket_addr_to_raw(addr);
-        let result = unsafe { aconnect(fd, &sockaddr as *const _ as *const sockaddr, len, self.user_data) };
+        let result = unsafe { aconnect(self.fd, &sockaddr as *const _ as *const sockaddr, len, self.user_data) };
         if result == -1 {
             let err = Error::last_os_error();
             if err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EINPROGRESS) {
@@ -262,12 +191,12 @@ impl SocketFactory {
         Ok(())
     }
 
-    fn arecvfrom(&self, fd: ares_socket_t, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+    fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
         let arecvfrom = self.funcs.arecvfrom.unwrap_or(default_arecvfrom);
         let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as socklen_t;
         let result = unsafe {
-            arecvfrom(fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0, &mut addr as *mut _ as *mut sockaddr, &mut addrlen, self.user_data)
+            arecvfrom(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0, &mut addr as *mut _ as *mut sockaddr, &mut addrlen, self.user_data)
         };
         if result == -1 {
             return Err(Error::last_os_error());
@@ -276,17 +205,46 @@ impl SocketFactory {
         Ok((result as usize, sock_addr))
     }
 
-    fn asendv(&self, fd: ares_socket_t, bufs: &[&[u8]]) -> io::Result<usize> {
+    fn send(&self, data: &[u8]) -> io::Result<usize> {
         let asendv = self.funcs.asendv.unwrap_or(default_asendv);
-        assert!(bufs.len() <= 4, "asendv: more than 4 buffers not supported");
-        let mut iovecs = [iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 4];
-        for (i, b) in bufs.iter().enumerate() {
-            iovecs[i] = iovec { iov_base: b.as_ptr() as *mut c_void, iov_len: b.len() };
-        }
-        let result = unsafe { asendv(fd, iovecs.as_ptr(), bufs.len() as c_int, self.user_data) };
+        let iovecs = [iovec { iov_base: data.as_ptr() as *mut c_void, iov_len: data.len() }];
+        let result = unsafe { asendv(self.fd, iovecs.as_ptr(), 1, self.user_data) };
         if result == -1 {
             return Err(Error::last_os_error());
         }
         Ok(result as usize)
+    }
+}
+
+impl Drop for CSocket {
+    fn drop(&mut self) {
+        let aclose = self.funcs.aclose.unwrap_or(default_aclose);
+        unsafe { aclose(self.fd, self.user_data) };
+    }
+}
+
+impl SocketFactory {
+    pub fn new(funcs: AresSocketFunctions, user_data: *mut c_void) -> Rc<Self> {
+        Rc::new(Self { funcs, user_data })
+    }
+
+    fn create(&self, addr: SocketAddr, socket_type: c_int) -> io::Result<Rc<dyn crate::core::transport::Transport>> {
+        let domain = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
+        let asocket = self.funcs.asocket.unwrap_or(default_asocket);
+        let fd = unsafe { asocket(domain, socket_type, 0, self.user_data) };
+        if fd == ARES_SOCKET_BAD {
+            return Err(Error::last_os_error());
+        }
+        Ok(Rc::new(CSocket { fd, funcs: self.funcs.clone(), user_data: self.user_data }))
+    }
+}
+
+impl crate::core::transport::TransportFactory for SocketFactory {
+    fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::core::transport::Transport>> {
+        self.create(bind, SOCK_DGRAM)
+    }
+
+    fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::core::transport::Transport>> {
+        self.create(bind, SOCK_STREAM)
     }
 }
