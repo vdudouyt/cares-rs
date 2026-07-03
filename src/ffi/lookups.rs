@@ -6,13 +6,8 @@ use std::rc::Rc;
 
 use super::*;
 use crate::core::api;
-use crate::core::channel::cache_store_names;
-use crate::core::launch::{
-    drive_addrinfo, launch_pooled, AddrInfoDelivery, AddrInfoSeed, HostTaskSeed, LaunchOutcome,
-};
-use crate::core::preflight::{
-    format_ip_with_scope, get_service_string, hosts_file_lookup, service_to_port, ServicePort,
-};
+use crate::core::launch::{drive_addrinfo, AddrInfoDelivery, AddrInfoSeed, HostTaskSeed};
+use crate::core::preflight::{assemble_nameinfo, hosts_file_lookup, service_to_port, ServicePort};
 
 
 /// The Copy delivery tail of an ares_gethostbyname lookup: where results go
@@ -489,100 +484,28 @@ pub(crate) fn run_ares_callback_dnsrec(res: Result<&[u8], c_int>, callback: Ares
 }
 
 pub(crate) fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: AresNameinfoCallback, ffidata: &FFIData) {
-    let services = Services::default();
-
-    let want_service = (ffidata.nameinfo_flags & ARES_NI_LOOKUPSERVICE) != 0;
-
-    let hostname_result = (|| -> Result<CString, c_int> {
-        let buf = res?;
-        let parsed = ParsedResponse::from_buf(buf)?;
-        let ptr_records = parsed.process_answers::<CString>(buf, RECORD_TYPE_PTR)?;
-
-        if ptr_records.aliases.is_empty() {
-            return Err(ARES_ENOTFOUND);
-        }
-
-        let mut name = ptr_records.name;
-
-        if ffidata.nameinfo_flags & ARES_NI_NOFQDN != 0 {
-            let name_str = name.to_string_lossy();
-            if let Some(dot_pos) = name_str.find('.') {
-                name = CString::new(&name_str[..dot_pos]).map_err(|_| ARES_EBADSTR)?;
-            }
-        }
-
-        Ok(name)
-    })();
-
-    let (status, hostname) = match hostname_result {
-        Ok(name) => (ARES_SUCCESS, Some(name)),
-        Err(err) => {
-            if err == ARES_ENOTFOUND && (ffidata.nameinfo_flags & ARES_NI_NAMEREQD) == 0 {
-                let ip_str = format_ip_with_scope(&ffidata.ip.unwrap(), ffidata.scope_id, ffidata.nameinfo_flags);
-                match CString::new(ip_str) {
-                    Ok(name) => (ARES_SUCCESS, Some(name)),
-                    Err(_) => {
-                        unsafe { callback(ffidata.arg, ARES_EBADSTR, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-                        return;
-                    }
-                }
-            } else {
-                unsafe { callback(ffidata.arg, err, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-                return;
-            }
-        }
-    };
-
-    let service = if want_service {
-        get_service_string(&services, ffidata.port, ffidata.nameinfo_flags)
-    } else {
-        None
-    };
-
-    let hostname_ptr = hostname.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
-    let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
-    unsafe { callback(ffidata.arg, status, ffidata.timeouts, hostname_ptr, service_ptr) };
+    let reply = assemble_nameinfo(
+        res, ffidata.ip.unwrap(), ffidata.scope_id, ffidata.port,
+        ffidata.nameinfo_flags, ffidata.timeouts,
+    );
+    let node_ptr = reply.node.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
+    let service_ptr = reply.service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
+    unsafe { callback(ffidata.arg, reply.status, reply.timeouts, node_ptr, service_ptr) };
 }
 
-/// Issue the next search-domain query for an `ares_search`. On socket-creation
-/// failure, deliver ARES_ECONNREFUSED to the user and free the search state
-/// (rather than panicking or leaking).
-/// Re-issue a search query for the next name in the plan. On socket-creation
-/// failure, deliver ECONNREFUSED directly (the lookup's remaining Rcs drop
-/// naturally — no manual free).
-pub(crate) fn issue_search_query(channeldata: &mut ChannelData, hostname: &str, sm: Rc<RefCell<SearchSm>>, tail: SearchTail, timeouts: c_int) {
-    let new_ffidata = FFIData { timeouts, ..FFIData::base(Callback::Search(sm, tail)) };
-    if channeldata.state.ares.enqueue(dns_query_payload(hostname, tail.dnstype), SocketSource::Udp, 0, new_ffidata).is_err() {
-        match tail.delivery {
-            SearchDelivery::Raw { callback, arg } => unsafe {
-                callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut(), 0);
-            },
-            SearchDelivery::DnsRec { callback, arg } => unsafe {
-                callback(arg, ARES_ECONNREFUSED, 0, std::ptr::null_mut());
-            },
-        }
-    }
-}
-
-/// Executor for the search state machine: feed the event to `SearchSm::step`
-/// (borrow held for the decision only), then perform the returned action —
-/// re-issue the query or call the C callback — with all borrows dropped.
+/// Executor for a settled search task: one core call decides (and performs
+/// any re-issue); the marshal here only fires the returned delivery.
 pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, sm: &Rc<RefCell<SearchSm>>, tail: SearchTail, ffidata: &FFIData, channeldata: &mut ChannelData) {
-    let ev = match res {
-        Ok(buf) => LookupEvent::Reply(buf),
-        Err(status) => LookupEvent::Error(status),
-    };
-    let action = sm.borrow_mut().step(ev);
-    match action {
-        SearchAction::Send(next_name) => {
-            issue_search_query(channeldata, &next_name, sm.clone(), tail, ffidata.timeouts);
-        }
-        SearchAction::DeliverSuccess => {
-            let buf = res.unwrap_or(&[]); // DeliverSuccess is only emitted for Ok replies
+    let timeouts = ffidata.timeouts;
+    let mut make_userdata = |sm: Rc<RefCell<SearchSm>>| FFIData { timeouts, ..FFIData::base(Callback::Search(sm, tail)) };
+    match api::on_search_reply(&mut channeldata.state, sm, res, tail.dnstype, ffidata.timeouts, &mut make_userdata) {
+        None => {}
+        Some(api::SearchReplyDelivery::Success { timeouts }) => {
+            let buf = res.unwrap_or(&[]); // Success is only emitted for Ok replies
             match tail.delivery {
                 SearchDelivery::Raw { callback, arg } => {
                     let buf_copy = buf.to_vec();
-                    unsafe { callback(arg, ARES_SUCCESS, ffidata.timeouts, buf_copy.as_ptr() as *mut u8, buf_copy.len() as c_int) };
+                    unsafe { callback(arg, ARES_SUCCESS, timeouts, buf_copy.as_ptr() as *mut u8, buf_copy.len() as c_int) };
                 }
                 SearchDelivery::DnsRec { callback, arg } => {
                     // Parse and deliver as dns record
@@ -590,100 +513,47 @@ pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, sm: &Rc<RefCel
                     let parse_status = unsafe { dns_record::ares_dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec) };
                     if parse_status == ARES_SUCCESS {
                         unsafe {
-                            callback(arg, ARES_SUCCESS, ffidata.timeouts as usize, dnsrec);
+                            callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec);
                             dns_record::ares_dns_record_destroy(dnsrec);
                         }
                     } else {
-                        unsafe { callback(arg, parse_status, ffidata.timeouts as usize, std::ptr::null_mut()) };
+                        unsafe { callback(arg, parse_status, timeouts as usize, std::ptr::null_mut()) };
                     }
                 }
             }
         }
-        SearchAction::DeliverFail(status) => match tail.delivery {
+        Some(api::SearchReplyDelivery::Fail { status, timeouts }) => match tail.delivery {
             SearchDelivery::Raw { callback, arg } => unsafe {
-                callback(arg, status, ffidata.timeouts, std::ptr::null_mut(), 0);
+                callback(arg, status, timeouts, std::ptr::null_mut(), 0);
             },
             SearchDelivery::DnsRec { callback, arg } => unsafe {
-                callback(arg, status, ffidata.timeouts as usize, std::ptr::null_mut());
+                callback(arg, status, timeouts as usize, std::ptr::null_mut());
             },
         },
     }
 }
 
-/// Executor for the gethostbyname state machine: parse the reply (parsing and
-/// hostent building stay ffi-side), feed the event to `HostByNameSm::step`
-/// (borrow held for the decision only), then perform the returned actions.
+/// Executor for a settled gethostbyname task: one core call parses, steps
+/// the machine, re-sends and cache-stores; the marshal here builds hostents
+/// and fires the C callbacks in the returned order.
 pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, sm: &Rc<RefCell<HostByNameSm>>, tail: HostTail, ffidata: &FFIData, channeldata: &mut ChannelData) {
-    // Parse outside the machine; the machine sees only the outcome.
-    let mut parsed_items: Option<ParsedRRs<AddrRecord>> = None;
-    let ev = match res {
-        Ok(buf) => {
-            let expected_rtype = sm.borrow().expected_rtype;
-            let parse = (|| -> Result<ParsedRRs<AddrRecord>, c_int> {
-                let response = ParsedResponse::from_buf(buf)?;
-                let parsed_rrs = response.process_answers::<AddrRecord>(buf, expected_rtype)?;
-                if parsed_rrs.items.is_empty() {
-                    return Err(ARES_ENODATA);
-                }
-                Ok(parsed_rrs)
-            })();
-            let outcome = match parse {
-                Ok(rrs) => {
-                    parsed_items = Some(rrs);
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            };
-            HostEvent::Reply {
-                truncated: is_truncated(buf),
-                parse: outcome,
-                io_timeouts: ffidata.timeouts,
-                server: ffidata.server_index,
-            }
-        }
-        Err(status) => HostEvent::Error { status },
-    };
-
-    let actions = {
-        let cfg = LookupCfg {
-            attempts: channeldata.state.ares.config.options.attempts,
-            ndots: channeldata.state.ares.config.options.ndots,
-            search: &channeldata.state.ares.config.search,
-        };
-        let mut machine = sm.borrow_mut();
-        machine.step(ev, &cfg, &mut channeldata.state.server_health)
-    };
-
-    for action in actions {
-        match action {
-            HostAction::Send { name, family, rtype, tcp, server } => {
-                let mut consent = sock_consent(channeldata);
-                let mut make_userdata = host_userdata(tail);
-                if let LaunchOutcome::Exhausted { timeouts } = launch_pooled(&mut channeldata.state, &name, family, rtype, tcp, server, sm, &mut make_userdata, &mut consent) {
-                    unsafe { (tail.callback)(tail.arg, ARES_ECONNREFUSED, timeouts, std::ptr::null_mut()) };
-                }
-            }
-            HostAction::NotifyServerFail { server, tcp } => {
+    let mut consent = sock_consent(channeldata);
+    let mut make_userdata = host_userdata(tail);
+    let deliveries = api::on_hostbyname_reply(
+        &mut channeldata.state, sm, res, ffidata.server_index, ffidata.timeouts,
+        Instant::now(), &mut make_userdata, &mut consent,
+    );
+    for delivery in deliveries {
+        match delivery {
+            api::HostDelivery::NotifyServerFail { server, tcp } => {
                 invoke_server_state_callback(channeldata, server, false, tcp);
             }
-            HostAction::CacheStore { names, rtype } => {
-                if channeldata.state.query_cache_max_ttl > 0 {
-                    if let (Ok(buf), Some(rrs)) = (&res, &parsed_items) {
-                        let ttl = rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-                        cache_store_names(&mut channeldata.state.query_cache, channeldata.state.query_cache_max_ttl, names, rtype, ttl, buf, Instant::now());
-                    }
-                }
-            }
-            HostAction::DeliverSuccess { family, timeouts } => {
-                let Some(mut rrs) = parsed_items.take() else { continue };
-                if !channeldata.state.sortlist.is_empty() {
-                    apply_sortlist(&channeldata.state.sortlist, &mut rrs.items);
-                }
+            api::HostDelivery::Success { rrs, family, timeouts } => {
                 let hostent = unsafe { rrs.into_raw_hostent(family) };
                 unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, timeouts, hostent) };
                 unsafe { ares_free_hostent(hostent) };
             }
-            HostAction::DeliverFail { status, timeouts } => {
+            api::HostDelivery::Fail { status, timeouts } => {
                 unsafe { (tail.callback)(tail.arg, status, timeouts, std::ptr::null_mut()) };
             }
         }
@@ -773,29 +643,12 @@ fn fire_addrinfo_deliveries(deliveries: Vec<AddrInfoDelivery>, tail: AddrInfoTai
     }
 }
 
-/// Callback for server failover probe queries — updates server state, no user callback.
+/// Callback for server failover probe queries — the rcode→health verdict is
+/// core's; only the server-state notification fires here.
 pub(crate) fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: &mut ChannelData, ffidata: &FFIData) {
     let si = ffidata.server_index;
-    match res {
-        Ok(buf) => {
-            // Check DNS rcode
-            let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0xff };
-            if rcode == 0 || rcode == 3 {
-                // Success or NXDOMAIN — server is alive, reset failure state
-                if channeldata.state.server_health.record_success(si) {
-                    invoke_server_state_callback(channeldata, si, true, false);
-                }
-            } else {
-                // SERVFAIL/NOTIMP/REFUSED — still failing
-                if channeldata.state.server_health.record_failure(si) {
-                    invoke_server_state_callback(channeldata, si, false, false);
-                }
-            }
-        }
-        Err(_) => {
-            // Timeout or other error — update failure timestamp
-            channeldata.state.server_health.record_failure_time(si);
-        }
+    if let Some(ok) = api::on_probe_reply(res, si, &mut channeldata.state.server_health) {
+        invoke_server_state_callback(channeldata, si, ok, false);
     }
 }
 

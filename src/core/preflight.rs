@@ -16,14 +16,82 @@ use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::sortlist::apply_sortlist;
 use crate::core::channel::ChannelState;
 use crate::ffi::error::{
-    ARES_EBADNAME, ARES_EFILE, ARES_ENODATA, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP,
+    ARES_EBADNAME, ARES_EBADSTR, ARES_EFILE, ARES_ENODATA, ARES_ENOSERVER, ARES_ENOTFOUND,
+    ARES_ENOTIMP, ARES_SUCCESS,
 };
 use crate::ffi::error::ARES_EBADFLAGS;
 use crate::ffi::{
-    ARES_NI_DGRAM, ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD,
+    ARES_NI_DGRAM, ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NOFQDN,
     ARES_NI_NUMERICHOST, ARES_NI_NUMERICSCOPE, ARES_NI_NUMERICSERV, RECORD_TYPE_A,
-    RECORD_TYPE_AAAA,
+    RECORD_TYPE_AAAA, RECORD_TYPE_PTR,
 };
+
+/// Everything getnameinfo's PTR delivery needs, assembled per the NI flag
+/// semantics: NOFQDN truncation, the ENOTFOUND+!NAMEREQD numeric fallback,
+/// and the LOOKUPSERVICE gate. Error deliveries carry zero timeouts (as
+/// historically); success carries the task's accumulated count.
+pub(crate) struct NameinfoReply {
+    pub status: i32,
+    pub node: Option<CString>,
+    pub service: Option<CString>,
+    pub timeouts: i32,
+}
+
+pub(crate) fn assemble_nameinfo(
+    res: Result<&[u8], i32>,
+    ip: IpAddr,
+    scope_id: u32,
+    port: u16,
+    flags: i32,
+    io_timeouts: i32,
+) -> NameinfoReply {
+    let services = Services::default();
+    let want_service = (flags & ARES_NI_LOOKUPSERVICE) != 0;
+
+    let hostname_result = (|| -> Result<CString, i32> {
+        let buf = res?;
+        let parsed = ParsedResponse::from_buf(buf)?;
+        let ptr_records = parsed.process_answers::<CString>(buf, RECORD_TYPE_PTR)?;
+
+        if ptr_records.aliases.is_empty() {
+            return Err(ARES_ENOTFOUND);
+        }
+
+        let mut name = ptr_records.name;
+
+        if flags & ARES_NI_NOFQDN != 0 {
+            let name_str = name.to_string_lossy();
+            if let Some(dot_pos) = name_str.find('.') {
+                name = CString::new(&name_str[..dot_pos]).map_err(|_| ARES_EBADSTR)?;
+            }
+        }
+
+        Ok(name)
+    })();
+
+    let (status, node) = match hostname_result {
+        Ok(name) => (ARES_SUCCESS, Some(name)),
+        Err(err) => {
+            if err == ARES_ENOTFOUND && (flags & ARES_NI_NAMEREQD) == 0 {
+                let ip_str = format_ip_with_scope(&ip, scope_id, flags);
+                match CString::new(ip_str) {
+                    Ok(name) => (ARES_SUCCESS, Some(name)),
+                    Err(_) => return NameinfoReply { status: ARES_EBADSTR, node: None, service: None, timeouts: 0 },
+                }
+            } else {
+                return NameinfoReply { status: err, node: None, service: None, timeouts: 0 };
+            }
+        }
+    };
+
+    let service = if want_service {
+        get_service_string(&services, port, flags)
+    } else {
+        None
+    };
+
+    NameinfoReply { status, node, service, timeouts: io_timeouts }
+}
 
 /// How a getaddrinfo service string resolves to a port.
 pub(crate) enum ServicePort {

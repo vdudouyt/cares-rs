@@ -352,6 +352,14 @@ impl<T> ChannelState<T> {
         self.tcp_connections.retain(|(_, rc)| Rc::strong_count(rc) > 1);
     }
 
+    /// Store a dnsrec-flavored reply in the query cache (no-op when the
+    /// cache is disabled) — the reactor's post-delivery hook.
+    pub fn cache_dnsrec_reply(&mut self, buf: &[u8], now: Instant) {
+        if self.query_cache_max_ttl > 0 {
+            cache_reply(&mut self.query_cache, self.query_cache_max_ttl, buf, now);
+        }
+    }
+
     /// Drop every pooled connection and TCP reassembly buffer (ares_cancel).
     pub fn clear_pools(&mut self) {
         self.udp_connections.clear();

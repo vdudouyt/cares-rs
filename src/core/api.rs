@@ -24,14 +24,20 @@ use crate::core::launch::{
     drive_addrinfo, issue, issue_consented, launch_pooled, maybe_launch_probe, AddrInfoDelivery,
     AddrInfoSeed, Consent, HostTaskSeed, LaunchOutcome,
 };
-use crate::core::lookup::SearchSm;
+use crate::core::channel::cache_store_names;
+use crate::core::lookup::{
+    is_truncated, HostAction, HostByNameSm, HostEvent, LookupCfg, LookupEvent, SearchAction,
+    SearchSm, ServerHealth,
+};
 use crate::core::packets::AddrRecord;
 use crate::core::preflight::{
     cached_reply, getaddrinfo_preflight, gethostbyaddr_preflight, gethostbyname_preflight,
     getnameinfo_preflight, no_servers, search_start, AddrInfo, AddrInfoPreflight, AddrPreflight,
     HostPreflight, NameinfoPreflight,
 };
-use crate::core::response::ParsedRRs;
+use crate::core::response::{ParsedRRs, ParsedResponse};
+use crate::core::sortlist::apply_sortlist;
+use crate::ffi::error::ARES_ENODATA;
 use crate::ffi::error::{ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_ENOSERVER};
 use crate::ffi::RECORD_TYPE_PTR;
 
@@ -278,6 +284,159 @@ pub(crate) fn getaddrinfo<T>(
 /// ares_search's shim-side pre-check, re-exported so the shim's single
 /// entry-ordering exception reads from the api layer.
 pub(crate) use crate::core::preflight::search_name_check as search_precheck;
+
+/// One C-side effect a settled gethostbyname task owes its owner, in firing
+/// order relative to the other deliveries.
+pub(crate) enum HostDelivery {
+    NotifyServerFail { server: usize, tcp: bool },
+    /// Sortlist already applied; build a hostent for `family` and deliver.
+    Success { rrs: ParsedRRs<AddrRecord>, family: i32, timeouts: i32 },
+    Fail { status: i32, timeouts: i32 },
+}
+
+/// A gethostbyname task settled (reply or error): parse, feed the machine,
+/// perform its re-sends (pooled launch) and cache stores, apply the
+/// sortlist, and return what the shim must deliver to C.
+#[allow(clippy::too_many_arguments)] // reply-executor seam: userdata factory + consent ride along
+pub(crate) fn on_hostbyname_reply<T>(
+    st: &mut ChannelState<T>,
+    sm: &Rc<RefCell<HostByNameSm>>,
+    res: Result<&[u8], i32>,
+    server: usize,
+    io_timeouts: i32,
+    now: Instant,
+    make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
+    consent: Consent<'_>,
+) -> Vec<HostDelivery> {
+    // Parse outside the machine; the machine sees only the outcome.
+    let mut parsed_items: Option<ParsedRRs<AddrRecord>> = None;
+    let ev = match res {
+        Ok(buf) => {
+            let expected_rtype = sm.borrow().expected_rtype;
+            let parse = (|| -> Result<ParsedRRs<AddrRecord>, i32> {
+                let response = ParsedResponse::from_buf(buf)?;
+                let parsed_rrs = response.process_answers::<AddrRecord>(buf, expected_rtype)?;
+                if parsed_rrs.items.is_empty() {
+                    return Err(ARES_ENODATA);
+                }
+                Ok(parsed_rrs)
+            })();
+            let outcome = match parse {
+                Ok(rrs) => {
+                    parsed_items = Some(rrs);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            HostEvent::Reply { truncated: is_truncated(buf), parse: outcome, io_timeouts, server }
+        }
+        Err(status) => HostEvent::Error { status },
+    };
+
+    let actions = {
+        let cfg = LookupCfg {
+            attempts: st.ares.config.options.attempts,
+            ndots: st.ares.config.options.ndots,
+            search: &st.ares.config.search,
+        };
+        let mut machine = sm.borrow_mut();
+        machine.step(ev, &cfg, &mut st.server_health)
+    };
+
+    let mut deliveries = Vec::new();
+    for action in actions {
+        match action {
+            HostAction::Send { name, family, rtype, tcp, server } => {
+                if let LaunchOutcome::Exhausted { timeouts } =
+                    launch_pooled(st, &name, family, rtype, tcp, server, sm, make_userdata, consent)
+                {
+                    deliveries.push(HostDelivery::Fail { status: ARES_ECONNREFUSED, timeouts });
+                }
+            }
+            HostAction::NotifyServerFail { server, tcp } => {
+                deliveries.push(HostDelivery::NotifyServerFail { server, tcp });
+            }
+            HostAction::CacheStore { names, rtype } => {
+                if st.query_cache_max_ttl > 0 {
+                    if let (Ok(buf), Some(rrs)) = (&res, &parsed_items) {
+                        let ttl = rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
+                        cache_store_names(&mut st.query_cache, st.query_cache_max_ttl, names, rtype, ttl, buf, now);
+                    }
+                }
+            }
+            HostAction::DeliverSuccess { family, timeouts } => {
+                let Some(mut rrs) = parsed_items.take() else { continue };
+                if !st.sortlist.is_empty() {
+                    apply_sortlist(&st.sortlist, &mut rrs.items);
+                }
+                deliveries.push(HostDelivery::Success { rrs, family, timeouts });
+            }
+            HostAction::DeliverFail { status, timeouts } => {
+                deliveries.push(HostDelivery::Fail { status, timeouts });
+            }
+        }
+    }
+    deliveries
+}
+
+/// What a settled search task owes its C callback (None: a follow-up query
+/// went out and the lookup is still in flight).
+pub(crate) enum SearchReplyDelivery {
+    /// Deliver the (raw or parsed) reply buffer with SUCCESS.
+    Success { timeouts: i32 },
+    Fail { status: i32, timeouts: i32 },
+}
+
+/// A search task settled: feed the machine, re-issue the next plan name if
+/// asked (a failed re-issue reports ECONNREFUSED with zero timeouts, as
+/// historically), or hand the delivery back to the shim.
+pub(crate) fn on_search_reply<T>(
+    st: &mut ChannelState<T>,
+    sm: &Rc<RefCell<SearchSm>>,
+    res: Result<&[u8], i32>,
+    dnstype: u16,
+    io_timeouts: i32,
+    make_userdata: &mut dyn FnMut(Rc<RefCell<SearchSm>>) -> T,
+) -> Option<SearchReplyDelivery> {
+    let ev = match res {
+        Ok(buf) => LookupEvent::Reply(buf),
+        Err(status) => LookupEvent::Error(status),
+    };
+    let action = sm.borrow_mut().step(ev);
+    match action {
+        SearchAction::Send(next_name) => {
+            let userdata = make_userdata(sm.clone());
+            match issue(st, dns_query_payload(&next_name, dnstype), SocketSource::Udp, 0, userdata) {
+                Ok(_) => None,
+                Err(()) => Some(SearchReplyDelivery::Fail { status: ARES_ECONNREFUSED, timeouts: 0 }),
+            }
+        }
+        SearchAction::DeliverSuccess => Some(SearchReplyDelivery::Success { timeouts: io_timeouts }),
+        SearchAction::DeliverFail(status) => Some(SearchReplyDelivery::Fail { status, timeouts: io_timeouts }),
+    }
+}
+
+/// A probe task settled: fold the reply's rcode into the server-health
+/// accounting. Some(ok) asks the shim to fire the server-state callback.
+pub(crate) fn on_probe_reply(res: Result<&[u8], i32>, server: usize, health: &mut ServerHealth) -> Option<bool> {
+    match res {
+        Ok(buf) => {
+            let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0xff };
+            if rcode == 0 || rcode == 3 {
+                // Success or NXDOMAIN — the server is alive again.
+                health.record_success(server).then_some(true)
+            } else {
+                // SERVFAIL/NOTIMP/REFUSED — still failing.
+                health.record_failure(server).then_some(false)
+            }
+        }
+        Err(_) => {
+            // Timeout or other error — update the failure timestamp only.
+            health.record_failure_time(server);
+            None
+        }
+    }
+}
 
 /// ares_timeout's clamp decision: nothing pending → report via maxtv;
 /// otherwise write `ms` into tv and return whichever of tv/maxtv is sooner.

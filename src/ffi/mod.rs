@@ -16,9 +16,8 @@ use std::cmp::min;
 use std::time::Instant;
 use bytes::BytesMut;
 use crate::core::packets::*;
-use crate::core::ares::{ Ares, Status, WriteResult, SocketSource, dns_query_payload };
+use crate::core::ares::{ Ares, Status, WriteResult, SocketSource };
 use crate::core::servers_csv;
-use crate::core::services::Services;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::*;
 // Re-export the address union (a field type of the public ares_addr_node /

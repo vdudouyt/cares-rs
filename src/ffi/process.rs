@@ -2,8 +2,8 @@
 //! state notification callbacks it fires.
 
 use super::*;
-use crate::core::channel::{cache_reply, tcp_payload};
-use crate::core::launch::reissue;
+use crate::core::channel::tcp_payload;
+use crate::core::launch::{read_tcp_frame, reissue, timeout_step};
 
 
 
@@ -69,21 +69,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
         if fd_readable || has_tcp_buffered {
             // For TCP shared connections: use per-fd recv buffer with framing
             let read_result = if task.sock.is_tcp() {
-                let msg_data: Option<Vec<u8>> = {
-                    let rbuf = channeldata.state.tcp_recv_buffers.entry(fd).or_default();
-                    if fd_readable {
-                        let mut tmp = [0u8; 65535];
-                        match task.sock.recv(&mut tmp) {
-                            Ok((n, _)) if n > 0 => rbuf.extend_from_slice(&tmp[..n]),
-                            _ => {},
-                        }
-                    }
-                    let msg = extract_tcp_frame(rbuf);
-                    if msg.is_some() {
-                        task.status = Status::Completed;
-                    }
-                    msg
-                };
+                let msg_data = read_tcp_frame(&mut channeldata.state.tcp_recv_buffers, task, fd_readable);
                 if let Some(ref msg) = msg_data {
                     readbuf[..msg.len()].copy_from_slice(msg);
                     Some((0, msg.len()))
@@ -151,8 +137,8 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                     TaskVerdict::Deliver => {}
                 }
                 // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
-                if channeldata.state.query_cache_max_ttl > 0 && task.userdata.callback.wants_dnsrec_cache() {
-                    cache_reply(&mut channeldata.state.query_cache, channeldata.state.query_cache_max_ttl, buf, Instant::now());
+                if task.userdata.callback.wants_dnsrec_cache() {
+                    channeldata.state.cache_dnsrec_reply(buf, Instant::now());
                 }
                 (task.userdata.callback).run(Ok(buf), &task.userdata, channeldata);
             }
@@ -169,10 +155,9 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
     let mut tasks = std::mem::take(&mut channeldata.state.ares.tasks);
     for task in &mut tasks {
         if task.is_expired() && task.status != Status::Completed {
-            task.tries_remaining += 1;
             // Invoke server_state_callback with failure for timeout
             invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp());
-            let timeout_verdict = on_timeout(task.tries_remaining, max_tries, task.userdata.server_index, &mut channeldata.state.server_health);
+            let timeout_verdict = timeout_step(task, max_tries, task.userdata.server_index, &mut channeldata.state.server_health);
             if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
                 let is_tcp = task.sock.is_tcp();
                 let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
