@@ -159,3 +159,58 @@ impl<'a> ParsedResponse<'a> {
         Ok(ParsedRRs { items, name, aliases, _limit_ttl: limit_ttl, success })
     }
 }
+
+/// What an address-record reply must contain to count as an answer — the
+/// three historical acceptance rules of the hostent-producing paths.
+pub enum ReplyRequire {
+    /// gethostbyname's forward path: at least one address record.
+    Items,
+    /// The legacy a/aaaa/ns parsers: records or aliases.
+    ItemsOrAliases,
+    /// PTR replies: at least one name.
+    Aliases,
+}
+
+/// Parse an address-record reply and apply the acceptance rule (ENODATA
+/// when it fails) — the shared front half of every hostent producer.
+pub fn addr_reply(buf: &[u8], expected_rtype: u16, require: ReplyRequire) -> Result<ParsedRRs<crate::core::packets::AddrRecord>, i32> {
+    let res = ParsedResponse::from_buf(buf)?;
+    let rrs = res.process_answers::<crate::core::packets::AddrRecord>(buf, expected_rtype)?;
+    let ok = match require {
+        ReplyRequire::Items => !rrs.items.is_empty(),
+        ReplyRequire::ItemsOrAliases => !(rrs.items.is_empty() && rrs.aliases.is_empty()),
+        ReplyRequire::Aliases => !rrs.aliases.is_empty(),
+    };
+    if !ok {
+        return Err(ARES_ENODATA);
+    }
+    Ok(rrs)
+}
+
+/// PTR flows report the queried address itself as a zero-TTL record
+/// alongside the resolved names (both the async and the legacy parser path).
+pub fn push_synthetic_ptr(rrs: &mut ParsedRRs<crate::core::packets::AddrRecord>, ip: std::net::IpAddr) {
+    rrs.items.push(crate::core::packets::AddrRecord { ip, ttl: 0 });
+}
+
+/// The TXT-ext answer set: per-answer chunk lists flattened in order, plus
+/// how many RRs of the type parsed (the empty-chain status depends on it).
+#[allow(clippy::type_complexity)]
+pub fn txt_ext_items(buf: &[u8]) -> Result<(Vec<crate::core::packets::TxtReplyExt<'_>>, usize), i32> {
+    let res = ParsedResponse::from_buf(buf)?;
+    let rrs = res.process_answers::<Vec<crate::core::packets::TxtReplyExt>>(buf, crate::ffi::RECORD_TYPE_TXT)?;
+    Ok((rrs.items.into_iter().flatten().collect(), rrs.success))
+}
+
+/// A reply whose typed chain came out empty still parsed: report success if
+/// at least one RR of the type was seen, EBADRESP otherwise (the linked-list
+/// parsers' shared tail rule).
+pub fn empty_chain_status(success: usize) -> i32 {
+    if success > 0 { crate::ffi::error::ARES_SUCCESS } else { ARES_EBADRESP }
+}
+
+/// ares_parse_soa_reply reports a missing SOA as EBADRESP where the generic
+/// machinery says ENODATA.
+pub fn soa_status(status: i32) -> i32 {
+    if status == ARES_ENODATA { ARES_EBADRESP } else { status }
+}

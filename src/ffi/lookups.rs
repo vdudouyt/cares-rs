@@ -7,7 +7,7 @@ use std::rc::Rc;
 use super::*;
 use crate::core::api;
 use crate::core::launch::{drive_addrinfo, AddrInfoDelivery, AddrInfoSeed, HostTaskSeed};
-use crate::core::preflight::{assemble_nameinfo, hosts_file_lookup, service_to_port, ServicePort};
+use crate::core::preflight::{assemble_nameinfo, service_to_port, ServicePort};
 
 
 /// The Copy delivery tail of an ares_gethostbyname lookup: where results go
@@ -202,13 +202,8 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         api::HostStart::Deliver(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
-        api::HostStart::DeliverHost(lookup) => {
-            let hostent = unsafe { hostent_from_lookup(lookup) };
-            unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-            unsafe { ares_free_hostent(hostent) };
-        }
-        api::HostStart::DeliverParsed(parsed_rrs, hostent_family) => {
-            let hostent = unsafe { parsed_rrs.into_raw_hostent(hostent_family) };
+        api::HostStart::DeliverHostent(bp) => {
+            let hostent = unsafe { build_hostent(bp) };
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
             unsafe { ares_free_hostent(hostent) };
         }
@@ -224,9 +219,9 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
     let channeldata = unsafe { &mut *channel };
     let name_str = unsafe { cstr_lossy(name) };
 
-    match hosts_file_lookup(&mut channeldata.state, name_str, family) {
-        Ok(lookup) => {
-            unsafe { *host = hostent_from_lookup(lookup) };
+    match api::gethostbyname_file(&mut channeldata.state, name_str, family) {
+        Ok(bp) => {
+            unsafe { *host = build_hostent(bp) };
             ARES_SUCCESS
         }
         Err(status) => {
@@ -258,8 +253,8 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         api::HostByAddrStart::Deliver(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
-        api::HostByAddrStart::DeliverHost(lookup) => {
-            let hostent = unsafe { hostent_from_lookup(lookup) };
+        api::HostByAddrStart::DeliverHostent(bp) => {
+            let hostent = unsafe { build_hostent(bp) };
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
             unsafe { ares_free_hostent(hostent) };
         }
@@ -435,24 +430,9 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 
 
 pub(crate) fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHostCallback, ffidata: &FFIData) {
-    let res = (|| {
-        let buf = res?;
-        let res = ParsedResponse::from_buf(buf)?;
-        let mut addr_records = res.process_answers::<AddrRecord>(buf, ffidata.expected_record_type as u16)?;
-        if ffidata.expected_record_type as u16 == RECORD_TYPE_PTR {
-            if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
-                return Err(ARES_ENODATA);
-            }
-        } else if addr_records.items.is_empty() {
-            return Err(ARES_ENODATA);
-        }
-        if ffidata.expected_record_type as u16 == RECORD_TYPE_PTR {
-            addr_records.items.push(AddrRecord { ip: ffidata.ip.unwrap(), ttl: 0 });
-        }
-        Ok(unsafe { addr_records.into_raw_hostent(ffidata.family) })
-    })();
-    match res {
-        Ok(raw_hostent) => {
+    match api::on_host_reply(res, ffidata.expected_record_type as u16, ffidata.family, ffidata.ip) {
+        Ok(bp) => {
+            let raw_hostent = unsafe { build_hostent(bp) };
             unsafe { callback(ffidata.arg, ARES_SUCCESS, ffidata.timeouts, &mut *raw_hostent) };
             unsafe { ares_free_hostent(raw_hostent) };
         },
@@ -548,8 +528,8 @@ pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, sm: &Rc<Re
             api::HostDelivery::NotifyServerFail { server, tcp } => {
                 invoke_server_state_callback(channeldata, server, false, tcp);
             }
-            api::HostDelivery::Success { rrs, family, timeouts } => {
-                let hostent = unsafe { rrs.into_raw_hostent(family) };
+            api::HostDelivery::Success { hostent, timeouts } => {
+                let hostent = unsafe { build_hostent(hostent) };
                 unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, timeouts, hostent) };
                 unsafe { ares_free_hostent(hostent) };
             }

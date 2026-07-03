@@ -227,6 +227,19 @@ impl<'a> DnsLabel<'a> {
         }
         Some(result)
     }
+    /// `build_string` as a C string; None when the name has an embedded NUL.
+    pub fn build_cstring(&self, main_buf: &[u8]) -> Option<std::ffi::CString> {
+        std::ffi::CString::new(self.build_string(main_buf)?).ok()
+    }
+}
+
+/// Names-as-records (PTR/NS targets) parse into C strings directly.
+impl RRParser<'_> for std::ffi::CString {
+    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<std::ffi::CString> {
+        let mut buf = SliceBuf::new(answer.data);
+        let name = DnsLabel::parse(&mut buf)?;
+        name.build_cstring(answer.data)
+    }
 }
 
 /// Join DNS labels with '.', escaping any '.' or '\\' characters within individual labels.

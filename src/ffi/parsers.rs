@@ -4,8 +4,12 @@
 use super::*;
 
 
+/// A caller-array slot for one (address, ttl) pair; the wanted family and
+/// the C field writes per flavor. Filtering/ordering is core's
+/// (hostent::addrttl_fill) — this only transcribes.
 pub(crate) trait AddrTTL {
-    fn set_addr_ttl(&mut self, ip: &IpAddr, ttl: u32) -> Option<()>;
+    const WANT_V4: bool;
+    fn write(&mut self, ip: &IpAddr, ttl: u32);
 }
 
 #[repr(C)]
@@ -15,11 +19,12 @@ pub struct ares_addrttl {
 }
 
 impl AddrTTL for ares_addrttl {
-    fn set_addr_ttl(&mut self, ip: &IpAddr, ttl: u32) -> Option<()> {
-        let IpAddr::V4(ipv4) = ip else { return None };
-        self.ipaddr = libc::in_addr { s_addr: u32::from_ne_bytes(ipv4.octets()) };
-        self.ttl = ttl as c_int;
-        Some(())
+    const WANT_V4: bool = true;
+    fn write(&mut self, ip: &IpAddr, ttl: u32) {
+        if let IpAddr::V4(ipv4) = ip {
+            self.ipaddr = libc::in_addr { s_addr: u32::from_ne_bytes(ipv4.octets()) };
+            self.ttl = ttl as c_int;
+        }
     }
 }
 
@@ -30,78 +35,47 @@ pub struct ares_addr6ttl {
 }
 
 impl AddrTTL for ares_addr6ttl {
-    fn set_addr_ttl(&mut self, ip: &IpAddr, ttl: u32) -> Option<()> {
-        let IpAddr::V6(ipv6) = ip else { return None };
-        self.ip6addr = ares_in6_addr::from_octets(ipv6.octets());
-        self.ttl = ttl as c_int;
-        Some(())
+    const WANT_V4: bool = false;
+    fn write(&mut self, ip: &IpAddr, ttl: u32) {
+        if let IpAddr::V6(ipv6) = ip {
+            self.ip6addr = ares_in6_addr::from_octets(ipv6.octets());
+            self.ttl = ttl as c_int;
+        }
     }
-}
-
-pub(crate) unsafe fn hostent_from_lookup(lookup: HostLookup) -> *mut libc::hostent {
-    // Determine h_addrtype and h_length from the first address
-    let (h_addrtype, h_length) = match lookup.addrs[0] {
-        IpAddr::V4(_) => (libc::AF_INET, 4),
-        IpAddr::V6(_) => (libc::AF_INET6, 16),
-    };
-
-    // Build address list
-    let addrlist: Vec<*mut i8> = iplist_to_raw(&lookup.addrs, h_length);
-
-    // Build aliases list
-    let aliases: Vec<*mut i8> = lookup
-        .aliases
-        .into_iter()
-        .filter_map(|s| CString::new(s).ok().map(|c| c.into_raw())) // drop NUL-containing aliases
-        .collect();
-
-    let hostent = libc::hostent {
-        h_name: CString::new(lookup.canonical).unwrap_or_default().into_raw(),
-        h_aliases: unsafe { cnullterminated::from_vec(aliases) },
-        h_addrtype,
-        h_length: h_length as c_int,
-        h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
-    };
-
-    Box::into_raw(Box::new(hostent))
 }
 
 pub use crate::core::response::{ParsedRRs, ParsedResponse};
+use crate::core::hostent::{addrttl_fill, HostentBlueprint};
 use crate::core::query_builder::build_query;
-use crate::core::response::{expand_name_at, expand_string_at};
+use crate::core::response::{
+    addr_reply, empty_chain_status, expand_name_at, expand_string_at, push_synthetic_ptr,
+    soa_status, txt_ext_items, ReplyRequire,
+};
 use crate::ffi::convert::malloc_bytes;
 
-
-impl ParsedRRs<AddrRecord> {
-    pub(crate) unsafe fn into_raw_hostent(self, family: c_int) -> *mut libc::hostent {
-        let length = match family {
-            libc::AF_INET => 4,
-            libc::AF_INET6 => 16,
-            _ => 0,
-        };
-        let mut addrlist: Vec<*mut i8> = Vec::with_capacity(self.items.len());
-        for record in &self.items {
-            let raw: Box<[u8]> = match record.ip {
-                IpAddr::V4(v4) if length == 4 => Box::new(v4.octets()),
-                IpAddr::V6(v6) if length == 16 => Box::new(v6.octets()),
-                _ => continue,
+/// Build the C hostent graph from a core blueprint — pure transcription:
+/// every inclusion/ordering/family decision was already made in core.
+pub(crate) unsafe fn build_hostent(bp: HostentBlueprint) -> *mut libc::hostent {
+    let addrlist: Vec<*mut i8> = bp
+        .addrs
+        .iter()
+        .map(|ip| {
+            let raw: Box<[u8]> = match ip {
+                IpAddr::V4(v4) => Box::new(v4.octets()),
+                IpAddr::V6(v6) => Box::new(v6.octets()),
             };
-            addrlist.push(Box::into_raw(raw) as *mut i8);
-        }
-        let mut aliases: Vec<*mut i8> = Vec::with_capacity(self.aliases.len());
-        for a in self.aliases {
-            aliases.push(a.into_raw());
-        }
-        let hostent = libc::hostent {
-            h_name: self.name.into_raw(),
-            h_aliases: unsafe { cnullterminated::from_vec(aliases) },
-            h_addrtype: family,
-            h_length: length as c_int,
-            h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
-        };
-
-        Box::into_raw(Box::new(hostent))
-    }
+            Box::into_raw(raw) as *mut i8
+        })
+        .collect();
+    let aliases: Vec<*mut i8> = bp.aliases.into_iter().map(|c| c.into_raw()).collect();
+    let hostent = libc::hostent {
+        h_name: bp.name.into_raw(),
+        h_aliases: unsafe { cnullterminated::from_vec(aliases) },
+        h_addrtype: bp.addrtype,
+        h_length: bp.length as c_int,
+        h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
+    };
+    Box::into_raw(Box::new(hostent))
 }
 
 
@@ -127,19 +101,10 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
         return ARES_EBADRESP;
     }
     let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let res = match ParsedResponse::from_buf(buf) {
-        Ok(res) => res,
+    let (answers, parsed_count) = match txt_ext_items(buf) {
+        Ok(parts) => parts,
         Err(err) => return err,
     };
-
-    let parsed_rrs = match res.process_answers::<Vec<TxtReplyExt>>(buf, RECORD_TYPE_TXT) {
-        Ok(res) => res,
-        Err(err) => return err,
-    };
-
-    let answers = parsed_rrs.items;
-    let parsed_count = parsed_rrs.success;
-    let answers: Vec<_> = answers.into_iter().flatten().collect();
     let Some(aresreplies) = answers.into_iter().map(|x| x.into_ares_data(buf)).collect::<Option<Vec<_>>>() else {
         unsafe { *out = std::ptr::null_mut() };
         return ARES_EBADRESP;
@@ -147,7 +112,7 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
 
     let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
         unsafe { *out = std::ptr::null_mut() };
-        return if parsed_count > 0 { ARES_SUCCESS } else { ARES_EBADRESP };
+        return empty_chain_status(parsed_count);
     };
 
     let aresdata: AresData<AresTxtReplyExt> = AresData { data_type: AresTxtReplyExt::datatype(), data: reply };
@@ -226,7 +191,7 @@ where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let (aresreplies, success) = T2::parse_buf_to_clinkedlist_parts(buf, expected_record_type)?;
         let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
-            return Err(if success > 0 { ARES_SUCCESS } else { ARES_EBADRESP });
+            return Err(empty_chain_status(success));
         };
 
         let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
@@ -264,45 +229,11 @@ pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out:
     unsafe { parse_to_clinkedlist::<AresUriReply>(abuf, alen, out, RECORD_TYPE_URI) }
 }
 
-impl DnsLabel<'_> {
-    pub fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
-        CString::new(self.build_string(main_buf)?).ok()
-    }
-}
-
-
 /// # Safety
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
     unsafe { parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0) }
-}
-
-pub(crate) fn iplist_to_raw(addrlist: &[std::net::IpAddr], length: usize) -> Vec<*mut i8> {
-    let mut ret: Vec<*mut i8> = vec![];
-    for addr in addrlist {
-        let t = match addr {
-            IpAddr::V4(v4) => Box::new(v4.octets()) as Box<[u8]>,
-            IpAddr::V6(v6) => Box::new(v6.octets()) as Box<[u8]>,
-        };
-        if t.len() == length {
-            ret.push(Box::into_raw(t) as *mut i8);
-        }
-    }
-    ret
-}
-
-pub(crate) unsafe fn fill_addrttls<T: AddrTTL>(input: &[AddrRecord], addrttls: *mut T, naddrttls: usize) -> usize {
-    let mut i = 0;
-    for addr_record in input.iter() {
-        if i >= naddrttls {
-            break;
-        }
-        if (unsafe { &mut *addrttls.add(i) }).set_addr_ttl(&addr_record.ip, addr_record.ttl).is_some() {
-            i += 1;
-        }
-    }
-    i
 }
 
 pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, out_addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
@@ -311,19 +242,18 @@ pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abu
             return Err(ARES_EBADRESP);
         }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let res = ParsedResponse::from_buf(buf)?;
-        let addr_records = res.process_answers::<AddrRecord>(buf, expected_record_type)?;
-        if addr_records.items.is_empty() && addr_records.aliases.is_empty() {
-            return Err(ARES_ENODATA);
-        }
-        Ok(addr_records)
+        addr_reply(buf, expected_record_type, ReplyRequire::ItemsOrAliases)
     };
     let on_success = |res: ParsedRRs<AddrRecord>| -> c_int {
         if !out_addrttls.is_null() && !out_naddrttls.is_null() {
-            unsafe { *out_naddrttls = fill_addrttls(&res.items, out_addrttls, *out_naddrttls as usize) as c_int; }
+            let pairs = addrttl_fill(&res.items, T::WANT_V4, unsafe { *out_naddrttls } as usize);
+            for (i, (ip, ttl)) in pairs.iter().enumerate() {
+                unsafe { (*out_addrttls.add(i)).write(ip, *ttl) };
+            }
+            unsafe { *out_naddrttls = pairs.len() as c_int };
         }
         if !out.is_null() {
-            unsafe { *out = res.into_raw_hostent(family); }
+            unsafe { *out = build_hostent(HostentBlueprint::from_parsed(res, family)); }
         }
         ARES_SUCCESS
     };
@@ -352,14 +282,6 @@ pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out
     unsafe { parse_to_hostent(RECORD_TYPE_AAAA, abuf, alen, out, addrttls, out_naddrttls, libc::AF_INET6) }
 }
 
-impl RRParser<'_> for CString {
-    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<CString> {
-        let mut buf = SliceBuf::new(answer.data);
-        let name = DnsLabel::parse(&mut buf)?;
-        name.build_cstring(answer.data)
-    }
-}
-
 /// # Safety
 /// `abuf` must be valid for `alen` bytes and `addr` for `addrlen` bytes; `out` must be a valid, writable pointer.
 #[no_mangle]
@@ -369,18 +291,14 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
             return Err(ARES_EBADRESP);
         }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let res = ParsedResponse::from_buf(buf)?;
-        let mut addr_records = res.process_answers::<AddrRecord>(buf, RECORD_TYPE_PTR)?;
-        if addr_records.aliases.is_empty() {
-            return Err(ARES_ENODATA);
-        }
+        let mut addr_records = addr_reply(buf, RECORD_TYPE_PTR, ReplyRequire::Aliases)?;
         if addr.is_null() || addrlen < 0 {
             return Err(ARES_EBADRESP);
         }
         let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
         let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
-        addr_records.items.push(AddrRecord { ip, ttl: 0 });
-        unsafe { Ok(addr_records.into_raw_hostent(family)) }
+        push_synthetic_ptr(&mut addr_records, ip);
+        unsafe { Ok(build_hostent(HostentBlueprint::from_parsed(addr_records, family))) }
     };
     unsafe { ares_fn_wrapper(out, build) }
 }
@@ -389,9 +307,7 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
-    let ret = unsafe { parse_to_singleptr::<AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA) };
-    if ret == ARES_ENODATA { return ARES_EBADRESP; }
-    ret
+    soa_status(unsafe { parse_to_singleptr::<AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA) })
 }
 
 /// # Safety
@@ -537,9 +453,7 @@ pub unsafe extern "C" fn ares_create_query(
     }
     let Some(name_str) = (unsafe { cstr_opt(name) }) else { return ARES_EBADNAME };
 
-    // A non-positive max_udp_size means "no EDNS" (the kernel gates on > 0).
-    let max_udp = if max_udp_size > 0 { max_udp_size as u16 } else { 0 };
-    let packet = match build_query(name_str, dnsclass as u16, qtype as u16, id as u16, rd != 0, max_udp) {
+    let packet = match build_query(name_str, dnsclass as u16, qtype as u16, id as u16, rd != 0, max_udp_size) {
         Ok(p) => p,
         Err(e) => return e,
     };

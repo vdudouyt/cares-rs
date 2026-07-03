@@ -19,12 +19,12 @@ use bytes::BytesMut;
 
 use crate::core::ares::{dns_query_payload, rdns_name, SocketSource};
 use crate::core::channel::ChannelState;
-use crate::core::hostfile::HostLookup;
 use crate::core::launch::{
     drive_addrinfo, issue, issue_consented, launch_pooled, maybe_launch_probe, AddrInfoDelivery,
     AddrInfoSeed, Consent, HostTaskSeed, LaunchOutcome,
 };
 use crate::core::channel::cache_store_names;
+use crate::core::hostent::HostentBlueprint;
 use crate::core::lookup::{
     is_truncated, HostAction, HostByNameSm, HostEvent, LookupCfg, LookupEvent, SearchAction,
     SearchSm, ServerHealth,
@@ -32,12 +32,11 @@ use crate::core::lookup::{
 use crate::core::packets::AddrRecord;
 use crate::core::preflight::{
     cached_reply, getaddrinfo_preflight, gethostbyaddr_preflight, gethostbyname_preflight,
-    getnameinfo_preflight, no_servers, search_start, AddrInfo, AddrInfoPreflight, AddrPreflight,
-    HostPreflight, NameinfoPreflight,
+    getnameinfo_preflight, hosts_file_lookup, no_servers, search_start, AddrInfo,
+    AddrInfoPreflight, AddrPreflight, HostPreflight, NameinfoPreflight,
 };
-use crate::core::response::{ParsedRRs, ParsedResponse};
+use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedRRs, ReplyRequire};
 use crate::core::sortlist::apply_sortlist;
-use crate::ffi::error::ARES_ENODATA;
 use crate::ffi::error::{ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_ENOSERVER};
 use crate::ffi::RECORD_TYPE_PTR;
 
@@ -148,8 +147,13 @@ pub(crate) fn search<T>(
 /// How ares_gethostbyaddr settled before/at send time.
 pub(crate) enum HostByAddrStart {
     Deliver(i32),
-    DeliverHost(HostLookup),
+    DeliverHostent(HostentBlueprint),
     InFlight,
+}
+
+/// ares_gethostbyname_file: the hosts-file-only lookup, shaped for C.
+pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family: i32) -> Result<HostentBlueprint, i32> {
+    hosts_file_lookup(st, name, family).map(HostentBlueprint::from_lookup)
 }
 
 /// ares_gethostbyaddr: preflight (family/length validation, hosts-file
@@ -164,7 +168,9 @@ pub(crate) fn gethostbyaddr<T>(
 ) -> HostByAddrStart {
     let addr = match gethostbyaddr_preflight(st, addrbuf, family) {
         AddrPreflight::Fail(status) => return HostByAddrStart::Deliver(status),
-        AddrPreflight::DeliverHost(lookup) => return HostByAddrStart::DeliverHost(lookup),
+        AddrPreflight::DeliverHost(lookup) => {
+            return HostByAddrStart::DeliverHostent(HostentBlueprint::from_lookup(lookup))
+        }
         AddrPreflight::StartPtr(addr) => addr,
     };
     let userdata = make_userdata(addr);
@@ -213,11 +219,9 @@ pub(crate) fn getnameinfo<T>(
 pub(crate) enum HostStart {
     /// Deliver `status` with a NULL hostent.
     Deliver(i32),
-    /// Synchronous hit (IP literal / hosts file / localhost).
-    DeliverHost(HostLookup),
-    /// Query-cache hit: sortlist already applied; the i32 is the hostent
-    /// address family to emit.
-    DeliverParsed(ParsedRRs<AddrRecord>, i32),
+    /// Synchronous result (IP literal / hosts file / localhost / query
+    /// cache): build the hostent from the blueprint, deliver, free.
+    DeliverHostent(HostentBlueprint),
     InFlight,
 }
 
@@ -235,8 +239,10 @@ pub(crate) fn gethostbyname<T>(
 ) -> HostStart {
     match gethostbyname_preflight(st, hostname, family, now) {
         HostPreflight::Fail(status) => HostStart::Deliver(status),
-        HostPreflight::DeliverHost(lookup) => HostStart::DeliverHost(lookup),
-        HostPreflight::DeliverParsed(rrs, hostent_family) => HostStart::DeliverParsed(rrs, hostent_family),
+        HostPreflight::DeliverHost(lookup) => HostStart::DeliverHostent(HostentBlueprint::from_lookup(lookup)),
+        HostPreflight::DeliverParsed(rrs, hostent_family) => {
+            HostStart::DeliverHostent(HostentBlueprint::from_parsed(rrs, hostent_family))
+        }
         HostPreflight::StartDns { sm, query_hostname, first_server, use_tcp } => {
             let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
             let handle = Rc::new(RefCell::new(sm));
@@ -289,9 +295,23 @@ pub(crate) use crate::core::preflight::search_name_check as search_precheck;
 /// order relative to the other deliveries.
 pub(crate) enum HostDelivery {
     NotifyServerFail { server: usize, tcp: bool },
-    /// Sortlist already applied; build a hostent for `family` and deliver.
-    Success { rrs: ParsedRRs<AddrRecord>, family: i32, timeouts: i32 },
+    /// Sortlist already applied and the hostent shaped; build, deliver, free.
+    Success { hostent: HostentBlueprint, timeouts: i32 },
     Fail { status: i32, timeouts: i32 },
+}
+
+/// The plain host-callback path (ares_gethostbyaddr's direct PTR delivery):
+/// parse under the flow's acceptance rule, add the synthetic record for the
+/// queried address, and shape the hostent.
+pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip: Option<IpAddr>) -> Result<HostentBlueprint, i32> {
+    let buf = res?;
+    let is_ptr = rtype == RECORD_TYPE_PTR;
+    let require = if is_ptr { ReplyRequire::ItemsOrAliases } else { ReplyRequire::Items };
+    let mut rrs = addr_reply(buf, rtype, require)?;
+    if is_ptr {
+        push_synthetic_ptr(&mut rrs, ip.expect("PTR flows carry the queried ip"));
+    }
+    Ok(HostentBlueprint::from_parsed(rrs, family))
 }
 
 /// A gethostbyname task settled (reply or error): parse, feed the machine,
@@ -313,15 +333,7 @@ pub(crate) fn on_hostbyname_reply<T>(
     let ev = match res {
         Ok(buf) => {
             let expected_rtype = sm.borrow().expected_rtype;
-            let parse = (|| -> Result<ParsedRRs<AddrRecord>, i32> {
-                let response = ParsedResponse::from_buf(buf)?;
-                let parsed_rrs = response.process_answers::<AddrRecord>(buf, expected_rtype)?;
-                if parsed_rrs.items.is_empty() {
-                    return Err(ARES_ENODATA);
-                }
-                Ok(parsed_rrs)
-            })();
-            let outcome = match parse {
+            let outcome = match addr_reply(buf, expected_rtype, ReplyRequire::Items) {
                 Ok(rrs) => {
                     parsed_items = Some(rrs);
                     Ok(())
@@ -369,7 +381,7 @@ pub(crate) fn on_hostbyname_reply<T>(
                 if !st.sortlist.is_empty() {
                     apply_sortlist(&st.sortlist, &mut rrs.items);
                 }
-                deliveries.push(HostDelivery::Success { rrs, family, timeouts });
+                deliveries.push(HostDelivery::Success { hostent: HostentBlueprint::from_parsed(rrs, family), timeouts });
             }
             HostAction::DeliverFail { status, timeouts } => {
                 deliveries.push(HostDelivery::Fail { status, timeouts });

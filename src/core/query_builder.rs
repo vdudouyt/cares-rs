@@ -7,16 +7,18 @@ use std::ffi::c_int;
 
 use crate::ffi::error::{ARES_EBADNAME, ARES_ENOTFOUND};
 
-/// Build a DNS query packet for `name_str`. `max_udp_size > 0` appends an
-/// EDNS OPT pseudo-RR advertising that payload size.
+/// Build a DNS query packet for `name_str`. A positive `max_udp_size`
+/// appends an EDNS OPT pseudo-RR advertising that payload size; zero or
+/// negative means "no EDNS" (the historical ares_create_query gate).
 pub fn build_query(
     name_str: &str,
     dnsclass: u16,
     qtype: u16,
     id: u16,
     rd: bool,
-    max_udp_size: u16,
+    max_udp_size: i32,
 ) -> Result<Vec<u8>, c_int> {
+    let max_udp_size: u16 = if max_udp_size > 0 { max_udp_size as u16 } else { 0 };
     // Check if trailing dot is an unescaped separator (not a literal escaped dot)
     let has_unescaped_trailing_dot = if let Some(prefix) = name_str.strip_suffix('.') {
         // Count consecutive backslashes before the trailing dot
