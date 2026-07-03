@@ -5,7 +5,5 @@
 //! C arguments in, call one kernel, and marshal the verdict back out.
 #![forbid(unsafe_code)]
 
-pub(crate) mod channel;
 pub(crate) mod lookups;
-pub(crate) mod options;
 pub(crate) mod process;

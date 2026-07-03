@@ -17,7 +17,7 @@ pub type ares_ssize_t = libc::ssize_t;
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
     if channel.is_null() || funcs.is_null() { return }
     let channeldata = unsafe { &mut *channel };
-    channeldata.ares.socket_factory = SocketFactory::new((unsafe { &*funcs }).clone(), user_data);
+    channeldata.state.ares.socket_factory = SocketFactory::new((unsafe { &*funcs }).clone(), user_data);
 }
 
 /// Extended socket functions (c-ares 1.34.6 API).
@@ -49,7 +49,7 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
         asendv: None, // ex.asendto has different signature
     };
     let channeldata = unsafe { &mut *channel };
-    channeldata.ares.socket_factory = SocketFactory::new(basic, user_data);
+    channeldata.state.ares.socket_factory = SocketFactory::new(basic, user_data);
     0 // ARES_SUCCESS
 }
 

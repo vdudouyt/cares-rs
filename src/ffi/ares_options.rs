@@ -6,8 +6,9 @@ use crate::ffi::{ Channel, Ares };
 use std::net::Ipv4Addr;
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
-use crate::ffi::kernels::options::{apply_options, new_channel_data, saved_options, DecodedOptions};
+use crate::core::channel::{ChannelState, DecodedOptions};
 use crate::ffi::ares_socket::SocketFactory;
+use crate::ffi::channel::ChannelData;
 use crate::ares_socket_t;
 
 #[repr(C)]
@@ -185,8 +186,8 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         failover_retry_delay: options.server_failover_opts.retry_delay as u64,
     };
 
-    let mut channeldata = new_channel_data(Ares::from_sysconfig(std::rc::Rc::new(SocketFactory::default())));
-    apply_options(&mut channeldata, optmask, decoded);
+    let mut channeldata = ChannelData::new(ChannelState::new(Ares::from_sysconfig(std::rc::Rc::new(SocketFactory::default()))));
+    channeldata.state.apply_options(optmask, decoded);
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -199,7 +200,7 @@ pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_
         return ARES_ENODATA;
     }
     let channeldata = unsafe { &*channel };
-    let saved = saved_options(channeldata);
+    let saved = channeldata.state.saved_options();
 
     let out = unsafe { &mut *options };
     *out = ares_options::default();
@@ -218,7 +219,9 @@ pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_
         let count = saved.v4_servers.len();
         let ptr = unsafe { libc::malloc(count * std::mem::size_of::<in_addr>()) as *mut in_addr };
         if !ptr.is_null() {
-            unsafe { std::ptr::copy_nonoverlapping(saved.v4_servers.as_ptr(), ptr, count) };
+            for (i, v4) in saved.v4_servers.iter().enumerate() {
+                unsafe { *ptr.add(i) = in_addr { s_addr: u32::from(*v4).to_be() } };
+            }
             out.servers = ptr;
             out.nservers = count as c_int;
             mask |= ARES_OPT_SERVERS;

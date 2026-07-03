@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ares;
+pub mod channel;
 pub mod lookup;
 pub mod transport;
 pub mod packets;

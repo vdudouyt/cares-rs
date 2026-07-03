@@ -2,44 +2,54 @@
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
 
 use super::*;
-use crate::ffi::kernels::channel::{
-    active_query_count, clear_servers, dup_channel, getsock_mask, install_csv_servers,
-    normalize_port, poll_fds, server_list, servers_csv_string, set_servers, timeout_millis,
-    ServerSpec,
-};
-use crate::ffi::kernels::options::new_channel_data;
+use crate::core::channel::{getsock_mask, normalize_port, ChannelState, ServerSpec};
 
 
+/// The C-visible channel: the pure core state plus the channel-level C
+/// callbacks. Everything the shims marshal lives behind `.state`; the six
+/// callback fields are the only C-tainted residents.
 pub struct ChannelData {
-    pub(crate) ares: Ares<FFIData>,
+    pub(crate) state: ChannelState<FFIData>,
     pub(crate) sock_create_callback: ares_sock_create_callback,
     pub(crate) sock_create_callback_arg: *mut libc::c_void,
     pub(crate) sock_config_callback: ares_sock_config_callback,
     pub(crate) sock_config_callback_arg: *mut libc::c_void,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
-    pub(crate) readbuf: Vec<u8>,
-    pub(crate) server_health: ServerHealth,
-    pub(crate) sortlist: Vec<SortlistEntry>,
-    pub flags: i32,
-    pub maxtimeout: i32,
-    pub lookups: String,
-    pub resolvconf_path: String,
-    pub hosts_path: String,
-    pub(crate) query_cache: std::collections::HashMap<(String, u16), (Vec<u8>, Instant)>,
-    pub(crate) query_cache_max_ttl: u32, // 0 = disabled
-    pub(crate) udp_max_queries: u32, // 0 = unlimited
-    pub(crate) udp_connections: Vec<(usize, std::rc::Rc<dyn crate::core::transport::Transport>, u32)>, // (server_index, shared_socket, query_count)
-    pub(crate) tcp_connections: Vec<(usize, std::rc::Rc<dyn crate::core::transport::Transport>)>, // (server_index, shared_socket)
-    pub(crate) tcp_recv_buffers: std::collections::HashMap<i32, Vec<u8>>, // fd -> accumulated TCP receive data
-    pub(crate) server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
-    pub(crate) server_failover_retry_delay: u64,  // milliseconds
+}
+
+impl ChannelData {
+    /// A fresh channel: pure state, no callbacks installed.
+    pub(crate) fn new(state: ChannelState<FFIData>) -> Self {
+        ChannelData {
+            state,
+            sock_create_callback: None,
+            sock_create_callback_arg: std::ptr::null_mut(),
+            sock_config_callback: None,
+            sock_config_callback_arg: std::ptr::null_mut(),
+            server_state_callback: None,
+            server_state_callback_arg: std::ptr::null_mut(),
+        }
+    }
+
+    /// ares_dup: duplicate the pure state, copy the installed callbacks.
+    pub(crate) fn dup_from(&self) -> Self {
+        ChannelData {
+            state: self.state.duplicate(),
+            sock_create_callback: self.sock_create_callback,
+            sock_create_callback_arg: self.sock_create_callback_arg,
+            sock_config_callback: self.sock_config_callback,
+            sock_config_callback_arg: self.sock_config_callback_arg,
+            server_state_callback: self.server_state_callback,
+            server_state_callback_arg: self.server_state_callback_arg,
+        }
+    }
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
-    let channeldata = new_channel_data(Ares::from_sysconfig(std::rc::Rc::new(SocketFactory::default())));
+    let channeldata = ChannelData::new(ChannelState::new(Ares::from_sysconfig(std::rc::Rc::new(SocketFactory::default()))));
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
@@ -50,7 +60,7 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int {
     if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
     let src = unsafe { &*source };
-    let channeldata = dup_channel(src);
+    let channeldata = src.dup_from();
     unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
     ARES_SUCCESS
 }
@@ -60,16 +70,14 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     if channel.is_null() { return; }
     let channeldata = unsafe { &mut *channel };
-    let tasks: Vec<_> = channeldata.ares.tasks.drain(..).collect();
+    let tasks: Vec<_> = channeldata.state.ares.tasks.drain(..).collect();
     for task in tasks {
         if task.status != Status::Completed {
             task.userdata.callback.run(Err(ARES_ECANCELLED), &task.userdata, channeldata);
         }
     }
     // Clear connection pools so stale sockets don't linger
-    channeldata.udp_connections.clear();
-    channeldata.tcp_connections.clear();
-    channeldata.tcp_recv_buffers.clear();
+    channeldata.state.clear_pools();
 }
 
 #[no_mangle]
@@ -78,7 +86,7 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     if !channel.is_null() {
         // Fire callbacks with ARES_EDESTRUCTION for all pending tasks
         let channeldata = unsafe { &mut *channel };
-        let tasks: Vec<_> = channeldata.ares.tasks.drain(..).collect();
+        let tasks: Vec<_> = channeldata.state.ares.tasks.drain(..).collect();
         for task in tasks {
             if task.status != Status::Completed {
                 task.userdata.callback.run(Err(ARES_EDESTRUCTION), &task.userdata, channeldata);
@@ -97,7 +105,7 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
     unsafe { libc::FD_ZERO(read_fds) };
 
     let mut nfds = 0;
-    for (fd, wants_write) in poll_fds(channeldata) {
+    for (fd, wants_write) in channeldata.state.poll_fds() {
         if wants_write {
             unsafe { libc::FD_SET(fd, write_fds) };
         } else {
@@ -116,7 +124,7 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
         return std::ptr::null_mut();
     }
     let channeldata = unsafe { &mut *channel };
-    let Some(max_wait_time) = timeout_millis(channeldata) else {
+    let Some(max_wait_time) = channeldata.state.timeout_millis() else {
         if maxtv.is_null() { return std::ptr::null_mut(); }
         return maxtv;
     };
@@ -154,7 +162,7 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
         }
         head = unsafe { (*head).next };
     }
-    set_servers(channeldata, servers);
+    channeldata.state.set_servers(servers);
     ARES_SUCCESS
 }
 
@@ -181,7 +189,7 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut
         }
         head = node.next;
     }
-    set_servers(channeldata, servers);
+    channeldata.state.set_servers(servers);
     ARES_SUCCESS
 }
 
@@ -191,7 +199,7 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut
     if channel.is_null() { return ARES_ENODATA; }
     let channeldata = unsafe { &mut *channel };
     let mut data: Vec<AresAddrPortNode> = vec![];
-    for (ip, udp_port, tcp_port) in server_list(channeldata) {
+    for (ip, udp_port, tcp_port) in channeldata.state.server_list() {
         let (family, addr) = match ip {
             IpAddr::V4(v4) => {
                 let s_addr = u32::from_ne_bytes(v4.octets());
@@ -226,18 +234,18 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
     let channeldata = unsafe { &mut *channel };
     // NULL or empty string clears servers
     if servers.is_null() {
-        clear_servers(channeldata);
+        channeldata.state.clear_servers();
         return ARES_SUCCESS;
     }
     let Some(s) = (unsafe { cstr_opt(servers) }) else { return ARES_EBADSTR };
     if s.is_empty() {
-        clear_servers(channeldata);
+        channeldata.state.clear_servers();
         return ARES_SUCCESS;
     }
     let mut cursor = Cursor::new(s);
     match servers_csv::parse_from_reader(&mut cursor) {
         Some(ns) => {
-            install_csv_servers(channeldata, ns);
+            channeldata.state.install_csv_servers(ns);
             ARES_SUCCESS
         }
         None => ARES_EBADSTR,
@@ -261,7 +269,7 @@ pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_
     let channeldata = unsafe { &mut *channel };
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
 
-    let fds = poll_fds(channeldata);
+    let fds = channeldata.state.poll_fds();
     for i in 0..n {
         let fd = fds.get(i).map(|(fd, _)| *fd).unwrap_or(ARES_SOCKET_BAD);
         unsafe { std::ptr::write(socks.add(i), fd) };
@@ -304,7 +312,7 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
     // chain so the caller can free it with ares_free_data (the c-ares contract).
     // (A plain Box chain here corrupted the heap under ares_free_data.)
     let mut data: Vec<ares_addr_node> = vec![];
-    for (ip, _, _) in server_list(channeldata) {
+    for (ip, _, _) in channeldata.state.server_list() {
         let (family, addr) = match ip {
             IpAddr::V4(v4) => {
                 let s_addr = u32::from_ne_bytes(v4.octets());
@@ -329,7 +337,7 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
 pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
     if channel.is_null() { return std::ptr::null_mut(); }
     let channeldata = unsafe { &*channel };
-    let csv = servers_csv_string(channeldata);
+    let csv = channeldata.state.servers_csv_string();
     // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
     unsafe { malloc_cstr(csv.as_bytes()) }
 }
@@ -340,13 +348,13 @@ pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_c
     if channel.is_null() { return ARES_ENODATA; }
     let channeldata = unsafe { &mut *channel };
     if sortstr.is_null() {
-        channeldata.sortlist.clear();
+        channeldata.state.sortlist.clear();
         return ARES_SUCCESS;
     }
     let Some(s) = (unsafe { cstr_opt(sortstr) }) else { return ARES_EBADSTR };
     match parse_sortlist(s) {
         Ok(entries) => {
-            channeldata.sortlist = entries;
+            channeldata.state.sortlist = entries;
             ARES_SUCCESS
         }
         Err(e) => e,
@@ -386,7 +394,7 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
     if channel.is_null() { return 0; }
     let channeldata = unsafe { &*channel };
-    active_query_count(channeldata) as c_int
+    channeldata.state.active_query_count() as c_int
 }
 
 #[no_mangle]
