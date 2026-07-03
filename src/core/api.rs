@@ -72,18 +72,17 @@ pub(crate) fn send<T>(st: &mut ChannelState<T>, query_buf: &[u8], userdata: T) -
     }
 }
 
-/// ares_query_dnsrec's pre-send phase. A cache hit hands the raw reply back
-/// for the shim to parse and deliver; a hit that fails to parse falls
-/// through via [`query_dnsrec_uncached`]. (Once the record codec lives in
-/// core, the parse — and with it the fall-through policy — folds in here.)
+/// ares_query_dnsrec's pre-send phase. A cache hit is parsed right here;
+/// the shim boxes the record, delivers, and destroys.
 pub(crate) enum DnsrecStart {
     Deliver(i32),
-    DeliverCached(Vec<u8>),
+    DeliverParsed(crate::core::dns_record::ares_dns_record_t),
     InFlight,
 }
 
 /// ares_query_dnsrec: server guard, then the query cache (keyed without the
-/// trailing dot), then a fresh query.
+/// trailing dot; a cached reply that fails to parse falls through), then a
+/// fresh query.
 pub(crate) fn query_dnsrec<T>(
     st: &mut ChannelState<T>,
     name_raw: &str,
@@ -96,25 +95,13 @@ pub(crate) fn query_dnsrec<T>(
     }
     let name_clean = name_raw.strip_suffix('.').unwrap_or(name_raw);
     if let Some(cached_buf) = cached_reply(st, name_clean, qtype, now) {
-        return DnsrecStart::DeliverCached(cached_buf);
+        if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf) {
+            return DnsrecStart::DeliverParsed(rec);
+        }
     }
-    match query_dnsrec_uncached(st, name_raw, qtype, userdata) {
-        StartOutcome::InFlight => DnsrecStart::InFlight,
-        StartOutcome::Deliver(status) => DnsrecStart::Deliver(status),
-    }
-}
-
-/// The fresh-query tail of ares_query_dnsrec, also the fall-through when a
-/// cached reply turned out unparseable.
-pub(crate) fn query_dnsrec_uncached<T>(
-    st: &mut ChannelState<T>,
-    name_raw: &str,
-    qtype: u16,
-    userdata: T,
-) -> StartOutcome {
     match issue(st, dns_query_payload(name_raw, qtype), SocketSource::Udp, 0, userdata) {
-        Ok(_) => StartOutcome::InFlight,
-        Err(()) => StartOutcome::Deliver(ARES_ECONNREFUSED),
+        Ok(_) => DnsrecStart::InFlight,
+        Err(()) => DnsrecStart::Deliver(ARES_ECONNREFUSED),
     }
 }
 
@@ -278,7 +265,14 @@ pub(crate) fn getaddrinfo<T>(
 ) -> AddrInfoStart {
     match getaddrinfo_preflight(st, hostname_raw, ai_family) {
         AddrInfoPreflight::Fail(status) => AddrInfoStart::Deliver(status),
-        AddrInfoPreflight::DeliverAddrs { addrs, canonical } => AddrInfoStart::DeliverAddrs { addrs, canonical },
+        AddrInfoPreflight::DeliverAddrs { mut addrs, canonical } => {
+            // Only addresses of the requested family reach the node list.
+            addrs.retain(|ip| match ip {
+                IpAddr::V4(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET,
+                IpAddr::V6(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET6,
+            });
+            AddrInfoStart::DeliverAddrs { addrs, canonical }
+        }
         AddrInfoPreflight::StartDns { sm, first_server } => {
             let handle = Rc::new(RefCell::new(sm));
             let actions = handle.borrow_mut().begin_batch(first_server);

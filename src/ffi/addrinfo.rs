@@ -38,13 +38,15 @@ pub struct ares_addrinfo {
     pub name: *mut c_char,
 }
 
-pub(crate) fn addrinfo_nodes_from_addrs_port(addrs: &[IpAddr], family_filter: c_int, port: u16) -> *mut ares_addrinfo_node {
+/// Build the C node list for a synchronous (IP-literal / hosts-file)
+/// delivery — pure transcription: the family filter was already applied in
+/// core (api::getaddrinfo's DeliverAddrs arm).
+pub(crate) fn addrinfo_nodes_from_addrs_port(addrs: &[IpAddr], port: u16) -> *mut ares_addrinfo_node {
     let mut head: *mut ares_addrinfo_node = std::ptr::null_mut();
     let mut tail: *mut ares_addrinfo_node = std::ptr::null_mut();
     for ip in addrs {
         let (ai_family, ai_addrlen, ai_addr): (c_int, libc::socklen_t, *mut libc::sockaddr) = match ip {
             IpAddr::V4(v4) => {
-                if family_filter != libc::AF_UNSPEC && family_filter != libc::AF_INET { continue; }
                 let sa = Box::new(libc::sockaddr_in {
                     sin_family: libc::AF_INET as libc::sa_family_t,
                     sin_port: port.to_be(),
@@ -55,7 +57,6 @@ pub(crate) fn addrinfo_nodes_from_addrs_port(addrs: &[IpAddr], family_filter: c_
                  Box::into_raw(sa) as *mut libc::sockaddr)
             }
             IpAddr::V6(v6) => {
-                if family_filter != libc::AF_UNSPEC && family_filter != libc::AF_INET6 { continue; }
                 let sa = Box::new(libc::sockaddr_in6 {
                     sin6_family: libc::AF_INET6 as libc::sa_family_t,
                     sin6_port: port.to_be(),

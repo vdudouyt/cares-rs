@@ -319,19 +319,10 @@ pub unsafe extern "C" fn ares_query_dnsrec(
         api::DnsrecStart::Deliver(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
-        api::DnsrecStart::DeliverCached(cached_buf) => {
-            if let Ok(rec) = dns_record::parse_record(&cached_buf) {
-                let dnsrec = Box::into_raw(Box::new(rec));
-                unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
-                unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
-            } else {
-                // Unparseable cache entry: fall through to a fresh query.
-                // (Folds into api::query_dnsrec once the codec lives in core.)
-                let ffidata = FFIData { arg, expected_record_type: dnstype, ..FFIData::base(Callback::AresCallbackDnsRec(callback)) };
-                if let api::StartOutcome::Deliver(status) = api::query_dnsrec_uncached(&mut channeldata.state, name, dnstype as u16, ffidata) {
-                    unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
-                }
-            }
+        api::DnsrecStart::DeliverParsed(rec) => {
+            let dnsrec = Box::into_raw(Box::new(rec));
+            unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
+            unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
         }
         api::DnsrecStart::InFlight => {}
     }
@@ -448,18 +439,13 @@ pub(crate) fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallbac
 }
 
 pub(crate) fn run_ares_callback_dnsrec(res: Result<&[u8], c_int>, callback: AresCallbackDnsRec, ffidata: &FFIData) {
-    match res {
-        Ok(buf) => {
-            let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
-            let status = unsafe { dns_record::ares_dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec) };
-            if status == ARES_SUCCESS {
-                unsafe { callback(ffidata.arg, ARES_SUCCESS, ffidata.timeouts as usize, dnsrec) };
-                unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
-            } else {
-                unsafe { callback(ffidata.arg, status, ffidata.timeouts as usize, std::ptr::null_mut()) };
-            }
+    match res.and_then(dns_record::parse_record) {
+        Ok(rec) => {
+            let dnsrec = Box::into_raw(Box::new(rec));
+            unsafe { callback(ffidata.arg, ARES_SUCCESS, ffidata.timeouts as usize, dnsrec) };
+            unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
         }
-        Err(err) => unsafe { callback(ffidata.arg, err, ffidata.timeouts as usize, std::ptr::null_mut()) },
+        Err(status) => unsafe { callback(ffidata.arg, status, ffidata.timeouts as usize, std::ptr::null_mut()) },
     }
 }
 
@@ -488,16 +474,16 @@ pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, sm: &Rc<RefCel
                     unsafe { callback(arg, ARES_SUCCESS, timeouts, buf_copy.as_ptr() as *mut u8, buf_copy.len() as c_int) };
                 }
                 SearchDelivery::DnsRec { callback, arg } => {
-                    // Parse and deliver as dns record
-                    let mut dnsrec: *mut dns_record::ares_dns_record_t = std::ptr::null_mut();
-                    let parse_status = unsafe { dns_record::ares_dns_parse(buf.as_ptr(), buf.len(), 0, &mut dnsrec) };
-                    if parse_status == ARES_SUCCESS {
-                        unsafe {
-                            callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec);
-                            dns_record::ares_dns_record_destroy(dnsrec);
+                    // Parse (in core) and deliver as a dns record
+                    match dns_record::parse_record(buf) {
+                        Ok(rec) => {
+                            let dnsrec = Box::into_raw(Box::new(rec));
+                            unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };
+                            unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
                         }
-                    } else {
-                        unsafe { callback(arg, parse_status, timeouts as usize, std::ptr::null_mut()) };
+                        Err(parse_status) => {
+                            unsafe { callback(arg, parse_status, timeouts as usize, std::ptr::null_mut()) };
+                        }
                     }
                 }
             }
@@ -585,7 +571,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
         api::AddrInfoStart::DeliverAddrs { addrs, canonical } => {
-            let nodes = addrinfo_nodes_from_addrs_port(&addrs, ai_family, port);
+            let nodes = addrinfo_nodes_from_addrs_port(&addrs, port);
             let ai = build_ares_addrinfo(&canonical, nodes);
             unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
         }
