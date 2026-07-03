@@ -68,8 +68,7 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let tasks: Vec<_> = channeldata.state.ares.tasks.drain(..).collect();
     for task in tasks {
         if task.status != Status::Completed {
@@ -83,9 +82,8 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
-    if !channel.is_null() {
+    if let Some(channeldata) = unsafe { channel.as_mut() } {
         // Fire callbacks with ARES_EDESTRUCTION for all pending tasks
-        let channeldata = unsafe { &mut *channel };
         let tasks: Vec<_> = channeldata.state.ares.tasks.drain(..).collect();
         for task in tasks {
             if task.status != Status::Completed {
@@ -99,8 +97,7 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
-    if channel.is_null() { return 0; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
     unsafe { libc::FD_ZERO(write_fds) };
     unsafe { libc::FD_ZERO(read_fds) };
 
@@ -119,10 +116,8 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
     // Upstream: NULL channel or output buffer -> return NULL.
-    if channel.is_null() || tv.is_null() {
-        return std::ptr::null_mut();
-    }
-    let channeldata = unsafe { &mut *channel };
+    if tv.is_null() { return std::ptr::null_mut(); }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return std::ptr::null_mut(); };
     let maxtv_ms = (!maxtv.is_null())
         .then(|| unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 });
     match crate::core::api::clamp_timeout(channeldata.state.timeout_millis(), maxtv_ms) {
@@ -143,8 +138,7 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) -> c_int {
-    if channel.is_null() { return ARES_ENODATA; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     let mut servers = Vec::new();
     while !head.is_null() {
         let node = unsafe { &(*head) };
@@ -168,8 +162,7 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut AresAddrPortNode) -> c_int {
-    if channel.is_null() { return ARES_ENODATA; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     let mut servers = Vec::new();
     while !head.is_null() {
         let node = unsafe { &*head };
@@ -195,8 +188,7 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut AresAddrPortNode) -> c_int {
-    if channel.is_null() { return ARES_ENODATA; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     let mut data: Vec<AresAddrPortNode> = vec![];
     for (ip, udp_port, tcp_port) in channeldata.state.server_list() {
         let (family, addr) = match ip {
@@ -229,8 +221,7 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
-    if channel.is_null() { return ARES_ENODATA; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     // NULL or empty string clears servers
     if servers.is_null() {
         channeldata.state.clear_servers();
@@ -262,10 +253,8 @@ pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const 
 #[no_mangle]
 pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
     // Upstream: NULL channel or non-positive numsocks -> return 0 (no sockets).
-    if channel.is_null() || numsocks <= 0 {
-        return 0;
-    }
-    let channeldata = unsafe { &mut *channel };
+    if numsocks <= 0 { return 0; }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
 
     let fds = channeldata.state.poll_fds();
@@ -294,8 +283,7 @@ pub extern "C" fn ares_set_local_dev(_channel: Channel, _local_dev_name: *const 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ares_sock_create_callback, arg: *mut c_void) {
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     channeldata.sock_create_callback = callback;
     channeldata.sock_create_callback_arg = arg;
 }
@@ -303,10 +291,8 @@ pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ar
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_addr_node) -> c_int {
-    if channel.is_null() || out.is_null() {
-        return ARES_ENODATA;
-    }
-    let channeldata = unsafe { &mut *channel };
+    if out.is_null() { return ARES_ENODATA; }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     // Build the list the same way as ares_get_servers_ports: an AresData-wrapped
     // chain so the caller can free it with ares_free_data (the c-ares contract).
     // (A plain Box chain here corrupted the heap under ares_free_data.)
@@ -334,8 +320,7 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
-    if channel.is_null() { return std::ptr::null_mut(); }
-    let channeldata = unsafe { &*channel };
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return std::ptr::null_mut(); };
     let csv = channeldata.state.servers_csv_string();
     // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
     unsafe { malloc_cstr(csv.as_bytes()) }
@@ -344,8 +329,7 @@ pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_char) -> c_int {
-    if channel.is_null() { return ARES_ENODATA; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     if sortstr.is_null() {
         channeldata.state.sortlist.clear();
         return ARES_SUCCESS;
@@ -371,8 +355,7 @@ pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, callback: ares_sock_config_callback, arg: *mut c_void) {
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     channeldata.sock_config_callback = callback;
     channeldata.sock_config_callback_arg = arg;
 }
@@ -380,8 +363,7 @@ pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, ca
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callback: ares_server_state_callback, arg: *mut c_void) {
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     channeldata.server_state_callback = callback;
     channeldata.server_state_callback_arg = arg;
 }
@@ -391,8 +373,7 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 /// `ares_init`/`ares_init_options` and not yet destroyed.
 #[no_mangle]
 pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
-    if channel.is_null() { return 0; }
-    let channeldata = unsafe { &*channel };
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
     channeldata.state.active_query_count() as c_int
 }
 

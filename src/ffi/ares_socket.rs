@@ -15,8 +15,8 @@ pub type ares_ssize_t = libc::ssize_t;
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
-    if channel.is_null() || funcs.is_null() { return }
-    let channeldata = unsafe { &mut *channel };
+    if funcs.is_null() { return; }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     channeldata.state.ares.socket_factory = SocketFactory::new((unsafe { &*funcs }).clone(), user_data);
 }
 
@@ -39,7 +39,7 @@ pub struct AresSocketFunctionsEx {
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *const AresSocketFunctionsEx, user_data: *mut c_void) -> c_int {
-    if channel.is_null() || funcs.is_null() { return 0; }
+    if funcs.is_null() { return 0; }
     let ex = unsafe { &*funcs };
     let basic = AresSocketFunctions {
         asocket: ex.asocket,
@@ -48,7 +48,7 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
         arecvfrom: ex.arecvfrom,
         asendv: None, // ex.asendto has different signature
     };
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
     channeldata.state.ares.socket_factory = SocketFactory::new(basic, user_data);
     0 // ARES_SUCCESS
 }

@@ -196,10 +196,8 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_options, optmask: *mut c_int) -> c_int {
-    if channel.is_null() || options.is_null() || optmask.is_null() {
-        return ARES_ENODATA;
-    }
-    let channeldata = unsafe { &*channel };
+    if options.is_null() || optmask.is_null() { return ARES_ENODATA; }
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return ARES_ENODATA; };
     let saved = channeldata.state.saved_options();
 
     let out = unsafe { &mut *options };

@@ -215,8 +215,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 /// `channel` must be a valid channel, `name` a valid NUL-terminated C string, and `host` a writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
-    if channel.is_null() { return ARES_ENOTFOUND; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENOTFOUND; };
     let name_str = unsafe { cstr_lossy(name) };
 
     match api::gethostbyname_file(&mut channeldata.state, name_str, family) {
@@ -235,8 +234,7 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: ares_host_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     // NULL/negative-length buffers report the same ENOTIMP the family check
     // does, so guarding here first is observably identical.
     if addr.is_null() || addrlen < 0 {
@@ -274,8 +272,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
         unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
         return;
     }
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let _ = dnsclass;
     let tail = SearchTail { dnstype: dnstype as u16, delivery: SearchDelivery::Raw { callback, arg } };
     let mut make_userdata = |sm| FFIData::base(Callback::Search(sm, tail));
@@ -289,8 +286,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
 #[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
     let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
     if let api::StartOutcome::Deliver(status) = api::query(&mut channeldata.state, name, dnstype as u16, ffidata) {
@@ -311,8 +307,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     _qid: *mut c_int, // output parameter for query ID, ignored for now
 ) {
     let Some(callback) = callback else { return; };
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
     let ffidata = FFIData { arg, expected_record_type: dnstype, ..FFIData::base(Callback::AresCallbackDnsRec(callback)) };
     match api::query_dnsrec(&mut channeldata.state, name, dnstype as u16, Instant::now(), ffidata) {
@@ -359,8 +354,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
         unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         return;
     }
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let tail = SearchTail { dnstype: qtype as u16, delivery: SearchDelivery::DnsRec { callback, arg } };
     let mut make_userdata = |sm| FFIData::base(Callback::Search(sm, tail));
     if let api::StartOutcome::Deliver(status) = api::search(&mut channeldata.state, name_str, qtype as u16, true, &mut make_userdata) {
@@ -384,8 +378,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: ares_nameinfo_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
 
     // Extract IP address and port from sockaddr
     let addr_info = match extract_addr_port(sa, salen) {
@@ -537,8 +530,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     arg: *mut c_void,
 ) {
     let Some(callback) = callback else { return; };
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
 
     let ai_family = if hints.is_null() { libc::AF_UNSPEC } else { unsafe { (*hints).ai_family } };
 
@@ -665,7 +657,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut(), 0) };
         return;
     }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
     let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
     if let api::StartOutcome::Deliver(status) = api::send(&mut channeldata.state, query_buf, ffidata) {

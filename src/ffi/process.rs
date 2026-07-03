@@ -29,8 +29,7 @@ pub unsafe extern "C" fn ares_process_fd(channel: Channel, read_fd: c_int, write
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
-    if channel.is_null() { return; }
-    let channeldata = unsafe { &mut *channel };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     process_channel(channeldata, read_fds, write_fds);
 }
 
