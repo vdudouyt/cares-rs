@@ -668,27 +668,6 @@ impl AddrInfoSm {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TaskKind { AddrInfo, HostByName, Search, Probe, Other }
 
-/// What a cancel/destroy teardown owes a pending task's owner.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TeardownDelivery {
-    /// Report the teardown status with an empty/NULL payload directly.
-    DeliverNull,
-    /// Probes have no owner: drop silently.
-    Silent,
-    /// Run the task's normal error path (the AddrInfo machine folds the
-    /// cancel into its batch join; plain callbacks just get the status).
-    Full,
-}
-
-/// The cancel/destroy policy table, keyed by lifecycle.
-pub fn teardown_delivery(kind: TaskKind) -> TeardownDelivery {
-    match kind {
-        TaskKind::HostByName | TaskKind::Search => TeardownDelivery::DeliverNull,
-        TaskKind::Probe => TeardownDelivery::Silent,
-        TaskKind::AddrInfo | TaskKind::Other => TeardownDelivery::Full,
-    }
-}
-
 /// Reactor-level side effect (executed by ares_process).
 #[derive(Debug, PartialEq)]
 pub enum ReactorAction {

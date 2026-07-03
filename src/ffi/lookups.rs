@@ -66,26 +66,19 @@ impl Callback {
         // Cancel/destroy deliveries follow the core policy table.
         if let Err(status) = &buf {
             if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED {
-                match teardown_delivery(self.kind()) {
-                    TeardownDelivery::DeliverNull => {
-                        match self {
-                            Self::HostByName(_, tail) => {
-                                unsafe { (tail.callback)(tail.arg, *status, 0, std::ptr::null_mut()) };
-                            }
-                            Self::Search(_, tail) => match tail.delivery {
-                                SearchDelivery::Raw { callback, arg } => unsafe {
-                                    callback(arg, *status, ffidata.timeouts, std::ptr::null_mut(), 0);
-                                },
-                                SearchDelivery::DnsRec { callback, arg } => unsafe {
-                                    callback(arg, *status, ffidata.timeouts as usize, std::ptr::null_mut());
-                                },
-                            },
-                            _ => unreachable!("core maps DeliverNull only to HostByName/Search"),
-                        }
-                        return;
+                match self {
+                    Self::HostByName(_, tail) => {
+                        unsafe { (tail.callback)(tail.arg, *status, 0, std::ptr::null_mut()) };
                     }
-                    TeardownDelivery::Silent => return,
-                    TeardownDelivery::Full => {}
+                    Self::Search(_, tail) => match tail.delivery {
+                        SearchDelivery::Raw { callback, arg } => unsafe {
+                            callback(arg, *status, ffidata.timeouts, std::ptr::null_mut(), 0);
+                        },
+                        SearchDelivery::DnsRec { callback, arg } => unsafe {
+                            callback(arg, *status, ffidata.timeouts as usize, std::ptr::null_mut());
+                        },
+                    },
+                    _ => {}
                 }
             }
         }
