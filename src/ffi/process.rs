@@ -202,19 +202,6 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
     channeldata.state.retain_pools();
 }
 
-/// Call socket create + configure callbacks. Returns false if either callback fails.
-pub(crate) fn invoke_sock_callbacks(channeldata: &ChannelData, fd: c_int, sock_type: c_int) -> bool {
-    if let Some(cb) = channeldata.sock_create_callback {
-        let ret = unsafe { cb(fd, sock_type, channeldata.sock_create_callback_arg) };
-        if ret != 0 { return false; }
-    }
-    if let Some(cb) = channeldata.sock_config_callback {
-        let ret = unsafe { cb(fd, sock_type, channeldata.sock_config_callback_arg) };
-        if ret != 0 { return false; }
-    }
-    true
-}
-
 /// The channel's socket callbacks as a core-consumable consent closure: it
 /// captures only the Copy fn pointers + args, so it stays valid while
 /// `channeldata.state` is mutably borrowed inside a core launch/retry call.

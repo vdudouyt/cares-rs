@@ -20,12 +20,18 @@ use bytes::BytesMut;
 use crate::core::ares::{dns_query_payload, rdns_name, SocketSource};
 use crate::core::channel::ChannelState;
 use crate::core::hostfile::HostLookup;
-use crate::core::launch::{issue, issue_consented, Consent};
-use crate::core::lookup::SearchSm;
-use crate::core::preflight::{
-    cached_reply, gethostbyaddr_preflight, getnameinfo_preflight, no_servers, search_start,
-    AddrInfo, AddrPreflight, NameinfoPreflight,
+use crate::core::launch::{
+    drive_addrinfo, issue, issue_consented, launch_pooled, maybe_launch_probe, AddrInfoDelivery,
+    AddrInfoSeed, Consent, HostTaskSeed, LaunchOutcome,
 };
+use crate::core::lookup::SearchSm;
+use crate::core::packets::AddrRecord;
+use crate::core::preflight::{
+    cached_reply, getaddrinfo_preflight, gethostbyaddr_preflight, gethostbyname_preflight,
+    getnameinfo_preflight, no_servers, search_start, AddrInfo, AddrInfoPreflight, AddrPreflight,
+    HostPreflight, NameinfoPreflight,
+};
+use crate::core::response::ParsedRRs;
 use crate::ffi::error::{ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_ENOSERVER};
 use crate::ffi::RECORD_TYPE_PTR;
 
@@ -194,6 +200,78 @@ pub(crate) fn getnameinfo<T>(
     match issue_consented(st, dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), 0, userdata, false, consent) {
         Ok(()) => NameinfoStart::InFlight,
         Err(()) => NameinfoStart::Fail(ARES_ECONNREFUSED),
+    }
+}
+
+/// How ares_gethostbyname settled before/at send time.
+pub(crate) enum HostStart {
+    /// Deliver `status` with a NULL hostent.
+    Deliver(i32),
+    /// Synchronous hit (IP literal / hosts file / localhost).
+    DeliverHost(HostLookup),
+    /// Query-cache hit: sortlist already applied; the i32 is the hostent
+    /// address family to emit.
+    DeliverParsed(ParsedRRs<AddrRecord>, i32),
+    InFlight,
+}
+
+/// ares_gethostbyname: the full pre-DNS cascade, then the pooled launch and
+/// the failover probe. On exhaustion the probe still runs (its health
+/// bookkeeping sees the launch failures), and ECONNREFUSED is delivered by
+/// the shim afterwards.
+pub(crate) fn gethostbyname<T>(
+    st: &mut ChannelState<T>,
+    hostname: &str,
+    family: i32,
+    now: Instant,
+    make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
+    consent: Consent<'_>,
+) -> HostStart {
+    match gethostbyname_preflight(st, hostname, family, now) {
+        HostPreflight::Fail(status) => HostStart::Deliver(status),
+        HostPreflight::DeliverHost(lookup) => HostStart::DeliverHost(lookup),
+        HostPreflight::DeliverParsed(rrs, hostent_family) => HostStart::DeliverParsed(rrs, hostent_family),
+        HostPreflight::StartDns { sm, query_hostname, first_server, use_tcp } => {
+            let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
+            let handle = Rc::new(RefCell::new(sm));
+            let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, make_userdata, consent);
+            // Server failover probing: if enabled, probe an expired-failure
+            // server in parallel with the primary query.
+            maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, make_userdata, consent);
+            match launched {
+                LaunchOutcome::Launched => HostStart::InFlight,
+                LaunchOutcome::Exhausted { .. } => HostStart::Deliver(ARES_ECONNREFUSED),
+            }
+        }
+    }
+}
+
+/// How ares_getaddrinfo settled at entry: a synchronous delivery, or the
+/// batch went out — possibly already producing a (failure) delivery when
+/// every send was refused.
+pub(crate) enum AddrInfoStart {
+    Deliver(i32),
+    DeliverAddrs { addrs: Vec<IpAddr>, canonical: String },
+    Started(Vec<AddrInfoDelivery>),
+}
+
+/// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
+/// then mint the machine and drive the A/AAAA batch.
+pub(crate) fn getaddrinfo<T>(
+    st: &mut ChannelState<T>,
+    hostname_raw: &str,
+    ai_family: i32,
+    make_userdata: &mut dyn FnMut(AddrInfoSeed, usize) -> T,
+    consent: Consent<'_>,
+) -> AddrInfoStart {
+    match getaddrinfo_preflight(st, hostname_raw, ai_family) {
+        AddrInfoPreflight::Fail(status) => AddrInfoStart::Deliver(status),
+        AddrInfoPreflight::DeliverAddrs { addrs, canonical } => AddrInfoStart::DeliverAddrs { addrs, canonical },
+        AddrInfoPreflight::StartDns { sm, first_server } => {
+            let handle = Rc::new(RefCell::new(sm));
+            let actions = handle.borrow_mut().begin_batch(first_server);
+            AddrInfoStart::Started(drive_addrinfo(st, &handle, actions, make_userdata, consent))
+        }
     }
 }
 

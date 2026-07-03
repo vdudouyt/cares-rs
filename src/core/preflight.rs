@@ -25,6 +25,26 @@ use crate::ffi::{
     RECORD_TYPE_AAAA,
 };
 
+/// How a getaddrinfo service string resolves to a port.
+pub(crate) enum ServicePort {
+    Port(u16),
+    /// Not numeric and not in the well-known table: the shim asks the system
+    /// resolver (getservbyname — inherently a C call), defaulting to 0.
+    NeedSystemLookup,
+}
+
+/// Service→port resolution order: numeric, then the built-in well-known
+/// table, then the system services database.
+pub(crate) fn service_to_port(svc: &str) -> ServicePort {
+    if let Ok(p) = svc.parse::<u16>() {
+        return ServicePort::Port(p);
+    }
+    if let Some(p) = well_known_port(svc) {
+        return ServicePort::Port(p);
+    }
+    ServicePort::NeedSystemLookup
+}
+
 /// A decoded socket address (the pure result of the shim-side sockaddr
 /// unmarshal): what getnameinfo works from.
 pub(crate) struct AddrInfo {
