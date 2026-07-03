@@ -37,7 +37,7 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
 /// The 4-phase reactor loop (I/O, timeouts, task cleanup, pool cleanup) as a
 /// safe fn — the only unsafe left inside is the FD_ISSET macro and the
 /// C-callback invokers it drives; every decision is a core verdict or a
-/// kernel call.
+/// core call.
 pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
     // Phase 1: I/O (write + read) processing.
     // The receive buffer is taken out of the channel for the duration of the

@@ -1,6 +1,6 @@
 //! Entry-point preflight logic: everything a lookup export decides before
-//! (or instead of) touching the network, as pure verdict-returning functions (moved from ffi/kernels).
-//! Kernels never invoke C callbacks and never hold RefCell borrows at return
+//! (or instead of) touching the network, as pure verdict-returning functions consumed by core::api.
+//! Nothing here invokes C callbacks or holds a RefCell borrow at return
 //! — the shim matches on the verdict, marshals, and dispatches.
 
 use std::net::IpAddr;

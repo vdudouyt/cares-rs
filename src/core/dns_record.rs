@@ -171,7 +171,7 @@ pub(crate) static KEYS_RAW_RR: [u32; 2] =
 
 
 // ---------------------------------------------------------------------------
-// Metadata string/table kernels (the pure bodies of the ares_dns_* metadata
+// Metadata string/table logic (the pure bodies of the ares_dns_* metadata
 // shims — each shim is one call into here)
 // ---------------------------------------------------------------------------
 
@@ -1097,7 +1097,7 @@ pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Record/RR accessor kernels — the shims in mod.rs never touch the model
+// Record/RR accessors — the ffi shims never touch the model
 // fields or RRValue directly; every read and mutation goes through these.
 // ---------------------------------------------------------------------------
 
@@ -1348,7 +1348,7 @@ impl ares_dns_rr_t {
 }
 
 // ---------------------------------------------------------------------------
-// Whole-message codec kernels (the pure bodies of ares_dns_parse/write)
+// Whole-message codec (the pure bodies of ares_dns_parse/write)
 // ---------------------------------------------------------------------------
 
 impl ares_dns_record_t {

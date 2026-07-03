@@ -16,8 +16,8 @@
 //!   lowest-failures-first server selection for failover and probing
 //!
 //! Per-flow machines — each consumes events (a parsed reply or an I/O error)
-//! and returns actions (send a query, notify, cache, deliver) that the
-//! executors in `src/ffi/lookups.rs` perform:
+//! and returns actions (send a query, notify, cache, deliver) that
+//! `core::api`'s per-export handlers drive:
 //! - [`SearchSm`] — ares_search / ares_search_dnsrec
 //! - [`HostByNameSm`] — ares_gethostbyname's DNS phase (TC retry, failover,
 //!   search iteration, the AF_UNSPEC AAAA→A switch)
@@ -31,10 +31,10 @@
 //! - [`on_timeout`] → [`TimeoutVerdict`] (retry / expire)
 //!
 //! The pre-DNS short-circuits (IP literals, hosts file, localhost,
-//! HOSTALIASES, cache probes) live in `src/ffi/kernels/lookups.rs` as
-//! verdict-returning preflight kernels — safe like this module, but coupled
-//! to `ChannelData`. The socket-launch retry loops live with the executors —
-//! their failure accounting calls back into [`ServerHealth`].
+//! HOSTALIASES, cache probes) live in `core::preflight`; the socket-launch
+//! retry loops (whose failure accounting calls back into [`ServerHealth`])
+//! in `core::launch`; and the one-call-per-export composition of all of it
+//! in `core::api`. The ffi shims only marshal C values and fire callbacks.
 
 use std::ffi::c_int;
 use std::time::{Duration, Instant};
