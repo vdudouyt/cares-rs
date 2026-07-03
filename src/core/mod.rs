@@ -6,6 +6,7 @@
 pub mod api;
 pub mod ares;
 pub mod channel;
+pub mod dns_record;
 pub mod launch;
 pub mod hostent;
 pub mod lookup;

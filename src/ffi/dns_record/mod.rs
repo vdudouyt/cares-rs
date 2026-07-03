@@ -917,7 +917,7 @@ pub unsafe extern "C" fn ares_dns_write(
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rec_type_tostr(rtype: c_uint) -> *const c_char {
-    rec_type_name(rtype)
+    crate::core::dns_record::rec_type_name(rtype).as_ptr()
 }
 
 #[no_mangle]
@@ -932,7 +932,7 @@ pub unsafe extern "C" fn ares_dns_rec_type_fromstr(
         Ok(s) => s,
         Err(_) => return ARES_FALSE,
     };
-    match rec_type_from_name(s) {
+    match crate::core::dns_record::rec_type_from_name(s) {
         Some(val) => {
             unsafe { *rtype = val };
             ARES_TRUE
@@ -943,7 +943,7 @@ pub unsafe extern "C" fn ares_dns_rec_type_fromstr(
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_class_tostr(qclass: c_uint) -> *const c_char {
-    class_name(qclass)
+    crate::core::dns_record::class_name(qclass).as_ptr()
 }
 
 #[no_mangle]
@@ -958,7 +958,7 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
         Ok(s) => s,
         Err(_) => return ARES_FALSE,
     };
-    match class_from_name(s) {
+    match crate::core::dns_record::class_from_name(s) {
         Some(val) => {
             unsafe { *qclass = val };
             ARES_TRUE
@@ -969,7 +969,7 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_key_tostr(key: c_uint) -> *const c_char {
-    rr_key_name(key)
+    crate::core::dns_record::rr_key_name(key).as_ptr()
 }
 
 #[no_mangle]
@@ -980,7 +980,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_keys(
     if cnt.is_null() {
         return std::ptr::null();
     }
-    match keys_for(rtype) {
+    match crate::core::dns_record::keys_for(rtype) {
         Some(keys) => {
             unsafe { *cnt = keys.len() };
             keys.as_ptr()
@@ -994,27 +994,27 @@ pub unsafe extern "C" fn ares_dns_rr_get_keys(
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_key_datatype(key: c_uint) -> c_uint {
-    rr_key_datatype_of(key)
+    crate::core::dns_record::rr_key_datatype_of(key)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_key_to_rec_type(key: c_uint) -> c_uint {
-    rr_key_rec_type(key)
+    crate::core::dns_record::rr_key_rec_type(key)
 }
 
 #[no_mangle]
 pub extern "C" fn ares_dns_opcode_tostr(opcode: c_uint) -> *const c_char {
-    opcode_name(opcode)
+    crate::core::dns_record::opcode_name(opcode).as_ptr()
 }
 
 #[no_mangle]
 pub extern "C" fn ares_dns_rcode_tostr(rcode: c_uint) -> *const c_char {
-    rcode_name(rcode)
+    crate::core::dns_record::rcode_name(rcode).as_ptr()
 }
 
 #[no_mangle]
 pub extern "C" fn ares_dns_section_tostr(section: c_uint) -> *const c_char {
-    section_name(section)
+    crate::core::dns_record::section_name(section).as_ptr()
 }
 
 #[no_mangle]
