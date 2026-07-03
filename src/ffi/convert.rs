@@ -73,12 +73,7 @@ where F: FnOnce() -> Result<*mut T, c_int>
     }
 }
 
-pub(crate) struct AddrInfo {
-    pub(crate) ip: IpAddr,
-    pub(crate) port: u16,
-    pub(crate) family: c_int,
-    pub(crate) scope_id: u32,
-}
+use crate::core::preflight::AddrInfo;
 
 /// Validate + decode a caller-supplied `sockaddr`/`salen` pair.
 /// Error codes match upstream getnameinfo: NULL/short → ENOMEM, unknown

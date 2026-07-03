@@ -1,9 +1,8 @@
-//! Entry-point preflight kernels: everything a lookup export decides before
-//! (or instead of) touching the network, as pure verdict-returning functions.
+//! Entry-point preflight logic: everything a lookup export decides before
+//! (or instead of) touching the network, as pure verdict-returning functions (moved from ffi/kernels).
 //! Kernels never invoke C callbacks and never hold RefCell borrows at return
 //! — the shim matches on the verdict, marshals, and dispatches.
 
-use std::ffi::c_int;
 use std::net::IpAddr;
 use std::time::Instant;
 
@@ -19,7 +18,6 @@ use crate::core::channel::ChannelState;
 use crate::ffi::error::{
     ARES_EBADNAME, ARES_EFILE, ARES_ENODATA, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP,
 };
-use crate::ffi::convert::AddrInfo;
 use crate::ffi::error::ARES_EBADFLAGS;
 use crate::ffi::{
     ARES_NI_DGRAM, ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD,
@@ -27,16 +25,25 @@ use crate::ffi::{
     RECORD_TYPE_AAAA,
 };
 
+/// A decoded socket address (the pure result of the shim-side sockaddr
+/// unmarshal): what getnameinfo works from.
+pub(crate) struct AddrInfo {
+    pub(crate) ip: IpAddr,
+    pub(crate) port: u16,
+    pub(crate) family: i32,
+    pub(crate) scope_id: u32,
+}
+
 /// The verdict of ares_gethostbyname's pre-DNS phase.
 pub(crate) enum HostPreflight {
     /// Deliver `status` with a NULL hostent.
-    Fail(c_int),
+    Fail(i32),
     /// Synchronous hit (IP literal / hosts file / localhost): deliver a
     /// hostent built from this lookup, then free it.
     DeliverHost(HostLookup),
-    /// Query-cache hit: sortlist already applied; the c_int is the hostent
+    /// Query-cache hit: sortlist already applied; the i32 is the hostent
     /// address family to emit.
-    DeliverParsed(ParsedRRs<AddrRecord>, c_int),
+    DeliverParsed(ParsedRRs<AddrRecord>, i32),
     /// No short-circuit applies — seed the state machine and go to DNS.
     StartDns {
         sm: HostByNameSm,
@@ -54,7 +61,7 @@ pub(crate) enum HostPreflight {
 pub(crate) fn gethostbyname_preflight<T>(
     st: &mut ChannelState<T>,
     hostname: &str,
-    family: c_int,
+    family: i32,
     now: Instant,
 ) -> HostPreflight {
     // Reject non-ASCII names
@@ -167,7 +174,7 @@ pub(crate) fn gethostbyname_preflight<T>(
         if let Some((cached_buf, expires_at)) = st.query_cache.get(&cache_key) {
             if now < *expires_at {
                 let cached_buf = cached_buf.clone();
-                let parsed = (|| -> Result<ParsedRRs<AddrRecord>, c_int> {
+                let parsed = (|| -> Result<ParsedRRs<AddrRecord>, i32> {
                     let response = ParsedResponse::from_buf(&cached_buf)?;
                     let parsed_rrs = response.process_answers::<AddrRecord>(&cached_buf, record_type)?;
                     if parsed_rrs.items.is_empty() {
@@ -210,8 +217,8 @@ pub(crate) fn gethostbyname_preflight<T>(
 pub(crate) fn hosts_file_lookup<T>(
     st: &mut ChannelState<T>,
     name: &str,
-    family: c_int,
-) -> Result<HostLookup, c_int> {
+    family: i32,
+) -> Result<HostLookup, i32> {
     // Convert C family constant to our Family enum
     let family_filter = match family {
         libc::AF_INET => AddressFamily::Ipv4,
@@ -233,7 +240,7 @@ pub(crate) fn hosts_file_lookup<T>(
 /// The verdict of ares_getaddrinfo's pre-DNS phase.
 pub(crate) enum AddrInfoPreflight {
     /// Deliver `status` with a NULL result.
-    Fail(c_int),
+    Fail(i32),
     /// IP-literal or hosts-file hit: the shim builds family-filtered nodes
     /// from these addresses under `canonical` and delivers ARES_SUCCESS.
     DeliverAddrs { addrs: Vec<IpAddr>, canonical: String },
@@ -264,7 +271,7 @@ pub(crate) fn well_known_port(svc: &str) -> Option<u16> {
 pub(crate) fn getaddrinfo_preflight<T>(
     st: &mut ChannelState<T>,
     hostname_raw: &str,
-    ai_family: c_int,
+    ai_family: i32,
 ) -> AddrInfoPreflight {
     let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
 
@@ -333,20 +340,20 @@ pub(crate) fn getaddrinfo_preflight<T>(
 /// The verdict of ares_getnameinfo's pre-DNS phase.
 pub(crate) enum NameinfoPreflight {
     /// Deliver `status` with NULL node and service.
-    Fail(c_int),
+    Fail(i32),
     /// Service-only lookup: deliver (NULL node, service).
     DeliverService(Option<CString>),
     /// Numeric-host path: deliver both without DNS.
     DeliverNumeric { node: CString, service: Option<CString> },
     /// PTR lookup required; `flags` carries the defaulted flag set.
-    StartPtr { flags: c_int },
+    StartPtr { flags: i32 },
 }
 
 /// Flag defaulting and the service-only / numeric-host short-circuits.
 pub(crate) fn getnameinfo_preflight<T>(
     st: &mut ChannelState<T>,
     addr: &AddrInfo,
-    flags: c_int,
+    flags: i32,
 ) -> NameinfoPreflight {
     // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
     let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
@@ -387,7 +394,7 @@ pub(crate) fn getnameinfo_preflight<T>(
 }
 
 /// Format an IP address with scope ID for IPv6 (e.g., "fe80::1%0")
-pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: c_int) -> String {
+pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: i32) -> String {
     match ip {
         // The scope id is currently appended regardless of the flag/scope_id
         // check; the branches are intentionally identical for now.
@@ -404,7 +411,7 @@ pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: c_int) -> 
 }
 
 /// Get the service string based on flags
-pub(crate) fn get_service_string(services: &Services, port: u16, flags: c_int) -> Option<CString> {
+pub(crate) fn get_service_string(services: &Services, port: u16, flags: i32) -> Option<CString> {
     if port == 0 {
         return None;
     }
@@ -429,7 +436,7 @@ pub(crate) fn get_service_string(services: &Services, port: u16, flags: c_int) -
 /// Empty/onion rejection shared by ares_search and ares_search_dnsrec —
 /// checked before the channel is even dereferenced (order is behavior:
 /// these fire even on a NULL channel).
-pub(crate) fn search_name_check(name_str: &str) -> Option<c_int> {
+pub(crate) fn search_name_check(name_str: &str) -> Option<i32> {
     if name_str.is_empty() {
         return Some(ARES_ENOTFOUND);
     }
@@ -446,7 +453,7 @@ pub(crate) fn search_start<T>(
     st: &mut ChannelState<T>,
     name_str: &str,
     retry_server_error: bool,
-) -> Result<(SearchSm, String), c_int> {
+) -> Result<(SearchSm, String), i32> {
     if st.ares.config.nameservers.is_empty() {
         return Err(ARES_ENOSERVER);
     }
@@ -489,7 +496,7 @@ pub(crate) fn cached_reply<T>(
 /// The verdict of ares_gethostbyaddr's pre-DNS phase.
 pub(crate) enum AddrPreflight {
     /// Deliver `status` with a NULL hostent.
-    Fail(c_int),
+    Fail(i32),
     /// Hosts-file reverse hit: deliver a hostent from this lookup, then free.
     DeliverHost(HostLookup),
     /// Issue the PTR query for this address.
@@ -500,7 +507,7 @@ pub(crate) enum AddrPreflight {
 pub(crate) fn gethostbyaddr_preflight<T>(
     st: &mut ChannelState<T>,
     addrbuf: &[u8],
-    family: c_int,
+    family: i32,
 ) -> AddrPreflight {
     if family != libc::AF_INET && family != libc::AF_INET6 {
         return AddrPreflight::Fail(ARES_ENOTIMP);

@@ -8,6 +8,7 @@ pub mod channel;
 pub mod lookup;
 pub mod transport;
 pub mod packets;
+pub mod preflight;
 pub mod query_builder;
 pub mod response;
 pub mod sortlist;

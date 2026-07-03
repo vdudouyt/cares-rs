@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use super::*;
 use crate::core::channel::cache_store_names;
-use crate::ffi::kernels::lookups::{
+use crate::core::preflight::{
     format_ip_with_scope, get_service_string, getaddrinfo_preflight, gethostbyname_preflight,
     cached_reply, gethostbyaddr_preflight, getnameinfo_preflight, hosts_file_lookup, no_servers,
     search_name_check, search_start, well_known_port, AddrInfoPreflight, AddrPreflight,
@@ -115,6 +115,18 @@ impl Callback {
             _ => TaskKind::Other,
         }
     }
+    /// Whether a delivered reply should populate the query cache: plain dnsrec
+    /// queries and dnsrec-delivery searches. Reads SearchDelivery through a
+    /// transient RefCell borrow that is dropped at return.
+    pub(crate) fn wants_dnsrec_cache(&self) -> bool {
+        match self {
+            Self::AresCallbackDnsRec(_) => true,
+            Self::Search(lookup) => {
+                matches!(lookup.borrow().delivery, SearchDelivery::DnsRec { .. })
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -130,6 +142,24 @@ pub(crate) struct FFIData {
     pub(crate) scope_id: u32,
     pub(crate) server_index: usize,
     pub(crate) timeouts: c_int,
+}
+
+impl FFIData {
+    /// A retry copy of this task's userdata aimed at `server_index`.
+    pub(crate) fn retarget(&self, server_index: usize, timeouts: c_int) -> FFIData {
+        FFIData {
+            callback: self.callback.clone(),
+            arg: self.arg,
+            family: self.family,
+            expected_record_type: self.expected_record_type,
+            ip: self.ip,
+            nameinfo_flags: self.nameinfo_flags,
+            port: self.port,
+            scope_id: self.scope_id,
+            server_index,
+            timeouts,
+        }
+    }
 }
 
 #[no_mangle]

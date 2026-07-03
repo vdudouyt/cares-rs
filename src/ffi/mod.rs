@@ -7,7 +7,6 @@ mod cstr;
 mod clinkedlist;
 pub mod dns_record;
 pub mod error;
-mod kernels;
 mod offset_of;
 
 use std::ffi::{ c_int, c_uint, c_void, c_char };

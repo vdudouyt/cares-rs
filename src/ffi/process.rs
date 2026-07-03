@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::core::channel::{cache_reply, tcp_payload};
-use crate::ffi::kernels::process::wants_dnsrec_cache;
+
 
 
 #[no_mangle]
@@ -156,7 +156,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                     TaskVerdict::Deliver => {}
                 }
                 // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
-                if channeldata.state.query_cache_max_ttl > 0 && wants_dnsrec_cache(&task.userdata.callback) {
+                if channeldata.state.query_cache_max_ttl > 0 && task.userdata.callback.wants_dnsrec_cache() {
                     cache_reply(&mut channeldata.state.query_cache, channeldata.state.query_cache_max_ttl, buf, Instant::now());
                 }
                 (task.userdata.callback).run(Ok(buf), &task.userdata, channeldata);
