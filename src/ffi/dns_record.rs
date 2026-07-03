@@ -3,16 +3,15 @@
 // contract, so per-function `# Safety` docs would just be noise.
 #![allow(clippy::missing_safety_doc)]
 
-use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::ffi::convert::malloc_bytes;
 use crate::ffi::error::{ARES_EBADRESP, ARES_ENOMEM, ARES_SUCCESS};
 
-mod safe;
-use safe::*;
-pub(crate) use safe::parse_record;
+pub use crate::core::dns_record::{ares_dns_record_t, ares_dns_rr_t};
+pub(crate) use crate::core::dns_record::parse_record;
+use crate::core::dns_record::write_record;
 
 // ---------------------------------------------------------------------------
 // ARES_TRUE / ARES_FALSE
@@ -187,54 +186,6 @@ pub const ARES_RR_CAA_VALUE: u32 = 257 * 100 + 3;
 pub const ARES_RR_RAW_RR_TYPE: u32 = 65536 * 100 + 1;
 pub const ARES_RR_RAW_RR_DATA: u32 = 65536 * 100 + 2;
 
-// ---------------------------------------------------------------------------
-// RRValue - discriminated union for RR field values
-// ---------------------------------------------------------------------------
-enum RRValue {
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    Addr(Ipv4Addr),
-    Addr6(Ipv6Addr),
-    Str(CString),
-    Bin(Vec<u8>), // Always null-terminated: last byte is \0, not counted in logical length
-}
-
-// ---------------------------------------------------------------------------
-// Core types
-// ---------------------------------------------------------------------------
-struct DnsRecordQuery {
-    name: String,
-    name_c: CString, // cached C string for lifetime management
-    qtype: u16,
-    qclass: u16,
-}
-
-pub struct ares_dns_rr_t {
-    name: String,
-    name_c: CString,
-    rtype: u16,
-    rclass: u16,
-    ttl: u32,
-    data: HashMap<u32, RRValue>,
-    opts: Vec<(u16, Vec<u8>)>,
-    // Cached libc structs backing the pointer-returning getters — interior
-    // mutable so a *const rr handle can refresh them without a *mut cast.
-    cached_in_addr: std::cell::Cell<libc::in_addr>,
-    cached_in6_addr: std::cell::Cell<crate::ffi::ares_in6_addr>,
-}
-
-pub struct ares_dns_record_t {
-    id: u16,
-    flags: u16,
-    opcode: u16,
-    rcode: u16,
-    queries: Vec<DnsRecordQuery>,
-    answers: Vec<ares_dns_rr_t>,
-    authority: Vec<ares_dns_rr_t>,
-    additional: Vec<ares_dns_rr_t>,
-}
-
 // =========================================================================
 // FFI functions
 // =========================================================================
@@ -384,7 +335,7 @@ pub unsafe extern "C" fn ares_dns_record_query_get(
         return ARES_EBADRESP;
     };
     if !name.is_null() {
-        unsafe { *name = q_name; }
+        unsafe { *name = q_name.as_ptr(); }
     }
     if !qtype.is_null() {
         unsafe { *qtype = q_type as c_uint; }
@@ -528,7 +479,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_name(
     if rr.is_null() {
         return std::ptr::null();
     }
-    unsafe { &*rr }.name_ptr()
+    unsafe { &*rr }.name_cstr().as_ptr()
 }
 
 #[no_mangle]
@@ -563,7 +514,13 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr(
     if rr.is_null() {
         return std::ptr::null();
     }
-    unsafe { &*rr }.addr_cached(key).unwrap_or(std::ptr::null())
+    let rr = unsafe { &*rr };
+    if rr.refresh_v4(key) {
+        // Cell<u32> is layout-identical to struct in_addr { u32 }.
+        rr.cached_v4.as_ptr() as *const libc::in_addr
+    } else {
+        std::ptr::null()
+    }
 }
 
 #[no_mangle]
@@ -574,7 +531,13 @@ pub unsafe extern "C" fn ares_dns_rr_get_addr6(
     if rr.is_null() {
         return std::ptr::null();
     }
-    unsafe { &*rr }.addr6_cached(key).unwrap_or(std::ptr::null())
+    let rr = unsafe { &*rr };
+    if rr.refresh_v6(key) {
+        // Cell<[u8; 16]> is layout-identical to struct ares_in6_addr.
+        rr.cached_v6.as_ptr() as *const crate::ffi::ares_in6_addr
+    } else {
+        std::ptr::null()
+    }
 }
 
 #[no_mangle]
@@ -585,7 +548,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_str(
     if rr.is_null() {
         return std::ptr::null();
     }
-    unsafe { &*rr }.str_ptr(key).unwrap_or(std::ptr::null())
+    unsafe { &*rr }.str_val(key).map(|s| s.as_ptr()).unwrap_or(std::ptr::null())
 }
 
 #[no_mangle]
@@ -636,12 +599,9 @@ pub unsafe extern "C" fn ares_dns_rr_get_bin(
             if !len.is_null() {
                 unsafe { *len = logical_len; }
             }
-            if data.is_empty() {
-                static EMPTY: u8 = 0;
-                &EMPTY as *const u8
-            } else {
-                data.as_ptr()
-            }
+            // Bin storage always carries its trailing NUL, so the slice is
+            // never empty: the pointer is strlen-safe as-is.
+            data.as_ptr()
         }
         None => {
             if !len.is_null() {
@@ -1042,12 +1002,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
     match (unsafe { &*rr }).bin_val(key) {
         Some((data, logical_len)) => {
             unsafe { *len = logical_len; }
-            if data.is_empty() {
-                static EMPTY: u8 = 0;
-                &EMPTY as *const u8
-            } else {
-                data.as_ptr()
-            }
+            data.as_ptr()
         }
         None => {
             unsafe { *len = 0; }

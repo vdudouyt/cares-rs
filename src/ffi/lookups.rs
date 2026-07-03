@@ -351,16 +351,16 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     if dnsrec.is_null() { return; }
     // Extract the first query's name/type through the record's safe accessors.
     let rec = unsafe { &*dnsrec };
-    let mut name_ptr: *const c_char = std::ptr::null();
+    let mut query_name: Option<&CStr> = None;
     let mut qtype: c_uint = 0;
     if rec.query_cnt() > 0 {
         if let Some((q_name, q_type, _qclass)) = rec.query_at(0) {
-            name_ptr = q_name;
+            query_name = Some(q_name);
             qtype = q_type as c_uint;
         }
     }
-    if name_ptr.is_null() { return; }
-    let name_str = unsafe { cstr_lossy(name_ptr) };
+    let Some(query_name) = query_name else { return; };
+    let name_str = query_name.to_str().unwrap_or("");
 
     // Same pre-state ordering as ares_search: bad names report before the
     // channel is dereferenced.
