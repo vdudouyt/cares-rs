@@ -47,68 +47,70 @@ use crate::ffi::{
     RECORD_TYPE_AAAA, RECORD_TYPE_PTR,
 };
 
-/// How a fire-and-forget entry (query/send/search/…) settled: the query is
-/// in flight, or `status` must be delivered with a NULL payload.
-pub(crate) enum StartOutcome {
-    InFlight,
-    Deliver(i32),
+/// How an `ares_*` entry point settled, uniformly across every handler. The
+/// `Result` is the fail axis — `Err(status)` means "deliver this non-success
+/// status now, with a NULL payload". For the handlers that can produce a
+/// synchronous result, the `Ok` side is an `Operation`, the sync-vs-async axis:
+/// * `Ok(Operation::Ready(v))` — settled synchronously; build the C result
+///   from `v` and deliver SUCCESS. Always terminal (fires the callback once).
+/// * `Ok(Operation::Pending)` — the query is on the wire; the reply path fires
+///   the callback later.
+///
+/// The fire-and-forget entries (query/send/search) have no synchronous result,
+/// so they return `Result<(), i32>` directly — `Ok(())` means "launched".
+pub(crate) enum Operation<T> {
+    Pending,
+    Ready(T),
 }
 
 /// ares_query: reject server-less channels, then enqueue.
-pub(crate) fn query<T>(st: &mut ChannelState<T>, name: &str, qtype: u16, userdata: T) -> StartOutcome {
+pub(crate) fn query<T>(st: &mut ChannelState<T>, name: &str, qtype: u16, userdata: T) -> Result<(), i32> {
     if no_servers(st) {
-        return StartOutcome::Deliver(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER);
     }
     match issue(st, dns_query_payload(name, qtype), SocketSource::Udp, 0, userdata) {
-        Ok(_) => StartOutcome::InFlight,
-        Err(()) => StartOutcome::Deliver(ARES_ECONNREFUSED),
+        Ok(_) => Ok(()),
+        Err(()) => Err(ARES_ECONNREFUSED),
     }
 }
 
 /// ares_send: a pre-built packet must at least hold a DNS header.
-pub(crate) fn send<T>(st: &mut ChannelState<T>, query_buf: &[u8], userdata: T) -> StartOutcome {
+pub(crate) fn send<T>(st: &mut ChannelState<T>, query_buf: &[u8], userdata: T) -> Result<(), i32> {
     if query_buf.len() < 12 {
-        return StartOutcome::Deliver(ARES_EBADQUERY);
+        return Err(ARES_EBADQUERY);
     }
     if no_servers(st) {
-        return StartOutcome::Deliver(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER);
     }
     match issue(st, BytesMut::from(query_buf), SocketSource::Udp, 0, userdata) {
-        Ok(_) => StartOutcome::InFlight,
-        Err(()) => StartOutcome::Deliver(ARES_ECONNREFUSED),
+        Ok(_) => Ok(()),
+        Err(()) => Err(ARES_ECONNREFUSED),
     }
-}
-
-/// ares_query_dnsrec's pre-send phase. A cache hit is parsed right here;
-/// the shim boxes the record, delivers, and destroys.
-pub(crate) enum DnsrecStart {
-    Deliver(i32),
-    DeliverParsed(crate::core::dns_record::ares_dns_record_t),
-    InFlight,
 }
 
 /// ares_query_dnsrec: server guard, then the query cache (keyed without the
 /// trailing dot; a cached reply that fails to parse falls through), then a
-/// fresh query.
+/// fresh query. A cache hit is parsed right here (`Ready`); the shim boxes the
+/// record, delivers, and destroys.
 pub(crate) fn query_dnsrec<T>(
     st: &mut ChannelState<T>,
     name_raw: &str,
     qtype: u16,
     now: Instant,
     userdata: T,
-) -> DnsrecStart {
+) -> Result<Operation<crate::core::dns_record::ares_dns_record_t>, i32> {
     if no_servers(st) {
-        return DnsrecStart::Deliver(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER);
     }
     let name_clean = name_raw.strip_suffix('.').unwrap_or(name_raw);
     if let Some(cached_buf) = cached_reply(st, name_clean, qtype, now) {
         if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf) {
-            return DnsrecStart::DeliverParsed(rec);
+            return Ok(Operation::Ready(rec));
         }
     }
     match issue(st, dns_query_payload(name_raw, qtype), SocketSource::Udp, 0, userdata) {
-        Ok(_) => DnsrecStart::InFlight,
-        Err(()) => DnsrecStart::Deliver(ARES_ECONNREFUSED),
+        Ok(_) => Ok(Operation::Pending),
+        Err(()) => Err(ARES_ECONNREFUSED),
     }
 }
 
@@ -125,26 +127,16 @@ pub(crate) fn search<T>(
     dnstype: u16,
     retry_server_error: bool,
     binding: T,
-) -> StartOutcome {
-    let (sm, query_hostname) = match search_start(st, name, retry_server_error) {
-        Ok(seed) => seed,
-        Err(status) => return StartOutcome::Deliver(status),
-    };
+) -> Result<(), i32> {
+    let (sm, query_hostname) = search_start(st, name, retry_server_error)?;
     let handle = Rc::new(RefCell::new(sm));
     match issue(st, dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, binding) {
         Ok(_) => {
             if let Some(t) = st.ares.tasks.last_mut() { t.machine = TaskMachine::Search(handle); }
-            StartOutcome::InFlight
+            Ok(())
         }
-        Err(()) => StartOutcome::Deliver(ARES_ECONNREFUSED),
+        Err(()) => Err(ARES_ECONNREFUSED),
     }
-}
-
-/// How ares_gethostbyaddr settled before/at send time.
-pub(crate) enum HostByAddrStart {
-    Deliver(i32),
-    DeliverHostent(Hostent),
-    InFlight,
 }
 
 /// ares_gethostbyname_file: the hosts-file-only lookup, shaped for C.
@@ -165,22 +157,22 @@ pub(crate) fn gethostbyaddr<T>(
     addrbuf: &[u8],
     family: i32,
     userdata: T,
-) -> HostByAddrStart {
+) -> Result<Operation<Hostent>, i32> {
     // family-validate -> buf_to_ip -> hosts reverse lookup -> no-servers -> PTR.
     if family != libc::AF_INET && family != libc::AF_INET6 {
-        return HostByAddrStart::Deliver(ARES_ENOTIMP);
+        return Err(ARES_ENOTIMP);
     }
     let addr = match buf_to_ip(addrbuf) {
         Ok(ip) => ip,
-        Err(_) => return HostByAddrStart::Deliver(ARES_ENOTIMP),
+        Err(_) => return Err(ARES_ENOTIMP),
     };
     // Check hosts file first
     if let Some(lookup) = st.ares.hosts().reverse_lookup(addr) {
-        return HostByAddrStart::DeliverHostent(Hostent::from_lookup(lookup));
+        return Ok(Operation::Ready(Hostent::from_lookup(lookup)));
     }
     // No servers configured
     if st.ares.config.nameservers.is_empty() {
-        return HostByAddrStart::Deliver(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER);
     }
     match issue(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
         Ok(_) => {
@@ -189,20 +181,18 @@ pub(crate) fn gethostbyaddr<T>(
                 t.family = family;
                 t.rtype = RECORD_TYPE_PTR;
             }
-            HostByAddrStart::InFlight
+            Ok(Operation::Pending)
         }
-        Err(()) => HostByAddrStart::Deliver(ARES_ECONNREFUSED),
+        Err(()) => Err(ARES_ECONNREFUSED),
     }
 }
 
-/// How ares_getnameinfo settled before/at send time. Fail and the Deliver*
-/// variants marshal straight to the C callback; InFlight means the PTR
-/// query is on the wire.
-pub(crate) enum NameinfoStart {
-    Fail(i32),
-    DeliverService(Option<CString>),
-    DeliverNumeric { node: CString, service: Option<CString> },
-    InFlight,
+/// The synchronous result `ares_getnameinfo` can hand back: a service-only
+/// answer, or a numeric-host answer. Both marshal straight to the C callback;
+/// a PTR query on the wire is `Operation::Pending`, an error is `Err(status)`.
+pub(crate) enum NameinfoOk {
+    Service(Option<CString>),
+    Numeric { node: CString, service: Option<CString> },
 }
 
 /// ares_getnameinfo: flag defaulting + the numeric/service short-circuits,
@@ -216,7 +206,7 @@ pub(crate) fn getnameinfo<T>(
     addr: &AddrInfo,
     flags: i32,
     userdata: T,
-) -> NameinfoStart {
+) -> Result<Operation<NameinfoOk>, i32> {
     // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
     let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
         flags | ARES_NI_LOOKUPHOST
@@ -229,7 +219,7 @@ pub(crate) fn getnameinfo<T>(
 
     // If only service lookup requested (no host), deliver immediately
     if want_service && !want_host {
-        return NameinfoStart::DeliverService(get_service_string(st.ares.services(), addr.port, flags));
+        return Ok(Operation::Ready(NameinfoOk::Service(get_service_string(st.ares.services(), addr.port, flags))));
     }
 
     // Host lookup requested (guaranteed by the defaulting above).
@@ -237,7 +227,7 @@ pub(crate) fn getnameinfo<T>(
     if (flags & ARES_NI_NUMERICHOST) != 0 {
         // ARES_NI_NUMERICHOST + ARES_NI_NAMEREQD is illegal (contradiction)
         if (flags & ARES_NI_NAMEREQD) != 0 {
-            return NameinfoStart::Fail(ARES_EBADFLAGS);
+            return Err(ARES_EBADFLAGS);
         }
         let node = CString::new(format_ip_with_scope(&addr.ip, addr.scope_id, flags)).unwrap();
         let service = if want_service {
@@ -245,37 +235,28 @@ pub(crate) fn getnameinfo<T>(
         } else {
             None
         };
-        return NameinfoStart::DeliverNumeric { node, service };
+        return Ok(Operation::Ready(NameinfoOk::Numeric { node, service }));
     }
 
     // PTR lookup required.
     match issue(st, dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
-        Ok(_) => NameinfoStart::InFlight,
-        Err(()) => NameinfoStart::Fail(ARES_ECONNREFUSED),
+        Ok(_) => Ok(Operation::Pending),
+        Err(()) => Err(ARES_ECONNREFUSED),
     }
-}
-
-/// How ares_gethostbyname settled before/at send time.
-pub(crate) enum HostStart {
-    /// Deliver `status` with a NULL hostent.
-    Deliver(i32),
-    /// Synchronous result (IP literal / hosts file / localhost / query
-    /// cache): build the hostent from the blueprint, deliver, free.
-    DeliverHostent(Hostent),
-    InFlight,
 }
 
 /// ares_gethostbyname: the full pre-DNS cascade, then the pooled launch and
 /// the failover probe. On exhaustion the probe still runs (its health
 /// bookkeeping sees the launch failures), and ECONNREFUSED is delivered by
-/// the shim afterwards.
+/// the shim afterwards. A synchronous hit (IP literal / hosts file / localhost
+/// / query cache) is `Ok(Operation::Ready(hostent))`.
 pub(crate) fn gethostbyname<T: Copy + Default>(
     st: &mut ChannelState<T>,
     hostname: &str,
     family: i32,
     now: Instant,
     binding: T,
-) -> HostStart {
+) -> Result<Operation<Hostent>, i32> {
     // Check order is behavior (each stage may deliver before the next runs):
     // ascii -> onion -> family-validate -> IP literal -> hosts file ->
     // localhost -> HOSTALIASES (fs read; PermissionDenied => Deliver(EFILE)) ->
@@ -284,18 +265,18 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
 
     // Reject non-ASCII names
     if !hostname.is_ascii() {
-        return HostStart::Deliver(ARES_EBADNAME);
+        return Err(ARES_EBADNAME);
     }
 
     // Reject .onion domains immediately (RFC 7686)
     if is_onion_domain(hostname) {
-        return HostStart::Deliver(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND);
     }
 
     // Family validation; the A/AAAA mapping itself lives in HostByNameSm::new.
     match family {
         libc::AF_INET | libc::AF_INET6 | libc::AF_UNSPEC => {}
-        _ => return HostStart::Deliver(ARES_ENOTIMP),
+        _ => return Err(ARES_ENOTIMP),
     }
 
     let family_filter = match family {
@@ -313,11 +294,11 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
             AddressFamily::Any => true,
         };
         if matches {
-            return HostStart::DeliverHostent(Hostent::from_lookup(HostLookup {
+            return Ok(Operation::Ready(Hostent::from_lookup(HostLookup {
                 canonical: hostname.to_string(),
                 aliases: vec![],
                 addrs: vec![ip],
-            }));
+            })));
         }
     }
 
@@ -325,7 +306,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
     let hosts_result = st.ares.hosts().lookup(hostname, family_filter);
     if let Some(ref lookup) = hosts_result {
         if !lookup.addrs.is_empty() {
-            return HostStart::DeliverHostent(Hostent::from_lookup(lookup.clone()));
+            return Ok(Operation::Ready(Hostent::from_lookup(lookup.clone())));
         }
     }
 
@@ -340,11 +321,11 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
                 IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             ],
         };
-        return HostStart::DeliverHostent(Hostent::from_lookup(HostLookup {
+        return Ok(Operation::Ready(Hostent::from_lookup(HostLookup {
             canonical: hostname.to_string(),
             aliases: vec![],
             addrs,
-        }));
+        })));
     }
 
     // Check HOSTALIASES env var for single-label names
@@ -364,7 +345,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
                     alias_found.unwrap_or_else(|| hostname_str.clone())
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    return HostStart::Deliver(ARES_EFILE);
+                    return Err(ARES_EFILE);
                 }
                 Err(_) => hostname_str.clone(),
             }
@@ -377,7 +358,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
 
     // No servers configured — return ENOSERVER immediately
     if st.ares.config.nameservers.is_empty() {
-        return HostStart::Deliver(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER);
     }
 
     // Check query cache
@@ -410,7 +391,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
                         libc::AF_INET6 => libc::AF_INET6,
                         _ => libc::AF_INET6,
                     };
-                    return HostStart::DeliverHostent(Hostent::from_parsed(parsed_rrs, current_family));
+                    return Ok(Operation::Ready(Hostent::from_parsed(parsed_rrs, current_family)));
                 }
             } else {
                 st.query_cache.remove(&cache_key);
@@ -438,18 +419,17 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
     // server in parallel with the primary query (its binding is T::default).
     maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp);
     match launched {
-        LaunchOutcome::Launched => HostStart::InFlight,
-        LaunchOutcome::Exhausted { .. } => HostStart::Deliver(ARES_ECONNREFUSED),
+        LaunchOutcome::Launched => Ok(Operation::Pending),
+        LaunchOutcome::Exhausted { .. } => Err(ARES_ECONNREFUSED),
     }
 }
 
-/// How ares_getaddrinfo settled at entry: a synchronous delivery, or the
-/// batch went out — possibly already producing a (failure) delivery when
-/// every send was refused.
-pub(crate) enum AddrInfoStart {
-    Deliver(i32),
-    DeliverAddrs { addrs: Vec<IpAddr>, canonical: String },
-    Started(Vec<AddrInfoDelivery>),
+/// The synchronous address result `ares_getaddrinfo` can hand back — an
+/// IP-literal or hosts-file hit. (An async A/AAAA batch is `Operation::Pending`;
+/// an error, including every socket refused, is `Err(status)`.)
+pub(crate) struct AddrInfoOk {
+    pub addrs: Vec<IpAddr>,
+    pub canonical: String,
 }
 
 /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
@@ -459,7 +439,7 @@ pub(crate) fn getaddrinfo<T: Copy>(
     hostname_raw: &str,
     ai_family: i32,
     binding: T,
-) -> AddrInfoStart {
+) -> Result<Operation<AddrInfoOk>, i32> {
     // Check order is behavior: empty-name -> onion -> IP literal (family
     // mismatch fails, no fall-through) -> hosts file -> no-servers -> DNS.
     // The raw name keeps its trailing dot for the SearchPlan; checks and the
@@ -472,18 +452,18 @@ pub(crate) fn getaddrinfo<T: Copy>(
             IpAddr::V4(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET,
             IpAddr::V6(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET6,
         });
-        AddrInfoStart::DeliverAddrs { addrs, canonical }
+        Ok(Operation::Ready(AddrInfoOk { addrs, canonical }))
     };
 
     let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
 
     if hostname.is_empty() {
-        return AddrInfoStart::Deliver(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND);
     }
 
     // Reject .onion domains immediately (RFC 7686)
     if is_onion_domain(hostname) {
-        return AddrInfoStart::Deliver(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND);
     }
 
     // IP literal check
@@ -497,7 +477,7 @@ pub(crate) fn getaddrinfo<T: Copy>(
         if matches {
             return deliver(vec![ip], hostname.to_string());
         } else {
-            return AddrInfoStart::Deliver(ARES_ENOTFOUND);
+            return Err(ARES_ENOTFOUND);
         }
     }
 
@@ -515,7 +495,7 @@ pub(crate) fn getaddrinfo<T: Copy>(
 
     // No servers configured
     if st.ares.config.nameservers.is_empty() {
-        return AddrInfoStart::Deliver(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER);
     }
 
     // DNS path: mint the machine and drive the parallel A/AAAA batch.
@@ -531,7 +511,14 @@ pub(crate) fn getaddrinfo<T: Copy>(
 
     let handle = Rc::new(RefCell::new(sm));
     let actions = handle.borrow_mut().begin_batch(first_server);
-    AddrInfoStart::Started(drive_addrinfo(st, &handle, actions, binding))
+    // At entry the batch can only yield nothing (still in flight) or a single
+    // all-sockets-refused failure — never a synchronous success, which needs a
+    // reply. `Ready` is terminal; the async result arrives via the reply path.
+    match drive_addrinfo(st, &handle, actions, binding).as_slice() {
+        [] => Ok(Operation::Pending),
+        [AddrInfoDelivery::Fail { status }] => Err(*status),
+        _ => unreachable!("getaddrinfo entry yields nothing or a single ECONNREFUSED"),
+    }
 }
 
 /// ares_search's shim-side pre-check, re-exported so the shim's single

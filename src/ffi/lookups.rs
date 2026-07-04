@@ -169,15 +169,15 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     // FFIData::default() (Callback::Probe), minted by core.
     let binding = FFIData::base(Callback::HostByName(HostTail { callback, arg }));
     match api::gethostbyname(&mut channeldata.state, hostname, family, Instant::now(), binding) {
-        api::HostStart::Deliver(status) => {
+        Err(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
-        api::HostStart::DeliverHostent(bp) => {
+        Ok(api::Operation::Ready(bp)) => {
             let hostent = unsafe { build_hostent(bp) };
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
             unsafe { ares_free_hostent(hostent) };
         }
-        api::HostStart::InFlight => {}
+        Ok(api::Operation::Pending) => {}
     }
 }
 
@@ -220,15 +220,15 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         ..FFIData::base(Callback::AresHostCallback(callback))
     };
     match api::gethostbyaddr(&mut channeldata.state, addrbuf, family, userdata) {
-        api::HostByAddrStart::Deliver(status) => {
+        Err(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
-        api::HostByAddrStart::DeliverHostent(bp) => {
+        Ok(api::Operation::Ready(bp)) => {
             let hostent = unsafe { build_hostent(bp) };
             unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
             unsafe { ares_free_hostent(hostent) };
         }
-        api::HostByAddrStart::InFlight => {}
+        Ok(api::Operation::Pending) => {}
     }
 }
 
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     let _ = dnsclass;
     let tail = SearchTail { dnstype: dnstype as u16, delivery: SearchDelivery::Raw { callback, arg } };
     let binding = FFIData::base(Callback::Search(tail));
-    if let api::StartOutcome::Deliver(status) = api::search(&mut channeldata.state, name_str, dnstype as u16, false, binding) {
+    if let Err(status) = api::search(&mut channeldata.state, name_str, dnstype as u16, false, binding) {
         unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
     }
 }
@@ -261,7 +261,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
     let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
-    if let api::StartOutcome::Deliver(status) = api::query(&mut channeldata.state, name, dnstype as u16, ffidata) {
+    if let Err(status) = api::query(&mut channeldata.state, name, dnstype as u16, ffidata) {
         unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
     }
 }
@@ -283,15 +283,15 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     let name = unsafe { cstr_lossy(name) };
     let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallbackDnsRec(callback)) };
     match api::query_dnsrec(&mut channeldata.state, name, dnstype as u16, Instant::now(), ffidata) {
-        api::DnsrecStart::Deliver(status) => {
+        Err(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
-        api::DnsrecStart::DeliverParsed(rec) => {
+        Ok(api::Operation::Ready(rec)) => {
             let dnsrec = Box::into_raw(Box::new(rec));
             unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
             unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
         }
-        api::DnsrecStart::InFlight => {}
+        Ok(api::Operation::Pending) => {}
     }
 }
 
@@ -329,7 +329,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let tail = SearchTail { dnstype: qtype as u16, delivery: SearchDelivery::DnsRec { callback, arg } };
     let binding = FFIData::base(Callback::Search(tail));
-    if let api::StartOutcome::Deliver(status) = api::search(&mut channeldata.state, name_str, qtype as u16, true, binding) {
+    if let Err(status) = api::search(&mut channeldata.state, name_str, qtype as u16, true, binding) {
         unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
     }
 }
@@ -370,18 +370,18 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         ..FFIData::base(Callback::AresNameinfoCallback(callback))
     };
     match api::getnameinfo(&mut channeldata.state, &addr_info, flags, userdata) {
-        api::NameinfoStart::Fail(status) => {
+        Err(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
         }
-        api::NameinfoStart::DeliverService(service) => {
+        Ok(api::Operation::Ready(api::NameinfoOk::Service(service))) => {
             let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
             unsafe { callback(arg, ARES_SUCCESS, 0, std::ptr::null_mut(), service_ptr) };
         }
-        api::NameinfoStart::DeliverNumeric { node, service } => {
+        Ok(api::Operation::Ready(api::NameinfoOk::Numeric { node, service })) => {
             let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
             unsafe { callback(arg, ARES_SUCCESS, 0, node.into_raw(), service_ptr) };
         }
-        api::NameinfoStart::InFlight => {}
+        Ok(api::Operation::Pending) => {}
     }
 }
 
@@ -531,17 +531,15 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     let binding = FFIData::base(Callback::AddrInfo(tail));
 
     match api::getaddrinfo(&mut channeldata.state, hostname_raw, ai_family, binding) {
-        api::AddrInfoStart::Deliver(status) => {
+        Err(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
-        api::AddrInfoStart::DeliverAddrs { addrs, canonical } => {
+        Ok(api::Operation::Ready(api::AddrInfoOk { addrs, canonical })) => {
             let nodes = addrinfo_nodes_from_addrs_port(&addrs, port);
             let ai = build_ares_addrinfo(&canonical, nodes);
             unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
         }
-        api::AddrInfoStart::Started(deliveries) => {
-            fire_addrinfo_deliveries(deliveries, tail);
-        }
+        Ok(api::Operation::Pending) => {}
     }
 }
 
@@ -620,7 +618,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
     let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
-    if let api::StartOutcome::Deliver(status) = api::send(&mut channeldata.state, query_buf, ffidata) {
+    if let Err(status) = api::send(&mut channeldata.state, query_buf, ffidata) {
         unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
     }
 }
