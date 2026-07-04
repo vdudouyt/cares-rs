@@ -207,13 +207,12 @@ pub(crate) fn timeout_step<T>(
 
 /// Launch a probe query to an expired-failure server in parallel with the
 /// primary query (no user callback; a failed/refused socket just skips it).
-pub(crate) fn maybe_launch_probe<T>(
+pub(crate) fn maybe_launch_probe<T: Default>(
     st: &mut ChannelState<T>,
     hostname: &str,
     family: i32,
     primary_server: usize,
     use_tcp: bool,
-    probe_binding: T,
 ) {
     if st.server_failover_retry_chance == 0 {
         return;
@@ -224,8 +223,9 @@ pub(crate) fn maybe_launch_probe<T>(
     };
     let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
     // Best-effort: if the probe's socket can't be created (or is refused), skip it.
-    // A probe has no state machine (Task.machine stays None).
-    let _ = issue(st, dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), probe_server, probe_binding);
+    // A probe has no user callback (T::default) and no state machine
+    // (Task.machine stays None).
+    let _ = issue(st, dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), probe_server, T::default());
 }
 
 /// Plain enqueue (no socket-callback involvement — ares_query/ares_send/

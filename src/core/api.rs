@@ -269,13 +269,12 @@ pub(crate) enum HostStart {
 /// the failover probe. On exhaustion the probe still runs (its health
 /// bookkeeping sees the launch failures), and ECONNREFUSED is delivered by
 /// the shim afterwards.
-pub(crate) fn gethostbyname<T: Clone>(
+pub(crate) fn gethostbyname<T: Clone + Default>(
     st: &mut ChannelState<T>,
     hostname: &str,
     family: i32,
     now: Instant,
-    lookup_binding: T,
-    probe_binding: T,
+    binding: T,
 ) -> HostStart {
     // Check order is behavior (each stage may deliver before the next runs):
     // ascii -> onion -> family-validate -> IP literal -> hosts file ->
@@ -434,10 +433,10 @@ pub(crate) fn gethostbyname<T: Clone>(
 
     let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
     let handle = Rc::new(RefCell::new(sm));
-    let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, lookup_binding);
+    let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, binding);
     // Server failover probing: if enabled, probe an expired-failure
-    // server in parallel with the primary query.
-    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, probe_binding);
+    // server in parallel with the primary query (its binding is T::default).
+    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp);
     match launched {
         LaunchOutcome::Launched => HostStart::InFlight,
         LaunchOutcome::Exhausted { .. } => HostStart::Deliver(ARES_ECONNREFUSED),

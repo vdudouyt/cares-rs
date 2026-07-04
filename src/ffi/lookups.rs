@@ -42,7 +42,7 @@ pub(crate) struct SearchTail {
     pub(crate) delivery: SearchDelivery,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 // Variants are named after the c-ares FFI callback typedefs they dispatch to;
 // the shared `Callback` suffix is intentional for that correspondence.
 // Stateful lookups carry only their Copy C delivery tail here; the shared
@@ -57,7 +57,11 @@ pub(crate) enum Callback {
     AddrInfo(AddrInfoTail),
     HostByName(HostTail),
     Search(SearchTail),
-    Probe, // Server failover probe — no user callback
+    /// Server failover probe — no user callback. Also the `Default`: an empty
+    /// binding is one with nothing to deliver, which core mints itself for
+    /// probes (so the probe needn't be threaded in as a separate argument).
+    #[default]
+    Probe,
 }
 
 impl Callback {
@@ -125,7 +129,7 @@ impl Callback {
 /// family/record-type, server, timeouts, queried ip) lives on the core
 /// `Task`, so this is a plain value the shim builds eagerly and core clones
 /// per task — no factory closure.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct FFIData {
     pub(crate) callback: Callback,
     pub(crate) arg: *mut c_void,
@@ -161,9 +165,10 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { cstr_lossy(hostname) };
-    // Two plain bindings (no factory closure): the lookup sends and the probe.
-    let lookup = FFIData::base(Callback::HostByName(HostTail { callback, arg }));
-    match api::gethostbyname(&mut channeldata.state, hostname, family, Instant::now(), lookup, FFIData::base(Callback::Probe)) {
+    // One plain binding (no factory closure); the failover probe's binding is
+    // FFIData::default() (Callback::Probe), minted by core.
+    let binding = FFIData::base(Callback::HostByName(HostTail { callback, arg }));
+    match api::gethostbyname(&mut channeldata.state, hostname, family, Instant::now(), binding) {
         api::HostStart::Deliver(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
