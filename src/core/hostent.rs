@@ -11,7 +11,7 @@ use crate::core::response::ParsedRRs;
 
 /// Everything a `struct hostent` will say, decided: representative family,
 /// per-family address filter, and the NUL-safety alias policy.
-pub(crate) struct HostentBlueprint {
+pub(crate) struct Hostent {
     pub name: CString,
     pub aliases: Vec<CString>,
     pub addrtype: i32,
@@ -19,7 +19,7 @@ pub(crate) struct HostentBlueprint {
     pub addrs: Vec<IpAddr>,
 }
 
-impl HostentBlueprint {
+impl Hostent {
     /// A synchronous (hosts-file / IP-literal / localhost) result: the
     /// representative family comes from the first address; aliases that
     /// cannot become C strings (embedded NUL) are dropped; a NUL-containing
@@ -35,7 +35,7 @@ impl HostentBlueprint {
             .into_iter()
             .filter_map(|s| CString::new(s).ok()) // drop NUL-containing aliases
             .collect();
-        HostentBlueprint {
+        Hostent {
             name: CString::new(lookup.canonical).unwrap_or_default(),
             aliases,
             addrtype,
@@ -53,7 +53,7 @@ impl HostentBlueprint {
             _ => 0,
         };
         let addrs = rrs.items.iter().map(|r| r.ip).filter(|ip| ip_len(ip) == length).collect();
-        HostentBlueprint { name: rrs.name, aliases: rrs.aliases, addrtype: family, length, addrs }
+        Hostent { name: rrs.name, aliases: rrs.aliases, addrtype: family, length, addrs }
     }
 }
 

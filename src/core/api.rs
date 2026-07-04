@@ -25,7 +25,7 @@ use crate::core::launch::{
 };
 use crate::core::ares::TaskMachine;
 use crate::core::channel::cache_store_names;
-use crate::core::hostent::HostentBlueprint;
+use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup};
 use crate::core::lookup::{
     is_localhost, is_onion_domain, is_truncated, AddrInfoSm, HostAction, HostByNameSm, HostEvent,
@@ -143,13 +143,13 @@ pub(crate) fn search<T>(
 /// How ares_gethostbyaddr settled before/at send time.
 pub(crate) enum HostByAddrStart {
     Deliver(i32),
-    DeliverHostent(HostentBlueprint),
+    DeliverHostent(Hostent),
     InFlight,
 }
 
 /// ares_gethostbyname_file: the hosts-file-only lookup, shaped for C.
-pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family: i32) -> Result<HostentBlueprint, i32> {
-    hosts_file_lookup(st, name, family).map(HostentBlueprint::from_lookup)
+pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family: i32) -> Result<Hostent, i32> {
+    hosts_file_lookup(st, name, family).map(Hostent::from_lookup)
 }
 
 /// ares_gethostbyaddr: preflight (family/length validation, hosts-file
@@ -176,7 +176,7 @@ pub(crate) fn gethostbyaddr<T>(
     };
     // Check hosts file first
     if let Some(lookup) = st.ares.hosts().reverse_lookup(addr) {
-        return HostByAddrStart::DeliverHostent(HostentBlueprint::from_lookup(lookup));
+        return HostByAddrStart::DeliverHostent(Hostent::from_lookup(lookup));
     }
     // No servers configured
     if st.ares.config.nameservers.is_empty() {
@@ -261,7 +261,7 @@ pub(crate) enum HostStart {
     Deliver(i32),
     /// Synchronous result (IP literal / hosts file / localhost / query
     /// cache): build the hostent from the blueprint, deliver, free.
-    DeliverHostent(HostentBlueprint),
+    DeliverHostent(Hostent),
     InFlight,
 }
 
@@ -313,7 +313,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
             AddressFamily::Any => true,
         };
         if matches {
-            return HostStart::DeliverHostent(HostentBlueprint::from_lookup(HostLookup {
+            return HostStart::DeliverHostent(Hostent::from_lookup(HostLookup {
                 canonical: hostname.to_string(),
                 aliases: vec![],
                 addrs: vec![ip],
@@ -325,7 +325,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
     let hosts_result = st.ares.hosts().lookup(hostname, family_filter);
     if let Some(ref lookup) = hosts_result {
         if !lookup.addrs.is_empty() {
-            return HostStart::DeliverHostent(HostentBlueprint::from_lookup(lookup.clone()));
+            return HostStart::DeliverHostent(Hostent::from_lookup(lookup.clone()));
         }
     }
 
@@ -340,7 +340,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
                 IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             ],
         };
-        return HostStart::DeliverHostent(HostentBlueprint::from_lookup(HostLookup {
+        return HostStart::DeliverHostent(Hostent::from_lookup(HostLookup {
             canonical: hostname.to_string(),
             aliases: vec![],
             addrs,
@@ -410,7 +410,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
                         libc::AF_INET6 => libc::AF_INET6,
                         _ => libc::AF_INET6,
                     };
-                    return HostStart::DeliverHostent(HostentBlueprint::from_parsed(parsed_rrs, current_family));
+                    return HostStart::DeliverHostent(Hostent::from_parsed(parsed_rrs, current_family));
                 }
             } else {
                 st.query_cache.remove(&cache_key);
@@ -543,14 +543,14 @@ pub(crate) use crate::core::preflight::search_name_check as search_precheck;
 pub(crate) enum HostDelivery {
     NotifyServerFail { server: usize, tcp: bool },
     /// Sortlist already applied and the hostent shaped; build, deliver, free.
-    Success { hostent: HostentBlueprint, timeouts: i32 },
+    Success { hostent: Hostent, timeouts: i32 },
     Fail { status: i32, timeouts: i32 },
 }
 
 /// The plain host-callback path (ares_gethostbyaddr's direct PTR delivery):
 /// parse under the flow's acceptance rule, add the synthetic record for the
 /// queried address, and shape the hostent.
-pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip: Option<IpAddr>) -> Result<HostentBlueprint, i32> {
+pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip: Option<IpAddr>) -> Result<Hostent, i32> {
     let buf = res?;
     let is_ptr = rtype == RECORD_TYPE_PTR;
     let require = if is_ptr { ReplyRequire::ItemsOrAliases } else { ReplyRequire::Items };
@@ -558,7 +558,7 @@ pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip
     if is_ptr {
         push_synthetic_ptr(&mut rrs, ip.expect("PTR flows carry the queried ip"));
     }
-    Ok(HostentBlueprint::from_parsed(rrs, family))
+    Ok(Hostent::from_parsed(rrs, family))
 }
 
 /// A gethostbyname task settled (reply or error): parse, feed the machine,
@@ -627,7 +627,7 @@ pub(crate) fn on_hostbyname_reply<T: Copy>(
                 if !st.sortlist.is_empty() {
                     apply_sortlist(&st.sortlist, &mut rrs.items);
                 }
-                deliveries.push(HostDelivery::Success { hostent: HostentBlueprint::from_parsed(rrs, family), timeouts });
+                deliveries.push(HostDelivery::Success { hostent: Hostent::from_parsed(rrs, family), timeouts });
             }
             HostAction::DeliverFail { status, timeouts } => {
                 deliveries.push(HostDelivery::Fail { status, timeouts });

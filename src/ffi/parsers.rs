@@ -45,7 +45,7 @@ impl AddrTTL for ares_addr6ttl {
 }
 
 pub use crate::core::response::{ParsedRRs, ParsedResponse};
-use crate::core::hostent::{addrttl_fill, HostentBlueprint};
+use crate::core::hostent::{addrttl_fill, Hostent};
 use crate::core::query_builder::build_query;
 use crate::core::response::{
     addr_reply, empty_chain_status, expand_name_at, expand_string_at, push_synthetic_ptr,
@@ -55,7 +55,7 @@ use crate::ffi::convert::malloc_bytes;
 
 /// Build the C hostent graph from a core blueprint — pure transcription:
 /// every inclusion/ordering/family decision was already made in core.
-pub(crate) unsafe fn build_hostent(bp: HostentBlueprint) -> *mut libc::hostent {
+pub(crate) unsafe fn build_hostent(bp: Hostent) -> *mut libc::hostent {
     let addrlist: Vec<*mut i8> = bp
         .addrs
         .iter()
@@ -253,7 +253,7 @@ pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abu
             unsafe { *out_naddrttls = pairs.len() as c_int };
         }
         if !out.is_null() {
-            unsafe { *out = build_hostent(HostentBlueprint::from_parsed(res, family)); }
+            unsafe { *out = build_hostent(Hostent::from_parsed(res, family)); }
         }
         ARES_SUCCESS
     };
@@ -298,7 +298,7 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
         let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
         let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
         push_synthetic_ptr(&mut addr_records, ip);
-        unsafe { Ok(build_hostent(HostentBlueprint::from_parsed(addr_records, family))) }
+        unsafe { Ok(build_hostent(Hostent::from_parsed(addr_records, family))) }
     };
     unsafe { ares_fn_wrapper(out, build) }
 }
