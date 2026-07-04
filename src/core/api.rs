@@ -25,20 +25,26 @@ use crate::core::launch::{
 };
 use crate::core::channel::cache_store_names;
 use crate::core::hostent::HostentBlueprint;
+use crate::core::hostfile::{AddressFamily, HostLookup};
 use crate::core::lookup::{
-    is_truncated, HostAction, HostByNameSm, HostEvent, LookupCfg, LookupEvent, SearchAction,
-    SearchSm, ServerHealth,
+    is_localhost, is_onion_domain, is_truncated, AddrInfoSm, HostAction, HostByNameSm, HostEvent,
+    LookupCfg, LookupEvent, SearchAction, SearchPlan, SearchSm, ServerHealth,
 };
-use crate::core::packets::AddrRecord;
+use crate::core::packets::{buf_to_ip, AddrRecord};
 use crate::core::preflight::{
-    cached_reply, getaddrinfo_preflight, gethostbyaddr_preflight, gethostbyname_preflight,
-    getnameinfo_preflight, hosts_file_lookup, no_servers, search_start, AddrInfo,
-    AddrInfoPreflight, AddrPreflight, HostPreflight, NameinfoPreflight,
+    cached_reply, format_ip_with_scope, get_service_string, hosts_file_lookup, no_servers,
+    search_start, AddrInfo,
 };
-use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedRRs, ReplyRequire};
+use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedResponse, ParsedRRs, ReplyRequire};
 use crate::core::sortlist::apply_sortlist;
-use crate::ffi::error::{ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_ENOSERVER};
-use crate::ffi::RECORD_TYPE_PTR;
+use crate::ffi::error::{
+    ARES_EBADFLAGS, ARES_EBADNAME, ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_EFILE, ARES_ENODATA,
+    ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP,
+};
+use crate::ffi::{
+    ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NUMERICHOST, RECORD_TYPE_A,
+    RECORD_TYPE_AAAA, RECORD_TYPE_PTR,
+};
 
 /// How a fire-and-forget entry (query/send/search/…) settled: the query is
 /// in flight, or `status` must be delivered with a NULL payload.
@@ -153,13 +159,22 @@ pub(crate) fn gethostbyaddr<T>(
     make_userdata: &mut dyn FnMut(IpAddr) -> T,
     consent: Consent<'_>,
 ) -> HostByAddrStart {
-    let addr = match gethostbyaddr_preflight(st, addrbuf, family) {
-        AddrPreflight::Fail(status) => return HostByAddrStart::Deliver(status),
-        AddrPreflight::DeliverHost(lookup) => {
-            return HostByAddrStart::DeliverHostent(HostentBlueprint::from_lookup(lookup))
-        }
-        AddrPreflight::StartPtr(addr) => addr,
+    // family-validate -> buf_to_ip -> hosts reverse lookup -> no-servers -> PTR.
+    if family != libc::AF_INET && family != libc::AF_INET6 {
+        return HostByAddrStart::Deliver(ARES_ENOTIMP);
+    }
+    let addr = match buf_to_ip(addrbuf) {
+        Ok(ip) => ip,
+        Err(_) => return HostByAddrStart::Deliver(ARES_ENOTIMP),
     };
+    // Check hosts file first
+    if let Some(lookup) = st.ares.hosts().reverse_lookup(addr) {
+        return HostByAddrStart::DeliverHostent(HostentBlueprint::from_lookup(lookup));
+    }
+    // No servers configured
+    if st.ares.config.nameservers.is_empty() {
+        return HostByAddrStart::Deliver(ARES_ENOSERVER);
+    }
     let userdata = make_userdata(addr);
     match issue_consented(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), 0, userdata, false, consent) {
         Ok(()) => HostByAddrStart::InFlight,
@@ -187,14 +202,38 @@ pub(crate) fn getnameinfo<T>(
     make_userdata: &mut dyn FnMut(i32) -> T,
     consent: Consent<'_>,
 ) -> NameinfoStart {
-    let flags = match getnameinfo_preflight(st, addr, flags) {
-        NameinfoPreflight::Fail(status) => return NameinfoStart::Fail(status),
-        NameinfoPreflight::DeliverService(service) => return NameinfoStart::DeliverService(service),
-        NameinfoPreflight::DeliverNumeric { node, service } => {
-            return NameinfoStart::DeliverNumeric { node, service }
-        }
-        NameinfoPreflight::StartPtr { flags } => flags,
+    // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
+    let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
+        flags | ARES_NI_LOOKUPHOST
+    } else {
+        flags
     };
+
+    let want_host = (flags & ARES_NI_LOOKUPHOST) != 0;
+    let want_service = (flags & ARES_NI_LOOKUPSERVICE) != 0;
+
+    // If only service lookup requested (no host), deliver immediately
+    if want_service && !want_host {
+        return NameinfoStart::DeliverService(get_service_string(st.ares.services(), addr.port, flags));
+    }
+
+    // Host lookup requested (guaranteed by the defaulting above).
+    // Numeric host can be handled without DNS
+    if (flags & ARES_NI_NUMERICHOST) != 0 {
+        // ARES_NI_NUMERICHOST + ARES_NI_NAMEREQD is illegal (contradiction)
+        if (flags & ARES_NI_NAMEREQD) != 0 {
+            return NameinfoStart::Fail(ARES_EBADFLAGS);
+        }
+        let node = CString::new(format_ip_with_scope(&addr.ip, addr.scope_id, flags)).unwrap();
+        let service = if want_service {
+            get_service_string(st.ares.services(), addr.port, flags)
+        } else {
+            None
+        };
+        return NameinfoStart::DeliverNumeric { node, service };
+    }
+
+    // PTR lookup required.
     let userdata = make_userdata(flags);
     match issue_consented(st, dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), 0, userdata, false, consent) {
         Ok(()) => NameinfoStart::InFlight,
@@ -224,24 +263,170 @@ pub(crate) fn gethostbyname<T>(
     make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
     consent: Consent<'_>,
 ) -> HostStart {
-    match gethostbyname_preflight(st, hostname, family, now) {
-        HostPreflight::Fail(status) => HostStart::Deliver(status),
-        HostPreflight::DeliverHost(lookup) => HostStart::DeliverHostent(HostentBlueprint::from_lookup(lookup)),
-        HostPreflight::DeliverParsed(rrs, hostent_family) => {
-            HostStart::DeliverHostent(HostentBlueprint::from_parsed(rrs, hostent_family))
+    // Check order is behavior (each stage may deliver before the next runs):
+    // ascii -> onion -> family-validate -> IP literal -> hosts file ->
+    // localhost -> HOSTALIASES (fs read; PermissionDenied => Deliver(EFILE)) ->
+    // no-servers -> query cache (evict expired; parse; sortlist; a cache-hit
+    // parse error falls through to DNS) -> DNS launch.
+
+    // Reject non-ASCII names
+    if !hostname.is_ascii() {
+        return HostStart::Deliver(ARES_EBADNAME);
+    }
+
+    // Reject .onion domains immediately (RFC 7686)
+    if is_onion_domain(hostname) {
+        return HostStart::Deliver(ARES_ENOTFOUND);
+    }
+
+    // Family validation; the A/AAAA mapping itself lives in HostByNameSm::new.
+    match family {
+        libc::AF_INET | libc::AF_INET6 | libc::AF_UNSPEC => {}
+        _ => return HostStart::Deliver(ARES_ENOTIMP),
+    }
+
+    let family_filter = match family {
+        libc::AF_INET => AddressFamily::Ipv4,
+        libc::AF_INET6 => AddressFamily::Ipv6,
+        libc::AF_UNSPEC => AddressFamily::Any,
+        _ => AddressFamily::Any,
+    };
+
+    // Check IP literal first
+    if let Ok(ip) = hostname.parse::<IpAddr>() {
+        let matches = match family_filter {
+            AddressFamily::Ipv4 => ip.is_ipv4(),
+            AddressFamily::Ipv6 => ip.is_ipv6(),
+            AddressFamily::Any => true,
+        };
+        if matches {
+            return HostStart::DeliverHostent(HostentBlueprint::from_lookup(HostLookup {
+                canonical: hostname.to_string(),
+                aliases: vec![],
+                addrs: vec![ip],
+            }));
         }
-        HostPreflight::StartDns { sm, query_hostname, first_server, use_tcp } => {
-            let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
-            let handle = Rc::new(RefCell::new(sm));
-            let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, make_userdata, consent);
-            // Server failover probing: if enabled, probe an expired-failure
-            // server in parallel with the primary query.
-            maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, make_userdata, consent);
-            match launched {
-                LaunchOutcome::Launched => HostStart::InFlight,
-                LaunchOutcome::Exhausted { .. } => HostStart::Deliver(ARES_ECONNREFUSED),
+    }
+
+    // Check hosts file
+    let hosts_result = st.ares.hosts().lookup(hostname, family_filter);
+    if let Some(ref lookup) = hosts_result {
+        if !lookup.addrs.is_empty() {
+            return HostStart::DeliverHostent(HostentBlueprint::from_lookup(lookup.clone()));
+        }
+    }
+
+    // RFC 6761 section 6.3: recognize "localhost" and any name under ".localhost"
+    // as special and always return the loopback address.
+    if is_localhost(hostname) {
+        let addrs = match family_filter {
+            AddressFamily::Ipv4 => vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+            AddressFamily::Ipv6 => vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
+            AddressFamily::Any => vec![
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            ],
+        };
+        return HostStart::DeliverHostent(HostentBlueprint::from_lookup(HostLookup {
+            canonical: hostname.to_string(),
+            aliases: vec![],
+            addrs,
+        }));
+    }
+
+    // Check HOSTALIASES env var for single-label names
+    let hostname_str = hostname.to_string();
+    let resolved_name = if !hostname.contains('.') {
+        if let Ok(aliases_path) = std::env::var("HOSTALIASES") {
+            match std::fs::read_to_string(&aliases_path) {
+                Ok(content) => {
+                    let mut alias_found = None;
+                    for line in content.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 && parts[0].eq_ignore_ascii_case(hostname) {
+                            alias_found = Some(parts[1].to_string());
+                            break;
+                        }
+                    }
+                    alias_found.unwrap_or_else(|| hostname_str.clone())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return HostStart::Deliver(ARES_EFILE);
+                }
+                Err(_) => hostname_str.clone(),
+            }
+        } else {
+            hostname_str.clone()
+        }
+    } else {
+        hostname_str.clone()
+    };
+
+    // No servers configured — return ENOSERVER immediately
+    if st.ares.config.nameservers.is_empty() {
+        return HostStart::Deliver(ARES_ENOSERVER);
+    }
+
+    // Check query cache
+    if st.query_cache_max_ttl > 0 {
+        let record_type = match family {
+            libc::AF_INET => RECORD_TYPE_A,
+            libc::AF_INET6 => RECORD_TYPE_AAAA,
+            libc::AF_UNSPEC => RECORD_TYPE_AAAA,
+            _ => RECORD_TYPE_A,
+        };
+        let cache_key = (resolved_name.clone(), record_type);
+        if let Some((cached_buf, expires_at)) = st.query_cache.get(&cache_key) {
+            if now < *expires_at {
+                let cached_buf = cached_buf.clone();
+                let parsed = (|| -> Result<ParsedRRs<AddrRecord>, i32> {
+                    let response = ParsedResponse::from_buf(&cached_buf)?;
+                    let parsed_rrs = response.process_answers::<AddrRecord>(&cached_buf, record_type)?;
+                    if parsed_rrs.items.is_empty() {
+                        return Err(ARES_ENODATA);
+                    }
+                    Ok(parsed_rrs)
+                })();
+                // On a cache-hit parse error, fall through to a fresh DNS query.
+                if let Ok(mut parsed_rrs) = parsed {
+                    if !st.sortlist.is_empty() {
+                        apply_sortlist(&st.sortlist, &mut parsed_rrs.items);
+                    }
+                    let current_family = match family {
+                        libc::AF_INET => libc::AF_INET,
+                        libc::AF_INET6 => libc::AF_INET6,
+                        _ => libc::AF_INET6,
+                    };
+                    return HostStart::DeliverHostent(HostentBlueprint::from_parsed(parsed_rrs, current_family));
+                }
+            } else {
+                st.query_cache.remove(&cache_key);
             }
         }
+    }
+
+    // Build the search plan + state machine, then the pooled launch and the
+    // failover probe. On exhaustion the probe still runs (its health
+    // bookkeeping sees the launch failures) and ECONNREFUSED is delivered.
+    let use_tcp = st.ares.config.options.use_vc;
+    let plan = SearchPlan::for_gethostbyname(
+        &resolved_name,
+        st.ares.config.options.ndots,
+        &st.ares.config.search,
+    );
+    let query_hostname = plan.current.clone();
+    let sm = HostByNameSm::new(plan, family, use_tcp);
+    let first_server = st.server_health.pick_next();
+
+    let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
+    let handle = Rc::new(RefCell::new(sm));
+    let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, make_userdata, consent);
+    // Server failover probing: if enabled, probe an expired-failure
+    // server in parallel with the primary query.
+    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, make_userdata, consent);
+    match launched {
+        LaunchOutcome::Launched => HostStart::InFlight,
+        LaunchOutcome::Exhausted { .. } => HostStart::Deliver(ARES_ECONNREFUSED),
     }
 }
 
@@ -263,22 +448,78 @@ pub(crate) fn getaddrinfo<T>(
     make_userdata: &mut dyn FnMut(AddrInfoSeed, usize) -> T,
     consent: Consent<'_>,
 ) -> AddrInfoStart {
-    match getaddrinfo_preflight(st, hostname_raw, ai_family) {
-        AddrInfoPreflight::Fail(status) => AddrInfoStart::Deliver(status),
-        AddrInfoPreflight::DeliverAddrs { mut addrs, canonical } => {
-            // Only addresses of the requested family reach the node list.
-            addrs.retain(|ip| match ip {
-                IpAddr::V4(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET,
-                IpAddr::V6(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET6,
-            });
-            AddrInfoStart::DeliverAddrs { addrs, canonical }
-        }
-        AddrInfoPreflight::StartDns { sm, first_server } => {
-            let handle = Rc::new(RefCell::new(sm));
-            let actions = handle.borrow_mut().begin_batch(first_server);
-            AddrInfoStart::Started(drive_addrinfo(st, &handle, actions, make_userdata, consent))
+    // Check order is behavior: empty-name -> onion -> IP literal (family
+    // mismatch fails, no fall-through) -> hosts file -> no-servers -> DNS.
+    // The raw name keeps its trailing dot for the SearchPlan; checks and the
+    // delivered canonical name use the stripped form.
+
+    // A synchronous (IP-literal / hosts-file) hit: only addresses of the
+    // requested family reach the node list.
+    let deliver = |mut addrs: Vec<IpAddr>, canonical: String| {
+        addrs.retain(|ip| match ip {
+            IpAddr::V4(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET,
+            IpAddr::V6(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET6,
+        });
+        AddrInfoStart::DeliverAddrs { addrs, canonical }
+    };
+
+    let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
+
+    if hostname.is_empty() {
+        return AddrInfoStart::Deliver(ARES_ENOTFOUND);
+    }
+
+    // Reject .onion domains immediately (RFC 7686)
+    if is_onion_domain(hostname) {
+        return AddrInfoStart::Deliver(ARES_ENOTFOUND);
+    }
+
+    // IP literal check
+    if let Ok(ip) = hostname.parse::<IpAddr>() {
+        let matches = match ai_family {
+            libc::AF_INET => ip.is_ipv4(),
+            libc::AF_INET6 => ip.is_ipv6(),
+            libc::AF_UNSPEC => true,
+            _ => false,
+        };
+        if matches {
+            return deliver(vec![ip], hostname.to_string());
+        } else {
+            return AddrInfoStart::Deliver(ARES_ENOTFOUND);
         }
     }
+
+    // Hosts file check
+    let family_filter = match ai_family {
+        libc::AF_INET => AddressFamily::Ipv4,
+        libc::AF_INET6 => AddressFamily::Ipv6,
+        _ => AddressFamily::Any,
+    };
+    if let Some(lookup) = st.ares.hosts().lookup(hostname, family_filter) {
+        if !lookup.addrs.is_empty() {
+            return deliver(lookup.addrs, hostname.to_string());
+        }
+    }
+
+    // No servers configured
+    if st.ares.config.nameservers.is_empty() {
+        return AddrInfoStart::Deliver(ARES_ENOSERVER);
+    }
+
+    // DNS path: mint the machine and drive the parallel A/AAAA batch.
+    // (the raw name carries the trailing dot the plan needs to see)
+    let use_tcp = st.ares.config.options.use_vc;
+    let plan = SearchPlan::for_search(
+        hostname_raw,
+        st.ares.config.options.ndots,
+        &st.ares.config.search,
+    );
+    let first_server = st.server_health.pick_next();
+    let sm = AddrInfoSm::new(plan, ai_family, use_tcp);
+
+    let handle = Rc::new(RefCell::new(sm));
+    let actions = handle.borrow_mut().begin_batch(first_server);
+    AddrInfoStart::Started(drive_addrinfo(st, &handle, actions, make_userdata, consent))
 }
 
 /// ares_search's shim-side pre-check, re-exported so the shim's single
