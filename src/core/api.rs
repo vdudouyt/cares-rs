@@ -331,11 +331,9 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
 
     // Check query cache
     if st.query_cache_max_ttl > 0 {
-        let record_type = match family {
-            libc::AF_INET => RECORD_TYPE_A,
-            libc::AF_INET6 => RECORD_TYPE_AAAA,
-            libc::AF_UNSPEC => RECORD_TYPE_AAAA,
-            _ => RECORD_TYPE_A,
+        let record_type = match family_filter {
+            AddressFamily::Ipv4 => RECORD_TYPE_A,
+            AddressFamily::Ipv6 | AddressFamily::Any => RECORD_TYPE_AAAA,
         };
         let cache_key = (resolved_name.clone(), record_type);
         if let Some((cached_buf, expires_at)) = st.query_cache.get(&cache_key) {
@@ -354,10 +352,9 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
                     if !st.sortlist.is_empty() {
                         apply_sortlist(&st.sortlist, &mut parsed_rrs.items);
                     }
-                    let current_family = match family {
-                        libc::AF_INET => libc::AF_INET,
-                        libc::AF_INET6 => libc::AF_INET6,
-                        _ => libc::AF_INET6,
+                    let current_family = match family_filter {
+                        AddressFamily::Ipv4 => libc::AF_INET,
+                        AddressFamily::Ipv6 | AddressFamily::Any => libc::AF_INET6,
                     };
                     return Ok(Operation::Ready(Hostent::from_parsed(parsed_rrs, current_family)));
                 }
