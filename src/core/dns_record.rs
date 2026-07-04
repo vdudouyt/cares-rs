@@ -1124,10 +1124,7 @@ impl ares_dns_record_t {
     }
 
     pub(crate) fn query_add(&mut self, name: &str, qtype: u16, qclass: u16) -> Result<(), AresError> {
-        let name_c = match CString::new(name) {
-            Ok(c) => c,
-            Err(_) => return Err(ARES_EBADRESP.into()),
-        };
+        let name_c = CString::new(name).map_err(|_| ARES_EBADRESP)?;
         self.queries.push(DnsRecordQuery {
             name: name.to_string(),
             name_c,
@@ -1152,10 +1149,7 @@ impl ares_dns_record_t {
         if idx >= self.queries.len() {
             return Err(ARES_EBADRESP.into());
         }
-        let name_c = match CString::new(name) {
-            Ok(c) => c,
-            Err(_) => return Err(ARES_EBADRESP.into()),
-        };
+        let name_c = CString::new(name).map_err(|_| ARES_EBADRESP)?;
         self.queries[idx].name = name.to_string();
         self.queries[idx].name_c = name_c;
         Ok(())
@@ -1400,10 +1394,7 @@ pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, AresError> 
 
     // Parse questions
     for _ in 0..qdcount {
-        let name = match parse_dns_name(data, &mut pos) {
-            Some(n) => n,
-            None => return Err(ARES_EBADRESP.into()),
-        };
+        let name = parse_dns_name(data, &mut pos).ok_or(ARES_EBADRESP)?;
         if pos + 4 > buf_len {
             return Err(ARES_EBADRESP.into());
         }
@@ -1428,10 +1419,7 @@ pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, AresError> 
 
     for (count, section) in &section_counts {
         for _ in 0..*count {
-            let rr_name = match parse_dns_name(data, &mut pos) {
-                Some(n) => n,
-                None => return Err(ARES_EBADRESP.into()),
-            };
+            let rr_name = parse_dns_name(data, &mut pos).ok_or(ARES_EBADRESP)?;
             if pos + 10 > buf_len {
                 return Err(ARES_EBADRESP.into());
             }
@@ -1456,10 +1444,7 @@ pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, AresError> 
             let mut rr = new_rr(&rr_name, rtype, rclass, ttl);
             parse_rdata(rtype, rdata, data, rdata_start, &mut rr);
 
-            let vec = match section_vec_mut(&mut rec, *section) {
-                Some(v) => v,
-                None => return Err(ARES_EBADRESP.into()),
-            };
+            let vec = section_vec_mut(&mut rec, *section).ok_or(ARES_EBADRESP)?;
             vec.push(rr);
         }
     }

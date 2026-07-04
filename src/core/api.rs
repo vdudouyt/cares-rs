@@ -153,10 +153,7 @@ pub(crate) fn gethostbyaddr<T>(
     if family != libc::AF_INET && family != libc::AF_INET6 {
         return Err(ARES_ENOTIMP.into());
     }
-    let addr = match buf_to_ip(addrbuf) {
-        Ok(ip) => ip,
-        Err(_) => return Err(ARES_ENOTIMP.into()),
-    };
+    let addr = buf_to_ip(addrbuf).map_err(|_| ARES_ENOTIMP)?;
     // Check hosts file first
     if let Some(lookup) = st.ares.hosts().reverse_lookup(addr) {
         return Ok(Operation::Ready(Hostent::from_lookup(lookup)));
