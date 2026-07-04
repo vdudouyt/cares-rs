@@ -54,7 +54,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
             match channeldata.state.ares.write_impl(task) {
                 WriteResult::Ok => {},
                 WriteResult::Failed => {
-                    task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
+                    task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, channeldata);
                 },
                 WriteResult::TryAgain => {
                     // Leave in Writing status for next select cycle
@@ -79,7 +79,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                     Ok(v) => v,
                     Err(()) => {
                         // recv failed (e.g. ECONNREFUSED) — fire callback
-                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
+                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, channeldata);
                         continue;
                     }
                 }
@@ -117,7 +117,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                         let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
                         if !reissue(&mut channeldata.state, payload, SocketSource::fresh(is_tcp), next_server, new_ffidata, 0) {
                             // Retry socket couldn't be created — deliver the error.
-                            task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
+                            task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, channeldata);
                         }
                         task.status = Status::Completed;
                         continue;
@@ -126,7 +126,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                         let si = task.userdata.server_index;
                         let new_ffidata = task.userdata.retarget(si, task.userdata.timeouts);
                         if !reissue(&mut channeldata.state, task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata, 0) {
-                            task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
+                            task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, channeldata);
                         }
                         task.status = Status::Completed;
                         continue;
@@ -137,7 +137,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                 if task.userdata.callback.wants_dnsrec_cache() {
                     channeldata.state.cache_dnsrec_reply(buf, Instant::now());
                 }
-                (task.userdata.callback).run(Ok(buf), &task.userdata, channeldata);
+                (task.userdata.callback).run(Ok(buf), task, channeldata);
             }
         }
     }
@@ -163,10 +163,10 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                 // The retry task inherits this task's expiry count.
                 if !reissue(&mut channeldata.state, payload, SocketSource::fresh(is_tcp), si, new_ffidata, task.tries_remaining) {
                     // Retry socket couldn't be created — deliver the error.
-                    task.userdata.callback.run(Err(ARES_ECONNREFUSED), &task.userdata, channeldata);
+                    task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, channeldata);
                 }
             } else {
-                task.userdata.callback.run(Err(ARES_ETIMEOUT), &task.userdata, channeldata);
+                task.userdata.callback.run(Err(ARES_ETIMEOUT), task, channeldata);
                 task.status = Status::Completed;
             }
         }

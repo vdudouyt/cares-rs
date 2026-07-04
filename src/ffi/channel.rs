@@ -80,7 +80,7 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     let tasks: Vec<_> = channeldata.state.ares.tasks.drain(..).collect();
     for task in tasks {
         if task.status != Status::Completed {
-            task.userdata.callback.run(Err(ARES_ECANCELLED), &task.userdata, channeldata);
+            task.userdata.callback.run(Err(ARES_ECANCELLED), &task, channeldata);
         }
     }
     // Clear connection pools so stale sockets don't linger
@@ -95,7 +95,7 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
         let tasks: Vec<_> = channeldata.state.ares.tasks.drain(..).collect();
         for task in tasks {
             if task.status != Status::Completed {
-                task.userdata.callback.run(Err(ARES_EDESTRUCTION), &task.userdata, channeldata);
+                task.userdata.callback.run(Err(ARES_EDESTRUCTION), &task, channeldata);
             }
         }
         unsafe { drop(Box::from_raw(channel)); }

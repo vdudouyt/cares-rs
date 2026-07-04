@@ -164,7 +164,7 @@ impl<T> Ares<T> {
         // TCP needs the 2-byte length prefix; UDP sends the payload as-is.
         let writebuf = if sock.is_tcp() { frame_tcp(&payload) } else { payload };
         let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
-        self.tasks.push(Task { status: Status::Writing, sock, writebuf, userdata, expires_at, server_index, tries_remaining: 0 });
+        self.tasks.push(Task { status: Status::Writing, sock, writebuf, userdata, expires_at, server_index, tries_remaining: 0, queried_ip: None });
         Ok(())
     }
     /// Create + wrap a transport socket bound for `server_index` (not yet connected).
@@ -269,6 +269,10 @@ pub struct Task<T> {
     pub expires_at: Instant,
     pub server_index: usize,
     pub tries_remaining: u32,
+    /// The address a reverse (PTR) query was issued for, when core owns it
+    /// rather than the ffi userdata. Threaded to the reply so gethostbyaddr
+    /// can synthesize the queried-address record. `None` for other flows.
+    pub queried_ip: Option<IpAddr>,
 }
 
 impl<T> Task<T> {

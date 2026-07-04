@@ -62,7 +62,8 @@ pub(crate) enum Callback {
 }
 
 impl Callback {
-    pub(crate) fn run(&self, buf: Result<&[u8], c_int>, ffidata: &FFIData, channeldata: &mut ChannelData) {
+    pub(crate) fn run(&self, buf: Result<&[u8], c_int>, task: &crate::core::ares::Task<FFIData>, channeldata: &mut ChannelData) {
+        let ffidata = &task.userdata;
         // Cancel/destroy deliveries follow the core policy table.
         if let Err(status) = &buf {
             if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED {
@@ -90,7 +91,7 @@ impl Callback {
             }
         }
         match self {
-            Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, ffidata),
+            Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, ffidata, task.queried_ip),
             Self::AresCallback(callback) => run_ares_callback(buf, *callback, ffidata),
             Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, ffidata),
             Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, ffidata),
@@ -241,11 +242,13 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         return;
     }
     let addrbuf = unsafe { std::slice::from_raw_parts(addr as *mut u8, addrlen as usize) };
-    let mut make_userdata = |ip: IpAddr| FFIData {
-        arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(ip),
+    // Built eagerly and passed by value — no factory closure. The queried
+    // address is core-owned (Task.queried_ip), so `ip` is left None here.
+    let userdata = FFIData {
+        arg, family, expected_record_type: RECORD_TYPE_PTR as c_int,
         ..FFIData::base(Callback::AresHostCallback(callback))
     };
-    match api::gethostbyaddr(&mut channeldata.state, addrbuf, family, &mut make_userdata) {
+    match api::gethostbyaddr(&mut channeldata.state, addrbuf, family, userdata) {
         api::HostByAddrStart::Deliver(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
@@ -410,8 +413,8 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 }
 
 
-pub(crate) fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHostCallback, ffidata: &FFIData) {
-    match api::on_host_reply(res, ffidata.expected_record_type as u16, ffidata.family, ffidata.ip) {
+pub(crate) fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHostCallback, ffidata: &FFIData, queried_ip: Option<IpAddr>) {
+    match api::on_host_reply(res, ffidata.expected_record_type as u16, ffidata.family, queried_ip) {
         Ok(bp) => {
             let raw_hostent = unsafe { build_hostent(bp) };
             unsafe { callback(ffidata.arg, ARES_SUCCESS, ffidata.timeouts, &mut *raw_hostent) };

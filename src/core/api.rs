@@ -152,11 +152,16 @@ pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family
 /// ares_gethostbyaddr: preflight (family/length validation, hosts-file
 /// reverse hit, no-servers), then the PTR query — whose fresh socket the
 /// channel's socket callback may refuse (→ ECONNREFUSED).
+///
+/// The `userdata` is a plain value the shim built eagerly (no factory
+/// closure): the only per-task datum core computes here — the queried
+/// address — is recorded on the `Task` itself (`queried_ip`), not stamped
+/// into the ffi userdata, and the reply reads it back from there.
 pub(crate) fn gethostbyaddr<T>(
     st: &mut ChannelState<T>,
     addrbuf: &[u8],
     family: i32,
-    make_userdata: &mut dyn FnMut(IpAddr) -> T,
+    userdata: T,
 ) -> HostByAddrStart {
     // family-validate -> buf_to_ip -> hosts reverse lookup -> no-servers -> PTR.
     if family != libc::AF_INET && family != libc::AF_INET6 {
@@ -174,9 +179,11 @@ pub(crate) fn gethostbyaddr<T>(
     if st.ares.config.nameservers.is_empty() {
         return HostByAddrStart::Deliver(ARES_ENOSERVER);
     }
-    let userdata = make_userdata(addr);
     match issue(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
-        Ok(_) => HostByAddrStart::InFlight,
+        Ok(_) => {
+            st.ares.tasks.last_mut().expect("issue pushed a task").queried_ip = Some(addr);
+            HostByAddrStart::InFlight
+        }
         Err(()) => HostByAddrStart::Deliver(ARES_ECONNREFUSED),
     }
 }
