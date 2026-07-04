@@ -229,15 +229,17 @@ pub(crate) fn maybe_launch_probe<T: Default>(
 }
 
 /// Plain enqueue (no socket-callback involvement — ares_query/ares_send/
-/// search flows). Ok(fd) of the task's socket.
+/// search flows). `Ok(fd)` of the task's socket; a socket that could not be
+/// created is `Err(ARES_ECONNREFUSED)` — the status every caller delivers —
+/// so call sites just use `?`.
 pub(crate) fn issue<T>(
     st: &mut ChannelState<T>,
     payload: BytesMut,
     source: SocketSource,
     server: usize,
     userdata: T,
-) -> Result<i32, ()> {
-    st.ares.enqueue(payload, source, server, userdata).map_err(|_| ())?;
+) -> Result<i32, i32> {
+    st.ares.enqueue(payload, source, server, userdata).map_err(|_| ARES_ECONNREFUSED)?;
     Ok(st.ares.tasks.last().expect("enqueue pushed a task").sock.as_raw_fd())
 }
 

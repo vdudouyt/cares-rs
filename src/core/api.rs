@@ -68,10 +68,8 @@ pub(crate) fn query<T>(st: &mut ChannelState<T>, name: &str, qtype: u16, userdat
     if no_servers(st) {
         return Err(ARES_ENOSERVER);
     }
-    match issue(st, dns_query_payload(name, qtype), SocketSource::Udp, 0, userdata) {
-        Ok(_) => Ok(()),
-        Err(()) => Err(ARES_ECONNREFUSED),
-    }
+    issue(st, dns_query_payload(name, qtype), SocketSource::Udp, 0, userdata)?;
+    Ok(())
 }
 
 /// ares_send: a pre-built packet must at least hold a DNS header.
@@ -82,10 +80,8 @@ pub(crate) fn send<T>(st: &mut ChannelState<T>, query_buf: &[u8], userdata: T) -
     if no_servers(st) {
         return Err(ARES_ENOSERVER);
     }
-    match issue(st, BytesMut::from(query_buf), SocketSource::Udp, 0, userdata) {
-        Ok(_) => Ok(()),
-        Err(()) => Err(ARES_ECONNREFUSED),
-    }
+    issue(st, BytesMut::from(query_buf), SocketSource::Udp, 0, userdata)?;
+    Ok(())
 }
 
 /// ares_query_dnsrec: server guard, then the query cache (keyed without the
@@ -108,10 +104,8 @@ pub(crate) fn query_dnsrec<T>(
             return Ok(Operation::Ready(rec));
         }
     }
-    match issue(st, dns_query_payload(name_raw, qtype), SocketSource::Udp, 0, userdata) {
-        Ok(_) => Ok(Operation::Pending),
-        Err(()) => Err(ARES_ECONNREFUSED),
-    }
+    issue(st, dns_query_payload(name_raw, qtype), SocketSource::Udp, 0, userdata)?;
+    Ok(Operation::Pending)
 }
 
 /// ares_search / ares_search_dnsrec: seed the search plan, mint the shared
@@ -130,13 +124,9 @@ pub(crate) fn search<T>(
 ) -> Result<(), i32> {
     let (sm, query_hostname) = search_start(st, name, retry_server_error)?;
     let handle = Rc::new(RefCell::new(sm));
-    match issue(st, dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, binding) {
-        Ok(_) => {
-            if let Some(t) = st.ares.tasks.last_mut() { t.machine = TaskMachine::Search(handle); }
-            Ok(())
-        }
-        Err(()) => Err(ARES_ECONNREFUSED),
-    }
+    issue(st, dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, binding)?;
+    if let Some(t) = st.ares.tasks.last_mut() { t.machine = TaskMachine::Search(handle); }
+    Ok(())
 }
 
 /// ares_gethostbyname_file: the hosts-file-only lookup, shaped for C.
@@ -174,17 +164,13 @@ pub(crate) fn gethostbyaddr<T>(
     if st.ares.config.nameservers.is_empty() {
         return Err(ARES_ENOSERVER);
     }
-    match issue(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
-        Ok(_) => {
-            if let Some(t) = st.ares.tasks.last_mut() {
-                t.queried_ip = Some(addr);
-                t.family = family;
-                t.rtype = RECORD_TYPE_PTR;
-            }
-            Ok(Operation::Pending)
-        }
-        Err(()) => Err(ARES_ECONNREFUSED),
+    issue(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
+    if let Some(t) = st.ares.tasks.last_mut() {
+        t.queried_ip = Some(addr);
+        t.family = family;
+        t.rtype = RECORD_TYPE_PTR;
     }
+    Ok(Operation::Pending)
 }
 
 /// The synchronous result `ares_getnameinfo` can hand back: a service-only
@@ -239,10 +225,8 @@ pub(crate) fn getnameinfo<T>(
     }
 
     // PTR lookup required.
-    match issue(st, dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
-        Ok(_) => Ok(Operation::Pending),
-        Err(()) => Err(ARES_ECONNREFUSED),
-    }
+    issue(st, dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
+    Ok(Operation::Pending)
 }
 
 /// ares_gethostbyname: the full pre-DNS cascade, then the pooled launch and
@@ -655,7 +639,7 @@ pub(crate) fn on_search_reply<T>(
                     if let Some(t) = st.ares.tasks.last_mut() { t.machine = TaskMachine::Search(sm.clone()); }
                     None
                 }
-                Err(()) => Some(SearchReplyDelivery::Fail { status: ARES_ECONNREFUSED, timeouts: 0 }),
+                Err(status) => Some(SearchReplyDelivery::Fail { status, timeouts: 0 }),
             }
         }
         SearchAction::DeliverSuccess => Some(SearchReplyDelivery::Success { timeouts: io_timeouts }),
