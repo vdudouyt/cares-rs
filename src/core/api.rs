@@ -26,7 +26,7 @@ use crate::core::launch::{
 use crate::core::ares::TaskMachine;
 use crate::core::channel::cache_store_names;
 use crate::core::hostent::Hostent;
-use crate::core::hostfile::{AddressFamily, HostLookup};
+use crate::core::hostfile::AddressFamily;
 use crate::core::lookup::{
     is_localhost, is_onion_domain, is_truncated, AddrInfoSm, HostAction, HostByNameSm, HostEvent,
     LookupCfg, LookupEvent, SearchAction, SearchPlan, SearchSm, ServerHealth,
@@ -276,11 +276,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
             AddressFamily::Any => true,
         };
         if matches {
-            return Ok(Operation::Ready(Hostent::from_lookup(HostLookup {
-                canonical: hostname.to_string(),
-                aliases: vec![],
-                addrs: vec![ip],
-            })));
+            return Ok(Operation::Ready(Hostent::new(hostname.to_string(), vec![ip])));
         }
     }
 
@@ -303,11 +299,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
                 IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             ],
         };
-        return Ok(Operation::Ready(Hostent::from_lookup(HostLookup {
-            canonical: hostname.to_string(),
-            aliases: vec![],
-            addrs,
-        })));
+        return Ok(Operation::Ready(Hostent::new(hostname.to_string(), addrs)));
     }
 
     // Check HOSTALIASES env var for single-label names

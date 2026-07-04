@@ -20,6 +20,13 @@ pub(crate) struct Hostent {
 }
 
 impl Hostent {
+    /// A synthetic result with no aliases (IP literal / localhost): the
+    /// representative family and per-family filter come from `addrs` (which
+    /// must be non-empty), via [`Self::from_lookup`].
+    pub fn new(canonical: String, addrs: Vec<IpAddr>) -> Self {
+        Self::from_lookup(HostLookup { canonical, aliases: vec![], addrs })
+    }
+
     /// A synchronous (hosts-file / IP-literal / localhost) result: the
     /// representative family comes from the first address; aliases that
     /// cannot become C strings (embedded NUL) are dropped; a NUL-containing
