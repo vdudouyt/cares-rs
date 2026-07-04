@@ -269,7 +269,7 @@ pub(crate) enum HostStart {
 /// the failover probe. On exhaustion the probe still runs (its health
 /// bookkeeping sees the launch failures), and ECONNREFUSED is delivered by
 /// the shim afterwards.
-pub(crate) fn gethostbyname<T: Clone + Default>(
+pub(crate) fn gethostbyname<T: Copy + Default>(
     st: &mut ChannelState<T>,
     hostname: &str,
     family: i32,
@@ -454,7 +454,7 @@ pub(crate) enum AddrInfoStart {
 
 /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
 /// then mint the machine and drive the A/AAAA batch.
-pub(crate) fn getaddrinfo<T: Clone>(
+pub(crate) fn getaddrinfo<T: Copy>(
     st: &mut ChannelState<T>,
     hostname_raw: &str,
     ai_family: i32,
@@ -565,7 +565,7 @@ pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip
 /// perform its re-sends (pooled launch) and cache stores, apply the
 /// sortlist, and return what the shim must deliver to C.
 #[allow(clippy::too_many_arguments)] // reply-executor seam: the task's binding rides along
-pub(crate) fn on_hostbyname_reply<T: Clone>(
+pub(crate) fn on_hostbyname_reply<T: Copy>(
     st: &mut ChannelState<T>,
     sm: &Rc<RefCell<HostByNameSm>>,
     res: Result<&[u8], i32>,
@@ -606,7 +606,7 @@ pub(crate) fn on_hostbyname_reply<T: Clone>(
         match action {
             HostAction::Send { name, family, rtype, tcp, server } => {
                 if let LaunchOutcome::Exhausted { timeouts } =
-                    launch_pooled(st, &name, family, rtype, tcp, server, sm, binding.clone())
+                    launch_pooled(st, &name, family, rtype, tcp, server, sm, binding)
                 {
                     deliveries.push(HostDelivery::Fail { status: ARES_ECONNREFUSED, timeouts });
                 }

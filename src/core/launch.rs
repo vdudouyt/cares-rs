@@ -43,7 +43,7 @@ pub(crate) enum LaunchOutcome {
 /// possible, otherwise create one — retrying across servers on socket-
 /// creation or consent failure (the failure accounting is ServerHealth's).
 #[allow(clippy::too_many_arguments)] // internal seam of api::gethostbyname / on_hostbyname_reply
-pub(crate) fn launch_pooled<T: Clone>(
+pub(crate) fn launch_pooled<T: Copy>(
     st: &mut ChannelState<T>,
     hostname: &str,
     family: i32,
@@ -63,7 +63,7 @@ pub(crate) fn launch_pooled<T: Clone>(
     if use_tcp {
         if let Some(idx) = st.tcp_connections.iter().position(|(s, _)| *s == si) {
             let shared_sock = st.tcp_connections[idx].1.clone();
-            let _ = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::ares::DnsSocket::Tcp(shared_sock)), si, binding.clone());
+            let _ = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::ares::DnsSocket::Tcp(shared_sock)), si, binding);
             stamp(st, machine(), family, rtype, 0);
             return LaunchOutcome::Launched;
         }
@@ -76,7 +76,7 @@ pub(crate) fn launch_pooled<T: Clone>(
         if let Some(idx) = st.udp_connections.iter().position(|(s, _, c)| *s == si && *c < limit) {
             let shared_sock = st.udp_connections[idx].1.clone();
             st.udp_connections[idx].2 += 1;
-            let _ = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::ares::DnsSocket::Udp(shared_sock)), si, binding.clone());
+            let _ = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::ares::DnsSocket::Udp(shared_sock)), si, binding);
             stamp(st, machine(), family, rtype, 0);
             return LaunchOutcome::Launched;
         }
@@ -84,7 +84,7 @@ pub(crate) fn launch_pooled<T: Clone>(
     }
 
     for _try in 0..max_tries {
-        if st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, binding.clone()).is_ok() {
+        if st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, binding).is_ok() {
             stamp(st, machine(), family, rtype, 0);
             // Add the fresh socket to the connection pool for reuse.
             if use_tcp {
@@ -127,7 +127,7 @@ pub(crate) enum AddrInfoDelivery {
 /// socket — creation error or a callback-refused fd — feeds LaunchFailed for a
 /// batch send, or ResendFailed for a re-send, back into the machine) and
 /// collect the Deliver* actions for the shim.
-pub(crate) fn drive_addrinfo<T: Clone>(
+pub(crate) fn drive_addrinfo<T: Copy>(
     st: &mut ChannelState<T>,
     sm: &Rc<RefCell<AddrInfoSm>>,
     actions: Vec<AddrInfoAction>,
@@ -140,7 +140,7 @@ pub(crate) fn drive_addrinfo<T: Clone>(
             AddrInfoAction::Send { name, family, tcp, server, timeouts, batch } => {
                 let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
                 let rtype = if family == libc::AF_INET { RECORD_TYPE_A } else { RECORD_TYPE_AAAA };
-                let failed = st.ares.enqueue(dns_query_payload(&name, qtype_of(core_family)), SocketSource::fresh(tcp), server, binding.clone()).is_err();
+                let failed = st.ares.enqueue(dns_query_payload(&name, qtype_of(core_family)), SocketSource::fresh(tcp), server, binding).is_err();
                 if !failed {
                     stamp(st, TaskMachine::AddrInfo(sm.clone()), family, rtype, timeouts);
                 }

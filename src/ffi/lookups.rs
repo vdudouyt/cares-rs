@@ -42,7 +42,7 @@ pub(crate) struct SearchTail {
     pub(crate) delivery: SearchDelivery,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 // Variants are named after the c-ares FFI callback typedefs they dispatch to;
 // the shared `Callback` suffix is intentional for that correspondence.
 // Stateful lookups carry only their Copy C delivery tail here; the shared
@@ -129,7 +129,7 @@ impl Callback {
 /// family/record-type, server, timeouts, queried ip) lives on the core
 /// `Task`, so this is a plain value the shim builds eagerly and core clones
 /// per task — no factory closure.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FFIData {
     pub(crate) callback: Callback,
     pub(crate) arg: *mut c_void,
@@ -430,7 +430,7 @@ pub(crate) fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: Ar
 /// any re-issue); the marshal here only fires the returned delivery.
 pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, tail: SearchTail, task: &Task<FFIData>, channeldata: &mut ChannelData) {
     let TaskMachine::Search(sm) = &task.machine else { unreachable!("search task carries a Search machine") };
-    let binding = task.userdata.clone();
+    let binding = task.userdata;
     match api::on_search_reply(&mut channeldata.state, sm, res, tail.dnstype, task.timeouts, binding) {
         None => {}
         Some(api::SearchReplyDelivery::Success { timeouts }) => {
@@ -473,7 +473,7 @@ pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, tail: Host
     let TaskMachine::HostByName(sm) = &task.machine else { unreachable!("gethostbyname task carries a HostByName machine") };
     let deliveries = api::on_hostbyname_reply(
         &mut channeldata.state, sm, res, task.server_index, task.timeouts,
-        Instant::now(), task.userdata.clone(),
+        Instant::now(), task.userdata,
     );
     for delivery in deliveries {
         match delivery {
@@ -605,7 +605,7 @@ pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, tail: AddrIn
         let mut machine = sm.borrow_mut();
         machine.step(ev, &cfg, &mut channeldata.state.server_health)
     };
-    let deliveries = drive_addrinfo(&mut channeldata.state, sm, actions, task.userdata.clone());
+    let deliveries = drive_addrinfo(&mut channeldata.state, sm, actions, task.userdata);
     fire_addrinfo_deliveries(deliveries, tail);
 }
 
