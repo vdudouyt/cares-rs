@@ -130,9 +130,7 @@ pub(crate) fn hosts_file_lookup<T>(
     };
 
     // Lookup in the hosts file cache
-    let Some(lookup) = st.ares.hosts().lookup(name, family_filter) else {
-        return Err(ARES_ENOTFOUND.into());
-    };
+    let lookup = st.ares.hosts().lookup(name, family_filter).ok_or(ARES_ENOTFOUND)?;
     if lookup.addrs.is_empty() {
         return Err(ARES_ENOTFOUND.into());
     }

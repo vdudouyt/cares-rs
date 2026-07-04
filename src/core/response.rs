@@ -65,9 +65,7 @@ pub struct ParsedRRs<T> {
 impl<'a> ParsedResponse<'a> {
     pub(crate) fn from_buf(buf: &'a [u8]) -> Result<Self, AresError> {
         let mut sbuf = SliceBuf::new(buf);
-        let Some(header) = DnsHeader::parse(&mut sbuf) else {
-            return Err(ARES_EBADRESP.into());
-        };
+        let header = DnsHeader::parse(&mut sbuf).ok_or(ARES_EBADRESP)?;
         match header.flags & 0x0f {
             0 => {},
             1 => return Err(ARES_EFORMERR.into()),
@@ -80,9 +78,7 @@ impl<'a> ParsedResponse<'a> {
         if header.qdcount != 1 {
             return Err(ARES_EBADRESP.into());
         }
-        let Some(query) = DnsQuery::parse(&mut sbuf) else {
-            return Err(ARES_EBADRESP.into());
-        };
+        let query = DnsQuery::parse(&mut sbuf).ok_or(ARES_EBADRESP)?;
         let answer_count = header.ancount as usize;
         if answer_count == 0 {
             return Err(ARES_ENODATA.into());
@@ -95,9 +91,7 @@ impl<'a> ParsedResponse<'a> {
         let mut answers = Vec::new();
         // Only parse answer section (ancount); authority and additional sections are skipped
         for _ in 0..answer_count {
-            let Some(answer) = DnsAnswer::parse(&mut sbuf) else {
-                return Err(ARES_EBADRESP.into());
-            };
+            let answer = DnsAnswer::parse(&mut sbuf).ok_or(ARES_EBADRESP)?;
             answers.push(answer);
         }
         if answers.is_empty() {

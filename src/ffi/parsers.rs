@@ -190,9 +190,7 @@ where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
         }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let (aresreplies, success) = T2::parse_buf_to_clinkedlist_parts(buf, expected_record_type)?;
-        let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
-            return Err(empty_chain_status(success).code());
-        };
+        let reply = clinkedlist::chain_nodes(aresreplies).ok_or_else(|| empty_chain_status(success).code())?;
 
         let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
         let aresdata = Box::into_raw(Box::new(aresdata));
