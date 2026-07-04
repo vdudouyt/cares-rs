@@ -255,17 +255,11 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
         return Err(ARES_ENOTFOUND.into());
     }
 
-    // Family validation; the A/AAAA mapping itself lives in HostByNameSm::new.
-    match family {
-        libc::AF_INET | libc::AF_INET6 | libc::AF_UNSPEC => {}
-        _ => return Err(ARES_ENOTIMP.into()),
-    }
-
     let family_filter = match family {
         libc::AF_INET => AddressFamily::Ipv4,
         libc::AF_INET6 => AddressFamily::Ipv6,
         libc::AF_UNSPEC => AddressFamily::Any,
-        _ => AddressFamily::Any,
+        _ => return Err(ARES_ENOTIMP.into()),
     };
 
     // Check IP literal first
