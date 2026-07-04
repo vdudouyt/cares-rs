@@ -1,12 +1,11 @@
-//! Enqueue/consent primitives: the send-side building blocks the api layer
-//! (and, until the launch loops finish moving, the ffi executors) compose.
+//! Enqueue primitives: the send-side building blocks the api layer (and,
+//! until the launch loops finish moving, the ffi executors) compose.
 //!
-//! `Consent` is the one deliberately opaque hook: the shim wraps the
-//! channel's C socket callbacks in a closure capturing only Copy data, so
-//! core can run launch/retry policy without ever seeing a C pointer. A
-//! consent closure must never hold a RefCell borrow — it runs while the
-//! channel state is mutably borrowed and C callbacks may re-enter ares_*
-//! only *after* these primitives return.
+//! Socket creation can fail — including when a channel's socket callback
+//! refuses a fresh fd (the factory returns Err, matching upstream
+//! ares_conn.c). These primitives surface that as ECONNREFUSED / server
+//! failover, exactly like any other socket-creation error; core never sees
+//! the C callback.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -18,10 +17,6 @@ use crate::core::channel::ChannelState;
 use crate::core::lookup::{AddrInfoAction, AddrInfoEvent, AddrInfoSm, HostByNameSm, LookupCfg};
 use crate::ffi::error::ARES_ECONNREFUSED;
 use crate::ffi::{RECORD_TYPE_A, RECORD_TYPE_AAAA};
-
-/// "May this fresh socket (fd, is_tcp) proceed?" — the sock-create/config
-/// callback verdict, injected by the shim.
-pub(crate) type Consent<'a> = &'a mut dyn FnMut(i32, bool) -> bool;
 
 /// What kind of task a gethostbyname flow enqueues; the shim's userdata
 /// factory wraps it (plus the target server) into the task userdata.
@@ -61,7 +56,6 @@ pub(crate) fn launch_pooled<T>(
     server_index: usize,
     sm: &Rc<RefCell<HostByNameSm>>,
     make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
-    consent: Consent<'_>,
 ) -> LaunchOutcome {
     let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
     let max_tries = st.ares.config.options.attempts as usize;
@@ -94,19 +88,8 @@ pub(crate) fn launch_pooled<T>(
 
     for _try in 0..max_tries {
         let userdata = make_userdata(HostTaskSeed::Lookup { sm: sm.clone(), family, rtype }, si);
-        let issued = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, userdata).is_ok();
-        if !issued {
-            // Socket creation failed (e.g. fd exhaustion): treat as a server
-            // failure and try the next server, like upstream c-ares.
-            if nservers > 1 {
-                st.server_health.record_failure(si);
-                si = st.server_health.pick_next();
-            }
-            continue;
-        }
-        let fd = st.ares.tasks.last().expect("enqueue pushed").sock.as_raw_fd();
-        if consent(fd, use_tcp) {
-            // Add to the connection pool for reuse.
+        if st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, userdata).is_ok() {
+            // Add the fresh socket to the connection pool for reuse.
             if use_tcp {
                 if let crate::core::ares::DnsSocket::Tcp(ref rc_sock) = st.ares.tasks.last().expect("just pushed").sock {
                     st.tcp_connections.push((si, rc_sock.clone()));
@@ -118,8 +101,8 @@ pub(crate) fn launch_pooled<T>(
             }
             return LaunchOutcome::Launched;
         }
-        // Consent vetoed — close and remove the task, try the next server.
-        st.ares.tasks.pop();
+        // Socket creation failed — fd exhaustion, or a socket callback refused
+        // the fd: treat as a server failure and try the next, like upstream.
         if nservers > 1 {
             st.server_health.record_failure(si);
             si = st.server_health.pick_next();
@@ -143,17 +126,15 @@ pub(crate) enum AddrInfoDelivery {
     Fail { status: i32 },
 }
 
-/// Drive the getaddrinfo machine's action queue: perform every Send (batch
-/// sends honor the consent veto by completing the task and feeding
-/// LaunchFailed back into the machine; re-sends run consent advisorily and
-/// feed ResendFailed only on socket-creation failure), and collect the
-/// Deliver* actions for the shim.
+/// Drive the getaddrinfo machine's action queue: perform every Send (a failed
+/// socket — creation error or a callback-refused fd — feeds LaunchFailed for a
+/// batch send, or ResendFailed for a re-send, back into the machine) and
+/// collect the Deliver* actions for the shim.
 pub(crate) fn drive_addrinfo<T>(
     st: &mut ChannelState<T>,
     sm: &Rc<RefCell<AddrInfoSm>>,
     actions: Vec<AddrInfoAction>,
     make_userdata: &mut dyn FnMut(AddrInfoSeed, usize) -> T,
-    consent: Consent<'_>,
 ) -> Vec<AddrInfoDelivery> {
     let mut deliveries = Vec::new();
     let mut queue: std::collections::VecDeque<AddrInfoAction> = actions.into();
@@ -163,24 +144,7 @@ pub(crate) fn drive_addrinfo<T>(
                 let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
                 let rtype = if family == libc::AF_INET { RECORD_TYPE_A } else { RECORD_TYPE_AAAA };
                 let userdata = make_userdata(AddrInfoSeed { sm: sm.clone(), family, rtype, timeouts }, server);
-                let issued = st.ares.enqueue(dns_query_payload(&name, qtype_of(core_family)), SocketSource::fresh(tcp), server, userdata).is_ok();
-                let failed = if !issued {
-                    true
-                } else if batch {
-                    let fd = st.ares.tasks.last().expect("just pushed").sock.as_raw_fd();
-                    if consent(fd, tcp) {
-                        false
-                    } else {
-                        // Consent vetoed — mark the task completed with error.
-                        st.ares.tasks.last_mut().expect("just pushed").status = Status::Completed;
-                        true
-                    }
-                } else {
-                    // TC/failover re-send: consent verdicts are ignored.
-                    let fd = st.ares.tasks.last().expect("just pushed").sock.as_raw_fd();
-                    consent(fd, tcp);
-                    false
-                };
+                let failed = st.ares.enqueue(dns_query_payload(&name, qtype_of(core_family)), SocketSource::fresh(tcp), server, userdata).is_err();
                 if failed {
                     let ev = if batch { AddrInfoEvent::LaunchFailed } else { AddrInfoEvent::ResendFailed };
                     let more = {
@@ -243,7 +207,7 @@ pub(crate) fn timeout_step<T>(
 }
 
 /// Launch a probe query to an expired-failure server in parallel with the
-/// primary query (no user callback; consent is advisory).
+/// primary query (no user callback; a failed/refused socket just skips it).
 pub(crate) fn maybe_launch_probe<T>(
     st: &mut ChannelState<T>,
     hostname: &str,
@@ -251,7 +215,6 @@ pub(crate) fn maybe_launch_probe<T>(
     primary_server: usize,
     use_tcp: bool,
     make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
-    consent: Consent<'_>,
 ) {
     if st.server_failover_retry_chance == 0 {
         return;
@@ -263,10 +226,8 @@ pub(crate) fn maybe_launch_probe<T>(
     let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
     let rtype = if family == libc::AF_INET { RECORD_TYPE_A } else { RECORD_TYPE_AAAA };
     let userdata = make_userdata(HostTaskSeed::Probe { family, rtype }, probe_server);
-    // A probe has no user callback; if its socket can't be created, just skip it.
-    if let Ok(fd) = issue(st, dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), probe_server, userdata) {
-        consent(fd, use_tcp);
-    }
+    // Best-effort: if the probe's socket can't be created (or is refused), skip it.
+    let _ = issue(st, dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), probe_server, userdata);
 }
 
 /// Plain enqueue (no socket-callback involvement — ares_query/ares_send/
@@ -282,29 +243,10 @@ pub(crate) fn issue<T>(
     Ok(st.ares.tasks.last().expect("enqueue pushed a task").sock.as_raw_fd())
 }
 
-/// Enqueue a fresh-socket query whose sock callbacks may veto it: a veto
-/// pops the task and reports failure (the PTR entries gethostbyaddr /
-/// getnameinfo deliver ECONNREFUSED on Err).
-pub(crate) fn issue_consented<T>(
-    st: &mut ChannelState<T>,
-    payload: BytesMut,
-    server: usize,
-    userdata: T,
-    is_tcp: bool,
-    consent: Consent<'_>,
-) -> Result<(), ()> {
-    let fd = issue(st, payload, SocketSource::fresh(is_tcp), server, userdata)?;
-    if !consent(fd, is_tcp) {
-        st.ares.tasks.pop();
-        return Err(());
-    }
-    Ok(())
-}
-
 /// Re-enqueue for a retry (TC upgrade, rcode failover, timeout): carries the
-/// retry counter onto the new task and runs the sock callbacks advisorily —
-/// their verdict is ignored for re-sends, as historically. False when the
-/// socket could not be created (the caller delivers ECONNREFUSED).
+/// retry counter onto the new task. False when the socket could not be created
+/// — including a callback-refused fd — in which case the caller delivers
+/// ECONNREFUSED.
 pub(crate) fn reissue<T>(
     st: &mut ChannelState<T>,
     payload: BytesMut,
@@ -312,14 +254,10 @@ pub(crate) fn reissue<T>(
     server: usize,
     userdata: T,
     tries: u32,
-    consent: Consent<'_>,
 ) -> bool {
-    let Ok(fd) = issue(st, payload, source, server, userdata) else {
+    if issue(st, payload, source, server, userdata).is_err() {
         return false;
-    };
-    let task = st.ares.tasks.last_mut().expect("issue pushed a task");
-    task.tries_remaining = tries;
-    let is_tcp = task.sock.is_tcp();
-    consent(fd, is_tcp);
+    }
+    st.ares.tasks.last_mut().expect("issue pushed a task").tries_remaining = tries;
     true
 }

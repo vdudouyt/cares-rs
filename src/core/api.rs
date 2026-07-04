@@ -20,8 +20,8 @@ use bytes::BytesMut;
 use crate::core::ares::{dns_query_payload, rdns_name, SocketSource};
 use crate::core::channel::ChannelState;
 use crate::core::launch::{
-    drive_addrinfo, issue, issue_consented, launch_pooled, maybe_launch_probe, AddrInfoDelivery,
-    AddrInfoSeed, Consent, HostTaskSeed, LaunchOutcome,
+    drive_addrinfo, issue, launch_pooled, maybe_launch_probe, AddrInfoDelivery, AddrInfoSeed,
+    HostTaskSeed, LaunchOutcome,
 };
 use crate::core::channel::cache_store_names;
 use crate::core::hostent::HostentBlueprint;
@@ -150,14 +150,13 @@ pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family
 }
 
 /// ares_gethostbyaddr: preflight (family/length validation, hosts-file
-/// reverse hit, no-servers), then the PTR query — whose sock callbacks may
-/// veto it (veto pops the task and delivers ECONNREFUSED).
+/// reverse hit, no-servers), then the PTR query — whose fresh socket the
+/// channel's socket callback may refuse (→ ECONNREFUSED).
 pub(crate) fn gethostbyaddr<T>(
     st: &mut ChannelState<T>,
     addrbuf: &[u8],
     family: i32,
     make_userdata: &mut dyn FnMut(IpAddr) -> T,
-    consent: Consent<'_>,
 ) -> HostByAddrStart {
     // family-validate -> buf_to_ip -> hosts reverse lookup -> no-servers -> PTR.
     if family != libc::AF_INET && family != libc::AF_INET6 {
@@ -176,8 +175,8 @@ pub(crate) fn gethostbyaddr<T>(
         return HostByAddrStart::Deliver(ARES_ENOSERVER);
     }
     let userdata = make_userdata(addr);
-    match issue_consented(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), 0, userdata, false, consent) {
-        Ok(()) => HostByAddrStart::InFlight,
+    match issue(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
+        Ok(_) => HostByAddrStart::InFlight,
         Err(()) => HostByAddrStart::Deliver(ARES_ECONNREFUSED),
     }
 }
@@ -193,14 +192,14 @@ pub(crate) enum NameinfoStart {
 }
 
 /// ares_getnameinfo: flag defaulting + the numeric/service short-circuits,
-/// then the PTR query (sock callbacks may veto → ECONNREFUSED). The shim's
-/// userdata factory receives the (possibly defaulted) flags.
+/// then the PTR query (whose fresh socket the channel's socket callback may
+/// refuse → ECONNREFUSED). The shim's userdata factory receives the
+/// (possibly defaulted) flags.
 pub(crate) fn getnameinfo<T>(
     st: &mut ChannelState<T>,
     addr: &AddrInfo,
     flags: i32,
     make_userdata: &mut dyn FnMut(i32) -> T,
-    consent: Consent<'_>,
 ) -> NameinfoStart {
     // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
     let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
@@ -235,8 +234,8 @@ pub(crate) fn getnameinfo<T>(
 
     // PTR lookup required.
     let userdata = make_userdata(flags);
-    match issue_consented(st, dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), 0, userdata, false, consent) {
-        Ok(()) => NameinfoStart::InFlight,
+    match issue(st, dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
+        Ok(_) => NameinfoStart::InFlight,
         Err(()) => NameinfoStart::Fail(ARES_ECONNREFUSED),
     }
 }
@@ -261,7 +260,6 @@ pub(crate) fn gethostbyname<T>(
     family: i32,
     now: Instant,
     make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
-    consent: Consent<'_>,
 ) -> HostStart {
     // Check order is behavior (each stage may deliver before the next runs):
     // ascii -> onion -> family-validate -> IP literal -> hosts file ->
@@ -420,10 +418,10 @@ pub(crate) fn gethostbyname<T>(
 
     let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
     let handle = Rc::new(RefCell::new(sm));
-    let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, make_userdata, consent);
+    let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, make_userdata);
     // Server failover probing: if enabled, probe an expired-failure
     // server in parallel with the primary query.
-    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, make_userdata, consent);
+    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, make_userdata);
     match launched {
         LaunchOutcome::Launched => HostStart::InFlight,
         LaunchOutcome::Exhausted { .. } => HostStart::Deliver(ARES_ECONNREFUSED),
@@ -446,7 +444,6 @@ pub(crate) fn getaddrinfo<T>(
     hostname_raw: &str,
     ai_family: i32,
     make_userdata: &mut dyn FnMut(AddrInfoSeed, usize) -> T,
-    consent: Consent<'_>,
 ) -> AddrInfoStart {
     // Check order is behavior: empty-name -> onion -> IP literal (family
     // mismatch fails, no fall-through) -> hosts file -> no-servers -> DNS.
@@ -519,7 +516,7 @@ pub(crate) fn getaddrinfo<T>(
 
     let handle = Rc::new(RefCell::new(sm));
     let actions = handle.borrow_mut().begin_batch(first_server);
-    AddrInfoStart::Started(drive_addrinfo(st, &handle, actions, make_userdata, consent))
+    AddrInfoStart::Started(drive_addrinfo(st, &handle, actions, make_userdata))
 }
 
 /// ares_search's shim-side pre-check, re-exported so the shim's single
@@ -552,7 +549,7 @@ pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip
 /// A gethostbyname task settled (reply or error): parse, feed the machine,
 /// perform its re-sends (pooled launch) and cache stores, apply the
 /// sortlist, and return what the shim must deliver to C.
-#[allow(clippy::too_many_arguments)] // reply-executor seam: userdata factory + consent ride along
+#[allow(clippy::too_many_arguments)] // reply-executor seam: userdata factory rides along
 pub(crate) fn on_hostbyname_reply<T>(
     st: &mut ChannelState<T>,
     sm: &Rc<RefCell<HostByNameSm>>,
@@ -561,7 +558,6 @@ pub(crate) fn on_hostbyname_reply<T>(
     io_timeouts: i32,
     now: Instant,
     make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
-    consent: Consent<'_>,
 ) -> Vec<HostDelivery> {
     // Parse outside the machine; the machine sees only the outcome.
     let mut parsed_items: Option<ParsedRRs<AddrRecord>> = None;
@@ -595,7 +591,7 @@ pub(crate) fn on_hostbyname_reply<T>(
         match action {
             HostAction::Send { name, family, rtype, tcp, server } => {
                 if let LaunchOutcome::Exhausted { timeouts } =
-                    launch_pooled(st, &name, family, rtype, tcp, server, sm, make_userdata, consent)
+                    launch_pooled(st, &name, family, rtype, tcp, server, sm, make_userdata)
                 {
                     deliveries.push(HostDelivery::Fail { status: ARES_ECONNREFUSED, timeouts });
                 }

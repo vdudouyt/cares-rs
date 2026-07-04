@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::io;
 use std::io::{Error, ErrorKind};
+use crate::ffi::{ares_sock_config_callback, ares_sock_create_callback};
 use crate::{Channel, ARES_SOCKET_BAD};
 
 #[allow(non_camel_case_types)]
@@ -17,7 +18,8 @@ pub type ares_ssize_t = libc::ssize_t;
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
     if funcs.is_null() { return; }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    channeldata.state.ares.socket_factory = SocketFactory::new((unsafe { &*funcs }).clone(), user_data);
+    let factory = SocketFactory::with_funcs((unsafe { &*funcs }).clone(), user_data, &channeldata.socket_factory);
+    channeldata.apply_socket_factory(factory);
 }
 
 /// Extended socket functions (c-ares 1.34.6 API).
@@ -49,7 +51,9 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
         asendv: None, // ex.asendto has different signature
     };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
-    channeldata.state.ares.socket_factory = SocketFactory::new(basic, user_data);
+    let factory = SocketFactory::with_funcs(basic, user_data, &channeldata.socket_factory);
+    channeldata.socket_factory = factory.clone();
+    channeldata.state.ares.socket_factory = factory;
     0 // ARES_SUCCESS
 }
 
@@ -154,11 +158,28 @@ fn raw_to_socket_addr(storage: &libc::sockaddr_storage, len: socklen_t) -> Optio
 pub struct SocketFactory {
     funcs: AresSocketFunctions,
     user_data: *mut c_void,
+    // Socket-state callbacks (ares_set_socket_callback / _configure_callback),
+    // consulted on every freshly created fd. A nonzero return refuses the
+    // socket: `create` returns Err and core turns it into ARES_ECONNREFUSED,
+    // exactly as for an asocket() failure (matches upstream ares_conn.c).
+    // Immutable — a setter rebuilds the factory rather than mutating it, so
+    // channels that share an Rc (ares_dup) stay independent.
+    create_cb: ares_sock_create_callback,
+    create_arg: *mut c_void,
+    config_cb: ares_sock_config_callback,
+    config_arg: *mut c_void,
 }
 
 impl Default for SocketFactory {
     fn default() -> Self {
-        SocketFactory { funcs: AresSocketFunctions::default(), user_data: std::ptr::null_mut() }
+        SocketFactory {
+            funcs: AresSocketFunctions::default(),
+            user_data: std::ptr::null_mut(),
+            create_cb: None,
+            create_arg: std::ptr::null_mut(),
+            config_cb: None,
+            config_arg: std::ptr::null_mut(),
+        }
     }
 }
 
@@ -224,8 +245,27 @@ impl Drop for CSocket {
 }
 
 impl SocketFactory {
-    pub fn new(funcs: AresSocketFunctions, user_data: *mut c_void) -> Rc<Self> {
-        Rc::new(Self { funcs, user_data })
+    /// ares_set_socket_functions[_ex]: a new function table, but the
+    /// socket-state callbacks are an independent setting — carry them over.
+    pub fn with_funcs(funcs: AresSocketFunctions, user_data: *mut c_void, prev: &SocketFactory) -> Rc<Self> {
+        Rc::new(Self {
+            funcs,
+            user_data,
+            create_cb: prev.create_cb,
+            create_arg: prev.create_arg,
+            config_cb: prev.config_cb,
+            config_arg: prev.config_arg,
+        })
+    }
+
+    /// ares_set_socket_callback: keep everything, set the create callback.
+    pub fn with_create_cb(&self, cb: ares_sock_create_callback, arg: *mut c_void) -> Rc<Self> {
+        Rc::new(Self { create_cb: cb, create_arg: arg, funcs: self.funcs.clone(), ..*self })
+    }
+
+    /// ares_set_socket_configure_callback: keep everything, set the config callback.
+    pub fn with_config_cb(&self, cb: ares_sock_config_callback, arg: *mut c_void) -> Rc<Self> {
+        Rc::new(Self { config_cb: cb, config_arg: arg, funcs: self.funcs.clone(), ..*self })
     }
 
     fn create(&self, addr: SocketAddr, socket_type: c_int) -> io::Result<Rc<dyn crate::core::transport::Transport>> {
@@ -235,7 +275,25 @@ impl SocketFactory {
         if fd == ARES_SOCKET_BAD {
             return Err(Error::last_os_error());
         }
-        Ok(Rc::new(CSocket { fd, funcs: self.funcs.clone(), user_data: self.user_data }))
+        let sock = Rc::new(CSocket { fd, funcs: self.funcs.clone(), user_data: self.user_data });
+        // A socket-state callback may refuse the fresh fd; dropping `sock`
+        // closes it (CSocket::drop -> aclose) and the Err becomes ECONNREFUSED.
+        if !self.run_sock_callbacks(fd, socket_type == SOCK_STREAM) {
+            return Err(Error::from_raw_os_error(libc::ECONNREFUSED));
+        }
+        Ok(sock)
+    }
+
+    /// Run the create then configure callbacks on a fresh fd; false = refused.
+    fn run_sock_callbacks(&self, fd: c_int, is_tcp: bool) -> bool {
+        let sock_type = if is_tcp { SOCK_STREAM } else { SOCK_DGRAM };
+        if let Some(cb) = self.create_cb {
+            if unsafe { cb(fd, sock_type, self.create_arg) } != 0 { return false; }
+        }
+        if let Some(cb) = self.config_cb {
+            if unsafe { cb(fd, sock_type, self.config_arg) } != 0 { return false; }
+        }
+        true
     }
 }
 

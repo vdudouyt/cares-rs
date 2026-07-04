@@ -195,10 +195,9 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { cstr_lossy(hostname) };
-    let mut consent = sock_consent(channeldata);
     let mut make_userdata = host_userdata(HostTail { callback, arg });
 
-    match api::gethostbyname(&mut channeldata.state, hostname, family, Instant::now(), &mut make_userdata, &mut consent) {
+    match api::gethostbyname(&mut channeldata.state, hostname, family, Instant::now(), &mut make_userdata) {
         api::HostStart::Deliver(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
@@ -242,12 +241,11 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         return;
     }
     let addrbuf = unsafe { std::slice::from_raw_parts(addr as *mut u8, addrlen as usize) };
-    let mut consent = sock_consent(channeldata);
     let mut make_userdata = |ip: IpAddr| FFIData {
         arg, family, expected_record_type: RECORD_TYPE_PTR as c_int, ip: Some(ip),
         ..FFIData::base(Callback::AresHostCallback(callback))
     };
-    match api::gethostbyaddr(&mut channeldata.state, addrbuf, family, &mut make_userdata, &mut consent) {
+    match api::gethostbyaddr(&mut channeldata.state, addrbuf, family, &mut make_userdata) {
         api::HostByAddrStart::Deliver(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
@@ -390,13 +388,12 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         }
     };
 
-    let mut consent = sock_consent(channeldata);
     let mut make_userdata = |flags: c_int| FFIData {
         arg, family: addr_info.family, expected_record_type: RECORD_TYPE_PTR as c_int,
         ip: Some(addr_info.ip), nameinfo_flags: flags, port: addr_info.port, scope_id: addr_info.scope_id,
         ..FFIData::base(Callback::AresNameinfoCallback(callback))
     };
-    match api::getnameinfo(&mut channeldata.state, &addr_info, flags, &mut make_userdata, &mut consent) {
+    match api::getnameinfo(&mut channeldata.state, &addr_info, flags, &mut make_userdata) {
         api::NameinfoStart::Fail(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
         }
@@ -496,11 +493,10 @@ pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, sm: &Rc<RefCel
 /// the machine, re-sends and cache-stores; the marshal here builds hostents
 /// and fires the C callbacks in the returned order.
 pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, sm: &Rc<RefCell<HostByNameSm>>, tail: HostTail, ffidata: &FFIData, channeldata: &mut ChannelData) {
-    let mut consent = sock_consent(channeldata);
     let mut make_userdata = host_userdata(tail);
     let deliveries = api::on_hostbyname_reply(
         &mut channeldata.state, sm, res, ffidata.server_index, ffidata.timeouts,
-        Instant::now(), &mut make_userdata, &mut consent,
+        Instant::now(), &mut make_userdata,
     );
     for delivery in deliveries {
         match delivery {
@@ -555,10 +551,9 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 
     let hostname_raw = unsafe { cstr_lossy(name) };
     let tail = AddrInfoTail { callback, arg, port };
-    let mut consent = sock_consent(channeldata);
     let mut make_userdata = addrinfo_userdata(tail);
 
-    match api::getaddrinfo(&mut channeldata.state, hostname_raw, ai_family, &mut make_userdata, &mut consent) {
+    match api::getaddrinfo(&mut channeldata.state, hostname_raw, ai_family, &mut make_userdata) {
         api::AddrInfoStart::Deliver(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
         }
@@ -643,9 +638,8 @@ pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, sm: &Rc<RefC
         let mut machine = sm.borrow_mut();
         machine.step(ev, &cfg, &mut channeldata.state.server_health)
     };
-    let mut consent = sock_consent(channeldata);
     let mut make_userdata = addrinfo_userdata(tail);
-    let deliveries = drive_addrinfo(&mut channeldata.state, sm, actions, &mut make_userdata, &mut consent);
+    let deliveries = drive_addrinfo(&mut channeldata.state, sm, actions, &mut make_userdata);
     fire_addrinfo_deliveries(deliveries, tail);
 }
 

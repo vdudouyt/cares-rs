@@ -10,47 +10,55 @@ use crate::core::channel::{getsock_mask, normalize_port, ChannelState, ServerSpe
 /// callback fields are the only C-tainted residents.
 pub struct ChannelData {
     pub(crate) state: ChannelState<FFIData>,
-    pub(crate) sock_create_callback: ares_sock_create_callback,
-    pub(crate) sock_create_callback_arg: *mut libc::c_void,
-    pub(crate) sock_config_callback: ares_sock_config_callback,
-    pub(crate) sock_config_callback_arg: *mut libc::c_void,
+    /// Concrete handle to the same factory held as `Rc<dyn TransportFactory>`
+    /// in `state.ares`. The socket-state callbacks (create/configure) live in
+    /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
+    /// can simply share the Rc and stay independent.
+    pub(crate) socket_factory: std::rc::Rc<SocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
 }
 
 impl ChannelData {
     /// A fresh channel: pure state, no callbacks installed.
-    pub(crate) fn new(state: ChannelState<FFIData>) -> Self {
+    pub(crate) fn new(state: ChannelState<FFIData>, socket_factory: std::rc::Rc<SocketFactory>) -> Self {
         ChannelData {
             state,
-            sock_create_callback: None,
-            sock_create_callback_arg: std::ptr::null_mut(),
-            sock_config_callback: None,
-            sock_config_callback_arg: std::ptr::null_mut(),
+            socket_factory,
             server_state_callback: None,
             server_state_callback_arg: std::ptr::null_mut(),
         }
     }
 
-    /// ares_dup: duplicate the pure state, copy the installed callbacks.
+    /// ares_dup: duplicate the pure state and share the (immutable) factory.
     pub(crate) fn dup_from(&self) -> Self {
         ChannelData {
             state: self.state.duplicate(),
-            sock_create_callback: self.sock_create_callback,
-            sock_create_callback_arg: self.sock_create_callback_arg,
-            sock_config_callback: self.sock_config_callback,
-            sock_config_callback_arg: self.sock_config_callback_arg,
+            socket_factory: self.socket_factory.clone(),
             server_state_callback: self.server_state_callback,
             server_state_callback_arg: self.server_state_callback_arg,
         }
+    }
+
+    /// A fresh channel with the default (libc) socket factory.
+    pub(crate) fn new_default() -> Self {
+        let factory = std::rc::Rc::new(SocketFactory::default());
+        let state = ChannelState::new(Ares::from_sysconfig(factory.clone()));
+        ChannelData::new(state, factory)
+    }
+
+    /// Install a rebuilt socket factory, keeping the concrete handle and the
+    /// core's `Rc<dyn TransportFactory>` in sync (they are the same object).
+    pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<SocketFactory>) {
+        self.state.ares.socket_factory = factory.clone();
+        self.socket_factory = factory;
     }
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
-    let channeldata = ChannelData::new(ChannelState::new(Ares::from_sysconfig(std::rc::Rc::new(SocketFactory::default()))));
-    let channel = Box::into_raw(Box::new(channeldata));
+    let channel = Box::into_raw(Box::new(ChannelData::new_default()));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
 }
@@ -284,8 +292,8 @@ pub extern "C" fn ares_set_local_dev(_channel: Channel, _local_dev_name: *const 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ares_sock_create_callback, arg: *mut c_void) {
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    channeldata.sock_create_callback = callback;
-    channeldata.sock_create_callback_arg = arg;
+    let factory = channeldata.socket_factory.with_create_cb(callback, arg);
+    channeldata.apply_socket_factory(factory);
 }
 
 #[no_mangle]
@@ -356,8 +364,8 @@ pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, callback: ares_sock_config_callback, arg: *mut c_void) {
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    channeldata.sock_config_callback = callback;
-    channeldata.sock_config_callback_arg = arg;
+    let factory = channeldata.socket_factory.with_config_cb(callback, arg);
+    channeldata.apply_socket_factory(factory);
 }
 
 #[no_mangle]

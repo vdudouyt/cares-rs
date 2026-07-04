@@ -2,12 +2,11 @@
 #![allow(dead_code)]
 
 use libc::{in_addr};
-use crate::ffi::{ Channel, Ares };
+use crate::ffi::Channel;
 use std::net::Ipv4Addr;
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
-use crate::core::channel::{ChannelState, DecodedOptions};
-use crate::ffi::ares_socket::SocketFactory;
+use crate::core::channel::DecodedOptions;
 use crate::ffi::channel::ChannelData;
 use crate::ares_socket_t;
 
@@ -186,7 +185,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         failover_retry_delay: options.server_failover_opts.retry_delay as u64,
     };
 
-    let mut channeldata = ChannelData::new(ChannelState::new(Ares::from_sysconfig(std::rc::Rc::new(SocketFactory::default()))));
+    let mut channeldata = ChannelData::new_default();
     channeldata.state.apply_options(optmask, decoded);
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
