@@ -3,9 +3,10 @@
 //! section, follow CNAME chains, and collect typed records. Pure safe code —
 //! the C-facing hostent/linked-list emission stays in src/ffi.
 
-use std::ffi::{c_int, CString};
+use std::ffi::CString;
 
 use crate::core::packets::{DnsAnswer, DnsHeader, DnsLabel, DnsQuery, RRParser, SliceBuf};
+use crate::core::AresError;
 use crate::ffi::error::{
     ARES_EBADRESP, ARES_EFORMERR, ARES_ENODATA, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED,
     ARES_ESERVFAIL,
@@ -62,29 +63,29 @@ pub struct ParsedRRs<T> {
 }
 
 impl<'a> ParsedResponse<'a> {
-    pub fn from_buf(buf: &'a [u8]) -> Result<Self, c_int> {
+    pub(crate) fn from_buf(buf: &'a [u8]) -> Result<Self, AresError> {
         let mut sbuf = SliceBuf::new(buf);
         let Some(header) = DnsHeader::parse(&mut sbuf) else {
-            return Err(ARES_EBADRESP);
+            return Err(ARES_EBADRESP.into());
         };
         match header.flags & 0x0f {
             0 => {},
-            1 => return Err(ARES_EFORMERR),
-            2 => return Err(ARES_ESERVFAIL),
-            3 => return Err(ARES_ENOTFOUND),
-            4 => return Err(ARES_ENOTIMP),
-            5 => return Err(ARES_EREFUSED),
-            _ => return Err(ARES_ENODATA),
+            1 => return Err(ARES_EFORMERR.into()),
+            2 => return Err(ARES_ESERVFAIL.into()),
+            3 => return Err(ARES_ENOTFOUND.into()),
+            4 => return Err(ARES_ENOTIMP.into()),
+            5 => return Err(ARES_EREFUSED.into()),
+            _ => return Err(ARES_ENODATA.into()),
         };
         if header.qdcount != 1 {
-            return Err(ARES_EBADRESP);
+            return Err(ARES_EBADRESP.into());
         }
         let Some(query) = DnsQuery::parse(&mut sbuf) else {
-            return Err(ARES_EBADRESP);
+            return Err(ARES_EBADRESP.into());
         };
         let answer_count = header.ancount as usize;
         if answer_count == 0 {
-            return Err(ARES_ENODATA);
+            return Err(ARES_ENODATA.into());
         }
         // Grow on demand rather than pre-allocating `answer_count` (ancount is
         // attacker-controlled, up to 65535, and DnsAnswer is large, so a tiny
@@ -95,12 +96,12 @@ impl<'a> ParsedResponse<'a> {
         // Only parse answer section (ancount); authority and additional sections are skipped
         for _ in 0..answer_count {
             let Some(answer) = DnsAnswer::parse(&mut sbuf) else {
-                return Err(ARES_EBADRESP);
+                return Err(ARES_EBADRESP.into());
             };
             answers.push(answer);
         }
         if answers.is_empty() {
-            return Err(ARES_ENODATA);
+            return Err(ARES_ENODATA.into());
         }
         Ok(Self {
             query,
@@ -108,10 +109,10 @@ impl<'a> ParsedResponse<'a> {
         })
     }
 
-    pub fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, c_int> {
+    pub(crate) fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, AresError> {
         // The echoed question name comes from the (untrusted) response and may
         // contain an embedded NUL byte; fail gracefully instead of panicking.
-        let mut name = CString::new(self.query.name.join(".")).map_err(|_| ARES_EBADRESP)?;
+        let mut name = CString::new(self.query.name.join(".")).map_err(|_| AresError::from(ARES_EBADRESP))?;
         let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
         let mut success = 0;
         let mut aliases: Vec<CString> = vec![];
@@ -119,8 +120,8 @@ impl<'a> ParsedResponse<'a> {
         for mut answer in self.answers {
             if answer.record_type == RECORD_TYPE_CNAME {
                 let mut cname_buf = SliceBuf::new(answer.data);
-                let alias_of = DnsLabel::parse(&mut cname_buf).ok_or(ARES_EBADRESP)?;
-                let alias_of = alias_of.build_cstring(buf).ok_or(ARES_EBADRESP)?;
+                let alias_of = DnsLabel::parse(&mut cname_buf).ok_or(AresError::from(ARES_EBADRESP))?;
+                let alias_of = alias_of.build_cstring(buf).ok_or(AresError::from(ARES_EBADRESP))?;
                 if expected_record_type != RECORD_TYPE_PTR {
                     aliases.push(name);
                     name = alias_of;
@@ -135,8 +136,8 @@ impl<'a> ParsedResponse<'a> {
 
             if answer.record_type == RECORD_TYPE_PTR || answer.record_type == RECORD_TYPE_NS {
                 let mut ptr_buf = SliceBuf::new(answer.data);
-                let alias_of = DnsLabel::parse(&mut ptr_buf).ok_or(ARES_EBADRESP)?;
-                let alias_of = alias_of.build_cstring(buf).ok_or(ARES_EBADRESP)?;
+                let alias_of = DnsLabel::parse(&mut ptr_buf).ok_or(AresError::from(ARES_EBADRESP))?;
+                let alias_of = alias_of.build_cstring(buf).ok_or(AresError::from(ARES_EBADRESP))?;
                 aliases.push(alias_of.clone());
                 if answer.record_type == RECORD_TYPE_PTR { name = alias_of; }
                 continue;
@@ -173,7 +174,7 @@ pub enum ReplyRequire {
 
 /// Parse an address-record reply and apply the acceptance rule (ENODATA
 /// when it fails) — the shared front half of every hostent producer.
-pub fn addr_reply(buf: &[u8], expected_rtype: u16, require: ReplyRequire) -> Result<ParsedRRs<crate::core::packets::AddrRecord>, i32> {
+pub fn addr_reply(buf: &[u8], expected_rtype: u16, require: ReplyRequire) -> Result<ParsedRRs<crate::core::packets::AddrRecord>, AresError> {
     let res = ParsedResponse::from_buf(buf)?;
     let rrs = res.process_answers::<crate::core::packets::AddrRecord>(buf, expected_rtype)?;
     let ok = match require {
@@ -182,7 +183,7 @@ pub fn addr_reply(buf: &[u8], expected_rtype: u16, require: ReplyRequire) -> Res
         ReplyRequire::Aliases => !rrs.aliases.is_empty(),
     };
     if !ok {
-        return Err(ARES_ENODATA);
+        return Err(ARES_ENODATA.into());
     }
     Ok(rrs)
 }
@@ -196,7 +197,7 @@ pub fn push_synthetic_ptr(rrs: &mut ParsedRRs<crate::core::packets::AddrRecord>,
 /// The TXT-ext answer set: per-answer chunk lists flattened in order, plus
 /// how many RRs of the type parsed (the empty-chain status depends on it).
 #[allow(clippy::type_complexity)]
-pub fn txt_ext_items(buf: &[u8]) -> Result<(Vec<crate::core::packets::TxtReplyExt<'_>>, usize), i32> {
+pub fn txt_ext_items(buf: &[u8]) -> Result<(Vec<crate::core::packets::TxtReplyExt<'_>>, usize), AresError> {
     let res = ParsedResponse::from_buf(buf)?;
     let rrs = res.process_answers::<Vec<crate::core::packets::TxtReplyExt>>(buf, crate::ffi::RECORD_TYPE_TXT)?;
     Ok((rrs.items.into_iter().flatten().collect(), rrs.success))
@@ -205,12 +206,12 @@ pub fn txt_ext_items(buf: &[u8]) -> Result<(Vec<crate::core::packets::TxtReplyEx
 /// A reply whose typed chain came out empty still parsed: report success if
 /// at least one RR of the type was seen, EBADRESP otherwise (the linked-list
 /// parsers' shared tail rule).
-pub fn empty_chain_status(success: usize) -> i32 {
-    if success > 0 { crate::ffi::error::ARES_SUCCESS } else { ARES_EBADRESP }
+pub(crate) fn empty_chain_status(success: usize) -> AresError {
+    if success > 0 { crate::ffi::error::ARES_SUCCESS.into() } else { ARES_EBADRESP.into() }
 }
 
 /// ares_parse_soa_reply reports a missing SOA as EBADRESP where the generic
 /// machinery says ENODATA.
-pub fn soa_status(status: i32) -> i32 {
-    if status == ARES_ENODATA { ARES_EBADRESP } else { status }
+pub fn soa_status(status: AresError) -> AresError {
+    if status.code() == ARES_ENODATA { ARES_EBADRESP.into() } else { status }
 }

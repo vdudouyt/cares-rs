@@ -39,6 +39,7 @@
 use std::ffi::c_int;
 use std::time::{Duration, Instant};
 
+use crate::core::AresError;
 use crate::ffi::error::{
     ARES_ECANCELLED, ARES_ECONNREFUSED, ARES_EDESTRUCTION, ARES_ENODATA, ARES_ENOTFOUND,
     ARES_ENOTIMP, ARES_EREFUSED, ARES_ESERVFAIL, ARES_ETIMEOUT,
@@ -192,7 +193,7 @@ impl SearchPlan {
 /// status (timeout, refused connection, cancellation...).
 pub enum LookupEvent<'a> {
     Reply(&'a [u8]),
-    Error(c_int),
+    Error(AresError),
 }
 
 /// What the search state machine wants done next. The FFI executor performs
@@ -205,7 +206,7 @@ pub enum SearchAction {
     /// Deliver the current reply buffer to the caller as success.
     DeliverSuccess,
     /// Deliver failure with this status.
-    DeliverFail(c_int),
+    DeliverFail(AresError),
 }
 
 /// State machine for ares_search / ares_search_dnsrec: iterate the search
@@ -215,7 +216,7 @@ pub enum SearchAction {
 #[derive(Debug)]
 pub struct SearchSm {
     pub plan: SearchPlan,
-    pub last_error: c_int,
+    pub last_error: AresError,
     pub had_nodata: bool,
     /// dnsrec flavor also walks the search plan on server errors.
     pub retry_server_error: bool,
@@ -223,7 +224,7 @@ pub struct SearchSm {
 
 impl SearchSm {
     pub fn new(plan: SearchPlan, retry_server_error: bool) -> Self {
-        SearchSm { plan, last_error: ARES_ENODATA, had_nodata: false, retry_server_error }
+        SearchSm { plan, last_error: ARES_ENODATA.into(), had_nodata: false, retry_server_error }
     }
 
     pub fn step(&mut self, ev: LookupEvent<'_>) -> SearchAction {
@@ -232,19 +233,19 @@ impl SearchSm {
                 let summary = summarize(buf, 0);
                 match summary.rcode {
                     3 => { // NXDOMAIN
-                        self.last_error = ARES_ENOTFOUND;
+                        self.last_error = ARES_ENOTFOUND.into();
                     }
                     2 | 4 | 5 => { // SERVFAIL, NOTIMP, REFUSED
                         self.last_error = match summary.rcode {
                             2 => ARES_ESERVFAIL,
                             4 => ARES_ENOTIMP,
                             _ => ARES_EREFUSED,
-                        };
+                        }.into();
                     }
                     0 => {
                         if summary.ancount == 0 {
                             self.had_nodata = true;
-                            self.last_error = ARES_ENODATA;
+                            self.last_error = ARES_ENODATA.into();
                         } else {
                             // Success — deliver the raw response
                             return SearchAction::DeliverSuccess;
@@ -252,7 +253,7 @@ impl SearchSm {
                     }
                     _ => {
                         self.had_nodata = true;
-                        self.last_error = ARES_ENODATA;
+                        self.last_error = ARES_ENODATA.into();
                     }
                 }
             }
@@ -263,9 +264,9 @@ impl SearchSm {
 
         // Search domain iteration: on NXDOMAIN/ENODATA/ETIMEOUT — and for the
         // dnsrec flavor also on server errors — try the next name in the plan.
-        let iterate = matches!(self.last_error, ARES_ENOTFOUND | ARES_ENODATA | ARES_ETIMEOUT)
+        let iterate = matches!(self.last_error.code(), ARES_ENOTFOUND | ARES_ENODATA | ARES_ETIMEOUT)
             || (self.retry_server_error
-                && matches!(self.last_error, ARES_ESERVFAIL | ARES_EREFUSED | ARES_ENOTIMP));
+                && matches!(self.last_error.code(), ARES_ESERVFAIL | ARES_EREFUSED | ARES_ENOTIMP));
         if iterate {
             if let Some(next_name) = self.plan.advance() {
                 return SearchAction::Send(next_name);
@@ -274,8 +275,8 @@ impl SearchSm {
 
         // Finalize
         let mut status = self.last_error;
-        if self.had_nodata && status == ARES_ENOTFOUND {
-            status = ARES_ENODATA;
+        if self.had_nodata && status.code() == ARES_ENOTFOUND {
+            status = ARES_ENODATA.into();
         }
         SearchAction::DeliverFail(status)
     }
@@ -309,14 +310,14 @@ pub enum HostAction {
     CacheStore { names: Vec<String>, rtype: u16 },
     /// Reply parsed successfully — sort + build the hostent and deliver.
     DeliverSuccess { family: c_int, timeouts: c_int },
-    DeliverFail { status: c_int, timeouts: c_int },
+    DeliverFail { status: AresError, timeouts: c_int },
 }
 
 /// Input to the gethostbyname machine: a reply (with its parse outcome —
 /// parsing itself happens outside) or an I/O-level error.
 pub enum HostEvent {
-    Reply { truncated: bool, parse: Result<(), c_int>, io_timeouts: c_int, server: usize },
-    Error { status: c_int },
+    Reply { truncated: bool, parse: Result<(), AresError>, io_timeouts: c_int, server: usize },
+    Error { status: AresError },
 }
 
 /// State machine for ares_gethostbyname's DNS phase. One `step` per reply or
@@ -338,7 +339,7 @@ pub struct HostByNameSm {
     /// Timeout events accumulated across retries; reported on success as
     /// timeouts + the delivering task's own count, on failure as-is.
     pub timeouts: c_int,
-    pub last_error: c_int,
+    pub last_error: AresError,
 }
 
 impl HostByNameSm {
@@ -358,7 +359,7 @@ impl HostByNameSm {
             had_nodata: false,
             tried_aaaa: family == AF_UNSPEC,
             timeouts: 0,
-            last_error: ARES_ENODATA,
+            last_error: ARES_ENODATA.into(),
         }
     }
 
@@ -397,7 +398,7 @@ impl HostByNameSm {
                     Err(e) => {
                         // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
                         let nservers = health.len().max(1);
-                        if matches!(e, ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED) {
+                        if matches!(e.code(), ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED) {
                             actions.push(HostAction::NotifyServerFail { server, tcp: self.use_tcp });
                             health.record_failure(server);
                             self.attempt_count += 1;
@@ -414,7 +415,7 @@ impl HostByNameSm {
                                 return actions;
                             }
                         }
-                        if e == ARES_ENODATA {
+                        if e.code() == ARES_ENODATA {
                             self.had_nodata = true;
                         }
                         self.last_error = e;
@@ -422,7 +423,7 @@ impl HostByNameSm {
                 }
             }
             HostEvent::Error { status } => {
-                if status == ARES_ETIMEOUT {
+                if status.code() == ARES_ETIMEOUT {
                     self.timeouts += 1; // Count as one query timeout event
                 }
                 self.last_error = status;
@@ -430,9 +431,9 @@ impl HostByNameSm {
         }
 
         // Search domain iteration: on NXDOMAIN/ENODATA, try next search domain or bare name
-        if matches!(self.last_error, ARES_ENOTFOUND | ARES_ENODATA) {
+        if matches!(self.last_error.code(), ARES_ENOTFOUND | ARES_ENODATA) {
             if let Some(next_name) = self.plan.advance() {
-                self.last_error = ARES_ENODATA;
+                self.last_error = ARES_ENODATA.into();
                 self.attempt_count = 0;
                 actions.push(HostAction::Send {
                     name: next_name,
@@ -450,7 +451,7 @@ impl HostByNameSm {
             self.current_family = AF_INET;
             self.expected_rtype = RTYPE_A;
             self.tried_aaaa = false;
-            self.last_error = ARES_ENODATA;
+            self.last_error = ARES_ENODATA.into();
             self.attempt_count = 0;
             // Restore search domains for the A query round
             if !self.plan.base_name.is_empty() {
@@ -470,8 +471,8 @@ impl HostByNameSm {
         }
 
         // Finalize
-        let final_error = if self.had_nodata && self.last_error == ARES_ENOTFOUND {
-            ARES_ENODATA
+        let final_error = if self.had_nodata && self.last_error.code() == ARES_ENOTFOUND {
+            ARES_ENODATA.into()
         } else {
             self.last_error
         };
@@ -492,21 +493,21 @@ pub enum AddrInfoAction {
     /// All queries settled with at least one success: build the ares_addrinfo
     /// from the accumulated records and deliver.
     DeliverSuccess { name: String },
-    DeliverFail { status: c_int },
+    DeliverFail { status: AresError },
 }
 
 /// Input to the getaddrinfo machine, one per settled task (or failed send).
 pub enum AddrInfoEvent {
     Reply {
         truncated: bool,
-        parse: Result<Vec<crate::core::packets::AddrRecord>, c_int>,
+        parse: Result<Vec<crate::core::packets::AddrRecord>, AresError>,
         family: c_int,
         server: usize,
         io_timeouts: c_int,
     },
     /// I/O-level error, including ECANCELLED/EDESTRUCTION (which set the
     /// cancel flag and still participate in the pending join).
-    Error { status: c_int },
+    Error { status: AresError },
     /// A batch launch send failed: always records ECONNREFUSED.
     LaunchFailed,
     /// A TC/failover re-send failed: ECONNREFUSED is recorded only if this
@@ -529,7 +530,7 @@ pub struct AddrInfoSm {
     pub attempt_count: usize,
     pub has_success: bool,
     pub has_cancel: bool,
-    pub last_error: c_int,
+    pub last_error: AresError,
     /// Accumulated A/AAAA answers in arrival order across the parallel
     /// queries and any relaunches.
     pub addrs: Vec<crate::core::packets::AddrRecord>,
@@ -545,7 +546,7 @@ impl AddrInfoSm {
             attempt_count: 0,
             has_success: false,
             has_cancel: false,
-            last_error: ARES_ENODATA,
+            last_error: ARES_ENODATA.into(),
             addrs: Vec::new(),
         }
     }
@@ -596,7 +597,7 @@ impl AddrInfoSm {
                         // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
                         let nservers = health.len();
                         let max_attempts = nservers.max(1) * cfg.attempts as usize;
-                        if matches!(e, ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED) && nservers >= 1 {
+                        if matches!(e.code(), ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED) && nservers >= 1 {
                             health.record_failure(server);
                             self.attempt_count += 1;
                             if self.attempt_count < max_attempts {
@@ -615,18 +616,18 @@ impl AddrInfoSm {
                 }
             }
             AddrInfoEvent::Error { status } => {
-                if matches!(status, ARES_ECANCELLED | ARES_EDESTRUCTION) {
+                if matches!(status.code(), ARES_ECANCELLED | ARES_EDESTRUCTION) {
                     self.has_cancel = true;
                 }
                 self.last_error = status;
             }
             AddrInfoEvent::LaunchFailed => {
-                self.last_error = ARES_ECONNREFUSED;
+                self.last_error = ARES_ECONNREFUSED.into();
             }
             AddrInfoEvent::ResendFailed => {
                 self.pending -= 1;
                 if self.pending == 0 {
-                    self.last_error = ARES_ECONNREFUSED;
+                    self.last_error = ARES_ECONNREFUSED.into();
                     return vec![self.finalize()];
                 }
                 return vec![];
@@ -641,12 +642,12 @@ impl AddrInfoSm {
         // Search domain iteration: on NXDOMAIN/ENODATA/ETIMEOUT/SERVFAIL/
         // NOTIMP/REFUSED, try the next search domain or the bare name.
         if !self.has_success && !self.has_cancel
-            && matches!(self.last_error,
+            && matches!(self.last_error.code(),
                 ARES_ENOTFOUND | ARES_ENODATA | ARES_ETIMEOUT
                 | ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED)
             && self.plan.advance().is_some()
         {
-            self.last_error = ARES_ENODATA;
+            self.last_error = ARES_ENODATA.into();
             self.attempt_count = 0;
             return self.begin_batch(health.pick_next());
         }
@@ -965,7 +966,7 @@ mod tests {
         // empty answer -> NODATA -> bare-name fallback
         assert_eq!(sm.step(LookupEvent::Reply(&reply(0, 0))), SearchAction::Send("www".into()));
         // NXDOMAIN after a NODATA earlier in the walk finalizes as ENODATA
-        assert_eq!(sm.step(LookupEvent::Reply(&reply(3, 0))), SearchAction::DeliverFail(ARES_ENODATA));
+        assert_eq!(sm.step(LookupEvent::Reply(&reply(3, 0))), SearchAction::DeliverFail(ARES_ENODATA.into()));
     }
 
     #[test]
@@ -973,7 +974,7 @@ mod tests {
         let search = vec!["a.com".to_string()];
         let plan = SearchPlan::for_search("www", 1, &search);
         let mut plain = SearchSm::new(plan.clone(), false);
-        assert_eq!(plain.step(LookupEvent::Reply(&reply(2, 0))), SearchAction::DeliverFail(ARES_ESERVFAIL));
+        assert_eq!(plain.step(LookupEvent::Reply(&reply(2, 0))), SearchAction::DeliverFail(ARES_ESERVFAIL.into()));
         let mut dnsrec = SearchSm::new(plan, true);
         assert_eq!(dnsrec.step(LookupEvent::Reply(&reply(2, 0))), SearchAction::Send("www".into()));
     }
@@ -982,7 +983,7 @@ mod tests {
     fn search_sm_success_and_timeout() {
         let mut sm = SearchSm::new(SearchPlan::for_search("www.example.", 1, &[]), false);
         assert_eq!(sm.step(LookupEvent::Reply(&reply(0, 1))), SearchAction::DeliverSuccess);
-        assert_eq!(sm.step(LookupEvent::Error(ARES_ETIMEOUT)), SearchAction::DeliverFail(ARES_ETIMEOUT));
+        assert_eq!(sm.step(LookupEvent::Error(ARES_ETIMEOUT.into())), SearchAction::DeliverFail(ARES_ETIMEOUT.into()));
     }
 
     #[test]

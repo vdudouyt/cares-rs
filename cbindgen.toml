@@ -39,6 +39,9 @@ typedef struct ares_channeldata ares_channel_t;
 item_types = ["constants", "functions", "structs", "unions", "typedefs", "opaque", "enums"]
 exclude = [
   "AresData", "AresDataType", "SocketFactory", "UdpSocket", "TcpSocket",
+  # Internal ares-status newtype; converted to c_int at the FFI boundary, never
+  # crosses to C, so it must not appear in the generated header.
+  "AresError",
   # Internal bare-fn callback aliases; the public header uses the ares_*_callback
   # nullable typedefs instead (cbindgen can't collapse Option<TypeAlias>).
   "AresHostCallback", "AresCallback", "AresCallbackDnsRec", "AresNameinfoCallback",

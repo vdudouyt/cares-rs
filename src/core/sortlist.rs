@@ -1,6 +1,6 @@
 //! resolv.conf-style sortlist parsing and result ordering (RES_OPT sortlist).
 
-use std::ffi::c_int;
+use crate::core::AresError;
 use std::net::IpAddr;
 
 use crate::core::packets::AddrRecord;
@@ -39,7 +39,7 @@ pub fn apply_sortlist(sortlist: &[SortlistEntry], items: &mut [AddrRecord]) {
     });
 }
 
-pub fn parse_sortlist(s: &str) -> Result<Vec<SortlistEntry>, c_int> {
+pub(crate) fn parse_sortlist(s: &str) -> Result<Vec<SortlistEntry>, AresError> {
     let mut entries = Vec::new();
     for token in s.split(|c: char| c.is_whitespace() || c == ';').filter(|t| !t.is_empty()) {
         // Formats: "ip/mask" or "ip/bits" or just "ip"
@@ -48,7 +48,7 @@ pub fn parse_sortlist(s: &str) -> Result<Vec<SortlistEntry>, c_int> {
             // Try as CIDR bits first
             if let Ok(bits) = mask_s.parse::<u8>() {
                 let max = if addr.is_ipv4() { 32 } else { 128 };
-                if bits > max { return Err(ARES_EBADSTR); }
+                if bits > max { return Err(ARES_EBADSTR.into()); }
                 entries.push(SortlistEntry { addr, mask_bits: bits });
             } else {
                 // Try as dotted netmask (IPv4 only)

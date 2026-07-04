@@ -38,6 +38,7 @@ use crate::core::preflight::{
 };
 use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedResponse, ParsedRRs, ReplyRequire};
 use crate::core::sortlist::apply_sortlist;
+use crate::core::AresError;
 use crate::ffi::error::{
     ARES_EBADFLAGS, ARES_EBADNAME, ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_EFILE, ARES_ENODATA,
     ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP,
@@ -64,21 +65,21 @@ pub(crate) enum Operation<T> {
 }
 
 /// ares_query: reject server-less channels, then enqueue.
-pub(crate) fn query<T>(st: &mut ChannelState<T>, name: &str, qtype: u16, userdata: T) -> Result<(), i32> {
+pub(crate) fn query<T>(st: &mut ChannelState<T>, name: &str, qtype: u16, userdata: T) -> Result<(), AresError> {
     if no_servers(st) {
-        return Err(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER.into());
     }
     issue(st, dns_query_payload(name, qtype), SocketSource::Udp, 0, userdata)?;
     Ok(())
 }
 
 /// ares_send: a pre-built packet must at least hold a DNS header.
-pub(crate) fn send<T>(st: &mut ChannelState<T>, query_buf: &[u8], userdata: T) -> Result<(), i32> {
+pub(crate) fn send<T>(st: &mut ChannelState<T>, query_buf: &[u8], userdata: T) -> Result<(), AresError> {
     if query_buf.len() < 12 {
-        return Err(ARES_EBADQUERY);
+        return Err(ARES_EBADQUERY.into());
     }
     if no_servers(st) {
-        return Err(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER.into());
     }
     issue(st, BytesMut::from(query_buf), SocketSource::Udp, 0, userdata)?;
     Ok(())
@@ -94,9 +95,9 @@ pub(crate) fn query_dnsrec<T>(
     qtype: u16,
     now: Instant,
     userdata: T,
-) -> Result<Operation<crate::core::dns_record::ares_dns_record_t>, i32> {
+) -> Result<Operation<crate::core::dns_record::ares_dns_record_t>, AresError> {
     if no_servers(st) {
-        return Err(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER.into());
     }
     let name_clean = name_raw.strip_suffix('.').unwrap_or(name_raw);
     if let Some(cached_buf) = cached_reply(st, name_clean, qtype, now) {
@@ -121,7 +122,7 @@ pub(crate) fn search<T>(
     dnstype: u16,
     retry_server_error: bool,
     binding: T,
-) -> Result<(), i32> {
+) -> Result<(), AresError> {
     let (sm, query_hostname) = search_start(st, name, retry_server_error)?;
     let handle = Rc::new(RefCell::new(sm));
     issue(st, dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, binding)?;
@@ -130,7 +131,7 @@ pub(crate) fn search<T>(
 }
 
 /// ares_gethostbyname_file: the hosts-file-only lookup, shaped for C.
-pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family: i32) -> Result<Hostent, i32> {
+pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family: i32) -> Result<Hostent, AresError> {
     hosts_file_lookup(st, name, family).map(Hostent::from_lookup)
 }
 
@@ -147,14 +148,14 @@ pub(crate) fn gethostbyaddr<T>(
     addrbuf: &[u8],
     family: i32,
     userdata: T,
-) -> Result<Operation<Hostent>, i32> {
+) -> Result<Operation<Hostent>, AresError> {
     // family-validate -> buf_to_ip -> hosts reverse lookup -> no-servers -> PTR.
     if family != libc::AF_INET && family != libc::AF_INET6 {
-        return Err(ARES_ENOTIMP);
+        return Err(ARES_ENOTIMP.into());
     }
     let addr = match buf_to_ip(addrbuf) {
         Ok(ip) => ip,
-        Err(_) => return Err(ARES_ENOTIMP),
+        Err(_) => return Err(ARES_ENOTIMP.into()),
     };
     // Check hosts file first
     if let Some(lookup) = st.ares.hosts().reverse_lookup(addr) {
@@ -162,7 +163,7 @@ pub(crate) fn gethostbyaddr<T>(
     }
     // No servers configured
     if st.ares.config.nameservers.is_empty() {
-        return Err(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER.into());
     }
     issue(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
     if let Some(t) = st.ares.tasks.last_mut() {
@@ -192,7 +193,7 @@ pub(crate) fn getnameinfo<T>(
     addr: &AddrInfo,
     flags: i32,
     userdata: T,
-) -> Result<Operation<NameinfoOk>, i32> {
+) -> Result<Operation<NameinfoOk>, AresError> {
     // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
     let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
         flags | ARES_NI_LOOKUPHOST
@@ -213,7 +214,7 @@ pub(crate) fn getnameinfo<T>(
     if (flags & ARES_NI_NUMERICHOST) != 0 {
         // ARES_NI_NUMERICHOST + ARES_NI_NAMEREQD is illegal (contradiction)
         if (flags & ARES_NI_NAMEREQD) != 0 {
-            return Err(ARES_EBADFLAGS);
+            return Err(ARES_EBADFLAGS.into());
         }
         let node = CString::new(format_ip_with_scope(&addr.ip, addr.scope_id, flags)).unwrap();
         let service = if want_service {
@@ -240,7 +241,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
     family: i32,
     now: Instant,
     binding: T,
-) -> Result<Operation<Hostent>, i32> {
+) -> Result<Operation<Hostent>, AresError> {
     // Check order is behavior (each stage may deliver before the next runs):
     // ascii -> onion -> family-validate -> IP literal -> hosts file ->
     // localhost -> HOSTALIASES (fs read; PermissionDenied => Deliver(EFILE)) ->
@@ -249,18 +250,18 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
 
     // Reject non-ASCII names
     if !hostname.is_ascii() {
-        return Err(ARES_EBADNAME);
+        return Err(ARES_EBADNAME.into());
     }
 
     // Reject .onion domains immediately (RFC 7686)
     if is_onion_domain(hostname) {
-        return Err(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND.into());
     }
 
     // Family validation; the A/AAAA mapping itself lives in HostByNameSm::new.
     match family {
         libc::AF_INET | libc::AF_INET6 | libc::AF_UNSPEC => {}
-        _ => return Err(ARES_ENOTIMP),
+        _ => return Err(ARES_ENOTIMP.into()),
     }
 
     let family_filter = match family {
@@ -329,7 +330,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
                     alias_found.unwrap_or_else(|| hostname_str.clone())
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    return Err(ARES_EFILE);
+                    return Err(ARES_EFILE.into());
                 }
                 Err(_) => hostname_str.clone(),
             }
@@ -342,7 +343,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
 
     // No servers configured — return ENOSERVER immediately
     if st.ares.config.nameservers.is_empty() {
-        return Err(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER.into());
     }
 
     // Check query cache
@@ -357,11 +358,11 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
         if let Some((cached_buf, expires_at)) = st.query_cache.get(&cache_key) {
             if now < *expires_at {
                 let cached_buf = cached_buf.clone();
-                let parsed = (|| -> Result<ParsedRRs<AddrRecord>, i32> {
+                let parsed = (|| -> Result<ParsedRRs<AddrRecord>, AresError> {
                     let response = ParsedResponse::from_buf(&cached_buf)?;
                     let parsed_rrs = response.process_answers::<AddrRecord>(&cached_buf, record_type)?;
                     if parsed_rrs.items.is_empty() {
-                        return Err(ARES_ENODATA);
+                        return Err(ARES_ENODATA.into());
                     }
                     Ok(parsed_rrs)
                 })();
@@ -404,7 +405,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
     maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp);
     match launched {
         LaunchOutcome::Launched => Ok(Operation::Pending),
-        LaunchOutcome::Exhausted { .. } => Err(ARES_ECONNREFUSED),
+        LaunchOutcome::Exhausted { .. } => Err(ARES_ECONNREFUSED.into()),
     }
 }
 
@@ -423,7 +424,7 @@ pub(crate) fn getaddrinfo<T: Copy>(
     hostname_raw: &str,
     ai_family: i32,
     binding: T,
-) -> Result<Operation<AddrInfoOk>, i32> {
+) -> Result<Operation<AddrInfoOk>, AresError> {
     // Check order is behavior: empty-name -> onion -> IP literal (family
     // mismatch fails, no fall-through) -> hosts file -> no-servers -> DNS.
     // The raw name keeps its trailing dot for the SearchPlan; checks and the
@@ -442,12 +443,12 @@ pub(crate) fn getaddrinfo<T: Copy>(
     let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
 
     if hostname.is_empty() {
-        return Err(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND.into());
     }
 
     // Reject .onion domains immediately (RFC 7686)
     if is_onion_domain(hostname) {
-        return Err(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND.into());
     }
 
     // IP literal check
@@ -461,7 +462,7 @@ pub(crate) fn getaddrinfo<T: Copy>(
         if matches {
             return deliver(vec![ip], hostname.to_string());
         } else {
-            return Err(ARES_ENOTFOUND);
+            return Err(ARES_ENOTFOUND.into());
         }
     }
 
@@ -479,7 +480,7 @@ pub(crate) fn getaddrinfo<T: Copy>(
 
     // No servers configured
     if st.ares.config.nameservers.is_empty() {
-        return Err(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER.into());
     }
 
     // DNS path: mint the machine and drive the parallel A/AAAA batch.
@@ -515,13 +516,13 @@ pub(crate) enum HostDelivery {
     NotifyServerFail { server: usize, tcp: bool },
     /// Sortlist already applied and the hostent shaped; build, deliver, free.
     Success { hostent: Hostent, timeouts: i32 },
-    Fail { status: i32, timeouts: i32 },
+    Fail { status: AresError, timeouts: i32 },
 }
 
 /// The plain host-callback path (ares_gethostbyaddr's direct PTR delivery):
 /// parse under the flow's acceptance rule, add the synthetic record for the
 /// queried address, and shape the hostent.
-pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip: Option<IpAddr>) -> Result<Hostent, i32> {
+pub(crate) fn on_host_reply(res: Result<&[u8], AresError>, rtype: u16, family: i32, ip: Option<IpAddr>) -> Result<Hostent, AresError> {
     let buf = res?;
     let is_ptr = rtype == RECORD_TYPE_PTR;
     let require = if is_ptr { ReplyRequire::ItemsOrAliases } else { ReplyRequire::Items };
@@ -539,7 +540,7 @@ pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip
 pub(crate) fn on_hostbyname_reply<T: Copy>(
     st: &mut ChannelState<T>,
     sm: &Rc<RefCell<HostByNameSm>>,
-    res: Result<&[u8], i32>,
+    res: Result<&[u8], AresError>,
     server: usize,
     io_timeouts: i32,
     now: Instant,
@@ -579,7 +580,7 @@ pub(crate) fn on_hostbyname_reply<T: Copy>(
                 if let LaunchOutcome::Exhausted { timeouts } =
                     launch_pooled(st, &name, family, rtype, tcp, server, sm, binding)
                 {
-                    deliveries.push(HostDelivery::Fail { status: ARES_ECONNREFUSED, timeouts });
+                    deliveries.push(HostDelivery::Fail { status: ARES_ECONNREFUSED.into(), timeouts });
                 }
             }
             HostAction::NotifyServerFail { server, tcp } => {
@@ -613,7 +614,7 @@ pub(crate) fn on_hostbyname_reply<T: Copy>(
 pub(crate) enum SearchReplyDelivery {
     /// Deliver the (raw or parsed) reply buffer with SUCCESS.
     Success { timeouts: i32 },
-    Fail { status: i32, timeouts: i32 },
+    Fail { status: AresError, timeouts: i32 },
 }
 
 /// A search task settled: feed the machine, re-issue the next plan name if
@@ -622,7 +623,7 @@ pub(crate) enum SearchReplyDelivery {
 pub(crate) fn on_search_reply<T>(
     st: &mut ChannelState<T>,
     sm: &Rc<RefCell<SearchSm>>,
-    res: Result<&[u8], i32>,
+    res: Result<&[u8], AresError>,
     dnstype: u16,
     io_timeouts: i32,
     binding: T,
@@ -649,7 +650,7 @@ pub(crate) fn on_search_reply<T>(
 
 /// A probe task settled: fold the reply's rcode into the server-health
 /// accounting. Some(ok) asks the shim to fire the server-state callback.
-pub(crate) fn on_probe_reply(res: Result<&[u8], i32>, server: usize, health: &mut ServerHealth) -> Option<bool> {
+pub(crate) fn on_probe_reply(res: Result<&[u8], AresError>, server: usize, health: &mut ServerHealth) -> Option<bool> {
     match res {
         Ok(buf) => {
             let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0xff };

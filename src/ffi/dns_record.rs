@@ -306,7 +306,7 @@ pub unsafe extern "C" fn ares_dns_record_query_add(
     };
     match unsafe { &mut *dnsrec }.query_add(name_str, qtype as u16, qclass as u16) {
         Ok(()) => ARES_SUCCESS,
-        Err(e) => e,
+        Err(e) => e.code(),
     }
 }
 
@@ -361,7 +361,7 @@ pub unsafe extern "C" fn ares_dns_record_query_set_name(
     };
     match unsafe { &mut *dnsrec }.query_set_name(idx, name_str) {
         Ok(()) => ARES_SUCCESS,
-        Err(e) => e,
+        Err(e) => e.code(),
     }
 }
 
@@ -376,7 +376,7 @@ pub unsafe extern "C" fn ares_dns_record_query_set_type(
     }
     match unsafe { &mut *dnsrec }.query_set_type(idx, qtype as u16) {
         Ok(()) => ARES_SUCCESS,
-        Err(e) => e,
+        Err(e) => e.code(),
     }
 }
 
@@ -408,7 +408,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_add(
             }
             ARES_SUCCESS
         }
-        Err(e) => e,
+        Err(e) => e.code(),
     }
 }
 
@@ -464,7 +464,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_del(
     }
     match unsafe { &mut *dnsrec }.rr_del(sect, idx) {
         Ok(()) => ARES_SUCCESS,
-        Err(e) => e,
+        Err(e) => e.code(),
     }
 }
 
@@ -844,7 +844,7 @@ pub unsafe extern "C" fn ares_dns_parse(
             unsafe { *dnsrec = Box::into_raw(Box::new(rec)); }
             ARES_SUCCESS
         }
-        Err(e) => e,
+        Err(e) => e.code(),
     }
 }
 

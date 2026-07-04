@@ -15,6 +15,7 @@ use bytes::BytesMut;
 use crate::core::ares::{dns_query_payload, qtype_of, Family, SocketSource, Status, TaskMachine};
 use crate::core::channel::ChannelState;
 use crate::core::lookup::{AddrInfoAction, AddrInfoEvent, AddrInfoSm, HostByNameSm, LookupCfg};
+use crate::core::AresError;
 use crate::ffi::error::ARES_ECONNREFUSED;
 use crate::ffi::{RECORD_TYPE_A, RECORD_TYPE_AAAA};
 
@@ -108,7 +109,7 @@ pub(crate) fn launch_pooled<T: Copy>(
     // All retries exhausted.
     let timeouts = {
         let mut machine = sm.borrow_mut();
-        machine.last_error = ARES_ECONNREFUSED;
+        machine.last_error = ARES_ECONNREFUSED.into();
         machine.timeouts
     };
     LaunchOutcome::Exhausted { timeouts }
@@ -120,7 +121,7 @@ pub(crate) fn launch_pooled<T: Copy>(
 /// touches the machine.
 pub(crate) enum AddrInfoDelivery {
     Success { name: String, records: Vec<crate::core::packets::AddrRecord> },
-    Fail { status: i32 },
+    Fail { status: AresError },
 }
 
 /// Drive the getaddrinfo machine's action queue: perform every Send (a failed
@@ -238,8 +239,8 @@ pub(crate) fn issue<T>(
     source: SocketSource,
     server: usize,
     userdata: T,
-) -> Result<i32, i32> {
-    st.ares.enqueue(payload, source, server, userdata).map_err(|_| ARES_ECONNREFUSED)?;
+) -> Result<i32, AresError> {
+    st.ares.enqueue(payload, source, server, userdata).map_err(|_| AresError::from(ARES_ECONNREFUSED))?;
     Ok(st.ares.tasks.last().expect("enqueue pushed a task").sock.as_raw_fd())
 }
 

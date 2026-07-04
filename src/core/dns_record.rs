@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::core::AresError;
 use crate::ffi::error::ARES_EBADRESP;
 
 use crate::ffi::dns_record::{
@@ -1122,10 +1123,10 @@ impl ares_dns_record_t {
         self.id = id;
     }
 
-    pub(crate) fn query_add(&mut self, name: &str, qtype: u16, qclass: u16) -> Result<(), i32> {
+    pub(crate) fn query_add(&mut self, name: &str, qtype: u16, qclass: u16) -> Result<(), AresError> {
         let name_c = match CString::new(name) {
             Ok(c) => c,
-            Err(_) => return Err(ARES_EBADRESP),
+            Err(_) => return Err(ARES_EBADRESP.into()),
         };
         self.queries.push(DnsRecordQuery {
             name: name.to_string(),
@@ -1147,22 +1148,22 @@ impl ares_dns_record_t {
         Some((q.name_c.as_c_str(), q.qtype, q.qclass))
     }
 
-    pub(crate) fn query_set_name(&mut self, idx: usize, name: &str) -> Result<(), i32> {
+    pub(crate) fn query_set_name(&mut self, idx: usize, name: &str) -> Result<(), AresError> {
         if idx >= self.queries.len() {
-            return Err(ARES_EBADRESP);
+            return Err(ARES_EBADRESP.into());
         }
         let name_c = match CString::new(name) {
             Ok(c) => c,
-            Err(_) => return Err(ARES_EBADRESP),
+            Err(_) => return Err(ARES_EBADRESP.into()),
         };
         self.queries[idx].name = name.to_string();
         self.queries[idx].name_c = name_c;
         Ok(())
     }
 
-    pub(crate) fn query_set_type(&mut self, idx: usize, qtype: u16) -> Result<(), i32> {
+    pub(crate) fn query_set_type(&mut self, idx: usize, qtype: u16) -> Result<(), AresError> {
         if idx >= self.queries.len() {
-            return Err(ARES_EBADRESP);
+            return Err(ARES_EBADRESP.into());
         }
         self.queries[idx].qtype = qtype;
         Ok(())
@@ -1175,8 +1176,8 @@ impl ares_dns_record_t {
         rtype: u16,
         rclass: u16,
         ttl: u32,
-    ) -> Result<&mut ares_dns_rr_t, i32> {
-        let vec = section_vec_mut(self, sect).ok_or(ARES_EBADRESP)?;
+    ) -> Result<&mut ares_dns_rr_t, AresError> {
+        let vec = section_vec_mut(self, sect).ok_or(AresError::from(ARES_EBADRESP))?;
         vec.push(new_rr(name, rtype, rclass, ttl));
         Ok(vec.last_mut().unwrap())
     }
@@ -1196,10 +1197,10 @@ impl ares_dns_record_t {
         section_vec(self, sect)?.get(idx)
     }
 
-    pub(crate) fn rr_del(&mut self, sect: u32, idx: usize) -> Result<(), i32> {
-        let vec = section_vec_mut(self, sect).ok_or(ARES_EBADRESP)?;
+    pub(crate) fn rr_del(&mut self, sect: u32, idx: usize) -> Result<(), AresError> {
+        let vec = section_vec_mut(self, sect).ok_or(AresError::from(ARES_EBADRESP))?;
         if idx >= vec.len() {
-            return Err(ARES_EBADRESP);
+            return Err(ARES_EBADRESP.into());
         }
         vec.remove(idx);
         Ok(())
@@ -1367,10 +1368,10 @@ impl ares_dns_record_t {
 }
 
 /// Decode a whole DNS message (header, questions, all three RR sections).
-pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, i32> {
+pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, AresError> {
     let buf_len = data.len();
     if buf_len < 12 {
-        return Err(ARES_EBADRESP);
+        return Err(ARES_EBADRESP.into());
     }
 
     // Parse header (12 bytes)
@@ -1401,10 +1402,10 @@ pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, i32> {
     for _ in 0..qdcount {
         let name = match parse_dns_name(data, &mut pos) {
             Some(n) => n,
-            None => return Err(ARES_EBADRESP),
+            None => return Err(ARES_EBADRESP.into()),
         };
         if pos + 4 > buf_len {
-            return Err(ARES_EBADRESP);
+            return Err(ARES_EBADRESP.into());
         }
         let qtype = ((data[pos] as u16) << 8) | data[pos + 1] as u16;
         let qclass = ((data[pos + 2] as u16) << 8) | data[pos + 3] as u16;
@@ -1429,10 +1430,10 @@ pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, i32> {
         for _ in 0..*count {
             let rr_name = match parse_dns_name(data, &mut pos) {
                 Some(n) => n,
-                None => return Err(ARES_EBADRESP),
+                None => return Err(ARES_EBADRESP.into()),
             };
             if pos + 10 > buf_len {
-                return Err(ARES_EBADRESP);
+                return Err(ARES_EBADRESP.into());
             }
             let rtype = ((data[pos] as u16) << 8) | data[pos + 1] as u16;
             let rclass = ((data[pos + 2] as u16) << 8) | data[pos + 3] as u16;
@@ -1447,7 +1448,7 @@ pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, i32> {
 
             let rdata_start = pos;
             if pos + rdlength as usize > buf_len {
-                return Err(ARES_EBADRESP);
+                return Err(ARES_EBADRESP.into());
             }
             let rdata = &data[pos..pos + rdlength as usize];
             pos += rdlength as usize;
@@ -1457,7 +1458,7 @@ pub(crate) fn parse_record(data: &[u8]) -> Result<ares_dns_record_t, i32> {
 
             let vec = match section_vec_mut(&mut rec, *section) {
                 Some(v) => v,
-                None => return Err(ARES_EBADRESP),
+                None => return Err(ARES_EBADRESP.into()),
             };
             vec.push(rr);
         }

@@ -3,8 +3,7 @@
 //! .onion rejection, label validation, and wire-format packet assembly.
 //! The FFI shim only decodes the C string and mallocs the returned packet.
 
-use std::ffi::c_int;
-
+use crate::core::AresError;
 use crate::ffi::error::{ARES_EBADNAME, ARES_ENOTFOUND};
 
 /// Build a DNS query packet for `name_str`. A positive `max_udp_size`
@@ -17,7 +16,7 @@ pub fn build_query(
     id: u16,
     rd: bool,
     max_udp_size: i32,
-) -> Result<Vec<u8>, c_int> {
+) -> Result<Vec<u8>, AresError> {
     let max_udp_size: u16 = if max_udp_size > 0 { max_udp_size as u16 } else { 0 };
     // Check if trailing dot is an unescaped separator (not a literal escaped dot)
     let has_unescaped_trailing_dot = if let Some(prefix) = name_str.strip_suffix('.') {
@@ -42,7 +41,7 @@ pub fn build_query(
         &lower
     };
     if check.ends_with(".onion") || check == "onion" {
-        return Err(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND.into());
     }
 
     // Validate name length
@@ -52,7 +51,7 @@ pub fn build_query(
         name_str
     };
     if clean_name.len() > 253 {
-        return Err(ARES_EBADNAME);
+        return Err(ARES_EBADNAME.into());
     }
 
     // Check for escaped dots and handle them
@@ -88,10 +87,10 @@ pub fn build_query(
     for label in &labels {
         let unescaped = unescape_label(label);
         if unescaped.is_empty() {
-            return Err(ARES_EBADNAME);
+            return Err(ARES_EBADNAME.into());
         }
         if unescaped.len() > 63 {
-            return Err(ARES_EBADNAME);
+            return Err(ARES_EBADNAME.into());
         }
     }
 
@@ -111,7 +110,7 @@ pub fn build_query(
     for label in &labels {
         let unescaped = unescape_label(label);
         if unescaped.len() > 63 {
-            return Err(ARES_EBADNAME);
+            return Err(ARES_EBADNAME.into());
         }
         packet.push(unescaped.len() as u8);
         packet.extend_from_slice(&unescaped);

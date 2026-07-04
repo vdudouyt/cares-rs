@@ -348,7 +348,7 @@ pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_c
             channeldata.state.sortlist = entries;
             ARES_SUCCESS
         }
-        Err(e) => e,
+        Err(e) => e.code(),
     }
 }
 

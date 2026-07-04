@@ -13,6 +13,7 @@ use crate::core::services::Services;
 use crate::core::lookup::{is_onion_domain, SearchPlan, SearchSm};
 use crate::core::response::ParsedResponse;
 use crate::core::channel::ChannelState;
+use crate::core::AresError;
 use crate::ffi::error::{ARES_EBADSTR, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_SUCCESS};
 use crate::ffi::{
     ARES_NI_DGRAM, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NOFQDN, ARES_NI_NUMERICSCOPE,
@@ -24,14 +25,14 @@ use crate::ffi::{
 /// and the LOOKUPSERVICE gate. Error deliveries carry zero timeouts (as
 /// historically); success carries the task's accumulated count.
 pub(crate) struct NameinfoReply {
-    pub status: i32,
+    pub status: AresError,
     pub node: Option<CString>,
     pub service: Option<CString>,
     pub timeouts: i32,
 }
 
 pub(crate) fn assemble_nameinfo(
-    res: Result<&[u8], i32>,
+    res: Result<&[u8], AresError>,
     ip: IpAddr,
     scope_id: u32,
     port: u16,
@@ -41,13 +42,13 @@ pub(crate) fn assemble_nameinfo(
     let services = Services::default();
     let want_service = (flags & ARES_NI_LOOKUPSERVICE) != 0;
 
-    let hostname_result = (|| -> Result<CString, i32> {
+    let hostname_result = (|| -> Result<CString, AresError> {
         let buf = res?;
         let parsed = ParsedResponse::from_buf(buf)?;
         let ptr_records = parsed.process_answers::<CString>(buf, RECORD_TYPE_PTR)?;
 
         if ptr_records.aliases.is_empty() {
-            return Err(ARES_ENOTFOUND);
+            return Err(ARES_ENOTFOUND.into());
         }
 
         let mut name = ptr_records.name;
@@ -55,21 +56,21 @@ pub(crate) fn assemble_nameinfo(
         if flags & ARES_NI_NOFQDN != 0 {
             let name_str = name.to_string_lossy();
             if let Some(dot_pos) = name_str.find('.') {
-                name = CString::new(&name_str[..dot_pos]).map_err(|_| ARES_EBADSTR)?;
+                name = CString::new(&name_str[..dot_pos]).map_err(|_| AresError::from(ARES_EBADSTR))?;
             }
         }
 
         Ok(name)
     })();
 
-    let (status, node) = match hostname_result {
-        Ok(name) => (ARES_SUCCESS, Some(name)),
+    let (status, node): (AresError, _) = match hostname_result {
+        Ok(name) => (ARES_SUCCESS.into(), Some(name)),
         Err(err) => {
-            if err == ARES_ENOTFOUND && (flags & ARES_NI_NAMEREQD) == 0 {
+            if err.code() == ARES_ENOTFOUND && (flags & ARES_NI_NAMEREQD) == 0 {
                 let ip_str = format_ip_with_scope(&ip, scope_id, flags);
                 match CString::new(ip_str) {
-                    Ok(name) => (ARES_SUCCESS, Some(name)),
-                    Err(_) => return NameinfoReply { status: ARES_EBADSTR, node: None, service: None, timeouts: 0 },
+                    Ok(name) => (ARES_SUCCESS.into(), Some(name)),
+                    Err(_) => return NameinfoReply { status: ARES_EBADSTR.into(), node: None, service: None, timeouts: 0 },
                 }
             } else {
                 return NameinfoReply { status: err, node: None, service: None, timeouts: 0 };
@@ -119,21 +120,21 @@ pub(crate) fn hosts_file_lookup<T>(
     st: &mut ChannelState<T>,
     name: &str,
     family: i32,
-) -> Result<HostLookup, i32> {
+) -> Result<HostLookup, AresError> {
     // Convert C family constant to our Family enum
     let family_filter = match family {
         libc::AF_INET => AddressFamily::Ipv4,
         libc::AF_INET6 => AddressFamily::Ipv6,
         libc::AF_UNSPEC => AddressFamily::Any,
-        _ => return Err(ARES_ENOTFOUND),
+        _ => return Err(ARES_ENOTFOUND.into()),
     };
 
     // Lookup in the hosts file cache
     let Some(lookup) = st.ares.hosts().lookup(name, family_filter) else {
-        return Err(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND.into());
     };
     if lookup.addrs.is_empty() {
-        return Err(ARES_ENOTFOUND);
+        return Err(ARES_ENOTFOUND.into());
     }
     Ok(lookup)
 }
@@ -197,13 +198,13 @@ pub(crate) fn get_service_string(services: &Services, port: u16, flags: i32) -> 
 /// Empty/onion rejection shared by ares_search and ares_search_dnsrec —
 /// checked before the channel is even dereferenced (order is behavior:
 /// these fire even on a NULL channel).
-pub(crate) fn search_name_check(name_str: &str) -> Option<i32> {
+pub(crate) fn search_name_check(name_str: &str) -> Option<AresError> {
     if name_str.is_empty() {
-        return Some(ARES_ENOTFOUND);
+        return Some(ARES_ENOTFOUND.into());
     }
     // Reject .onion domains immediately (RFC 7686)
     if is_onion_domain(name_str) {
-        return Some(ARES_ENOTFOUND);
+        return Some(ARES_ENOTFOUND.into());
     }
     None
 }
@@ -214,9 +215,9 @@ pub(crate) fn search_start<T>(
     st: &mut ChannelState<T>,
     name_str: &str,
     retry_server_error: bool,
-) -> Result<(SearchSm, String), i32> {
+) -> Result<(SearchSm, String), AresError> {
     if st.ares.config.nameservers.is_empty() {
-        return Err(ARES_ENOSERVER);
+        return Err(ARES_ENOSERVER.into());
     }
     let plan = SearchPlan::for_search(
         name_str,

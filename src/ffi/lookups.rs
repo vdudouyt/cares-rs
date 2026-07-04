@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::core::api;
+use crate::core::AresError;
 use crate::core::ares::{Task, TaskMachine};
 use crate::core::launch::{drive_addrinfo, AddrInfoDelivery};
 use crate::core::preflight::{assemble_nameinfo, service_to_port, ServicePort};
@@ -170,7 +171,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let binding = FFIData::base(Callback::HostByName(HostTail { callback, arg }));
     match api::gethostbyname(&mut channeldata.state, hostname, family, Instant::now(), binding) {
         Err(status) => {
-            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         }
         Ok(api::Operation::Ready(bp)) => {
             let hostent = unsafe { build_hostent(bp) };
@@ -195,7 +196,7 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
         }
         Err(status) => {
             unsafe { *host = std::ptr::null_mut() };
-            status
+            status.code()
         }
     }
 }
@@ -221,7 +222,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
     };
     match api::gethostbyaddr(&mut channeldata.state, addrbuf, family, userdata) {
         Err(status) => {
-            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         }
         Ok(api::Operation::Ready(bp)) => {
             let hostent = unsafe { build_hostent(bp) };
@@ -241,7 +242,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     // Name sanity precedes the channel deref: a bad name reports even on a
     // NULL channel (upstream ordering), so this one check runs pre-state.
     if let Some(status) = api::search_precheck(name_str) {
-        unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
+        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
         return;
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
@@ -249,7 +250,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     let tail = SearchTail { dnstype: dnstype as u16, delivery: SearchDelivery::Raw { callback, arg } };
     let binding = FFIData::base(Callback::Search(tail));
     if let Err(status) = api::search(&mut channeldata.state, name_str, dnstype as u16, false, binding) {
-        unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
+        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
     }
 }
 
@@ -262,7 +263,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     let name = unsafe { cstr_lossy(name) };
     let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
     if let Err(status) = api::query(&mut channeldata.state, name, dnstype as u16, ffidata) {
-        unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
+        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
     }
 }
 
@@ -284,7 +285,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallbackDnsRec(callback)) };
     match api::query_dnsrec(&mut channeldata.state, name, dnstype as u16, Instant::now(), ffidata) {
         Err(status) => {
-            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         }
         Ok(api::Operation::Ready(rec)) => {
             let dnsrec = Box::into_raw(Box::new(rec));
@@ -323,14 +324,14 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     // Same pre-state ordering as ares_search: bad names report before the
     // channel is dereferenced.
     if let Some(status) = api::search_precheck(name_str) {
-        unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         return;
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let tail = SearchTail { dnstype: qtype as u16, delivery: SearchDelivery::DnsRec { callback, arg } };
     let binding = FFIData::base(Callback::Search(tail));
     if let Err(status) = api::search(&mut channeldata.state, name_str, qtype as u16, true, binding) {
-        unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
     }
 }
 
@@ -371,7 +372,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
     };
     match api::getnameinfo(&mut channeldata.state, &addr_info, flags, userdata) {
         Err(status) => {
-            unsafe { callback(arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
+            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), std::ptr::null_mut()) };
         }
         Ok(api::Operation::Ready(api::NameinfoOk::Service(service))) => {
             let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
@@ -387,13 +388,13 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 
 
 pub(crate) fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHostCallback, task: &Task<FFIData>) {
-    match api::on_host_reply(res, task.rtype, task.family, task.queried_ip) {
+    match api::on_host_reply(res.map_err(AresError::from), task.rtype, task.family, task.queried_ip) {
         Ok(bp) => {
             let raw_hostent = unsafe { build_hostent(bp) };
             unsafe { callback(task.userdata.arg, ARES_SUCCESS, task.timeouts, &mut *raw_hostent) };
             unsafe { ares_free_hostent(raw_hostent) };
         },
-        Err(err) => unsafe { callback(task.userdata.arg, err, task.timeouts, std::ptr::null_mut()) },
+        Err(err) => unsafe { callback(task.userdata.arg, err.code(), task.timeouts, std::ptr::null_mut()) },
     }
 }
 
@@ -405,25 +406,25 @@ pub(crate) fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallbac
 }
 
 pub(crate) fn run_ares_callback_dnsrec(res: Result<&[u8], c_int>, callback: AresCallbackDnsRec, task: &Task<FFIData>) {
-    match res.and_then(dns_record::parse_record) {
+    match res.map_err(AresError::from).and_then(dns_record::parse_record) {
         Ok(rec) => {
             let dnsrec = Box::into_raw(Box::new(rec));
             unsafe { callback(task.userdata.arg, ARES_SUCCESS, task.timeouts as usize, dnsrec) };
             unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
         }
-        Err(status) => unsafe { callback(task.userdata.arg, status, task.timeouts as usize, std::ptr::null_mut()) },
+        Err(status) => unsafe { callback(task.userdata.arg, status.code(), task.timeouts as usize, std::ptr::null_mut()) },
     }
 }
 
 pub(crate) fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: AresNameinfoCallback, task: &Task<FFIData>) {
     let ffidata = &task.userdata;
     let reply = assemble_nameinfo(
-        res, ffidata.ip.unwrap(), ffidata.scope_id, ffidata.port,
+        res.map_err(AresError::from), ffidata.ip.unwrap(), ffidata.scope_id, ffidata.port,
         ffidata.nameinfo_flags, task.timeouts,
     );
     let node_ptr = reply.node.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
     let service_ptr = reply.service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
-    unsafe { callback(ffidata.arg, reply.status, reply.timeouts, node_ptr, service_ptr) };
+    unsafe { callback(ffidata.arg, reply.status.code(), reply.timeouts, node_ptr, service_ptr) };
 }
 
 /// Executor for a settled search task: one core call decides (and performs
@@ -431,7 +432,7 @@ pub(crate) fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: Ar
 pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, tail: SearchTail, task: &Task<FFIData>, channeldata: &mut ChannelData) {
     let TaskMachine::Search(sm) = &task.machine else { unreachable!("search task carries a Search machine") };
     let binding = task.userdata;
-    match api::on_search_reply(&mut channeldata.state, sm, res, tail.dnstype, task.timeouts, binding) {
+    match api::on_search_reply(&mut channeldata.state, sm, res.map_err(AresError::from), tail.dnstype, task.timeouts, binding) {
         None => {}
         Some(api::SearchReplyDelivery::Success { timeouts }) => {
             let buf = res.unwrap_or(&[]); // Success is only emitted for Ok replies
@@ -449,7 +450,7 @@ pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, tail: SearchTa
                             unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
                         }
                         Err(parse_status) => {
-                            unsafe { callback(arg, parse_status, timeouts as usize, std::ptr::null_mut()) };
+                            unsafe { callback(arg, parse_status.code(), timeouts as usize, std::ptr::null_mut()) };
                         }
                     }
                 }
@@ -457,10 +458,10 @@ pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, tail: SearchTa
         }
         Some(api::SearchReplyDelivery::Fail { status, timeouts }) => match tail.delivery {
             SearchDelivery::Raw { callback, arg } => unsafe {
-                callback(arg, status, timeouts, std::ptr::null_mut(), 0);
+                callback(arg, status.code(), timeouts, std::ptr::null_mut(), 0);
             },
             SearchDelivery::DnsRec { callback, arg } => unsafe {
-                callback(arg, status, timeouts as usize, std::ptr::null_mut());
+                callback(arg, status.code(), timeouts as usize, std::ptr::null_mut());
             },
         },
     }
@@ -472,7 +473,7 @@ pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, tail: SearchTa
 pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, tail: HostTail, task: &Task<FFIData>, channeldata: &mut ChannelData) {
     let TaskMachine::HostByName(sm) = &task.machine else { unreachable!("gethostbyname task carries a HostByName machine") };
     let deliveries = api::on_hostbyname_reply(
-        &mut channeldata.state, sm, res, task.server_index, task.timeouts,
+        &mut channeldata.state, sm, res.map_err(AresError::from), task.server_index, task.timeouts,
         Instant::now(), task.userdata,
     );
     for delivery in deliveries {
@@ -486,7 +487,7 @@ pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, tail: Host
                 unsafe { ares_free_hostent(hostent) };
             }
             api::HostDelivery::Fail { status, timeouts } => {
-                unsafe { (tail.callback)(tail.arg, status, timeouts, std::ptr::null_mut()) };
+                unsafe { (tail.callback)(tail.arg, status.code(), timeouts, std::ptr::null_mut()) };
             }
         }
     }
@@ -532,7 +533,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 
     match api::getaddrinfo(&mut channeldata.state, hostname_raw, ai_family, binding) {
         Err(status) => {
-            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         }
         Ok(api::Operation::Ready(api::AddrInfoOk { addrs, canonical })) => {
             let nodes = addrinfo_nodes_from_addrs_port(&addrs, port);
@@ -554,7 +555,7 @@ fn fire_addrinfo_deliveries(deliveries: Vec<AddrInfoDelivery>, tail: AddrInfoTai
                 unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, 0, ai) };
             }
             AddrInfoDelivery::Fail { status } => {
-                unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) };
+                unsafe { (tail.callback)(tail.arg, status.code(), 0, std::ptr::null_mut()) };
             }
         }
     }
@@ -564,7 +565,7 @@ fn fire_addrinfo_deliveries(deliveries: Vec<AddrInfoDelivery>, tail: AddrInfoTai
 /// core's; only the server-state notification fires here.
 pub(crate) fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: &mut ChannelData, task: &Task<FFIData>) {
     let si = task.server_index;
-    if let Some(ok) = api::on_probe_reply(res, si, &mut channeldata.state.server_health) {
+    if let Some(ok) = api::on_probe_reply(res.map_err(AresError::from), si, &mut channeldata.state.server_health) {
         invoke_server_state_callback(channeldata, si, ok, false);
     }
 }
@@ -576,11 +577,11 @@ pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, tail: AddrIn
     let TaskMachine::AddrInfo(sm) = &task.machine else { unreachable!("getaddrinfo task carries an AddrInfo machine") };
     let ev = match res {
         Ok(buf) => {
-            let parse = (|| -> Result<Vec<AddrRecord>, c_int> {
+            let parse = (|| -> Result<Vec<AddrRecord>, AresError> {
                 let response = ParsedResponse::from_buf(buf)?;
                 let parsed_rrs = response.process_answers::<AddrRecord>(buf, task.rtype)?;
                 if parsed_rrs.items.is_empty() {
-                    return Err(ARES_ENODATA);
+                    return Err(ARES_ENODATA.into());
                 }
                 Ok(parsed_rrs.items)
             })();
@@ -592,7 +593,7 @@ pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, tail: AddrIn
                 io_timeouts: task.timeouts,
             }
         }
-        Err(status) => AddrInfoEvent::Error { status },
+        Err(status) => AddrInfoEvent::Error { status: status.into() },
     };
     let actions = {
         let cfg = LookupCfg {
@@ -619,7 +620,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
     let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
     if let Err(status) = api::send(&mut channeldata.state, query_buf, ffidata) {
-        unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) };
+        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
     }
 }
 

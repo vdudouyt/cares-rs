@@ -7,6 +7,7 @@ pub mod api;
 pub mod ares;
 pub mod channel;
 pub mod dns_record;
+pub mod error;
 pub mod launch;
 pub mod hostent;
 pub mod lookup;
@@ -20,3 +21,5 @@ pub mod sysconfig;
 pub mod servers_csv;
 pub mod hostfile;
 pub mod services;
+
+pub(crate) use error::AresError;
