@@ -374,11 +374,11 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         Err(status) => {
             unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), std::ptr::null_mut()) };
         }
-        Ok(api::Operation::Ready(api::NameinfoOk::Service(service))) => {
+        Ok(api::Operation::Ready(api::NameinfoResult::Service(service))) => {
             let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
             unsafe { callback(arg, ARES_SUCCESS, 0, std::ptr::null_mut(), service_ptr) };
         }
-        Ok(api::Operation::Ready(api::NameinfoOk::Numeric { node, service })) => {
+        Ok(api::Operation::Ready(api::NameinfoResult::Numeric { node, service })) => {
             let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
             unsafe { callback(arg, ARES_SUCCESS, 0, node.into_raw(), service_ptr) };
         }
@@ -535,7 +535,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
         Err(status) => {
             unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         }
-        Ok(api::Operation::Ready(api::AddrInfoOk { addrs, canonical })) => {
+        Ok(api::Operation::Ready(api::AddrInfoResult { addrs, canonical })) => {
             let nodes = addrinfo_nodes_from_addrs_port(&addrs, port);
             let ai = build_ares_addrinfo(&canonical, nodes);
             unsafe { callback(arg, ARES_SUCCESS, 0, ai) };

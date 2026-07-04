@@ -174,7 +174,7 @@ pub(crate) fn gethostbyaddr<T>(
 /// The synchronous result `ares_getnameinfo` can hand back: a service-only
 /// answer, or a numeric-host answer. Both marshal straight to the C callback;
 /// a PTR query on the wire is `Operation::Pending`, an error is `Err(status)`.
-pub(crate) enum NameinfoOk {
+pub(crate) enum NameinfoResult {
     Service(Option<CString>),
     Numeric { node: CString, service: Option<CString> },
 }
@@ -190,7 +190,7 @@ pub(crate) fn getnameinfo<T>(
     addr: &AddrInfo,
     flags: i32,
     userdata: T,
-) -> Result<Operation<NameinfoOk>, AresError> {
+) -> Result<Operation<NameinfoResult>, AresError> {
     // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
     let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
         flags | ARES_NI_LOOKUPHOST
@@ -203,7 +203,7 @@ pub(crate) fn getnameinfo<T>(
 
     // If only service lookup requested (no host), deliver immediately
     if want_service && !want_host {
-        return Ok(Operation::Ready(NameinfoOk::Service(get_service_string(st.ares.services(), addr.port, flags))));
+        return Ok(Operation::Ready(NameinfoResult::Service(get_service_string(st.ares.services(), addr.port, flags))));
     }
 
     // Host lookup requested (guaranteed by the defaulting above).
@@ -219,7 +219,7 @@ pub(crate) fn getnameinfo<T>(
         } else {
             None
         };
-        return Ok(Operation::Ready(NameinfoOk::Numeric { node, service }));
+        return Ok(Operation::Ready(NameinfoResult::Numeric { node, service }));
     }
 
     // PTR lookup required.
@@ -401,7 +401,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
 /// The synchronous address result `ares_getaddrinfo` can hand back — an
 /// IP-literal or hosts-file hit. (An async A/AAAA batch is `Operation::Pending`;
 /// an error, including every socket refused, is `Err(status)`.)
-pub(crate) struct AddrInfoOk {
+pub(crate) struct AddrInfoResult {
     pub addrs: Vec<IpAddr>,
     pub canonical: String,
 }
@@ -413,7 +413,7 @@ pub(crate) fn getaddrinfo<T: Copy>(
     hostname_raw: &str,
     ai_family: i32,
     binding: T,
-) -> Result<Operation<AddrInfoOk>, AresError> {
+) -> Result<Operation<AddrInfoResult>, AresError> {
     // Check order is behavior: empty-name -> onion -> IP literal (family
     // mismatch fails, no fall-through) -> hosts file -> no-servers -> DNS.
     // The raw name keeps its trailing dot for the SearchPlan; checks and the
@@ -426,7 +426,7 @@ pub(crate) fn getaddrinfo<T: Copy>(
             IpAddr::V4(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET,
             IpAddr::V6(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET6,
         });
-        Ok(Operation::Ready(AddrInfoOk { addrs, canonical }))
+        Ok(Operation::Ready(AddrInfoResult { addrs, canonical }))
     };
 
     let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
