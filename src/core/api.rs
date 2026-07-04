@@ -200,13 +200,15 @@ pub(crate) enum NameinfoStart {
 
 /// ares_getnameinfo: flag defaulting + the numeric/service short-circuits,
 /// then the PTR query (whose fresh socket the channel's socket callback may
-/// refuse → ECONNREFUSED). The shim's userdata factory receives the
-/// (possibly defaulted) flags.
+/// refuse → ECONNREFUSED). `userdata` is built by the shim and passed by
+/// value (no factory closure); it is consumed only on the PTR-query path.
+/// The LOOKUPHOST default the handler applies here affects only the path
+/// decision — never the reply — so the shim's raw-flag userdata is correct.
 pub(crate) fn getnameinfo<T>(
     st: &mut ChannelState<T>,
     addr: &AddrInfo,
     flags: i32,
-    make_userdata: &mut dyn FnMut(i32) -> T,
+    userdata: T,
 ) -> NameinfoStart {
     // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
     let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
@@ -240,7 +242,6 @@ pub(crate) fn getnameinfo<T>(
     }
 
     // PTR lookup required.
-    let userdata = make_userdata(flags);
     match issue(st, dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
         Ok(_) => NameinfoStart::InFlight,
         Err(()) => NameinfoStart::Fail(ARES_ECONNREFUSED),

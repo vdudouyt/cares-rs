@@ -391,12 +391,15 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         }
     };
 
-    let mut make_userdata = |flags: c_int| FFIData {
+    // Built eagerly and passed by value — no factory closure. `flags` here is
+    // the raw request; the handler's LOOKUPHOST defaulting affects only its
+    // path choice, not the reply, so raw flags in the userdata are correct.
+    let userdata = FFIData {
         arg, family: addr_info.family, expected_record_type: RECORD_TYPE_PTR as c_int,
         ip: Some(addr_info.ip), nameinfo_flags: flags, port: addr_info.port, scope_id: addr_info.scope_id,
         ..FFIData::base(Callback::AresNameinfoCallback(callback))
     };
-    match api::getnameinfo(&mut channeldata.state, &addr_info, flags, &mut make_userdata) {
+    match api::getnameinfo(&mut channeldata.state, &addr_info, flags, userdata) {
         api::NameinfoStart::Fail(status) => {
             unsafe { callback(arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
         }
