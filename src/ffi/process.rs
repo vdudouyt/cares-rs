@@ -2,8 +2,23 @@
 //! state notification callbacks it fires.
 
 use super::*;
-use crate::core::channel::tcp_payload;
+use crate::core::channel::{tcp_payload, ChannelState};
+use crate::core::ares::Task;
 use crate::core::launch::{read_tcp_frame, reissue, timeout_step};
+
+/// Copy the core-owned per-task data (state machine, family/record-type,
+/// queried ip) from a settled task onto the retry task `reissue` just pushed,
+/// stamping the accumulated timeout count — so the eventual reply is
+/// attributed just like the original send. (`enqueue` defaults these fields.)
+fn carry_over(state: &mut ChannelState<FFIData>, old: &Task<FFIData>, timeouts: i32) {
+    if let Some(t) = state.ares.tasks.last_mut() {
+        t.machine = old.machine.clone();
+        t.family = old.family;
+        t.rtype = old.rtype;
+        t.queried_ip = old.queried_ip;
+        t.timeouts = timeouts;
+    }
+}
 
 
 
@@ -98,7 +113,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                 let (actions, verdict) = on_datagram(
                     &summary,
                     task.userdata.callback.kind(),
-                    task.userdata.server_index,
+                    task.server_index,
                     task.sock.is_tcp(),
                     channeldata.state.ares.config.options.attempts,
                     &mut channeldata.state.server_health,
@@ -111,11 +126,12 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                 }
                 match verdict {
                     TaskVerdict::RetryNextServer { server: next_server } => {
-                        let new_ffidata = task.userdata.retarget(next_server, task.userdata.timeouts);
                         let is_tcp = task.sock.is_tcp();
                         // Strip the TCP length prefix; enqueue re-frames for the new transport.
                         let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
-                        if !reissue(&mut channeldata.state, payload, SocketSource::fresh(is_tcp), next_server, new_ffidata, 0) {
+                        if reissue(&mut channeldata.state, payload, SocketSource::fresh(is_tcp), next_server, task.userdata.clone(), 0) {
+                            carry_over(&mut channeldata.state, task, task.timeouts);
+                        } else {
                             // Retry socket couldn't be created — deliver the error.
                             task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, channeldata);
                         }
@@ -123,9 +139,10 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                         continue;
                     }
                     TaskVerdict::RetryTcp => {
-                        let si = task.userdata.server_index;
-                        let new_ffidata = task.userdata.retarget(si, task.userdata.timeouts);
-                        if !reissue(&mut channeldata.state, task.writebuf.clone(), SocketSource::Tcp, si, new_ffidata, 0) {
+                        let si = task.server_index;
+                        if reissue(&mut channeldata.state, task.writebuf.clone(), SocketSource::Tcp, si, task.userdata.clone(), 0) {
+                            carry_over(&mut channeldata.state, task, task.timeouts);
+                        } else {
                             task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, channeldata);
                         }
                         task.status = Status::Completed;
@@ -153,15 +170,17 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
     for task in &mut tasks {
         if task.is_expired() && task.status != Status::Completed {
             // Invoke server_state_callback with failure for timeout
-            invoke_server_state_callback(channeldata, task.userdata.server_index, false, task.sock.is_tcp());
-            let timeout_verdict = timeout_step(task, max_tries, task.userdata.server_index, &mut channeldata.state.server_health);
+            invoke_server_state_callback(channeldata, task.server_index, false, task.sock.is_tcp());
+            let timeout_verdict = timeout_step(task, max_tries, task.server_index, &mut channeldata.state.server_health);
             if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
                 let is_tcp = task.sock.is_tcp();
                 let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
-                let new_ffidata = task.userdata.retarget(si, task.userdata.timeouts + 1);
+                let new_timeouts = task.timeouts + 1;
                 task.status = Status::Completed;
                 // The retry task inherits this task's expiry count.
-                if !reissue(&mut channeldata.state, payload, SocketSource::fresh(is_tcp), si, new_ffidata, task.tries_remaining) {
+                if reissue(&mut channeldata.state, payload, SocketSource::fresh(is_tcp), si, task.userdata.clone(), task.tries_remaining) {
+                    carry_over(&mut channeldata.state, task, new_timeouts);
+                } else {
                     // Retry socket couldn't be created — deliver the error.
                     task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, channeldata);
                 }

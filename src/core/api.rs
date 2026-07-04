@@ -4,10 +4,11 @@
 //! Preflights, launch loops and cache policy are implementation details of
 //! these functions — never seams the ffi layer composes itself.
 //!
-//! Userdata factories (`make_userdata`) exist because core mints the shared
-//! state-machine handles but cannot construct the ffi userdata that carries
-//! them; the closures must capture only Copy data and Rc clones — never a
-//! RefCell borrow.
+//! Handlers take the ffi userdata as a plain value (a `Callback` binding the
+//! shim builds eagerly), not a factory closure: core owns the per-task data
+//! (the state-machine handle on `Task.machine`, plus family/rtype/timeouts/
+//! queried-ip), mints the machine, and clones the binding into each task —
+//! so nothing here constructs a C userdata.
 
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -20,9 +21,9 @@ use bytes::BytesMut;
 use crate::core::ares::{dns_query_payload, rdns_name, SocketSource};
 use crate::core::channel::ChannelState;
 use crate::core::launch::{
-    drive_addrinfo, issue, launch_pooled, maybe_launch_probe, AddrInfoDelivery, AddrInfoSeed,
-    HostTaskSeed, LaunchOutcome,
+    drive_addrinfo, issue, launch_pooled, maybe_launch_probe, AddrInfoDelivery, LaunchOutcome,
 };
+use crate::core::ares::TaskMachine;
 use crate::core::channel::cache_store_names;
 use crate::core::hostent::HostentBlueprint;
 use crate::core::hostfile::{AddressFamily, HostLookup};
@@ -123,16 +124,18 @@ pub(crate) fn search<T>(
     name: &str,
     dnstype: u16,
     retry_server_error: bool,
-    make_userdata: &mut dyn FnMut(Rc<RefCell<SearchSm>>) -> T,
+    binding: T,
 ) -> StartOutcome {
     let (sm, query_hostname) = match search_start(st, name, retry_server_error) {
         Ok(seed) => seed,
         Err(status) => return StartOutcome::Deliver(status),
     };
     let handle = Rc::new(RefCell::new(sm));
-    let userdata = make_userdata(handle);
-    match issue(st, dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, userdata) {
-        Ok(_) => StartOutcome::InFlight,
+    match issue(st, dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, binding) {
+        Ok(_) => {
+            if let Some(t) = st.ares.tasks.last_mut() { t.machine = TaskMachine::Search(handle); }
+            StartOutcome::InFlight
+        }
         Err(()) => StartOutcome::Deliver(ARES_ECONNREFUSED),
     }
 }
@@ -181,7 +184,11 @@ pub(crate) fn gethostbyaddr<T>(
     }
     match issue(st, dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata) {
         Ok(_) => {
-            st.ares.tasks.last_mut().expect("issue pushed a task").queried_ip = Some(addr);
+            if let Some(t) = st.ares.tasks.last_mut() {
+                t.queried_ip = Some(addr);
+                t.family = family;
+                t.rtype = RECORD_TYPE_PTR;
+            }
             HostByAddrStart::InFlight
         }
         Err(()) => HostByAddrStart::Deliver(ARES_ECONNREFUSED),
@@ -262,12 +269,13 @@ pub(crate) enum HostStart {
 /// the failover probe. On exhaustion the probe still runs (its health
 /// bookkeeping sees the launch failures), and ECONNREFUSED is delivered by
 /// the shim afterwards.
-pub(crate) fn gethostbyname<T>(
+pub(crate) fn gethostbyname<T: Clone>(
     st: &mut ChannelState<T>,
     hostname: &str,
     family: i32,
     now: Instant,
-    make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
+    lookup_binding: T,
+    probe_binding: T,
 ) -> HostStart {
     // Check order is behavior (each stage may deliver before the next runs):
     // ascii -> onion -> family-validate -> IP literal -> hosts file ->
@@ -426,10 +434,10 @@ pub(crate) fn gethostbyname<T>(
 
     let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
     let handle = Rc::new(RefCell::new(sm));
-    let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, make_userdata);
+    let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, lookup_binding);
     // Server failover probing: if enabled, probe an expired-failure
     // server in parallel with the primary query.
-    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, make_userdata);
+    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, probe_binding);
     match launched {
         LaunchOutcome::Launched => HostStart::InFlight,
         LaunchOutcome::Exhausted { .. } => HostStart::Deliver(ARES_ECONNREFUSED),
@@ -447,11 +455,11 @@ pub(crate) enum AddrInfoStart {
 
 /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
 /// then mint the machine and drive the A/AAAA batch.
-pub(crate) fn getaddrinfo<T>(
+pub(crate) fn getaddrinfo<T: Clone>(
     st: &mut ChannelState<T>,
     hostname_raw: &str,
     ai_family: i32,
-    make_userdata: &mut dyn FnMut(AddrInfoSeed, usize) -> T,
+    binding: T,
 ) -> AddrInfoStart {
     // Check order is behavior: empty-name -> onion -> IP literal (family
     // mismatch fails, no fall-through) -> hosts file -> no-servers -> DNS.
@@ -524,7 +532,7 @@ pub(crate) fn getaddrinfo<T>(
 
     let handle = Rc::new(RefCell::new(sm));
     let actions = handle.borrow_mut().begin_batch(first_server);
-    AddrInfoStart::Started(drive_addrinfo(st, &handle, actions, make_userdata))
+    AddrInfoStart::Started(drive_addrinfo(st, &handle, actions, binding))
 }
 
 /// ares_search's shim-side pre-check, re-exported so the shim's single
@@ -557,15 +565,15 @@ pub(crate) fn on_host_reply(res: Result<&[u8], i32>, rtype: u16, family: i32, ip
 /// A gethostbyname task settled (reply or error): parse, feed the machine,
 /// perform its re-sends (pooled launch) and cache stores, apply the
 /// sortlist, and return what the shim must deliver to C.
-#[allow(clippy::too_many_arguments)] // reply-executor seam: userdata factory rides along
-pub(crate) fn on_hostbyname_reply<T>(
+#[allow(clippy::too_many_arguments)] // reply-executor seam: the task's binding rides along
+pub(crate) fn on_hostbyname_reply<T: Clone>(
     st: &mut ChannelState<T>,
     sm: &Rc<RefCell<HostByNameSm>>,
     res: Result<&[u8], i32>,
     server: usize,
     io_timeouts: i32,
     now: Instant,
-    make_userdata: &mut dyn FnMut(HostTaskSeed, usize) -> T,
+    binding: T,
 ) -> Vec<HostDelivery> {
     // Parse outside the machine; the machine sees only the outcome.
     let mut parsed_items: Option<ParsedRRs<AddrRecord>> = None;
@@ -599,7 +607,7 @@ pub(crate) fn on_hostbyname_reply<T>(
         match action {
             HostAction::Send { name, family, rtype, tcp, server } => {
                 if let LaunchOutcome::Exhausted { timeouts } =
-                    launch_pooled(st, &name, family, rtype, tcp, server, sm, make_userdata)
+                    launch_pooled(st, &name, family, rtype, tcp, server, sm, binding.clone())
                 {
                     deliveries.push(HostDelivery::Fail { status: ARES_ECONNREFUSED, timeouts });
                 }
@@ -647,7 +655,7 @@ pub(crate) fn on_search_reply<T>(
     res: Result<&[u8], i32>,
     dnstype: u16,
     io_timeouts: i32,
-    make_userdata: &mut dyn FnMut(Rc<RefCell<SearchSm>>) -> T,
+    binding: T,
 ) -> Option<SearchReplyDelivery> {
     let ev = match res {
         Ok(buf) => LookupEvent::Reply(buf),
@@ -656,9 +664,11 @@ pub(crate) fn on_search_reply<T>(
     let action = sm.borrow_mut().step(ev);
     match action {
         SearchAction::Send(next_name) => {
-            let userdata = make_userdata(sm.clone());
-            match issue(st, dns_query_payload(&next_name, dnstype), SocketSource::Udp, 0, userdata) {
-                Ok(_) => None,
+            match issue(st, dns_query_payload(&next_name, dnstype), SocketSource::Udp, 0, binding) {
+                Ok(_) => {
+                    if let Some(t) = st.ares.tasks.last_mut() { t.machine = TaskMachine::Search(sm.clone()); }
+                    None
+                }
                 Err(()) => Some(SearchReplyDelivery::Fail { status: ARES_ECONNREFUSED, timeouts: 0 }),
             }
         }

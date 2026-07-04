@@ -3,11 +3,26 @@ use bytes::{ BytesMut, BufMut };
 use rand::Rng;
 use std::time::{ Instant, Duration };
 use std::rc::Rc;
+use std::cell::RefCell;
 
 use crate::core::sysconfig::SysConfig;
 use crate::core::hostfile::Hosts;
 use crate::core::services::Services;
 use crate::core::transport::{Transport, TransportFactory};
+use crate::core::lookup::{HostByNameSm, SearchSm, AddrInfoSm};
+
+/// The core-owned state-machine handle a task drives (moved out of the ffi
+/// `Callback` so the userdata is a plain, ffi-buildable binding — no factory
+/// closure). `None` for the stateless flows (query/send/gethostby*/nameinfo)
+/// and failover probes.
+#[derive(Clone, Default)]
+pub enum TaskMachine {
+    #[default]
+    None,
+    HostByName(Rc<RefCell<HostByNameSm>>),
+    Search(Rc<RefCell<SearchSm>>),
+    AddrInfo(Rc<RefCell<AddrInfoSm>>),
+}
 
 const BIND_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 const BIND_ADDR_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
@@ -164,7 +179,7 @@ impl<T> Ares<T> {
         // TCP needs the 2-byte length prefix; UDP sends the payload as-is.
         let writebuf = if sock.is_tcp() { frame_tcp(&payload) } else { payload };
         let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
-        self.tasks.push(Task { status: Status::Writing, sock, writebuf, userdata, expires_at, server_index, tries_remaining: 0, queried_ip: None });
+        self.tasks.push(Task { status: Status::Writing, sock, writebuf, userdata, expires_at, server_index, tries_remaining: 0, queried_ip: None, machine: TaskMachine::None, family: 0, rtype: 0, timeouts: 0 });
         Ok(())
     }
     /// Create + wrap a transport socket bound for `server_index` (not yet connected).
@@ -273,6 +288,14 @@ pub struct Task<T> {
     /// rather than the ffi userdata. Threaded to the reply so gethostbyaddr
     /// can synthesize the queried-address record. `None` for other flows.
     pub queried_ip: Option<IpAddr>,
+    /// Core-owned per-task data the reply needs, moved off the ffi userdata
+    /// so the userdata is a plain binding: the state-machine handle, the
+    /// query's family/record-type (the AddrInfo machine runs A+AAAA at once,
+    /// so each task carries its own), and the accumulated timeout count.
+    pub machine: TaskMachine,
+    pub family: i32,
+    pub rtype: u16,
+    pub timeouts: i32,
 }
 
 impl<T> Task<T> {

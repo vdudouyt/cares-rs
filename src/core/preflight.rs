@@ -111,7 +111,6 @@ pub(crate) fn service_to_port(svc: &str) -> ServicePort {
 pub(crate) struct AddrInfo {
     pub(crate) ip: IpAddr,
     pub(crate) port: u16,
-    pub(crate) family: i32,
     pub(crate) scope_id: u32,
 }
 

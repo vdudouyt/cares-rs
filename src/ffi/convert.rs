@@ -94,7 +94,7 @@ pub(crate) fn extract_addr_port(sa: *const libc::sockaddr, salen: libc::socklen_
             let addr_bytes = unsafe { (*sa_in).sin_addr.s_addr.to_ne_bytes() };
             let ip = IpAddr::from(addr_bytes);
             let port = unsafe { u16::from_be((*sa_in).sin_port) };
-            Ok(AddrInfo { ip, port, family: libc::AF_INET, scope_id: 0 })
+            Ok(AddrInfo { ip, port, scope_id: 0 })
         }
         libc::AF_INET6 => {
             if (salen as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
@@ -105,7 +105,7 @@ pub(crate) fn extract_addr_port(sa: *const libc::sockaddr, salen: libc::socklen_
             let ip = IpAddr::from(addr_bytes);
             let port = unsafe { u16::from_be((*sa_in6).sin6_port) };
             let scope_id = unsafe { (*sa_in6).sin6_scope_id };
-            Ok(AddrInfo { ip, port, family: libc::AF_INET6, scope_id })
+            Ok(AddrInfo { ip, port, scope_id })
         }
         _ => Err(ARES_ENOTIMP),
     }
