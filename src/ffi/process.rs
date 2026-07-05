@@ -112,7 +112,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                 let summary = summarize(buf, 0);
                 let (actions, verdict) = on_datagram(
                     &summary,
-                    task.userdata.callback.kind(),
+                    task_kind(task),
                     task.server_index,
                     task.sock.is_tcp(),
                     channeldata.state.ares.config.options.attempts,

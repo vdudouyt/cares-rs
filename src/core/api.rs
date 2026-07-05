@@ -232,7 +232,7 @@ pub(crate) fn getnameinfo<T>(
 /// bookkeeping sees the launch failures), and ECONNREFUSED is delivered by
 /// the shim afterwards. A synchronous hit (IP literal / hosts file / localhost
 /// / query cache) is `Ok(Operation::Ready(hostent))`.
-pub(crate) fn gethostbyname<T: Copy + Default>(
+pub(crate) fn gethostbyname<T: Copy>(
     st: &mut ChannelState<T>,
     hostname: &str,
     family: i32,
@@ -382,7 +382,7 @@ pub(crate) fn gethostbyname<T: Copy + Default>(
     let launched = launch_pooled(st, &query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, binding);
     // Server failover probing: if enabled, probe an expired-failure
     // server in parallel with the primary query (its binding is T::default).
-    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp);
+    maybe_launch_probe(st, &query_hostname, send_family, first_server, use_tcp, binding);
     match launched {
         LaunchOutcome::Launched => Ok(Operation::Pending),
         LaunchOutcome::Exhausted { .. } => Err(ARES_ECONNREFUSED.into()),

@@ -13,8 +13,7 @@ use crate::core::lookup::{HostByNameSm, SearchSm, AddrInfoSm};
 
 /// The core-owned state-machine handle a task drives (moved out of the ffi
 /// `Callback` so the userdata is a plain, ffi-buildable binding — no factory
-/// closure). `None` for the stateless flows (query/send/gethostby*/nameinfo)
-/// and failover probes.
+/// closure). `None` for the stateless flows (query/send/gethostby*/nameinfo).
 #[derive(Clone, Default)]
 pub enum TaskMachine {
     #[default]
@@ -22,6 +21,10 @@ pub enum TaskMachine {
     HostByName(Rc<RefCell<HostByNameSm>>),
     Search(Rc<RefCell<SearchSm>>),
     AddrInfo(Rc<RefCell<AddrInfoSm>>),
+    /// A server-failover probe: no user callback and no state machine. The
+    /// task carries a copy of the lookup's binding, but this marker routes its
+    /// reply to the probe handler so the user callback is never fired.
+    Probe,
 }
 
 const BIND_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);

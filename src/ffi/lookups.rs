@@ -43,7 +43,7 @@ pub(crate) struct SearchTail {
     pub(crate) delivery: SearchDelivery,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 // Variants are named after the c-ares FFI callback typedefs they dispatch to;
 // the shared `Callback` suffix is intentional for that correspondence.
 // Stateful lookups carry only their Copy C delivery tail here; the shared
@@ -58,15 +58,20 @@ pub(crate) enum Callback {
     AddrInfo(AddrInfoTail),
     HostByName(HostTail),
     Search(SearchTail),
-    /// Server failover probe — no user callback. Also the `Default`: an empty
-    /// binding is one with nothing to deliver, which core mints itself for
-    /// probes (so the probe needn't be threaded in as a separate argument).
-    #[default]
-    Probe,
 }
 
 impl Callback {
     pub(crate) fn run(&self, buf: Result<&[u8], c_int>, task: &crate::core::ares::Task<FFIData>, channeldata: &mut ChannelData) {
+        // A probe carries a copy of the lookup's binding but must never reach
+        // the user callback: route it to the probe handler (and stay silent on
+        // cancel/destroy). This is checked before the teardown dispatch below,
+        // which keys off the (real) callback kind.
+        if matches!(task.machine, TaskMachine::Probe) {
+            if let Err(status) = &buf {
+                if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED { return; }
+            }
+            return run_probe_callback(buf, channeldata, task);
+        }
         // Cancel/destroy deliveries follow the core policy table.
         if let Err(status) = &buf {
             if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED {
@@ -101,7 +106,6 @@ impl Callback {
             Self::AddrInfo(tail) => run_ares_addrinfo_callback(buf, *tail, task, channeldata),
             Self::HostByName(tail) => run_ares_hostbyname_callback(buf, *tail, task, channeldata),
             Self::Search(tail) => run_ares_search_callback(buf, *tail, task, channeldata),
-            Self::Probe => run_probe_callback(buf, channeldata, task),
         }
     }
     /// Which reactor-level policies apply to a task carrying this callback.
@@ -110,7 +114,6 @@ impl Callback {
             Self::AddrInfo(..) => TaskKind::AddrInfo,
             Self::HostByName(..) => TaskKind::HostByName,
             Self::Search(..) => TaskKind::Search,
-            Self::Probe => TaskKind::Probe,
             _ => TaskKind::Other,
         }
     }
@@ -125,12 +128,23 @@ impl Callback {
     }
 }
 
+/// The reactor's view of a task's kind: a failover probe (marked on the core
+/// `Task`, carrying a copy of the lookup's binding) reads as `Probe`;
+/// everything else defers to its `Callback`.
+pub(crate) fn task_kind(task: &Task<FFIData>) -> TaskKind {
+    if matches!(task.machine, TaskMachine::Probe) {
+        TaskKind::Probe
+    } else {
+        task.userdata.callback.kind()
+    }
+}
+
 /// The C-binding half of a task's userdata: only what the reply needs to
 /// fire the user's C callback. All per-task core data (state-machine handle,
 /// family/record-type, server, timeouts, queried ip) lives on the core
 /// `Task`, so this is a plain value the shim builds eagerly and core clones
 /// per task — no factory closure.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct FFIData {
     pub(crate) callback: Callback,
     pub(crate) arg: *mut c_void,
@@ -166,8 +180,8 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { cstr_lossy(hostname) };
-    // One plain binding (no factory closure); the failover probe's binding is
-    // FFIData::default() (Callback::Probe), minted by core.
+    // One plain binding (no factory closure); the failover probe reuses a copy
+    // of it, marked TaskMachine::Probe by core so its reply never fires the callback.
     let binding = FFIData::base(Callback::HostByName(HostTail { callback, arg }));
     match api::gethostbyname(&mut channeldata.state, hostname, family, Instant::now(), binding) {
         Err(status) => {
