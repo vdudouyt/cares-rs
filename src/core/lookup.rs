@@ -285,7 +285,6 @@ impl SearchSm {
 /// Config snapshot a state machine needs to make decisions. Borrowed from the
 /// channel's SysConfig for the duration of one `step` call.
 pub struct LookupCfg<'a> {
-    pub attempts: u32,
     pub ndots: u32,
     pub search: &'a [String],
 }
@@ -304,8 +303,6 @@ pub enum HostAction {
     /// a TC retry goes over TCP without flipping the machine's use_tcp, so a
     /// later failover returns to the configured transport.
     Send { name: String, family: c_int, rtype: u16, tcp: bool, server: usize },
-    /// Fire the server-state callback with failure for this server.
-    NotifyServerFail { server: usize, tcp: bool },
     /// Cache the current reply buffer under these names.
     CacheStore { names: Vec<String>, rtype: u16 },
     /// Reply parsed successfully — sort + build the hostent and deliver.
@@ -333,7 +330,6 @@ pub struct HostByNameSm {
     pub current_family: c_int,
     pub expected_rtype: u16,
     pub use_tcp: bool,
-    pub attempt_count: usize,
     pub had_nodata: bool,
     pub tried_aaaa: bool,
     /// Timeout events accumulated across retries; reported on success as
@@ -355,7 +351,6 @@ impl HostByNameSm {
             current_family,
             expected_rtype,
             use_tcp,
-            attempt_count: 0,
             had_nodata: false,
             tried_aaaa: family == AF_UNSPEC,
             timeouts: 0,
@@ -384,25 +379,8 @@ impl HostByNameSm {
                         return actions;
                     }
                     Err(e) => {
-                        // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
-                        let nservers = health.len().max(1);
-                        if matches!(e.code(), ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED) {
-                            actions.push(HostAction::NotifyServerFail { server, tcp: self.use_tcp });
-                            health.record_failure(server);
-                            self.attempt_count += 1;
-                            let max_attempts = nservers * cfg.attempts as usize;
-                            if self.attempt_count < max_attempts {
-                                let next_server = if health.len() > 1 { health.pick_next() } else { server };
-                                actions.push(HostAction::Send {
-                                    name: self.plan.current.clone(),
-                                    family: self.current_family,
-                                    rtype: self.expected_rtype,
-                                    tcp: self.use_tcp,
-                                    server: next_server,
-                                });
-                                return actions;
-                            }
-                        }
+                        // Server-error failover is handled by the reactor
+                        // (on_datagram); the SM only sees the settled error.
                         if e.code() == ARES_ENODATA {
                             self.had_nodata = true;
                         }
@@ -422,7 +400,6 @@ impl HostByNameSm {
         if matches!(self.last_error.code(), ARES_ENOTFOUND | ARES_ENODATA) {
             if let Some(next_name) = self.plan.advance() {
                 self.last_error = ARES_ENODATA.into();
-                self.attempt_count = 0;
                 actions.push(HostAction::Send {
                     name: next_name,
                     family: self.current_family,
@@ -440,7 +417,6 @@ impl HostByNameSm {
             self.expected_rtype = RTYPE_A;
             self.tried_aaaa = false;
             self.last_error = ARES_ENODATA.into();
-            self.attempt_count = 0;
             // Restore search domains for the A query round
             if !self.plan.base_name.is_empty() {
                 self.plan = SearchPlan::for_gethostbyname(&self.plan.base_name, cfg.ndots, cfg.search);
@@ -488,9 +464,7 @@ pub enum AddrInfoAction {
 pub enum AddrInfoEvent {
     Reply {
         parse: Result<Vec<crate::core::packets::AddrRecord>, AresError>,
-        family: c_int,
         server: usize,
-        io_timeouts: c_int,
     },
     /// I/O-level error, including ECANCELLED/EDESTRUCTION (which set the
     /// cancel flag and still participate in the pending join).
@@ -514,7 +488,6 @@ pub struct AddrInfoSm {
     pub ai_family: c_int,
     pub use_tcp: bool,
     pub pending: u32,
-    pub attempt_count: usize,
     pub has_success: bool,
     pub has_cancel: bool,
     pub last_error: AresError,
@@ -530,7 +503,6 @@ impl AddrInfoSm {
             ai_family,
             use_tcp,
             pending: 0,
-            attempt_count: 0,
             has_success: false,
             has_cancel: false,
             last_error: ARES_ENODATA.into(),
@@ -557,35 +529,19 @@ impl AddrInfoSm {
         }).collect()
     }
 
-    pub fn step(&mut self, ev: AddrInfoEvent, cfg: &LookupCfg<'_>, health: &mut ServerHealth) -> Vec<AddrInfoAction> {
+    pub fn step(&mut self, ev: AddrInfoEvent, health: &mut ServerHealth) -> Vec<AddrInfoAction> {
         match ev {
-            AddrInfoEvent::Reply { parse, family, server, io_timeouts } => {
+            AddrInfoEvent::Reply { parse, server } => {
                 match parse {
                     Ok(records) => {
                         // Server succeeded — reset its failure counter
                         health.record_success(server);
-                        self.attempt_count = 0;
                         self.has_success = true;
                         self.addrs.extend(records);
                     }
                     Err(e) => {
-                        // Server failover: on SERVFAIL/NOTIMP/REFUSED, retry (next server or same)
-                        let nservers = health.len();
-                        let max_attempts = nservers.max(1) * cfg.attempts as usize;
-                        if matches!(e.code(), ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED) && nservers >= 1 {
-                            health.record_failure(server);
-                            self.attempt_count += 1;
-                            if self.attempt_count < max_attempts {
-                                return vec![AddrInfoAction::Send {
-                                    name: self.plan.current.clone(),
-                                    family,
-                                    tcp: self.use_tcp,
-                                    server: health.pick_next(),
-                                    timeouts: io_timeouts,
-                                    batch: false,
-                                }];
-                            }
-                        }
+                        // Server-error failover is handled by the reactor
+                        // (on_datagram); the SM only sees the settled error.
                         self.last_error = e;
                     }
                 }
@@ -623,7 +579,6 @@ impl AddrInfoSm {
             && self.plan.advance().is_some()
         {
             self.last_error = ARES_ENODATA.into();
-            self.attempt_count = 0;
             return self.begin_batch(health.pick_next());
         }
 
@@ -674,8 +629,9 @@ pub enum ReactorAction {
 /// Reactor-level verdict for a datagram that already passed QID matching.
 #[derive(Debug, PartialEq)]
 pub enum TaskVerdict {
-    /// SERVFAIL/NOTIMP/REFUSED failover: resend the same payload to this server.
-    RetryNextServer { server: usize },
+    /// SERVFAIL/NOTIMP/REFUSED failover: resend the same payload to this
+    /// server; `tries` is the failover count to carry onto the retry task.
+    RetryNextServer { server: usize, tries: u32 },
     /// Truncated UDP reply: resend the same payload over TCP to the same server.
     RetryTcp,
     /// Hand the reply to the task's callback.
@@ -683,38 +639,39 @@ pub enum TaskVerdict {
 }
 
 /// The process-level decisions for one received datagram, in the historical
-/// order: rcode-based failover (skipped for the self-managing lookups),
-/// server-health bookkeeping + notifications, then the TC check. A failover
-/// retry preempts the TC check; everything else falls through to it.
+/// order: rcode-based failover, server-health bookkeeping + notifications,
+/// then the TC check. A failover retry preempts the TC check; everything else
+/// falls through to it. `tries` is the task's failover count so far — the
+/// budget is monotonic (`nservers * attempts` total sends), so a single server
+/// is retried in place rather than skipped.
 pub fn on_datagram(
     summary: &ReplySummary,
     kind: TaskKind,
     server: usize,
     is_tcp: bool,
     attempts: u32,
+    tries: u32,
     health: &mut ServerHealth,
 ) -> (Vec<ReactorAction>, TaskVerdict) {
     let mut actions = Vec::new();
     let is_server_error = matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
-    // AddrInfo/HostByName manage their own server-error failover (TC retry is
-    // handled here for every kind — see the truncation branch below).
-    let self_managed = matches!(kind, TaskKind::AddrInfo | TaskKind::HostByName);
     let nservers = health.len();
+    // getaddrinfo issues no server-state notifications (upstream parity); every
+    // other kind notifies on both success and server-error.
+    let notifies = kind != TaskKind::AddrInfo;
 
     if is_server_error {
-        if !self_managed {
+        if notifies {
             actions.push(ReactorAction::NotifyServerState { server, ok: false, tcp: is_tcp });
         }
-        if nservers > 1 && !self_managed {
-            health.record_failure(server);
-            let max_attempts = nservers * attempts as usize;
-            if (server + 1) < max_attempts {
-                return (actions, TaskVerdict::RetryNextServer { server: health.pick_next() });
-            }
+        health.record_failure(server);
+        if (tries as usize + 1) < nservers * attempts as usize {
+            let tries = tries + 1;
+            return (actions, TaskVerdict::RetryNextServer { server: health.pick_next(), tries });
         }
     } else {
         // Success response — notify + reset failure counters
-        if kind != TaskKind::AddrInfo {
+        if notifies {
             actions.push(ReactorAction::NotifyServerState { server, ok: true, tcp: is_tcp });
         }
         health.record_success(server);
@@ -1012,41 +969,37 @@ mod tests {
             let mut h = ServerHealth::default();
             h.reset(2);
             h.record_failure(0);
-            let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), kind, 0, false, 2, &mut h);
+            let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), kind, 0, false, 2, 0, &mut h);
             assert_eq!(v, TaskVerdict::Deliver);
             assert_eq!(a, if notifies { vec![notify_ok(0)] } else { vec![] });
             assert_eq!(h.failures[0], 0, "success resets failures");
         }
 
-        // SERVFAIL, 2 servers: Other/Search fail over; AddrInfo/HostByName self-manage
-        for (kind, fails_over) in [(TaskKind::Other, true), (TaskKind::Search, true),
-                                   (TaskKind::HostByName, false), (TaskKind::AddrInfo, false)] {
+        // SERVFAIL, 2 servers: every kind fails over to the next server (the
+        // reactor owns failover now); all notify server-state-fail except
+        // getaddrinfo, which issues no server-state notifications.
+        for kind in [TaskKind::Other, TaskKind::Search, TaskKind::HostByName, TaskKind::AddrInfo] {
             let mut h = ServerHealth::default();
             h.reset(2);
-            let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), kind, 0, false, 2, &mut h);
-            if fails_over {
-                assert_eq!(v, TaskVerdict::RetryNextServer { server: 1 });
-                assert_eq!(a, vec![notify_fail(0)]);
-                assert_eq!(h.failures[0], 1);
-            } else {
-                assert_eq!(v, TaskVerdict::Deliver);
-                assert_eq!(a, vec![]);
-                assert_eq!(h.failures[0], 0);
-            }
+            let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), kind, 0, false, 2, 0, &mut h);
+            assert_eq!(v, TaskVerdict::RetryNextServer { server: 1, tries: 1 });
+            assert_eq!(a, if kind != TaskKind::AddrInfo { vec![notify_fail(0)] } else { vec![] });
+            assert_eq!(h.failures[0], 1);
         }
 
-        // SERVFAIL, single server: no failover, no failure recorded, still notified
+        // SERVFAIL, single server: retried in place (pick_next returns the same
+        // server), failure recorded, still notified.
         let mut h = ServerHealth::default();
         h.reset(1);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), TaskKind::Other, 0, false, 2, &mut h);
-        assert_eq!(v, TaskVerdict::Deliver);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), TaskKind::Other, 0, false, 2, 0, &mut h);
+        assert_eq!(v, TaskVerdict::RetryNextServer { server: 0, tries: 1 });
         assert_eq!(a, vec![notify_fail(0)]);
-        assert_eq!(h.failures[0], 0);
+        assert_eq!(h.failures[0], 1);
 
-        // attempts exhausted: (server+1) >= nservers*attempts falls through to Deliver
+        // budget exhausted: tries+1 >= nservers*attempts falls through to Deliver
         let mut h = ServerHealth::default();
         h.reset(2);
-        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), TaskKind::Other, 3, false, 2, &mut h);
+        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), TaskKind::Other, 0, false, 2, 3, &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
 
         // TC flag on UDP: RetryTcp for every kind (the reactor owns TC now);
@@ -1055,9 +1008,9 @@ mod tests {
         for kind in [TaskKind::Other, TaskKind::Search, TaskKind::HostByName, TaskKind::AddrInfo] {
             let mut h = ServerHealth::default();
             h.reset(1);
-            let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, false, 2, &mut h);
+            let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, false, 2, 0, &mut h);
             assert_eq!(v, TaskVerdict::RetryTcp);
-            let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, true, 2, &mut h);
+            let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, true, 2, 0, &mut h);
             assert_eq!(v, TaskVerdict::Deliver);
         }
     }

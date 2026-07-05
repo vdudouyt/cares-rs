@@ -492,9 +492,6 @@ pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, tail: Host
     );
     for delivery in deliveries {
         match delivery {
-            api::HostDelivery::NotifyServerFail { server, tcp } => {
-                invoke_server_state_callback(channeldata, server, false, tcp);
-            }
             api::HostDelivery::Success { hostent, timeouts } => {
                 let hostent = unsafe { build_hostent(hostent) };
                 unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, timeouts, hostent) };
@@ -601,21 +598,14 @@ pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, tail: AddrIn
             })();
             AddrInfoEvent::Reply {
                 parse,
-                family: task.family,
                 server: task.server_index,
-                io_timeouts: task.timeouts,
             }
         }
         Err(status) => AddrInfoEvent::Error { status: status.into() },
     };
     let actions = {
-        let cfg = LookupCfg {
-            attempts: channeldata.state.ares.config.options.attempts,
-            ndots: channeldata.state.ares.config.options.ndots,
-            search: &channeldata.state.ares.config.search,
-        };
         let mut machine = sm.borrow_mut();
-        machine.step(ev, &cfg, &mut channeldata.state.server_health)
+        machine.step(ev, &mut channeldata.state.server_health)
     };
     let deliveries = drive_addrinfo(&mut channeldata.state, sm, actions, task.userdata);
     fire_addrinfo_deliveries(deliveries, tail);

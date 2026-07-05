@@ -493,7 +493,6 @@ pub(crate) use crate::core::preflight::search_name_check as search_precheck;
 /// One C-side effect a settled gethostbyname task owes its owner, in firing
 /// order relative to the other deliveries.
 pub(crate) enum HostDelivery {
-    NotifyServerFail { server: usize, tcp: bool },
     /// Sortlist already applied and the hostent shaped; build, deliver, free.
     Success { hostent: Hostent, timeouts: i32 },
     Fail { status: AresError, timeouts: i32 },
@@ -545,7 +544,6 @@ pub(crate) fn on_hostbyname_reply<T: Copy>(
 
     let actions = {
         let cfg = LookupCfg {
-            attempts: st.ares.config.options.attempts,
             ndots: st.ares.config.options.ndots,
             search: &st.ares.config.search,
         };
@@ -562,9 +560,6 @@ pub(crate) fn on_hostbyname_reply<T: Copy>(
                 {
                     deliveries.push(HostDelivery::Fail { status: ARES_ECONNREFUSED.into(), timeouts });
                 }
-            }
-            HostAction::NotifyServerFail { server, tcp } => {
-                deliveries.push(HostDelivery::NotifyServerFail { server, tcp });
             }
             HostAction::CacheStore { names, rtype } => {
                 if st.query_cache_max_ttl > 0 {

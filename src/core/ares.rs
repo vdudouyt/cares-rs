@@ -182,7 +182,7 @@ impl<T> Ares<T> {
         // TCP needs the 2-byte length prefix; UDP sends the payload as-is.
         let writebuf = if sock.is_tcp() { frame_tcp(&payload) } else { payload };
         let expires_at = Instant::now() + Duration::from_millis(self.config.options.timeout_ms as u64);
-        self.tasks.push(Task { status: Status::Writing, sock, writebuf, userdata, expires_at, server_index, tries_remaining: 0, queried_ip: None, machine: TaskMachine::None, family: 0, rtype: 0, timeouts: 0 });
+        self.tasks.push(Task { status: Status::Writing, sock, writebuf, userdata, expires_at, server_index, tries_remaining: 0, queried_ip: None, machine: TaskMachine::None, family: 0, rtype: 0, timeouts: 0, failover_tries: 0 });
         Ok(())
     }
     /// Create + wrap a transport socket bound for `server_index` (not yet connected).
@@ -299,6 +299,10 @@ pub struct Task<T> {
     pub family: i32,
     pub rtype: u16,
     pub timeouts: i32,
+    /// Server-error (SERVFAIL/NOTIMP/REFUSED) failover attempts made so far,
+    /// carried across reissues so the reactor's failover budget is monotonic
+    /// (the query index alone can't bound a single-server retry).
+    pub failover_tries: u32,
 }
 
 impl<T> Task<T> {

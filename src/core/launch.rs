@@ -14,7 +14,7 @@ use bytes::BytesMut;
 
 use crate::core::ares::{dns_query_payload, qtype_of, Family, SocketSource, Status, TaskMachine};
 use crate::core::channel::ChannelState;
-use crate::core::lookup::{AddrInfoAction, AddrInfoEvent, AddrInfoSm, HostByNameSm, LookupCfg};
+use crate::core::lookup::{AddrInfoAction, AddrInfoEvent, AddrInfoSm, HostByNameSm};
 use crate::core::AresError;
 use crate::ffi::error::ARES_ECONNREFUSED;
 use crate::ffi::{RECORD_TYPE_A, RECORD_TYPE_AAAA};
@@ -148,13 +148,8 @@ pub(crate) fn drive_addrinfo<T: Copy>(
                 if failed {
                     let ev = if batch { AddrInfoEvent::LaunchFailed } else { AddrInfoEvent::ResendFailed };
                     let more = {
-                        let cfg = LookupCfg {
-                            attempts: st.ares.config.options.attempts,
-                            ndots: st.ares.config.options.ndots,
-                            search: &st.ares.config.search,
-                        };
                         let mut machine = sm.borrow_mut();
-                        machine.step(ev, &cfg, &mut st.server_health)
+                        machine.step(ev, &mut st.server_health)
                     };
                     queue.extend(more);
                 }
