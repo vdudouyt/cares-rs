@@ -316,7 +316,7 @@ pub enum HostAction {
 /// Input to the gethostbyname machine: a reply (with its parse outcome —
 /// parsing itself happens outside) or an I/O-level error.
 pub enum HostEvent {
-    Reply { truncated: bool, parse: Result<(), AresError>, io_timeouts: c_int, server: usize },
+    Reply { parse: Result<(), AresError>, io_timeouts: c_int, server: usize },
     Error { status: AresError },
 }
 
@@ -366,19 +366,7 @@ impl HostByNameSm {
     pub fn step(&mut self, ev: HostEvent, cfg: &LookupCfg<'_>, health: &mut ServerHealth) -> Vec<HostAction> {
         let mut actions = Vec::new();
         match ev {
-            HostEvent::Reply { truncated, parse, io_timeouts, server } => {
-                // TC flag — retry over TCP if truncated and not already TCP.
-                // Deliberately does not set self.use_tcp (see Send docs).
-                if truncated && !self.use_tcp {
-                    actions.push(HostAction::Send {
-                        name: self.plan.current.clone(),
-                        family: self.current_family,
-                        rtype: self.expected_rtype,
-                        tcp: true,
-                        server,
-                    });
-                    return actions;
-                }
+            HostEvent::Reply { parse, io_timeouts, server } => {
                 match parse {
                     Ok(()) => {
                         // Success — cache under the query name and (when different)
@@ -499,7 +487,6 @@ pub enum AddrInfoAction {
 /// Input to the getaddrinfo machine, one per settled task (or failed send).
 pub enum AddrInfoEvent {
     Reply {
-        truncated: bool,
         parse: Result<Vec<crate::core::packets::AddrRecord>, AresError>,
         family: c_int,
         server: usize,
@@ -510,7 +497,7 @@ pub enum AddrInfoEvent {
     Error { status: AresError },
     /// A batch launch send failed: always records ECONNREFUSED.
     LaunchFailed,
-    /// A TC/failover re-send failed: ECONNREFUSED is recorded only if this
+    /// A failover re-send failed: ECONNREFUSED is recorded only if this
     /// was the last outstanding query.
     ResendFailed,
 }
@@ -572,19 +559,7 @@ impl AddrInfoSm {
 
     pub fn step(&mut self, ev: AddrInfoEvent, cfg: &LookupCfg<'_>, health: &mut ServerHealth) -> Vec<AddrInfoAction> {
         match ev {
-            AddrInfoEvent::Reply { truncated, parse, family, server, io_timeouts } => {
-                // TC flag — retry this query over TCP; the new task replaces
-                // this one, so pending is untouched.
-                if truncated && !self.use_tcp {
-                    return vec![AddrInfoAction::Send {
-                        name: self.plan.current.clone(),
-                        family,
-                        tcp: true,
-                        server,
-                        timeouts: io_timeouts,
-                        batch: false,
-                    }];
-                }
+            AddrInfoEvent::Reply { parse, family, server, io_timeouts } => {
                 match parse {
                     Ok(records) => {
                         // Server succeeded — reset its failure counter
@@ -721,7 +696,8 @@ pub fn on_datagram(
 ) -> (Vec<ReactorAction>, TaskVerdict) {
     let mut actions = Vec::new();
     let is_server_error = matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
-    // AddrInfo/HostByName manage their own failover + TC retry
+    // AddrInfo/HostByName manage their own server-error failover (TC retry is
+    // handled here for every kind — see the truncation branch below).
     let self_managed = matches!(kind, TaskKind::AddrInfo | TaskKind::HostByName);
     let nservers = health.len();
 
@@ -744,7 +720,7 @@ pub fn on_datagram(
         health.record_success(server);
     }
 
-    if summary.truncated && !is_tcp && !self_managed {
+    if summary.truncated && !is_tcp {
         return (actions, TaskVerdict::RetryTcp);
     }
     (actions, TaskVerdict::Deliver)
@@ -1073,15 +1049,14 @@ mod tests {
         let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), TaskKind::Other, 3, false, 2, &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
 
-        // TC flag on UDP: RetryTcp for Other/Search, Deliver for self-managed;
+        // TC flag on UDP: RetryTcp for every kind (the reactor owns TC now);
         // already-TCP never TC-retries
         let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
-        for (kind, retries) in [(TaskKind::Other, true), (TaskKind::Search, true),
-                                (TaskKind::HostByName, false), (TaskKind::AddrInfo, false)] {
+        for kind in [TaskKind::Other, TaskKind::Search, TaskKind::HostByName, TaskKind::AddrInfo] {
             let mut h = ServerHealth::default();
             h.reset(1);
             let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, false, 2, &mut h);
-            assert_eq!(v, if retries { TaskVerdict::RetryTcp } else { TaskVerdict::Deliver });
+            assert_eq!(v, TaskVerdict::RetryTcp);
             let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, true, 2, &mut h);
             assert_eq!(v, TaskVerdict::Deliver);
         }

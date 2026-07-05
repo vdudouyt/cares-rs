@@ -28,7 +28,7 @@ use crate::core::channel::cache_store_names;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::AddressFamily;
 use crate::core::lookup::{
-    is_localhost, is_onion_domain, is_truncated, AddrInfoSm, HostAction, HostByNameSm, HostEvent,
+    is_localhost, is_onion_domain, AddrInfoSm, HostAction, HostByNameSm, HostEvent,
     LookupCfg, LookupEvent, SearchAction, SearchPlan, SearchSm, ServerHealth,
 };
 use crate::core::packets::{buf_to_ip, AddrRecord};
@@ -538,7 +538,7 @@ pub(crate) fn on_hostbyname_reply<T: Copy>(
                 }
                 Err(e) => Err(e),
             };
-            HostEvent::Reply { truncated: is_truncated(buf), parse: outcome, io_timeouts, server }
+            HostEvent::Reply { parse: outcome, io_timeouts, server }
         }
         Err(status) => HostEvent::Error { status },
     };

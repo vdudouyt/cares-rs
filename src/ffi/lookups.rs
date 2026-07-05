@@ -600,7 +600,6 @@ pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, tail: AddrIn
                 Ok(parsed_rrs.items)
             })();
             AddrInfoEvent::Reply {
-                truncated: is_truncated(buf),
                 parse,
                 family: task.family,
                 server: task.server_index,
