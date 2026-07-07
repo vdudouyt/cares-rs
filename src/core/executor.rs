@@ -29,7 +29,6 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 
-use crate::core::hostent::Hostent;
 use crate::core::lookup::{
     extract_tcp_frame, on_datagram, on_timeout, qid_matches, summarize, ReactorAction, ServerHealth,
     TaskKind, TaskVerdict, TimeoutVerdict,
@@ -71,6 +70,10 @@ pub(crate) struct QueryIo {
     pub fired: Vec<i32>,
     /// Whether the deadline passed (set by the executor).
     pub expired: bool,
+    /// Accumulated timeout count, written by the future before it completes so
+    /// the ffi can pass it to the C callback (the host future's `Result` output
+    /// has no room for it; the raw path still carries it in `Delivery::Raw`).
+    pub timeouts: c_int,
 }
 
 /// The outcome of one [`WaitFds`] await: which fds fired, and whether it timed out.
@@ -130,14 +133,12 @@ fn notify(io: &Rc<RefCell<QueryIo>>, actions: Vec<ReactorAction>) {
 
 // ===== Delivery (the future's Output) =====
 
-/// What the executor delivers to C once a lifecycle future completes; the ffi
-/// completion path maps each arm to the right C callback.
+/// What the raw (ares_query / ares_send) lifecycle future delivers to C: reply
+/// bytes or a status code, plus the timeout count. (ares_gethostbyname's future
+/// returns `Result<Hostent, AresError>` directly and carries its timeout count
+/// via the mailbox — see `core::hostbyname`.)
 pub(crate) enum Delivery {
-    /// ares_query / ares_send: raw reply bytes or a status code.
     Raw { result: Result<Vec<u8>, c_int>, timeouts: c_int },
-    /// ares_gethostbyname: a finished hostent (sortlist already applied) or a
-    /// status code — the ffi only builds the C hostent + fires.
-    Host { result: Result<Hostent, c_int>, timeouts: c_int },
 }
 
 // ===== Owned resources (built by the channel, held by the future) =====

@@ -5,8 +5,10 @@ use super::*;
 use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
 use crate::core::query_builder::tcp_payload;
 use crate::core::executor::{noop_waker, raw_lifecycle, Delivery, Effect, QueryIo, RawLaunch};
+use crate::core::hostent::Hostent;
 use crate::core::launch::{read_tcp_frame, timeout_step};
 use crate::core::transport::Task;
+use crate::core::AresError;
 use super::lookups::{fire_host_success, HostTail};
 use super::process::carry_over;
 
@@ -28,22 +30,35 @@ pub struct ChannelData {
     async_queries: Vec<Option<AsyncQuery>>,
 }
 
-/// One in-flight async lifecycle: its mailbox, its boxed future, and how to
-/// deliver the future's result to C.
+/// One in-flight async lifecycle: its mailbox plus the boxed future and its C
+/// delivery target — both differ by kind (raw reply bytes vs a hostent).
 struct AsyncQuery {
     io: std::rc::Rc<std::cell::RefCell<QueryIo>>,
-    fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
-    sink: AsyncSink,
+    kind: AsyncKind,
 }
 
-/// How a completed lifecycle future is delivered to C. The future owns its
-/// socket(s), so nothing is enqueued as a `Task` — this only names the callback.
-#[derive(Clone, Copy)]
-pub(crate) enum AsyncSink {
-    /// ares_query / ares_send: raw reply bytes to the ares_callback.
-    Raw(AresCallback, *mut libc::c_void),
-    /// ares_gethostbyname: sorted answers built into a hostent for the host callback.
-    Host(HostTail),
+/// The two async lifecycle kinds: the future's `Output` and where its result
+/// goes in C. The future owns its socket(s), so nothing is enqueued as a `Task`.
+pub(crate) enum AsyncKind {
+    /// ares_query / ares_send: raw reply bytes (+ timeout count) to the ares_callback.
+    Raw {
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
+        callback: AresCallback,
+        arg: *mut libc::c_void,
+    },
+    /// ares_gethostbyname: a hostent (or status) to the ares_host_callback; the
+    /// timeout count is read from the mailbox (`io.timeouts`).
+    Host {
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hostent, AresError>>>>,
+        tail: HostTail,
+    },
+}
+
+/// A polled-to-completion future's output, held across the mailbox-borrow drop
+/// so its C callback fires after effects are applied (mirrors [`AsyncKind`]).
+enum Completed {
+    Raw(Delivery),
+    Host(Result<Hostent, AresError>),
 }
 
 impl ChannelData {
@@ -86,13 +101,8 @@ impl ChannelData {
     /// Register a lifecycle future + its delivery sink in a free slot and drive
     /// it once (issuing the initial send). The C callback fires when the reactor
     /// later settles the task (or in place if the launch fails immediately).
-    pub(crate) fn spawn(
-        &mut self,
-        io: std::rc::Rc<std::cell::RefCell<QueryIo>>,
-        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
-        sink: AsyncSink,
-    ) {
-        let slot = AsyncQuery { io, fut, sink };
+    pub(crate) fn spawn(&mut self, io: std::rc::Rc<std::cell::RefCell<QueryIo>>, kind: AsyncKind) {
+        let slot = AsyncQuery { io, kind };
         let id = match self.async_queries.iter().position(|s| s.is_none()) {
             Some(i) => {
                 self.async_queries[i] = Some(slot);
@@ -110,7 +120,7 @@ impl ChannelData {
     pub(crate) fn spawn_query(&mut self, launch: RawLaunch, callback: AresCallback, arg: *mut libc::c_void) {
         let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
         let fut = Box::pin(raw_lifecycle(io.clone(), launch));
-        self.spawn(io, fut, AsyncSink::Raw(callback, arg));
+        self.spawn(io, AsyncKind::Raw { fut, callback, arg });
     }
 
     /// Fire a settled classic-task outcome (search/getaddrinfo/gethostbyaddr/
@@ -129,9 +139,20 @@ impl ChannelData {
             return;
         }
         let waker = noop_waker();
-        let poll = {
+        // Poll the kind's future, capturing its output (if it completed) to fire
+        // after the mailbox borrow is released.
+        let done: Option<Completed> = {
             let mut cx = std::task::Context::from_waker(&waker);
-            self.async_queries[id].as_mut().unwrap().fut.as_mut().poll(&mut cx)
+            match &mut self.async_queries[id].as_mut().unwrap().kind {
+                AsyncKind::Raw { fut, .. } => match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(d) => Some(Completed::Raw(d)),
+                    std::task::Poll::Pending => None,
+                },
+                AsyncKind::Host { fut, .. } => match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(r) => Some(Completed::Host(r)),
+                    std::task::Poll::Pending => None,
+                },
+            }
         };
         let effects = {
             let aq = self.async_queries[id].as_ref().unwrap();
@@ -144,9 +165,22 @@ impl ChannelData {
                 }
             }
         }
-        if let std::task::Poll::Ready(delivery) = poll {
-            let sink = self.async_queries[id].take().unwrap().sink;
-            self.finalize(delivery, sink);
+        // On completion, reap the slot and fire the C callback.
+        if let Some(done) = done {
+            let slot = self.async_queries[id].take().unwrap();
+            match (done, slot.kind) {
+                (Completed::Raw(Delivery::Raw { result, timeouts }), AsyncKind::Raw { callback, arg, .. }) => {
+                    fire_ares_callback(callback, arg, result.as_deref().map_err(|&e| e), timeouts);
+                }
+                (Completed::Host(result), AsyncKind::Host { tail, .. }) => {
+                    let timeouts = slot.io.borrow().timeouts;
+                    match result {
+                        Ok(hostent) => fire_host_success(tail, hostent, timeouts),
+                        Err(e) => unsafe { (tail.callback)(tail.arg, e.code(), timeouts, std::ptr::null_mut()) },
+                    }
+                }
+                _ => unreachable!("async completion / slot kind mismatch"),
+            }
         }
     }
 
@@ -184,21 +218,6 @@ impl ChannelData {
         }
     }
 
-    /// Deliver a completed lifecycle future to C: raw reply bytes to the
-    /// ares_callback, or a sorted hostent to the host callback.
-    fn finalize(&mut self, delivery: Delivery, sink: AsyncSink) {
-        match (delivery, sink) {
-            (Delivery::Raw { result, timeouts }, AsyncSink::Raw(callback, arg)) => {
-                fire_ares_callback(callback, arg, result.as_deref().map_err(|&e| e), timeouts);
-            }
-            (Delivery::Host { result, timeouts }, AsyncSink::Host(tail)) => match result {
-                Ok(hostent) => fire_host_success(tail, hostent, timeouts),
-                Err(status) => unsafe { (tail.callback)(tail.arg, status, timeouts, std::ptr::null_mut()) },
-            },
-            _ => unreachable!("async delivery/sink kind mismatch"),
-        }
-    }
-
     /// Fire `status` to everything in flight — classic tasks via their C
     /// callback, async futures aborted (fire the terminal status + drop the
     /// future, which drops its owned sockets). The shared safe teardown for
@@ -224,9 +243,9 @@ impl ChannelData {
         let Some(slot) = self.async_queries.get_mut(id).and_then(|s| s.take()) else {
             return; // already reaped
         };
-        match slot.sink {
-            AsyncSink::Raw(callback, arg) => fire_ares_callback(callback, arg, Err(status), 0),
-            AsyncSink::Host(tail) => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) },
+        match slot.kind {
+            AsyncKind::Raw { callback, arg, .. } => fire_ares_callback(callback, arg, Err(status), 0),
+            AsyncKind::Host { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) },
         }
     }
 

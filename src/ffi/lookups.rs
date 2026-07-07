@@ -163,7 +163,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     // synchronous preflight hit fires re-entrantly on this first `advance`.
     let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
     let fut = Box::pin(gethostbyname(channeldata.state.host_ctx(), io.clone(), hostname.to_string(), family));
-    channeldata.spawn(io, fut, AsyncSink::Host(HostTail { callback, arg }));
+    channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
 }
 
 /// # Safety

@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use crate::core::cache::QueryCache;
-use crate::core::executor::{resolve_query, Delivery, QueryIo, Resources};
+use crate::core::executor::{resolve_query, QueryIo, Resources};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, Hosts};
 use crate::core::lookup::{
@@ -41,29 +41,24 @@ pub(crate) struct HostCtx {
     pub use_vc: bool,
 }
 
-fn host_ok(hostent: Hostent) -> Delivery {
-    Delivery::Host { result: Ok(hostent), timeouts: 0 }
-}
-fn host_err(status: c_int, timeouts: c_int) -> Delivery {
-    Delivery::Host { result: Err(status), timeouts }
-}
-
 /// The whole lifecycle, request to delivery. The preflight has no `.await`, so a
 /// synchronous hit completes on the spawn's first poll and fires re-entrantly
-/// (matching c-ares); otherwise it falls into the DNS loop.
-pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostname: String, family: c_int) -> Delivery {
+/// (matching c-ares); otherwise it falls into the DNS loop. The accumulated
+/// timeout count is written to `io.timeouts` for the ffi to read (a sync hit
+/// leaves it at its `0` default).
+pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostname: String, family: c_int) -> Result<Hostent, AresError> {
     // ===== preflight (synchronous) — order is behavior =====
     if !hostname.is_ascii() {
-        return host_err(ARES_EBADNAME, 0);
+        return Err(ARES_EBADNAME.into());
     }
     if is_onion_domain(&hostname) {
-        return host_err(ARES_ENOTFOUND, 0);
+        return Err(ARES_ENOTFOUND.into());
     }
     let filter = match family {
         AF_INET => AddressFamily::Ipv4,
         AF_INET6 => AddressFamily::Ipv6,
         AF_UNSPEC => AddressFamily::Any,
-        _ => return host_err(ARES_ENOTIMP, 0),
+        _ => return Err(ARES_ENOTIMP.into()),
     };
 
     // IP literal (a family mismatch falls through, not fails).
@@ -74,14 +69,14 @@ pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostna
             AddressFamily::Any => true,
         };
         if matches {
-            return host_ok(Hostent::new(hostname, vec![ip]));
+            return Ok(Hostent::new(hostname, vec![ip]));
         }
     }
 
     // Hosts file.
     if let Some(lookup) = ctx.hosts.lookup(&hostname, filter) {
         if !lookup.addrs.is_empty() {
-            return host_ok(Hostent::from_lookup(lookup));
+            return Ok(Hostent::from_lookup(lookup));
         }
     }
 
@@ -92,17 +87,17 @@ pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostna
             AddressFamily::Ipv6 => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
             AddressFamily::Any => vec![IpAddr::V6(Ipv6Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::LOCALHOST)],
         };
-        return host_ok(Hostent::new(hostname, addrs));
+        return Ok(Hostent::new(hostname, addrs));
     }
 
     // HOSTALIASES (single-label names): resolve via env-pointed file.
     let resolved = match resolve_hostaliases(&hostname) {
         Ok(name) => name,
-        Err(status) => return host_err(status, 0),
+        Err(status) => return Err(status.into()),
     };
 
     if ctx.res.endpoints.is_empty() {
-        return host_err(ARES_ENOSERVER, 0);
+        return Err(ARES_ENOSERVER.into());
     }
 
     // Query-cache probe: a fresh cached reply that parses to a non-empty answer
@@ -114,7 +109,7 @@ pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostna
             if !ctx.sortlist.is_empty() {
                 apply_sortlist(&ctx.sortlist, &mut rrs.items);
             }
-            return host_ok(Hostent::from_parsed(rrs, cache_family));
+            return Ok(Hostent::from_parsed(rrs, cache_family));
         }
     }
 
@@ -164,10 +159,8 @@ pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostna
                     if !ctx.sortlist.is_empty() {
                         apply_sortlist(&ctx.sortlist, &mut rrs.items);
                     }
-                    return Delivery::Host {
-                        result: Ok(Hostent::from_parsed(rrs, current_family)),
-                        timeouts: timeouts + io_timeouts,
-                    };
+                    io.borrow_mut().timeouts = timeouts + io_timeouts;
+                    return Ok(Hostent::from_parsed(rrs, current_family));
                 }
                 Err(e) => {
                     if e.code() == ARES_ENODATA {
@@ -204,7 +197,8 @@ pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostna
         } else {
             last_error.code()
         };
-        return host_err(status, timeouts);
+        io.borrow_mut().timeouts = timeouts;
+        return Err(status.into());
     }
 }
 
