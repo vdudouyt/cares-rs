@@ -10,7 +10,7 @@ use crate::core::launch::{read_tcp_frame, timeout_step};
 use crate::core::transport::Task;
 use crate::core::AresError;
 use crate::core::preflight::NameinfoReply;
-use super::lookups::{fire_host_success, HostTail, NameinfoTail};
+use super::lookups::{fire_host_success, HostTail, NameinfoTail, SearchDelivery, SearchTail};
 use super::process::carry_over;
 
 
@@ -66,6 +66,12 @@ pub(crate) enum AsyncKind {
         fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
         callback: AresCallbackDnsRec,
         arg: *mut libc::c_void,
+    },
+    /// ares_search / ares_search_dnsrec: raw reply bytes (or status) from
+    /// the name-iteration loop; the tail distinguishes Raw vs DnsRec delivery.
+    Search {
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
+        tail: SearchTail,
     },
 }
 
@@ -146,6 +152,15 @@ impl ChannelData {
         self.spawn(io, AsyncKind::DnsRec { fut, callback, arg });
     }
 
+    /// ares_search / ares_search_dnsrec: spawn the search name-iteration
+    /// lifecycle. The tail's delivery variant (Raw vs DnsRec) determines which
+    /// C callback fires on completion.
+    pub(crate) fn spawn_search(&mut self, ctx: crate::core::search::SearchCtx, name: String, dnstype: u16, retry_server_error: bool, tail: SearchTail) {
+        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+        let fut = Box::pin(crate::core::search::search_lifecycle(ctx, io.clone(), name, dnstype, retry_server_error));
+        self.spawn(io, AsyncKind::Search { fut, tail });
+    }
+
     /// Fire a settled classic-task outcome (search/getaddrinfo/gethostbyaddr/
     /// nameinfo/probe). The migrated async lifecycles own their sockets and
     /// never appear here.
@@ -183,6 +198,10 @@ impl ChannelData {
                     std::task::Poll::Ready(d) => Some(Completed::Raw(d)),
                     std::task::Poll::Pending => None,
                 },
+                AsyncKind::Search { fut, .. } => match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(d) => Some(Completed::Raw(d)),
+                    std::task::Poll::Pending => None,
+                },
             }
         };
         let effects = {
@@ -206,8 +225,6 @@ impl ChannelData {
                 (Completed::Raw(Delivery::Raw { result, timeouts }), AsyncKind::DnsRec { callback, arg, .. }) => {
                     match result {
                         Ok(ref buf) => {
-                            // Cache the raw reply (same as the old classic-reactor
-                            // `cache_dnsrec_reply` in process_channel).
                             self.state.cache.borrow_mut().store_reply(buf, Instant::now());
                             match crate::core::dns_record::parse_record(buf) {
                                 Ok(rec) => {
@@ -219,6 +236,31 @@ impl ChannelData {
                             }
                         }
                         Err(status) => unsafe { callback(arg, status, timeouts as usize, std::ptr::null_mut()) },
+                    }
+                }
+                (Completed::Raw(Delivery::Raw { result, timeouts }), AsyncKind::Search { tail, .. }) => {
+                    match (result, tail.delivery) {
+                        (Ok(buf), SearchDelivery::Raw { callback, arg }) => {
+                            unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) };
+                        }
+                        (Ok(buf), SearchDelivery::DnsRec { callback, arg }) => {
+                            // Cache the raw reply for dnsrec search (same as classic `wants_dnsrec_cache`).
+                            self.state.cache.borrow_mut().store_reply(&buf, Instant::now());
+                            match crate::core::dns_record::parse_record(&buf) {
+                                Ok(rec) => {
+                                    let dnsrec = Box::into_raw(Box::new(rec));
+                                    unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };
+                                    unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
+                                }
+                                Err(e) => unsafe { callback(arg, e.code(), timeouts as usize, std::ptr::null_mut()) },
+                            }
+                        }
+                        (Err(status), SearchDelivery::Raw { callback, arg }) => {
+                            unsafe { callback(arg, status, timeouts, std::ptr::null_mut(), 0) };
+                        }
+                        (Err(status), SearchDelivery::DnsRec { callback, arg }) => {
+                            unsafe { callback(arg, status, timeouts as usize, std::ptr::null_mut()) };
+                        }
                     }
                 }
                 (Completed::Host(result), AsyncKind::Host { tail, .. }) => {
@@ -302,6 +344,10 @@ impl ChannelData {
             AsyncKind::Host { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) },
             AsyncKind::Nameinfo { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) },
             AsyncKind::DnsRec { callback, arg, .. } => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
+            AsyncKind::Search { tail, .. } => match tail.delivery {
+                SearchDelivery::Raw { callback, arg } => unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) },
+                SearchDelivery::DnsRec { callback, arg } => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
+            },
         }
     }
 

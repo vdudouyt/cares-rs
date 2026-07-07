@@ -606,26 +606,6 @@ impl<T> Client<T> {
         Ok(executor::RawLaunch { res: self.resources(), payload: BytesMut::from(query_buf) })
     }
 
-    /// ares_search / ares_search_dnsrec: seed the search plan, mint the shared
-    /// state-machine handle, and issue the first query.
-    ///
-    /// NULL-pointer ordering note: the name sanity check runs in the shim (via
-    /// `search_precheck`) *before* the channel is dereferenced — a bad name is
-    /// reported even on a NULL channel, so it cannot live in here.
-    pub(crate) fn search(
-        &mut self,
-        name: &str,
-        dnstype: u16,
-        retry_server_error: bool,
-        binding: T,
-    ) -> Result<(), AresError> {
-        let (sm, query_hostname) = search_start(self, name, retry_server_error)?;
-        let handle = Rc::new(RefCell::new(sm));
-        self.enqueue(dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, binding)?;
-        if let Some(t) = self.transport.tasks.last_mut() { t.machine = TaskMachine::Search(handle); }
-        Ok(())
-    }
-
     /// ares_gethostbyname_file: the hosts-file-only lookup, shaped for C.
     pub(crate) fn gethostbyname_file(&mut self, name: &str, family: i32) -> Result<Hostent, AresError> {
         hosts_file_lookup(self, name, family).map(Hostent::from_lookup)
@@ -721,39 +701,6 @@ impl<T> Client<T> {
             [] => Ok(Operation::Pending),
             [AddrInfoDelivery::Fail { status }] => Err(*status),
             _ => unreachable!("getaddrinfo entry yields nothing or a single ECONNREFUSED"),
-        }
-    }
-
-    // ===== Reply executors =====
-
-    /// A search task settled: feed the machine, re-issue the next plan name if
-    /// asked (a failed re-issue reports ECONNREFUSED with zero timeouts, as
-    /// historically), or hand the delivery back to the shim.
-    pub(crate) fn on_search_reply(
-        &mut self,
-        sm: &Rc<RefCell<SearchSm>>,
-        res: Result<&[u8], AresError>,
-        dnstype: u16,
-        io_timeouts: i32,
-        binding: T,
-    ) -> Option<SearchReplyDelivery> {
-        let ev = match res {
-            Ok(buf) => LookupEvent::Reply(buf),
-            Err(status) => LookupEvent::Error(status),
-        };
-        let action = sm.borrow_mut().step(ev);
-        match action {
-            SearchAction::Send(next_name) => {
-                match self.enqueue(dns_query_payload(&next_name, dnstype), SocketSource::Udp, 0, binding) {
-                    Ok(_) => {
-                        if let Some(t) = self.transport.tasks.last_mut() { t.machine = TaskMachine::Search(sm.clone()); }
-                        None
-                    }
-                    Err(status) => Some(SearchReplyDelivery::Fail { status, timeouts: 0 }),
-                }
-            }
-            SearchAction::DeliverSuccess => Some(SearchReplyDelivery::Success { timeouts: io_timeouts }),
-            SearchAction::DeliverFail(status) => Some(SearchReplyDelivery::Fail { status, timeouts: io_timeouts }),
         }
     }
 

@@ -14,6 +14,7 @@ pub mod hostbyname;
 pub mod hostbyaddr;
 pub mod launch;
 pub mod nameinfo;
+pub mod search;
 pub mod hostent;
 pub mod lookup;
 pub mod transport;

@@ -65,7 +65,6 @@ pub(crate) enum Callback {
     AresCallbackDnsRec(AresCallbackDnsRec),
     AresNameinfoCallback(AresNameinfoCallback),
     AddrInfo(AddrInfoTail),
-    Search(SearchTail),
 }
 
 impl Callback {
@@ -73,23 +72,7 @@ impl Callback {
         // Cancel/destroy deliveries follow the core policy table.
         if let Err(status) = &buf {
             if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED {
-                match teardown_delivery(self.kind()) {
-                    TeardownDelivery::DeliverNull => {
-                        match self {
-                            Self::Search(tail) => match tail.delivery {
-                                SearchDelivery::Raw { callback, arg } => unsafe {
-                                    callback(arg, *status, task.timeouts, std::ptr::null_mut(), 0);
-                                },
-                                SearchDelivery::DnsRec { callback, arg } => unsafe {
-                                    callback(arg, *status, task.timeouts as usize, std::ptr::null_mut());
-                                },
-                            },
-                            _ => unreachable!("core maps DeliverNull only to Search"),
-                        }
-                        return;
-                    }
-                    TeardownDelivery::Full => {}
-                }
+                // All remaining classic variants use TeardownDelivery::Full.
             }
         }
         match self {
@@ -97,23 +80,18 @@ impl Callback {
             Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, task),
             Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, task),
             Self::AddrInfo(tail) => run_ares_addrinfo_callback(buf, *tail, task, channeldata),
-            Self::Search(tail) => run_ares_search_callback(buf, *tail, task, channeldata),
         }
     }
     /// Which reactor-level policies apply to a task carrying this callback.
     pub(crate) fn kind(&self) -> TaskKind {
         match self {
             Self::AddrInfo(..) => TaskKind::AddrInfo,
-            Self::Search(..) => TaskKind::Search,
             _ => TaskKind::Other,
         }
     }
-    /// Whether a delivered reply should populate the query cache: plain dnsrec
-    /// queries and dnsrec-delivery searches.
     pub(crate) fn wants_dnsrec_cache(&self) -> bool {
         match self {
             Self::AresCallbackDnsRec(_) => true,
-            Self::Search(tail) => matches!(tail.delivery, SearchDelivery::DnsRec { .. }),
             _ => false,
         }
     }
@@ -228,18 +206,21 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     let Some(callback) = callback else { return; };
     let name_str = unsafe { cstr_lossy(name) };
     // Name sanity precedes the channel deref: a bad name reports even on a
-    // NULL channel (upstream ordering), so this one check runs pre-state.
+    // NULL channel (upstream ordering).
     if let Some(status) = api::search_precheck(name_str) {
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
         return;
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let _ = dnsclass;
+    let ctx = crate::core::search::SearchCtx {
+        res: channeldata.state.resources(),
+        ndots: channeldata.state.transport.config.options.ndots,
+        search: std::rc::Rc::from(channeldata.state.transport.config.search.clone()),
+        use_vc: channeldata.state.transport.config.options.use_vc,
+    };
     let tail = SearchTail { dnstype: dnstype as u16, delivery: SearchDelivery::Raw { callback, arg } };
-    let binding = FFIData::base(Callback::Search(tail));
-    if let Err(status) = channeldata.state.search(name_str, dnstype as u16, false, binding) {
-        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
-    }
+    channeldata.spawn_search(ctx, name_str.to_string(), dnstype as u16, false, tail);
 }
 
 /// # Safety
@@ -299,9 +280,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     arg: *mut c_void,
 ) {
     let Some(callback) = callback else { return; };
-    // Extract the query name and type from the dns record
     if dnsrec.is_null() { return; }
-    // Extract the first query's name/type through the record's safe accessors.
     let rec = unsafe { &*dnsrec };
     let mut query_name: Option<&CStr> = None;
     let mut qtype: c_uint = 0;
@@ -313,19 +292,19 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     }
     let Some(query_name) = query_name else { return; };
     let name_str = query_name.to_str().unwrap_or("");
-
-    // Same pre-state ordering as ares_search: bad names report before the
-    // channel is dereferenced.
     if let Some(status) = api::search_precheck(name_str) {
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         return;
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let ctx = crate::core::search::SearchCtx {
+        res: channeldata.state.resources(),
+        ndots: channeldata.state.transport.config.options.ndots,
+        search: std::rc::Rc::from(channeldata.state.transport.config.search.clone()),
+        use_vc: channeldata.state.transport.config.options.use_vc,
+    };
     let tail = SearchTail { dnstype: qtype as u16, delivery: SearchDelivery::DnsRec { callback, arg } };
-    let binding = FFIData::base(Callback::Search(tail));
-    if let Err(status) = channeldata.state.search(name_str, qtype as u16, true, binding) {
-        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
-    }
+    channeldata.spawn_search(ctx, name_str.to_string(), qtype as u16, true, tail);
 }
 
 /// Looks up the node name and service name for a socket address.
@@ -417,46 +396,6 @@ pub(crate) fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: Ar
     let node_ptr = reply.node.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
     let service_ptr = reply.service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
     unsafe { callback(ffidata.arg, reply.status.code(), reply.timeouts, node_ptr, service_ptr) };
-}
-
-/// Executor for a settled search task: one core call decides (and performs
-/// any re-issue); the marshal here only fires the returned delivery.
-pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, tail: SearchTail, task: &Task<FFIData>, channeldata: &mut ChannelData) {
-    let TaskMachine::Search(sm) = &task.machine else { unreachable!("search task carries a Search machine") };
-    let binding = task.userdata;
-    match channeldata.state.on_search_reply(sm, res.map_err(AresError::from), tail.dnstype, task.timeouts, binding) {
-        None => {}
-        Some(api::SearchReplyDelivery::Success { timeouts }) => {
-            let buf = res.unwrap_or(&[]); // Success is only emitted for Ok replies
-            match tail.delivery {
-                SearchDelivery::Raw { callback, arg } => {
-                    let buf_copy = buf.to_vec();
-                    unsafe { callback(arg, ARES_SUCCESS, timeouts, buf_copy.as_ptr() as *mut u8, buf_copy.len() as c_int) };
-                }
-                SearchDelivery::DnsRec { callback, arg } => {
-                    // Parse (in core) and deliver as a dns record
-                    match dns_record::parse_record(buf) {
-                        Ok(rec) => {
-                            let dnsrec = Box::into_raw(Box::new(rec));
-                            unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };
-                            unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
-                        }
-                        Err(parse_status) => {
-                            unsafe { callback(arg, parse_status.code(), timeouts as usize, std::ptr::null_mut()) };
-                        }
-                    }
-                }
-            }
-        }
-        Some(api::SearchReplyDelivery::Fail { status, timeouts }) => match tail.delivery {
-            SearchDelivery::Raw { callback, arg } => unsafe {
-                callback(arg, status.code(), timeouts, std::ptr::null_mut(), 0);
-            },
-            SearchDelivery::DnsRec { callback, arg } => unsafe {
-                callback(arg, status.code(), timeouts as usize, std::ptr::null_mut());
-            },
-        },
-    }
 }
 
 #[no_mangle]
