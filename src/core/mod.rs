@@ -5,7 +5,7 @@
 
 pub mod api;
 pub mod socket;
-pub mod channel;
+pub mod client;
 pub mod dns_record;
 pub mod error;
 pub mod launch;

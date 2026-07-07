@@ -13,7 +13,7 @@ use std::rc::Rc;
 use bytes::BytesMut;
 
 use crate::core::transport::{dns_query_payload, qtype_of, Family, SocketSource, Status, TaskMachine};
-use crate::core::channel::ChannelState;
+use crate::core::client::Client;
 use crate::core::lookup::{AddrInfoAction, AddrInfoEvent, AddrInfoSm, HostByNameSm};
 use crate::core::AresError;
 use crate::ffi::error::ARES_ECONNREFUSED;
@@ -23,7 +23,7 @@ use crate::ffi::{RECORD_TYPE_A, RECORD_TYPE_AAAA};
 /// the state-machine handle plus the query's family/record-type (and, for a
 /// batch send, the accumulated timeout count). The ffi userdata carries none
 /// of this now — the reply reads it from the `Task`.
-fn stamp<T>(st: &mut ChannelState<T>, machine: TaskMachine, family: i32, rtype: u16, timeouts: i32) {
+fn stamp<T>(st: &mut Client<T>, machine: TaskMachine, family: i32, rtype: u16, timeouts: i32) {
     if let Some(t) = st.ares.tasks.last_mut() {
         t.machine = machine;
         t.family = family;
@@ -45,7 +45,7 @@ pub(crate) enum LaunchOutcome {
 /// creation or consent failure (the failure accounting is ServerHealth's).
 #[allow(clippy::too_many_arguments)] // internal seam of api::gethostbyname / on_hostbyname_reply
 pub(crate) fn launch_pooled<T: Copy>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     hostname: &str,
     family: i32,
     rtype: u16,
@@ -129,7 +129,7 @@ pub(crate) enum AddrInfoDelivery {
 /// batch send, or ResendFailed for a re-send, back into the machine) and
 /// collect the Deliver* actions for the shim.
 pub(crate) fn drive_addrinfo<T: Copy>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     sm: &Rc<RefCell<AddrInfoSm>>,
     actions: Vec<AddrInfoAction>,
     binding: T,
@@ -204,7 +204,7 @@ pub(crate) fn timeout_step<T>(
 /// Launch a probe query to an expired-failure server in parallel with the
 /// primary query (no user callback; a failed/refused socket just skips it).
 pub(crate) fn maybe_launch_probe<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     hostname: &str,
     family: i32,
     primary_server: usize,
@@ -234,7 +234,7 @@ pub(crate) fn maybe_launch_probe<T>(
 /// created is `Err(ARES_ECONNREFUSED)` — the status every caller delivers —
 /// so call sites just use `?`.
 pub(crate) fn issue<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     payload: BytesMut,
     source: SocketSource,
     server: usize,
@@ -249,7 +249,7 @@ pub(crate) fn issue<T>(
 /// — including a callback-refused fd — in which case the caller delivers
 /// ECONNREFUSED.
 pub(crate) fn reissue<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     payload: BytesMut,
     source: SocketSource,
     server: usize,

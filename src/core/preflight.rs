@@ -12,7 +12,7 @@ use crate::core::hostfile::{AddressFamily, HostLookup};
 use crate::core::services::Services;
 use crate::core::lookup::{is_onion_domain, SearchPlan, SearchSm};
 use crate::core::response::ParsedResponse;
-use crate::core::channel::ChannelState;
+use crate::core::client::Client;
 use crate::core::AresError;
 use crate::ffi::error::{ARES_EBADSTR, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_SUCCESS};
 use crate::ffi::{
@@ -117,7 +117,7 @@ pub(crate) struct AddrInfo {
 
 /// The pure body of ares_gethostbyname_file: hosts-file-only lookup.
 pub(crate) fn hosts_file_lookup<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     name: &str,
     family: i32,
 ) -> Result<HostLookup, AresError> {
@@ -210,7 +210,7 @@ pub(crate) fn search_name_check(name_str: &str) -> Option<AresError> {
 /// Seed a search-domain iteration (ares_search / ares_search_dnsrec):
 /// no-servers guard, then the SearchPlan + machine.
 pub(crate) fn search_start<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     name_str: &str,
     retry_server_error: bool,
 ) -> Result<(SearchSm, String), AresError> {
@@ -227,14 +227,14 @@ pub(crate) fn search_start<T>(
 }
 
 /// ENOSERVER guard shared by ares_query / ares_query_dnsrec / ares_send.
-pub(crate) fn no_servers<T>(st: &ChannelState<T>) -> bool {
+pub(crate) fn no_servers<T>(st: &Client<T>) -> bool {
     st.ares.config.nameservers.is_empty()
 }
 
 /// The ares_query_dnsrec cache probe: a fresh cached reply for
 /// (name, qtype), evicting an expired entry on the way.
 pub(crate) fn cached_reply<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     name_clean: &str,
     qtype: u16,
     now: Instant,

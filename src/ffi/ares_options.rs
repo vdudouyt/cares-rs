@@ -6,7 +6,7 @@ use crate::ffi::Channel;
 use std::net::Ipv4Addr;
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
-use crate::core::channel::DecodedOptions;
+use crate::core::client::DecodedOptions;
 use crate::ffi::channel::ChannelData;
 use crate::ares_socket_t;
 

@@ -19,12 +19,12 @@ use std::time::Instant;
 use bytes::BytesMut;
 
 use crate::core::transport::{dns_query_payload, rdns_name, SocketSource};
-use crate::core::channel::ChannelState;
+use crate::core::client::Client;
 use crate::core::launch::{
     drive_addrinfo, issue, launch_pooled, maybe_launch_probe, AddrInfoDelivery, LaunchOutcome,
 };
 use crate::core::transport::TaskMachine;
-use crate::core::channel::cache_store_names;
+use crate::core::client::cache_store_names;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::AddressFamily;
 use crate::core::lookup::{
@@ -65,7 +65,7 @@ pub(crate) enum Operation<T> {
 }
 
 /// ares_query: reject server-less channels, then enqueue.
-pub(crate) fn query<T>(st: &mut ChannelState<T>, name: &str, qtype: u16, userdata: T) -> Result<(), AresError> {
+pub(crate) fn query<T>(st: &mut Client<T>, name: &str, qtype: u16, userdata: T) -> Result<(), AresError> {
     if no_servers(st) {
         return Err(ARES_ENOSERVER.into());
     }
@@ -74,7 +74,7 @@ pub(crate) fn query<T>(st: &mut ChannelState<T>, name: &str, qtype: u16, userdat
 }
 
 /// ares_send: a pre-built packet must at least hold a DNS header.
-pub(crate) fn send<T>(st: &mut ChannelState<T>, query_buf: &[u8], userdata: T) -> Result<(), AresError> {
+pub(crate) fn send<T>(st: &mut Client<T>, query_buf: &[u8], userdata: T) -> Result<(), AresError> {
     if query_buf.len() < 12 {
         return Err(ARES_EBADQUERY.into());
     }
@@ -90,7 +90,7 @@ pub(crate) fn send<T>(st: &mut ChannelState<T>, query_buf: &[u8], userdata: T) -
 /// fresh query. A cache hit is parsed right here (`Ready`); the shim boxes the
 /// record, delivers, and destroys.
 pub(crate) fn query_dnsrec<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     name_raw: &str,
     qtype: u16,
     now: Instant,
@@ -117,7 +117,7 @@ pub(crate) fn query_dnsrec<T>(
 /// [`search_name_check`]) *before* the channel is dereferenced — a bad name
 /// is reported even on a NULL channel, so it cannot live in here.
 pub(crate) fn search<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     name: &str,
     dnstype: u16,
     retry_server_error: bool,
@@ -131,7 +131,7 @@ pub(crate) fn search<T>(
 }
 
 /// ares_gethostbyname_file: the hosts-file-only lookup, shaped for C.
-pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family: i32) -> Result<Hostent, AresError> {
+pub(crate) fn gethostbyname_file<T>(st: &mut Client<T>, name: &str, family: i32) -> Result<Hostent, AresError> {
     hosts_file_lookup(st, name, family).map(Hostent::from_lookup)
 }
 
@@ -144,7 +144,7 @@ pub(crate) fn gethostbyname_file<T>(st: &mut ChannelState<T>, name: &str, family
 /// address — is recorded on the `Task` itself (`queried_ip`), not stamped
 /// into the ffi userdata, and the reply reads it back from there.
 pub(crate) fn gethostbyaddr<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     addrbuf: &[u8],
     family: i32,
     userdata: T,
@@ -186,7 +186,7 @@ pub(crate) enum NameinfoResult {
 /// The LOOKUPHOST default the handler applies here affects only the path
 /// decision — never the reply — so the shim's raw-flag userdata is correct.
 pub(crate) fn getnameinfo<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     addr: &AddrInfo,
     flags: i32,
     userdata: T,
@@ -233,7 +233,7 @@ pub(crate) fn getnameinfo<T>(
 /// the shim afterwards. A synchronous hit (IP literal / hosts file / localhost
 /// / query cache) is `Ok(Operation::Ready(hostent))`.
 pub(crate) fn gethostbyname<T: Copy>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     hostname: &str,
     family: i32,
     now: Instant,
@@ -400,7 +400,7 @@ pub(crate) struct AddrInfoResult {
 /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
 /// then mint the machine and drive the A/AAAA batch.
 pub(crate) fn getaddrinfo<T: Copy>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     hostname_raw: &str,
     ai_family: i32,
     binding: T,
@@ -517,7 +517,7 @@ pub(crate) fn on_host_reply(res: Result<&[u8], AresError>, rtype: u16, family: i
 /// sortlist, and return what the shim must deliver to C.
 #[allow(clippy::too_many_arguments)] // reply-executor seam: the task's binding rides along
 pub(crate) fn on_hostbyname_reply<T: Copy>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     sm: &Rc<RefCell<HostByNameSm>>,
     res: Result<&[u8], AresError>,
     server: usize,
@@ -596,7 +596,7 @@ pub(crate) enum SearchReplyDelivery {
 /// asked (a failed re-issue reports ECONNREFUSED with zero timeouts, as
 /// historically), or hand the delivery back to the shim.
 pub(crate) fn on_search_reply<T>(
-    st: &mut ChannelState<T>,
+    st: &mut Client<T>,
     sm: &Rc<RefCell<SearchSm>>,
     res: Result<&[u8], AresError>,
     dnstype: u16,

@@ -2,7 +2,7 @@
 //! state notification callbacks it fires.
 
 use super::*;
-use crate::core::channel::{tcp_payload, ChannelState};
+use crate::core::client::{tcp_payload, Client};
 use crate::core::transport::Task;
 use crate::core::launch::{read_tcp_frame, reissue, timeout_step};
 
@@ -10,7 +10,7 @@ use crate::core::launch::{read_tcp_frame, reissue, timeout_step};
 /// queried ip) from a settled task onto the retry task `reissue` just pushed,
 /// stamping the accumulated timeout count — so the eventual reply is
 /// attributed just like the original send. (`enqueue` defaults these fields.)
-fn carry_over(state: &mut ChannelState<FFIData>, old: &Task<FFIData>, timeouts: i32, failover_tries: u32) {
+fn carry_over(state: &mut Client<FFIData>, old: &Task<FFIData>, timeouts: i32, failover_tries: u32) {
     if let Some(t) = state.ares.tasks.last_mut() {
         t.machine = old.machine.clone();
         t.family = old.family;

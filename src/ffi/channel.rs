@@ -2,14 +2,14 @@
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
 
 use super::*;
-use crate::core::channel::{getsock_mask, normalize_port, ChannelState, ServerSpec};
+use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
 
 
 /// The C-visible channel: the pure core state plus the channel-level C
 /// callbacks. Everything the shims marshal lives behind `.state`; the six
 /// callback fields are the only C-tainted residents.
 pub struct ChannelData {
-    pub(crate) state: ChannelState<FFIData>,
+    pub(crate) state: Client<FFIData>,
     /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
     /// in `state.ares`. The socket-state callbacks (create/configure) live in
     /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
@@ -21,7 +21,7 @@ pub struct ChannelData {
 
 impl ChannelData {
     /// A fresh channel: pure state, no callbacks installed.
-    pub(crate) fn new(state: ChannelState<FFIData>, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
+    pub(crate) fn new(state: Client<FFIData>, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
         ChannelData {
             state,
             socket_factory,
@@ -43,7 +43,7 @@ impl ChannelData {
     /// A fresh channel with the default (libc) socket factory.
     pub(crate) fn new_default() -> Self {
         let factory = std::rc::Rc::new(CSocketFactory::default());
-        let state = ChannelState::new(Transport::from_sysconfig(factory.clone()));
+        let state = Client::new(Transport::from_sysconfig(factory.clone()));
         ChannelData::new(state, factory)
     }
 

@@ -27,7 +27,7 @@ use crate::ffi::ares_options::{
 /// Everything a channel owns that is pure Rust: the engine, health/cache
 /// bookkeeping, configuration strings, and the shared-socket pools. Generic
 /// over the per-task userdata `T`, which core never inspects.
-pub(crate) struct ChannelState<T> {
+pub(crate) struct Client<T> {
     pub ares: Transport<T>,
     pub readbuf: Vec<u8>,
     pub server_health: ServerHealth,
@@ -47,10 +47,10 @@ pub(crate) struct ChannelState<T> {
     pub server_failover_retry_delay: u64,  // milliseconds
 }
 
-impl<T> ChannelState<T> {
+impl<T> Client<T> {
     /// A fresh channel around `ares` — shared by ares_init and ares_init_options.
     pub fn new(ares: Transport<T>) -> Self {
-        ChannelState {
+        Client {
             ares,
             readbuf: vec![0u8; 65_535],
             server_health: ServerHealth::default(),
@@ -74,11 +74,11 @@ impl<T> ChannelState<T> {
     /// The pure body of ares_dup: clone configuration, start with a fresh
     /// reactor state (empty query cache, no pooled connections, cleared
     /// failure timestamps — but cloned failure counts).
-    pub fn duplicate(&self) -> ChannelState<T> {
+    pub fn duplicate(&self) -> Client<T> {
         let mut ares = Transport::new(self.ares.config.clone(), self.ares.socket_factory.clone());
         ares.default_udp_port = self.ares.default_udp_port;
         ares.default_tcp_port = self.ares.default_tcp_port;
-        let mut dup = ChannelState::new(ares);
+        let mut dup = Client::new(ares);
         dup.server_health = ServerHealth {
             failures: self.server_health.failures.clone(),
             last_failure: vec![None; self.server_health.last_failure.len()],
