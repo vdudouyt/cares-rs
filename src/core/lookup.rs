@@ -444,15 +444,13 @@ impl AddrInfoSm {
 /// Which lifecycle owns a task. AddrInfo and HostByName run their own
 /// failover/TC machines, so the reactor-level policies skip them.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TaskKind { AddrInfo, HostByName, Search, Probe, Other }
+pub enum TaskKind { AddrInfo, Search, Other }
 
 /// What a cancel/destroy teardown owes a pending task's owner.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TeardownDelivery {
     /// Report the teardown status with an empty/NULL payload directly.
     DeliverNull,
-    /// Probes have no owner: drop silently.
-    Silent,
     /// Run the task's normal error path (the AddrInfo machine folds the
     /// cancel into its batch join; plain callbacks just get the status).
     Full,
@@ -461,8 +459,7 @@ pub enum TeardownDelivery {
 /// The cancel/destroy policy table, keyed by lifecycle.
 pub fn teardown_delivery(kind: TaskKind) -> TeardownDelivery {
     match kind {
-        TaskKind::HostByName | TaskKind::Search => TeardownDelivery::DeliverNull,
-        TaskKind::Probe => TeardownDelivery::Silent,
+        TaskKind::Search => TeardownDelivery::DeliverNull,
         TaskKind::AddrInfo | TaskKind::Other => TeardownDelivery::Full,
     }
 }
@@ -812,7 +809,7 @@ mod tests {
 
         // success rcode: notify-ok for everyone except AddrInfo; always Deliver
         for (kind, notifies) in [(TaskKind::Other, true), (TaskKind::Search, true),
-                                 (TaskKind::HostByName, true), (TaskKind::AddrInfo, false)] {
+                                 (TaskKind::AddrInfo, false)] {
             let mut h = ServerHealth::default();
             h.reset(2);
             h.record_failure(0);
@@ -825,7 +822,7 @@ mod tests {
         // SERVFAIL, 2 servers: every kind fails over to the next server (the
         // reactor owns failover now); all notify server-state-fail except
         // getaddrinfo, which issues no server-state notifications.
-        for kind in [TaskKind::Other, TaskKind::Search, TaskKind::HostByName, TaskKind::AddrInfo] {
+        for kind in [TaskKind::Other, TaskKind::Search, TaskKind::AddrInfo] {
             let mut h = ServerHealth::default();
             h.reset(2);
             let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), kind, 0, false, 2, 0, &mut h);
@@ -852,7 +849,7 @@ mod tests {
         // TC flag on UDP: RetryTcp for every kind (the reactor owns TC now);
         // already-TCP never TC-retries
         let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
-        for kind in [TaskKind::Other, TaskKind::Search, TaskKind::HostByName, TaskKind::AddrInfo] {
+        for kind in [TaskKind::Other, TaskKind::Search, TaskKind::AddrInfo] {
             let mut h = ServerHealth::default();
             h.reset(1);
             let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, false, 2, 0, &mut h);

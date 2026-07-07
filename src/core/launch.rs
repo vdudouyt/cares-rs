@@ -9,14 +9,6 @@
 use crate::core::transport::Status;
 use crate::core::AresError;
 
-/// How a pooled launch (the async gethostbyname send path) settled.
-pub(crate) enum LaunchOutcome {
-    Launched,
-    /// Every attempt failed to create a socket; the future settles with
-    /// ECONNREFUSED and reports its own timeout count.
-    Exhausted,
-}
-
 /// One delivery the getaddrinfo machine owes its C callback; the shim
 /// marshals and fires them after the drive returns. Success carries the
 /// machine's accumulated records (taken at emission), so the shim never

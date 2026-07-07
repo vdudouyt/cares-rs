@@ -7,16 +7,17 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 
 use crate::core::api::{AddrInfoResult, NameinfoResult, Operation, SearchReplyDelivery};
+use crate::core::executor;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::AddressFamily;
-use crate::core::launch::{AddrInfoDelivery, LaunchOutcome};
+use crate::core::launch::AddrInfoDelivery;
 use crate::core::lookup::{
     is_localhost, is_onion_domain, AddrInfoAction, AddrInfoEvent, AddrInfoSm, LookupEvent,
     SearchAction, SearchPlan, SearchSm, ServerHealth,
@@ -27,10 +28,10 @@ use crate::core::preflight::{
     search_start, AddrInfo,
 };
 use crate::core::response::{ParsedRRs, ParsedResponse};
-use crate::core::socket::Socket;
+use crate::core::query_builder::dns_query_payload;
 use crate::core::sortlist::{apply_sortlist, SortlistEntry};
 use crate::core::transport::{
-    dns_query_payload, qtype_of, rdns_name, Family, SocketSource, Status, TaskMachine, Transport,
+    qtype_of, rdns_name, Family, SocketSource, Status, TaskMachine, Transport,
 };
 use crate::core::AresError;
 use crate::ffi::ares_options::{
@@ -56,7 +57,9 @@ use crate::ffi::{
 pub(crate) struct Client<T> {
     pub transport: Transport<T>,
     pub readbuf: Vec<u8>,
-    pub server_health: ServerHealth,
+    /// Shared with the async engine's in-flight futures (`Rc<RefCell<_>>`) so
+    /// failover accounting, the probe, and the classic reactor agree.
+    pub server_health: Rc<RefCell<ServerHealth>>,
     pub sortlist: Vec<SortlistEntry>,
     pub flags: i32,
     pub maxtimeout: i32,
@@ -66,9 +69,13 @@ pub(crate) struct Client<T> {
     pub query_cache: HashMap<(String, u16), (Vec<u8>, Instant)>,
     pub query_cache_max_ttl: u32, // 0 = disabled
     pub udp_max_queries: u32, // 0 = unlimited
-    pub udp_connections: Vec<(usize, Rc<dyn Socket>, u32)>, // (server_index, shared_socket, query_count)
-    pub tcp_connections: Vec<(usize, Rc<dyn Socket>)>, // (server_index, shared_socket)
-    pub tcp_recv_buffers: HashMap<i32, Vec<u8>>, // fd -> accumulated TCP receive data
+    /// Shared TCP connections for the async engine (parallel lookups to one
+    /// server share a connection); handed to each future via its descriptor.
+    pub tcp_pool: Rc<RefCell<crate::core::executor::TcpPool>>,
+    /// Per-server connect endpoints, cached (rebuilt on server change) so each
+    /// async launch clones an `Rc` instead of re-snapshotting the config.
+    endpoints: Rc<Vec<executor::ServerEndpoint>>,
+    pub tcp_recv_buffers: HashMap<i32, Vec<u8>>, // classic reactor TCP reassembly (fd -> data)
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
 }
@@ -76,10 +83,10 @@ pub(crate) struct Client<T> {
 impl<T> Client<T> {
     /// A fresh channel around `transport` — shared by ares_init and ares_init_options.
     pub fn new(transport: Transport<T>) -> Self {
-        Client {
+        let mut client = Client {
             transport,
             readbuf: vec![0u8; 65_535],
-            server_health: ServerHealth::default(),
+            server_health: Rc::new(RefCell::new(ServerHealth::default())),
             sortlist: vec![],
             flags: 0,
             maxtimeout: 0,
@@ -89,12 +96,14 @@ impl<T> Client<T> {
             query_cache: HashMap::new(),
             query_cache_max_ttl: 0,
             udp_max_queries: 0,
-            udp_connections: vec![],
-            tcp_connections: vec![],
+            tcp_pool: Rc::new(RefCell::new(crate::core::executor::TcpPool::default())),
+            endpoints: Rc::new(Vec::new()),
             tcp_recv_buffers: HashMap::new(),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
-        }
+        };
+        client.rebuild_endpoints();
+        client
     }
 
     /// The pure body of ares_dup: clone configuration, start with a fresh
@@ -105,10 +114,13 @@ impl<T> Client<T> {
         transport.default_udp_port = self.transport.default_udp_port;
         transport.default_tcp_port = self.transport.default_tcp_port;
         let mut dup = Client::new(transport);
-        dup.server_health = ServerHealth {
-            failures: self.server_health.failures.clone(),
-            last_failure: vec![None; self.server_health.last_failure.len()],
-        };
+        {
+            let src = self.server_health.borrow();
+            dup.server_health = Rc::new(RefCell::new(ServerHealth {
+                failures: src.failures.clone(),
+                last_failure: vec![None; src.last_failure.len()],
+            }));
+        }
         dup.sortlist = self.sortlist.clone();
         dup.flags = self.flags;
         dup.maxtimeout = self.maxtimeout;
@@ -201,7 +213,8 @@ impl<T> Client<T> {
             self.server_failover_retry_chance = o.failover_retry_chance;
             self.server_failover_retry_delay = o.failover_retry_delay;
         }
-        self.server_health.reset(self.transport.config.nameservers.len());
+        self.server_health.borrow_mut().reset(self.transport.config.nameservers.len());
+        self.rebuild_endpoints();
     }
 
     /// The pure inverse of the cascade: read the channel back into option fields.
@@ -281,21 +294,24 @@ impl<T> Client<T> {
             self.transport.config.nameservers.push((server.ip, server.udp_port));
             self.transport.config.tcp_ports.push(server.tcp_port);
         }
-        self.server_health.reset(self.transport.config.nameservers.len());
+        self.server_health.borrow_mut().reset(self.transport.config.nameservers.len());
+        self.rebuild_endpoints();
     }
 
     /// NULL/empty CSV clears every configured server (ares_set_servers*_csv).
     pub fn clear_servers(&mut self) {
         self.transport.config.nameservers.clear();
         self.transport.config.tcp_ports.clear();
-        self.server_health.clear();
+        self.server_health.borrow_mut().clear();
+        self.rebuild_endpoints();
     }
 
     /// Install a parsed CSV server list (ares_set_servers_ports_csv).
     pub fn install_csv_servers(&mut self, ns: Vec<(IpAddr, Option<u16>)>) {
         self.transport.config.tcp_ports = vec![None; ns.len()];
-        self.server_health.reset(ns.len());
+        self.server_health.borrow_mut().reset(ns.len());
         self.transport.config.nameservers = ns;
+        self.rebuild_endpoints();
     }
 
     /// The configured servers with per-entry defaults applied, in order:
@@ -365,19 +381,6 @@ impl<T> Client<T> {
             .count()
     }
 
-    /// Phase-4 pool cleanup: drop UDP sockets past their query budget and TCP
-    /// sockets no task references anymore (Rc::strong_count == 1 == pool-only).
-    pub fn retain_pools(&mut self) {
-        if self.udp_max_queries > 0 {
-            let limit = self.udp_max_queries;
-            self.udp_connections.retain(|(_, rc, count)| {
-                *count < limit || Rc::strong_count(rc) > 1
-            });
-        }
-        // Clean up TCP connections where no tasks reference the socket anymore
-        self.tcp_connections.retain(|(_, rc)| Rc::strong_count(rc) > 1);
-    }
-
     /// Store a dnsrec-flavored reply in the query cache (no-op when the
     /// cache is disabled) — the reactor's post-delivery hook.
     pub fn cache_dnsrec_reply(&mut self, buf: &[u8], now: Instant) {
@@ -386,10 +389,9 @@ impl<T> Client<T> {
         }
     }
 
-    /// Drop every pooled connection and TCP reassembly buffer (ares_cancel).
+    /// Drop the classic reactor's TCP reassembly buffers (ares_cancel). The
+    /// async engine's shared TCP pool is cleared separately by the ffi.
     pub fn clear_pools(&mut self) {
-        self.udp_connections.clear();
-        self.tcp_connections.clear();
         self.tcp_recv_buffers.clear();
     }
 
@@ -470,82 +472,6 @@ impl<T> Client<T> {
         true
     }
 
-    /// Pooled send for an async gethostbyname future: reuse a pooled socket when
-    /// possible, otherwise create one — retrying across servers on socket-
-    /// creation or consent failure (the failure accounting is ServerHealth's).
-    /// The task is tagged `Async(id)` so the reactor routes its settled reply
-    /// back to that future. Returns `Exhausted` if no socket could be created.
-    #[allow(clippy::too_many_arguments)] // internal seam of the async gethostbyname executor
-    pub(crate) fn launch_pooled(
-        &mut self,
-        hostname: &str,
-        family: i32,
-        rtype: u16,
-        use_tcp: bool,
-        server_index: usize,
-        id: usize,
-        binding: T,
-    ) -> LaunchOutcome
-    where
-        T: Copy,
-    {
-        let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
-        let max_tries = self.transport.config.options.attempts as usize;
-        let nservers = self.server_health.len().max(1);
-        let mut si = server_index;
-        let machine = || TaskMachine::Async(id);
-
-        // TCP connection sharing: reuse an existing TCP connection to this server.
-        if use_tcp {
-            if let Some(idx) = self.tcp_connections.iter().position(|(s, _)| *s == si) {
-                let shared_sock = self.tcp_connections[idx].1.clone();
-                let _ = self.transport.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::transport::DnsSocket::Tcp(shared_sock)), si, binding);
-                self.stamp(machine(), family, rtype, 0);
-                return LaunchOutcome::Launched;
-            }
-            // No existing TCP connection — fall through to create one.
-        }
-
-        // UDP max queries: try to reuse an existing shared socket.
-        if !use_tcp && self.udp_max_queries > 0 {
-            let limit = self.udp_max_queries;
-            if let Some(idx) = self.udp_connections.iter().position(|(s, _, c)| *s == si && *c < limit) {
-                let shared_sock = self.udp_connections[idx].1.clone();
-                self.udp_connections[idx].2 += 1;
-                let _ = self.transport.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::transport::DnsSocket::Udp(shared_sock)), si, binding);
-                self.stamp(machine(), family, rtype, 0);
-                return LaunchOutcome::Launched;
-            }
-            // No reusable connection — create a fresh one, then pool it.
-        }
-
-        for _try in 0..max_tries {
-            if self.transport.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, binding).is_ok() {
-                self.stamp(machine(), family, rtype, 0);
-                // Add the fresh socket to the connection pool for reuse.
-                if use_tcp {
-                    if let crate::core::transport::DnsSocket::Tcp(ref rc_sock) = self.transport.tasks.last().expect("just pushed").sock {
-                        self.tcp_connections.push((si, rc_sock.clone()));
-                    }
-                } else if self.udp_max_queries > 0 {
-                    if let crate::core::transport::DnsSocket::Udp(ref rc_sock) = self.transport.tasks.last().expect("just pushed").sock {
-                        self.udp_connections.push((si, rc_sock.clone(), 1));
-                    }
-                }
-                return LaunchOutcome::Launched;
-            }
-            // Socket creation failed — fd exhaustion, or a socket callback refused
-            // the fd: treat as a server failure and try the next, like upstream.
-            if nservers > 1 {
-                self.server_health.record_failure(si);
-                si = self.server_health.pick_next();
-            }
-        }
-        // All retries exhausted — the future settles with ECONNREFUSED and
-        // reports its own accumulated timeout count.
-        LaunchOutcome::Exhausted
-    }
-
     /// Drive the getaddrinfo machine's action queue: perform every Send (a failed
     /// socket — creation error or a callback-refused fd — feeds LaunchFailed for a
     /// batch send, or ResendFailed for a re-send, back into the machine) and
@@ -574,7 +500,7 @@ impl<T> Client<T> {
                         let ev = if batch { AddrInfoEvent::LaunchFailed } else { AddrInfoEvent::ResendFailed };
                         let more = {
                             let mut machine = sm.borrow_mut();
-                            machine.step(ev, &mut self.server_health)
+                            machine.step(ev, &mut self.server_health.borrow_mut())
                         };
                         queue.extend(more);
                     }
@@ -591,57 +517,82 @@ impl<T> Client<T> {
         deliveries
     }
 
-    /// Launch a probe query to an expired-failure server in parallel with the
-    /// primary query (no user callback; a failed/refused socket just skips it).
-    pub(crate) fn maybe_launch_probe(
-        &mut self,
-        hostname: &str,
-        family: i32,
-        primary_server: usize,
-        use_tcp: bool,
-        probe_binding: T,
-    ) {
-        if self.server_failover_retry_chance == 0 {
-            return;
+    // ===== Async-engine resource builders =====
+
+    /// Rebuild the cached endpoint snapshot after a server/port change.
+    pub fn rebuild_endpoints(&mut self) {
+        self.endpoints = Rc::new(self.endpoint_snapshot());
+    }
+
+    /// Snapshot the per-server connect endpoints from config, so an async
+    /// lifecycle future needs no `Transport`.
+    fn endpoint_snapshot(&self) -> Vec<executor::ServerEndpoint> {
+        let default_udp = self.transport.default_udp_port;
+        let default_tcp = self.transport.default_tcp_port;
+        self.transport
+            .config
+            .nameservers
+            .iter()
+            .enumerate()
+            .map(|(i, &(ip, udp_override))| {
+                let udp_port = udp_override.unwrap_or(default_udp);
+                let tcp_port = self.transport.config.tcp_ports.get(i).copied().flatten().unwrap_or(default_tcp);
+                let bind = if ip.is_ipv6() {
+                    SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+                } else {
+                    SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+                };
+                executor::ServerEndpoint {
+                    udp_addr: SocketAddr::from((ip, udp_port)),
+                    tcp_addr: SocketAddr::from((ip, tcp_port)),
+                    bind,
+                }
+            })
+            .collect()
+    }
+
+    /// The retry/timeout knobs an async lifecycle needs.
+    fn query_opts(&self) -> executor::QueryOpts {
+        executor::QueryOpts {
+            attempts: self.transport.config.options.attempts,
+            timeout: Duration::from_millis(self.transport.config.options.timeout_ms as u64),
+            failover_chance: self.server_failover_retry_chance,
+            failover_delay: self.server_failover_retry_delay,
         }
-        let probe_server = match self.server_health.pick_probe(self.server_failover_retry_delay, primary_server) {
-            Some(s) => s,
-            None => return,
-        };
-        let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
-        // Best-effort: if the probe's socket can't be created (or is refused), skip it.
-        // The probe carries a copy of the lookup's binding, but `TaskMachine::Probe`
-        // marks it so the reply routes to the probe handler, never the user callback.
-        if self.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), probe_server, probe_binding).is_ok() {
-            if let Some(t) = self.transport.tasks.last_mut() {
-                t.machine = TaskMachine::Probe;
-            }
+    }
+
+    /// Bundle the owned resources an async lifecycle future carries. Cheap: all
+    /// `Rc` clones (endpoints cached, rebuilt only on server change).
+    fn resources(&self) -> executor::Resources {
+        executor::Resources {
+            factory: self.transport.socket_factory.clone(),
+            health: self.server_health.clone(),
+            endpoints: self.endpoints.clone(),
+            tcp_pool: self.tcp_pool.clone(),
+            opts: self.query_opts(),
         }
     }
 
     // ===== Entry points (one method per ares_* export) =====
 
-    /// ares_query via the executor spike: run the preflight (`no_servers`) and,
-    /// if it passes, hand back the wire payload for an async query-future to
-    /// send. All policy stays here; ffi only drives the future.
-    pub(crate) fn query_payload(&self, name: &str, qtype: u16) -> Result<BytesMut, AresError> {
+    /// ares_query: `no_servers` preflight, then a launch descriptor carrying the
+    /// owned resources + wire payload for the async lifecycle.
+    pub(crate) fn query_payload(&self, name: &str, qtype: u16) -> Result<executor::RawLaunch, AresError> {
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        Ok(dns_query_payload(name, qtype))
+        Ok(executor::RawLaunch { res: self.resources(), payload: dns_query_payload(name, qtype) })
     }
 
-    /// ares_send via the executor spike: preflight a pre-built packet (min DNS
-    /// header length, then `no_servers`) and hand back its payload for an async
-    /// query-future to send, instead of enqueuing it directly.
-    pub(crate) fn send_payload(&self, query_buf: &[u8]) -> Result<BytesMut, AresError> {
+    /// ares_send: min-DNS-length + `no_servers` preflight, then a launch descriptor.
+    pub(crate) fn send_payload(&self, query_buf: &[u8]) -> Result<executor::RawLaunch, AresError> {
         if query_buf.len() < 12 {
             return Err(ARES_EBADQUERY.into());
         }
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        Ok(BytesMut::from(query_buf))
+        Ok(executor::RawLaunch { res: self.resources(), payload: BytesMut::from(query_buf) })
     }
 
     /// ares_query_dnsrec: server guard, then the query cache (keyed without the
@@ -782,10 +733,7 @@ impl<T> Client<T> {
     /// an async lifecycle future. A synchronous hit (IP literal / hosts file /
     /// localhost / query cache) is [`HostStart::Ready`]; a rejected name or a
     /// server-less channel is [`HostStart::Fail`].
-    pub(crate) fn gethostbyname(&mut self, hostname: &str, family: i32, now: Instant, binding: T) -> HostStart
-    where
-        T: Copy,
-    {
+    pub(crate) fn gethostbyname(&mut self, hostname: &str, family: i32, now: Instant) -> HostStart {
         // Check order is behavior (each stage may deliver before the next runs):
         // ascii -> onion -> family-validate -> IP literal -> hosts file ->
         // localhost -> HOSTALIASES (fs read; PermissionDenied => Deliver(EFILE)) ->
@@ -911,26 +859,16 @@ impl<T> Client<T> {
             }
         }
 
-        // DNS path: launch the failover probe here (it needs `&mut self`), then
-        // hand the ffi a Launch descriptor for the async lifecycle future — which
-        // performs the primary query and drives search-iteration / AF_UNSPEC.
-        let use_tcp = self.transport.config.options.use_vc;
-        let ndots = self.transport.config.options.ndots;
-        let search = self.transport.config.search.clone();
-        // Mirror the future's first query for the probe: same first plan name and
-        // family (AF_UNSPEC probes AAAA, like the future's first send).
-        let query_hostname =
-            SearchPlan::for_gethostbyname(&resolved_name, ndots, &search).current;
-        let send_family = if family == libc::AF_INET { libc::AF_INET } else { libc::AF_INET6 };
-        let first_server = self.server_health.pick_next();
-        self.maybe_launch_probe(&query_hostname, send_family, first_server, use_tcp, binding);
-
-        HostStart::Launch(HostLaunch {
+        // DNS path: hand the ffi a launch descriptor for the async lifecycle
+        // future, which owns its socket(s) and runs the primary query, the
+        // failover probe, and search-iteration / AF_UNSPEC entirely itself.
+        HostStart::Launch(executor::HostLaunch {
+            res: self.resources(),
             hostname: resolved_name,
             family,
-            use_tcp,
-            ndots,
-            search,
+            use_tcp: self.transport.config.options.use_vc,
+            ndots: self.transport.config.options.ndots,
+            search: self.transport.config.search.clone(),
             cache: self.query_cache_max_ttl > 0,
         })
     }
@@ -1012,7 +950,7 @@ impl<T> Client<T> {
             self.transport.config.options.ndots,
             &self.transport.config.search,
         );
-        let first_server = self.server_health.pick_next();
+        let first_server = self.server_health.borrow().pick_next();
         let sm = AddrInfoSm::new(plan, ai_family, use_tcp);
 
         let handle = Rc::new(RefCell::new(sm));
@@ -1069,52 +1007,18 @@ impl<T> Client<T> {
         }
     }
 
-    /// A probe task settled: fold the reply's rcode into the server-health
-    /// accounting. Some(ok) asks the shim to fire the server-state callback.
-    pub(crate) fn on_probe_reply(&mut self, res: Result<&[u8], AresError>, server: usize) -> Option<bool> {
-        let health = &mut self.server_health;
-        match res {
-            Ok(buf) => {
-                let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0xff };
-                if rcode == 0 || rcode == 3 {
-                    // Success or NXDOMAIN — the server is alive again.
-                    health.record_success(server).then_some(true)
-                } else {
-                    // SERVFAIL/NOTIMP/REFUSED — still failing.
-                    health.record_failure(server).then_some(false)
-                }
-            }
-            Err(_) => {
-                // Timeout or other error — update the failure timestamp only.
-                health.record_failure_time(server);
-                None
-            }
-        }
-    }
 }
 
 /// Outcome of the `ares_gethostbyname` pre-DNS cascade: a synchronous hit, a
-/// synchronous failure, or the descriptor for an async DNS lifecycle.
+/// synchronous failure, or the descriptor for an async DNS lifecycle (the
+/// descriptor itself lives in the engine — see [`executor::HostLaunch`]).
 pub(crate) enum HostStart {
     /// IP literal / hosts file / localhost / query-cache hit — deliver now.
     Ready(Hostent),
     /// Rejected name or server-less channel — fail now.
     Fail(AresError),
-    /// Proceed to DNS: the ffi spawns a `hostbyname_lifecycle` future from this.
-    Launch(HostLaunch),
-}
-
-/// Everything the async gethostbyname future needs, snapshotted from the
-/// channel config at launch time (ndots/search don't change mid-lifecycle).
-pub(crate) struct HostLaunch {
-    /// The resolved query name (post-HOSTALIASES), before search-domain append.
-    pub hostname: String,
-    pub family: i32,
-    pub use_tcp: bool,
-    pub ndots: u32,
-    pub search: Vec<String>,
-    /// Whether successful replies should be cached (query_cache_max_ttl > 0).
-    pub cache: bool,
+    /// Proceed to DNS: the ffi spawns a `host_lifecycle` future from this.
+    Launch(executor::HostLaunch),
 }
 
 /// One decoded entry of a caller-supplied server list.
@@ -1229,12 +1133,3 @@ pub(crate) fn cache_store_names(
     }
 }
 
-/// Strip the 2-byte TCP length prefix when re-framing a write buffer for a
-/// retry (enqueue re-frames for the target transport).
-pub(crate) fn tcp_payload(writebuf: &[u8], was_tcp: bool) -> &[u8] {
-    if was_tcp && writebuf.len() > 2 {
-        &writebuf[2..]
-    } else {
-        writebuf
-    }
-}

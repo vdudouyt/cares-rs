@@ -2,9 +2,64 @@
 //! escaped-name analysis (trailing-dot and `\.`/`\DDD` handling), RFC 7686
 //! .onion rejection, label validation, and wire-format packet assembly.
 //! The FFI shim only decodes the C string and mallocs the returned packet.
+//!
+//! Also the neutral home of the lightweight wire codec the resolver engines
+//! share — `dns_query_payload` (build a UDP-form query) plus the TCP length-
+//! prefix helpers `frame_tcp`/`tcp_payload` — so neither the classic reactor
+//! (`transport.rs`) nor the async engine (`executor.rs`) depends on the other.
+
+use bytes::{BufMut, BytesMut};
+use rand::Rng;
 
 use crate::core::AresError;
 use crate::ffi::error::{ARES_EBADNAME, ARES_ENOTFOUND};
+
+/// Write a DNS query directly to the buffer from a hostname string,
+/// avoiding intermediate Vec<String>, DnsQuery, and DnsFrame allocations.
+fn write_dns_query_direct(buf: &mut BytesMut, hostname: &str, qtype: u16, transaction_id: u16) {
+    // Header: 12 bytes
+    buf.put_u16(transaction_id);
+    buf.put_u16(0x0100); // flags: standard query, recursion desired
+    buf.put_u16(1); // qdcount
+    buf.put_u16(0); // ancount
+    buf.put_u16(0); // nscount
+    buf.put_u16(0); // arcount
+
+    // Question: labels
+    for label in hostname.split('.').filter(|t| !t.is_empty()) {
+        buf.put_u8(label.len() as u8);
+        buf.put_slice(label.as_bytes());
+    }
+    buf.put_u8(0); // root label
+    buf.put_u16(qtype);
+    buf.put_u16(1); // qclass: IN
+}
+
+/// Build a UDP-form DNS query payload (with a fresh random transaction id).
+pub fn dns_query_payload(name: &str, qtype: u16) -> BytesMut {
+    let transaction_id = rand::thread_rng().r#gen::<u16>();
+    let mut buf = BytesMut::with_capacity(12 + name.len() + 2 + 4);
+    write_dns_query_direct(&mut buf, name, qtype, transaction_id);
+    buf
+}
+
+/// Wrap a DNS payload in the 2-byte big-endian length prefix used for TCP framing.
+pub fn frame_tcp(payload: &[u8]) -> BytesMut {
+    let mut framed = BytesMut::with_capacity(2 + payload.len());
+    framed.put_u16(payload.len() as u16);
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// Strip the 2-byte TCP length prefix, yielding the canonical UDP-form payload
+/// (used when a query moves TCP → UDP on reissue).
+pub(crate) fn tcp_payload(writebuf: &[u8], was_tcp: bool) -> &[u8] {
+    if was_tcp && writebuf.len() > 2 {
+        &writebuf[2..]
+    } else {
+        writebuf
+    }
+}
 
 /// Build a DNS query packet for `name_str`. A positive `max_udp_size`
 /// appends an EDNS OPT pseudo-RR advertising that payload size; zero or

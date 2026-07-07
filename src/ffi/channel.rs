@@ -2,14 +2,15 @@
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
 
 use super::*;
-use crate::core::client::{getsock_mask, normalize_port, tcp_payload, Client, HostLaunch, ServerSpec};
+use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
+use crate::core::query_builder::tcp_payload;
 use crate::core::executor::{
-    hostbyname_lifecycle, noop_waker, raw_lifecycle, Delivery, QueryIo, SendReq, SideEffect,
+    host_lifecycle, noop_waker, raw_lifecycle, Delivery, Effect, HostLaunch, QueryIo, RawLaunch,
 };
 use crate::core::hostent::Hostent;
-use crate::core::launch::{read_tcp_frame, timeout_step, LaunchOutcome};
+use crate::core::launch::{read_tcp_frame, timeout_step};
 use crate::core::sortlist::apply_sortlist;
-use crate::core::transport::{Task, TaskMachine};
+use crate::core::transport::Task;
 use super::lookups::{fire_host_success, HostTail};
 use super::process::carry_over;
 
@@ -39,27 +40,14 @@ struct AsyncQuery {
     sink: AsyncSink,
 }
 
-/// How a completed lifecycle future is delivered to C (and what placeholder
-/// binding its enqueued tasks carry). Async tasks are tagged `Async(id)`, so
-/// `settle` routes their replies to the future and this callback is never
-/// fired via the task — but the placeholder embeds the real one anyway so a
-/// stray fire would still be correct.
+/// How a completed lifecycle future is delivered to C. The future owns its
+/// socket(s), so nothing is enqueued as a `Task` — this only names the callback.
 #[derive(Clone, Copy)]
 enum AsyncSink {
     /// ares_query / ares_send: raw reply bytes to the ares_callback.
     Raw(AresCallback, *mut libc::c_void),
     /// ares_gethostbyname: sorted answers built into a hostent for the host callback.
     Host(HostTail),
-}
-
-impl AsyncSink {
-    /// The placeholder `FFIData` for the tasks this lifecycle enqueues.
-    fn placeholder(self) -> FFIData {
-        match self {
-            AsyncSink::Raw(cb, arg) => FFIData { arg, ..FFIData::base(Callback::AresCallback(cb)) },
-            AsyncSink::Host(tail) => FFIData { arg: tail.arg, ..FFIData::base(Callback::HostByName(tail)) },
-        }
-    }
 }
 
 impl ChannelData {
@@ -119,128 +107,93 @@ impl ChannelData {
                 self.async_queries.len() - 1
             }
         };
-        self.advance_async(id);
+        self.advance(id);
     }
 
     /// ares_query / ares_send: spawn the raw one-shot lifecycle.
-    pub(crate) fn spawn_query(&mut self, payload: BytesMut, callback: AresCallback, arg: *mut libc::c_void) {
+    pub(crate) fn spawn_query(&mut self, launch: RawLaunch, callback: AresCallback, arg: *mut libc::c_void) {
         let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(raw_lifecycle(io.clone(), payload));
+        let fut = Box::pin(raw_lifecycle(io.clone(), launch));
         self.spawn(io, fut, AsyncSink::Raw(callback, arg));
     }
 
     /// ares_gethostbyname (DNS path): spawn the search/AF_UNSPEC lifecycle.
-    pub(crate) fn spawn_hostbyname(&mut self, launch: HostLaunch, tail: HostTail) {
+    pub(crate) fn spawn_host(&mut self, launch: HostLaunch, tail: HostTail) {
         let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(hostbyname_lifecycle(
-            io.clone(),
-            launch.hostname,
-            launch.family,
-            launch.use_tcp,
-            launch.ndots,
-            launch.search,
-            launch.cache,
-        ));
+        let fut = Box::pin(host_lifecycle(io.clone(), launch));
         self.spawn(io, fut, AsyncSink::Host(tail));
     }
 
-    /// Route a settled task outcome: an async task feeds its future's mailbox
-    /// (reply bytes cloned in, since `readbuf` is transient) and is polled to
-    /// completion right here; every other task fires its C callback as before.
+    /// Fire a settled classic-task outcome (search/getaddrinfo/gethostbyaddr/
+    /// nameinfo/probe). The migrated async lifecycles own their sockets and
+    /// never appear here.
     fn settle(&mut self, task: &Task<FFIData>, res: Result<&[u8], c_int>) {
-        if let TaskMachine::Async(id) = task.machine {
-            match self.async_queries.get(id) {
-                Some(Some(aq)) => aq.io.borrow_mut().reply = Some((res.map(|b| b.to_vec()), task.timeouts)),
-                _ => return,
-            }
-            self.advance_async(id);
-        } else {
-            task.userdata.callback.run(res, task, self);
-        }
+        task.userdata.callback.run(res, task, self);
     }
 
-    /// Advance one async future after its mailbox changed (a spawn or a settled
-    /// reply): drain any sends it emits and enqueue them (tagged `Async(id)` so
-    /// the reactor routes the reply back), fire its C callback if it completed,
-    /// and reap the slot. O(1) in the number of in-flight queries — only the one
-    /// future the event touched is polled, never the whole set.
-    fn advance_async(&mut self, id: usize) {
+    /// Advance one async future one step: poll it, apply the effects it emitted
+    /// (server-state notify / success cache), and on completion fire its C
+    /// callback and reap the slot. On `Pending` the future has published the
+    /// fds it is now blocked on into its mailbox.
+    fn advance(&mut self, id: usize) {
+        if self.async_queries.get(id).and_then(|s| s.as_ref()).is_none() {
+            return;
+        }
         let waker = noop_waker();
-        loop {
-            if self.async_queries.get(id).and_then(|s| s.as_ref()).is_none() {
-                return;
-            }
-            let poll = {
-                let mut cx = std::task::Context::from_waker(&waker);
-                self.async_queries[id].as_mut().unwrap().fut.as_mut().poll(&mut cx)
-            };
-            // Apply any fire-and-forget effects the future emitted (cache stores).
-            let effects = {
-                let aq = self.async_queries[id].as_ref().unwrap();
-                std::mem::take(&mut aq.io.borrow_mut().effects)
-            };
-            for effect in effects {
-                match effect {
-                    SideEffect::Cache { names, rtype, ttl, reply } => {
-                        self.state.cache_named(names, rtype, ttl, &reply, Instant::now());
-                    }
+        let poll = {
+            let mut cx = std::task::Context::from_waker(&waker);
+            self.async_queries[id].as_mut().unwrap().fut.as_mut().poll(&mut cx)
+        };
+        let effects = {
+            let aq = self.async_queries[id].as_ref().unwrap();
+            std::mem::take(&mut aq.io.borrow_mut().effects)
+        };
+        for effect in effects {
+            match effect {
+                Effect::NotifyServerState { server, ok, tcp } => {
+                    self.invoke_server_state_callback(server, ok, tcp)
                 }
-            }
-            match poll {
-                std::task::Poll::Ready(delivery) => {
-                    let sink = self.async_queries[id].take().unwrap().sink;
-                    self.finalize(delivery, sink);
-                    return;
-                }
-                std::task::Poll::Pending => {
-                    let sink = self.async_queries[id].as_ref().unwrap().sink;
-                    // Move the outbox out (reuses its allocation; no extra alloc).
-                    let reqs = {
-                        let aq = self.async_queries[id].as_ref().unwrap();
-                        std::mem::take(&mut aq.io.borrow_mut().outbox)
-                    };
-                    if reqs.is_empty() {
-                        return; // genuinely suspended, awaiting a reply
-                    }
-                    for req in reqs {
-                        self.perform_send(id, req, sink);
-                    }
-                    // Loop: re-poll to observe an in-place reply (a launch that
-                    // failed immediately) or to suspend. After a successful launch
-                    // the next poll returns Pending with an empty outbox → return.
+                Effect::CacheNamed { names, rtype, ttl, reply } => {
+                    self.state.cache_named(names, rtype, ttl, &reply, Instant::now())
                 }
             }
         }
+        if let std::task::Poll::Ready(delivery) = poll {
+            let sink = self.async_queries[id].take().unwrap().sink;
+            self.finalize(delivery, sink);
+        }
     }
 
-    /// Perform one send a future emitted, tagging the task `Async(id)` so the
-    /// reactor routes its settled reply back. A launch that can't create a
-    /// socket settles the future with ECONNREFUSED in place.
-    fn perform_send(&mut self, id: usize, req: SendReq, sink: AsyncSink) {
-        let launched = match req {
-            SendReq::Raw { payload, source, server } => {
-                let ok = self.state.enqueue(payload, source, server, sink.placeholder()).is_ok();
-                if ok {
-                    if let Some(t) = self.state.transport.tasks.last_mut() {
-                        t.machine = TaskMachine::Async(id);
+    /// Drive every async future whose published fd is ready (or whose deadline
+    /// passed) this `ares_process` cycle: set its mailbox readiness and poll it.
+    fn drive_fd_futures(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
+        let now = Instant::now();
+        for id in 0..self.async_queries.len() {
+            // Compute readiness under the mailbox borrow (no waits clone), then
+            // release it before `advance` (which needs `&mut self`).
+            let ready = match self.async_queries.get(id).and_then(|s| s.as_ref()) {
+                Some(aq) => {
+                    let mut m = aq.io.borrow_mut();
+                    let mut fired = Vec::new();
+                    for w in &m.waits {
+                        let set = if w.writable { &mut *write_fds } else { &mut *read_fds };
+                        if unsafe { libc::FD_ISSET(w.fd, set) } {
+                            fired.push(w.fd);
+                        }
+                    }
+                    let expired = m.deadline.is_some_and(|d| now >= d);
+                    if fired.is_empty() && !expired {
+                        false
+                    } else {
+                        m.fired = fired;
+                        m.expired = expired;
+                        true
                     }
                 }
-                ok
-            }
-            SendReq::Pooled { hostname, family, rtype, use_tcp } => {
-                // The executor picks the server (matches the state-machine's
-                // per-send `pick_next`); `launch_pooled` tags the task `Async(id)`.
-                let server = self.state.server_health.pick_next();
-                matches!(
-                    self.state.launch_pooled(&hostname, family, rtype, use_tcp, server, id, sink.placeholder()),
-                    LaunchOutcome::Launched
-                )
-                // Exhausted → `launched` stays false → settle ECONNREFUSED below.
-            }
-        };
-        if !launched {
-            if let Some(Some(aq)) = self.async_queries.get(id) {
-                aq.io.borrow_mut().reply = Some((Err(ARES_ECONNREFUSED), 0));
+                None => continue,
+            };
+            if ready {
+                self.advance(id);
             }
         }
     }
@@ -265,32 +218,30 @@ impl ChannelData {
         }
     }
 
-    /// Fire `status` to every in-flight task — async futures routed through the
-    /// executor, others through their C callback — then reap. The shared safe
-    /// teardown for `ares_cancel` (ECANCELLED) / `ares_destroy` (EDESTRUCTION).
+    /// Fire `status` to everything in flight — classic tasks via their C
+    /// callback, async futures aborted (fire the terminal status + drop the
+    /// future, which drops its owned sockets). The shared safe teardown for
+    /// `ares_cancel` (ECANCELLED) / `ares_destroy` (EDESTRUCTION).
     pub(crate) fn abort_all(&mut self, status: c_int) {
         let tasks: Vec<_> = self.state.transport.tasks.drain(..).collect();
         for task in tasks {
-            if task.status == Status::Completed {
-                continue;
-            }
-            if let TaskMachine::Async(id) = task.machine {
-                // Cancel/destroy ABORTS the lifecycle — fire the terminal status
-                // and drop the future. It must NOT be fed as a reply, or a
-                // multi-step lifecycle (gethostbyname's AF_UNSPEC/search) would
-                // re-send into a channel being torn down.
-                self.terminate_async(id, status);
-            } else {
+            if task.status != Status::Completed {
                 task.userdata.callback.run(Err(status), &task, self);
             }
         }
+        for id in 0..self.async_queries.len() {
+            self.terminate_async(id, status);
+        }
+        // Drop any shared TCP connections the aborted futures held.
+        self.state.tcp_pool.borrow_mut().clear();
     }
 
     /// Abort one async lifecycle: fire its terminal status (ECANCELLED /
-    /// EDESTRUCTION) and drop the future without polling it.
+    /// EDESTRUCTION) and drop the future without polling it (so a multi-step
+    /// lifecycle won't re-send into a channel being torn down).
     fn terminate_async(&mut self, id: usize, status: c_int) {
         let Some(slot) = self.async_queries.get_mut(id).and_then(|s| s.take()) else {
-            return; // already reaped (e.g. a sibling task hit this id first)
+            return; // already reaped
         };
         match slot.sink {
             AsyncSink::Raw(callback, arg) => fire_ares_callback(callback, arg, Err(status), 0),
@@ -298,7 +249,35 @@ impl ChannelData {
         }
     }
 
-    /// The 4-phase reactor loop (I/O, timeouts, task cleanup, pool cleanup) as a
+    /// Every (fd, wants_write) the caller should select on: the classic tasks'
+    /// plus every in-flight async future's published waits.
+    fn all_poll_fds(&self) -> Vec<(i32, bool)> {
+        let mut fds = self.state.poll_fds();
+        for aq in self.async_queries.iter().flatten() {
+            for w in &aq.io.borrow().waits {
+                fds.push((w.fd, w.writable));
+            }
+        }
+        fds
+    }
+
+    /// The earliest timeout (ms) across classic tasks and async futures, or
+    /// `None` when nothing is in flight. Folding the futures in is required —
+    /// `timeout_millis` only sees `transport.tasks`, so a futures-only channel
+    /// would otherwise report "no timeout" and the caller would block forever.
+    fn next_deadline_ms(&self) -> Option<u128> {
+        let now = Instant::now();
+        let mut best = self.state.timeout_millis();
+        for aq in self.async_queries.iter().flatten() {
+            if let Some(d) = aq.io.borrow().deadline {
+                let ms = d.saturating_duration_since(now).as_millis();
+                best = Some(best.map_or(ms, |b| b.min(ms)));
+            }
+        }
+        best
+    }
+
+    /// The 4-phase reactor loop (I/O, timeouts, task cleanup, async drive) as a
     /// safe method — the only unsafe left inside is the FD_ISSET macro and the
     /// C-callback invokers it drives; every decision is a core verdict or a
     /// core call.
@@ -367,7 +346,7 @@ impl ChannelData {
                         task.sock.is_tcp(),
                         self.state.transport.config.options.attempts,
                         task.failover_tries,
-                        &mut self.state.server_health,
+                        &mut self.state.server_health.borrow_mut(),
                     );
                     for action in actions {
                         match action {
@@ -422,7 +401,7 @@ impl ChannelData {
             if task.is_expired() && task.status != Status::Completed {
                 // Invoke server_state_callback with failure for timeout
                 self.invoke_server_state_callback(task.server_index, false, task.sock.is_tcp());
-                let timeout_verdict = timeout_step(task, max_tries, task.server_index, &mut self.state.server_health);
+                let timeout_verdict = timeout_step(task, max_tries, task.server_index, &mut self.state.server_health.borrow_mut());
                 if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
                     let is_tcp = task.sock.is_tcp();
                     let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
@@ -449,8 +428,9 @@ impl ChannelData {
         // Phase 3: Cleanup completed tasks
         self.state.transport.tasks.retain(|task| task.status != Status::Completed);
 
-        // Phase 4: Cleanup stale connection pool entries
-        self.state.retain_pools();
+        // Phase 4: drive the fd-owning async futures whose socket is ready (or
+        // whose deadline passed) this cycle.
+        self.drive_fd_futures(read_fds, write_fds);
     }
 
     /// Fire the server-state notification callback (if installed) for a server
@@ -512,7 +492,7 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
     unsafe { libc::FD_ZERO(write_fds) };
     unsafe { libc::FD_ZERO(read_fds) };
 
-    let fds = channeldata.state.poll_fds();
+    let fds = channeldata.all_poll_fds();
     for (fd, wants_write) in &fds {
         if *wants_write {
             unsafe { libc::FD_SET(*fd, write_fds) };
@@ -531,7 +511,7 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return std::ptr::null_mut(); };
     let maxtv_ms = (!maxtv.is_null())
         .then(|| unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 });
-    match crate::core::api::clamp_timeout(channeldata.state.timeout_millis(), maxtv_ms) {
+    match crate::core::api::clamp_timeout(channeldata.next_deadline_ms(), maxtv_ms) {
         crate::core::api::TimeoutChoice::NoTasks => {
             if maxtv.is_null() { return std::ptr::null_mut(); }
             maxtv
@@ -668,7 +648,7 @@ pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
 
-    let fds = channeldata.state.poll_fds();
+    let fds = channeldata.all_poll_fds();
     for i in 0..n {
         let fd = fds.get(i).map(|(fd, _)| *fd).unwrap_or(ARES_SOCKET_BAD);
         unsafe { std::ptr::write(socks.add(i), fd) };
@@ -785,7 +765,8 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 #[no_mangle]
 pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
     let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
-    channeldata.state.active_query_count() as c_int
+    let async_active = channeldata.async_queries.iter().filter(|s| s.is_some()).count();
+    (channeldata.state.active_query_count() + async_active) as c_int
 }
 
 #[no_mangle]

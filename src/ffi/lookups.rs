@@ -54,35 +54,20 @@ pub(crate) struct SearchTail {
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum Callback {
     AresHostCallback(AresHostCallback),
-    AresCallback(AresCallback),
     AresCallbackDnsRec(AresCallbackDnsRec),
     AresNameinfoCallback(AresNameinfoCallback),
     AddrInfo(AddrInfoTail),
-    HostByName(HostTail),
     Search(SearchTail),
 }
 
 impl Callback {
     pub(crate) fn run(&self, buf: Result<&[u8], c_int>, task: &crate::core::transport::Task<FFIData>, channeldata: &mut ChannelData) {
-        // A probe carries a copy of the lookup's binding but must never reach
-        // the user callback: route it to the probe handler (and stay silent on
-        // cancel/destroy). This is checked before the teardown dispatch below,
-        // which keys off the (real) callback kind.
-        if matches!(task.machine, TaskMachine::Probe) {
-            if let Err(status) = &buf {
-                if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED { return; }
-            }
-            return run_probe_callback(buf, channeldata, task);
-        }
         // Cancel/destroy deliveries follow the core policy table.
         if let Err(status) = &buf {
             if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED {
                 match teardown_delivery(self.kind()) {
                     TeardownDelivery::DeliverNull => {
                         match self {
-                            Self::HostByName(tail) => {
-                                unsafe { (tail.callback)(tail.arg, *status, 0, std::ptr::null_mut()) };
-                            }
                             Self::Search(tail) => match tail.delivery {
                                 SearchDelivery::Raw { callback, arg } => unsafe {
                                     callback(arg, *status, task.timeouts, std::ptr::null_mut(), 0);
@@ -91,25 +76,19 @@ impl Callback {
                                     callback(arg, *status, task.timeouts as usize, std::ptr::null_mut());
                                 },
                             },
-                            _ => unreachable!("core maps DeliverNull only to HostByName/Search"),
+                            _ => unreachable!("core maps DeliverNull only to Search"),
                         }
                         return;
                     }
-                    TeardownDelivery::Silent => return,
                     TeardownDelivery::Full => {}
                 }
             }
         }
         match self {
             Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, task),
-            Self::AresCallback(callback) => run_ares_callback(buf, *callback, task),
             Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, task),
             Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, task),
             Self::AddrInfo(tail) => run_ares_addrinfo_callback(buf, *tail, task, channeldata),
-            // gethostbyname is driven by the executor: its tasks are tagged
-            // `Async` (routed by `settle`) or `Probe` (handled above), so a
-            // HostByName binding is never dispatched through here.
-            Self::HostByName(_) => unreachable!("gethostbyname runs via the executor, not Callback::run"),
             Self::Search(tail) => run_ares_search_callback(buf, *tail, task, channeldata),
         }
     }
@@ -117,7 +96,6 @@ impl Callback {
     pub(crate) fn kind(&self) -> TaskKind {
         match self {
             Self::AddrInfo(..) => TaskKind::AddrInfo,
-            Self::HostByName(..) => TaskKind::HostByName,
             Self::Search(..) => TaskKind::Search,
             _ => TaskKind::Other,
         }
@@ -133,19 +111,10 @@ impl Callback {
     }
 }
 
-/// The reactor's view of a task's kind: a failover probe (marked on the core
-/// `Task`, carrying a copy of the lookup's binding) reads as `Probe`;
-/// everything else defers to its `Callback`.
+/// The reactor's view of a classic task's kind — defers to its `Callback`.
+/// (The migrated async lifecycles own their sockets and never become tasks.)
 pub(crate) fn task_kind(task: &Task<FFIData>) -> TaskKind {
-    if matches!(task.machine, TaskMachine::Probe) {
-        TaskKind::Probe
-    } else if matches!(task.machine, TaskMachine::Async(_)) {
-        // An async query behaves like a plain query for reactor policy
-        // (failover / TC / timeout / server-state notification all apply).
-        TaskKind::Other
-    } else {
-        task.userdata.callback.kind()
-    }
+    task.userdata.callback.kind()
 }
 
 /// The C-binding half of a task's userdata: only what the reply needs to
@@ -190,15 +159,12 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { cstr_lossy(hostname) };
     let tail = HostTail { callback, arg };
-    // The binding is only used by the failover probe (tagged TaskMachine::Probe,
-    // so its reply never fires the callback); the async lifecycle carries `tail`.
-    let binding = FFIData::base(Callback::HostByName(tail));
-    match channeldata.state.gethostbyname(hostname, family, Instant::now(), binding) {
+    match channeldata.state.gethostbyname(hostname, family, Instant::now()) {
         HostStart::Fail(status) => {
             unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         }
         HostStart::Ready(bp) => fire_host_success(tail, bp, 0),
-        HostStart::Launch(launch) => channeldata.spawn_hostbyname(launch, tail),
+        HostStart::Launch(launch) => channeldata.spawn_host(launch, tail),
     }
 }
 
@@ -281,10 +247,10 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     let Some(callback) = callback else { return; };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
-    // Executor spike: preflight in core, then let an async query-future drive
-    // the send/await/fire lifecycle (the reactor still owns failover/TC/timeout).
+    // Preflight in core, then spawn an fd-owning async query lifecycle that
+    // creates the socket, sends, and drives its own failover/TC/timeout.
     match channeldata.state.query_payload(name, dnstype as u16) {
-        Ok(payload) => channeldata.spawn_query(payload, callback, arg),
+        Ok(launch) => channeldata.spawn_query(launch, callback, arg),
         Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
     }
 }
@@ -439,10 +405,6 @@ pub(crate) fn fire_host_success(tail: HostTail, hostent: Hostent, timeouts: c_in
     unsafe { ares_free_hostent(c_hostent) };
 }
 
-pub(crate) fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallback, task: &Task<FFIData>) {
-    fire_ares_callback(callback, task.userdata.arg, res, task.timeouts);
-}
-
 pub(crate) fn run_ares_callback_dnsrec(res: Result<&[u8], c_int>, callback: AresCallbackDnsRec, task: &Task<FFIData>) {
     match res.map_err(AresError::from).and_then(dns_record::parse_record) {
         Ok(rec) => {
@@ -573,15 +535,6 @@ fn fire_addrinfo_deliveries(deliveries: Vec<AddrInfoDelivery>, tail: AddrInfoTai
     }
 }
 
-/// Callback for server failover probe queries — the rcode→health verdict is
-/// core's; only the server-state notification fires here.
-pub(crate) fn run_probe_callback(res: Result<&[u8], c_int>, channeldata: &mut ChannelData, task: &Task<FFIData>) {
-    let si = task.server_index;
-    if let Some(ok) = channeldata.state.on_probe_reply(res.map_err(AresError::from), si) {
-        channeldata.invoke_server_state_callback(si, ok, false);
-    }
-}
-
 /// Executor entry for a settled getaddrinfo task: parse the reply (parsing
 /// stays ffi-side), feed the event to `AddrInfoSm::step` (borrow held for the
 /// decision only), then perform the returned actions borrow-free.
@@ -606,7 +559,7 @@ pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, tail: AddrIn
     };
     let actions = {
         let mut machine = sm.borrow_mut();
-        machine.step(ev, &mut channeldata.state.server_health)
+        machine.step(ev, &mut channeldata.state.server_health.borrow_mut())
     };
     let deliveries = channeldata.state.drive_addrinfo(sm, actions, task.userdata);
     fire_addrinfo_deliveries(deliveries, tail);
@@ -622,9 +575,9 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
-    // Executor spike: preflight in core, then drive the async query-future.
+    // Preflight in core, then spawn an fd-owning async query lifecycle.
     match channeldata.state.send_payload(query_buf) {
-        Ok(payload) => channeldata.spawn_query(payload, callback, arg),
+        Ok(launch) => channeldata.spawn_query(launch, callback, arg),
         Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
     }
 }

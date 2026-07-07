@@ -1,6 +1,6 @@
 use std::net::{ SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr };
-use bytes::{ BytesMut, BufMut };
-use rand::Rng;
+use bytes::BytesMut;
+use crate::core::query_builder::frame_tcp;
 use std::time::{ Instant, Duration };
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -20,15 +20,6 @@ pub enum TaskMachine {
     None,
     Search(Rc<RefCell<SearchSm>>),
     AddrInfo(Rc<RefCell<AddrInfoSm>>),
-    /// A server-failover probe: no user callback and no state machine. The
-    /// task carries a copy of the lookup's binding, but this marker routes its
-    /// reply to the probe handler so the user callback is never fired.
-    Probe,
-    /// An async lifecycle future owns this task (ares_query/ares_send/
-    /// gethostbyname): the reactor deposits the settled reply into
-    /// `ChannelData.async_queries[id]` and polls that future instead of firing
-    /// `task.userdata.callback`.
-    Async(usize),
 }
 
 const BIND_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
@@ -75,8 +66,6 @@ pub enum SocketSource {
     Udp,
     /// Create a fresh TCP socket and connect it to the target server.
     Tcp,
-    /// Reuse an already-open (pooled) socket.
-    Shared(DnsSocket),
 }
 
 impl SocketSource {
@@ -86,49 +75,12 @@ impl SocketSource {
     }
 }
 
-/// Write a DNS query directly to the buffer from a hostname string,
-/// avoiding intermediate Vec<String>, DnsQuery, and DnsFrame allocations.
-fn write_dns_query_direct(buf: &mut BytesMut, hostname: &str, qtype: u16, transaction_id: u16) {
-    // Header: 12 bytes
-    buf.put_u16(transaction_id);
-    buf.put_u16(0x0100); // flags: standard query, recursion desired
-    buf.put_u16(1);      // qdcount
-    buf.put_u16(0);      // ancount
-    buf.put_u16(0);      // nscount
-    buf.put_u16(0);      // arcount
-
-    // Question: labels
-    for label in hostname.split('.').filter(|t| !t.is_empty()) {
-        buf.put_u8(label.len() as u8);
-        buf.put_slice(label.as_bytes());
-    }
-    buf.put_u8(0); // root label
-    buf.put_u16(qtype);
-    buf.put_u16(1); // qclass: IN
-}
-
 /// A/AAAA query type for an address family.
 pub fn qtype_of(family: Family) -> u16 {
     match family {
         Family::Ipv4 => 0x01, // A
         Family::Ipv6 => 0x1c, // AAAA
     }
-}
-
-/// Build a UDP-form DNS query payload (with a fresh random transaction id).
-pub fn dns_query_payload(name: &str, qtype: u16) -> BytesMut {
-    let transaction_id = rand::thread_rng().r#gen::<u16>();
-    let mut buf = BytesMut::with_capacity(12 + name.len() + 2 + 4);
-    write_dns_query_direct(&mut buf, name, qtype, transaction_id);
-    buf
-}
-
-/// Wrap a DNS payload in the 2-byte big-endian length prefix used for TCP framing.
-fn frame_tcp(payload: &[u8]) -> BytesMut {
-    let mut framed = BytesMut::with_capacity(2 + payload.len());
-    framed.put_u16(payload.len() as u16);
-    framed.extend_from_slice(payload);
-    framed
 }
 
 pub enum WriteResult {
@@ -181,7 +133,6 @@ impl<T> Transport<T> {
                 self.connect_tcp(&s, server_index);
                 s
             }
-            SocketSource::Shared(ds) => ds,
         };
         // TCP needs the 2-byte length prefix; UDP sends the payload as-is.
         let writebuf = if sock.is_tcp() { frame_tcp(&payload) } else { payload };
@@ -328,6 +279,7 @@ pub fn build_sysconfig() -> SysConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::query_builder::dns_query_payload;
 
     #[test]
     fn write_impl_stale_server_index_fails_gracefully() {
