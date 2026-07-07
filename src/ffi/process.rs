@@ -12,7 +12,7 @@ use crate::core::transport::Task;
 /// stamping the accumulated timeout count — so the eventual reply is
 /// attributed just like the original send. (`enqueue` defaults these fields.)
 pub(crate) fn carry_over(state: &mut Client<FFIData>, old: &Task<FFIData>, timeouts: i32, failover_tries: u32) {
-    if let Some(t) = state.ares.tasks.last_mut() {
+    if let Some(t) = state.transport.tasks.last_mut() {
         t.machine = old.machine.clone();
         t.family = old.family;
         t.rtype = old.rtype;

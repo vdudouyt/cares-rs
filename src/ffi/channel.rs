@@ -13,7 +13,7 @@ use super::process::carry_over;
 pub struct ChannelData {
     pub(crate) state: Client<FFIData>,
     /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
-    /// in `state.ares`. The socket-state callbacks (create/configure) live in
+    /// in `state.transport`. The socket-state callbacks (create/configure) live in
     /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
     /// can simply share the Rc and stay independent.
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
@@ -52,7 +52,7 @@ impl ChannelData {
     /// Install a rebuilt socket factory, keeping the concrete handle and the
     /// core's `Rc<dyn SocketFactory>` in sync (they are the same object).
     pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<CSocketFactory>) {
-        self.state.ares.socket_factory = factory.clone();
+        self.state.transport.socket_factory = factory.clone();
         self.socket_factory = factory;
     }
 
@@ -70,11 +70,11 @@ impl ChannelData {
         if readbuf.len() < 65_535 {
             readbuf.resize(65_535, 0);
         }
-        let mut tasks = std::mem::take(&mut self.state.ares.tasks);
+        let mut tasks = std::mem::take(&mut self.state.transport.tasks);
         for task in &mut tasks {
             if task.status == Status::Completed { continue; }
             if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), write_fds) } {
-                match self.state.ares.write_impl(task) {
+                match self.state.transport.write_impl(task) {
                     WriteResult::Ok => {},
                     WriteResult::Failed => {
                         task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
@@ -123,7 +123,7 @@ impl ChannelData {
                         task_kind(task),
                         task.server_index,
                         task.sock.is_tcp(),
-                        self.state.ares.config.options.attempts,
+                        self.state.transport.config.options.attempts,
                         task.failover_tries,
                         &mut self.state.server_health,
                     );
@@ -169,13 +169,13 @@ impl ChannelData {
         }
         self.state.readbuf = readbuf;
         // Merge: new tasks from read/write callbacks + processed tasks
-        let mut new_tasks = std::mem::take(&mut self.state.ares.tasks);
+        let mut new_tasks = std::mem::take(&mut self.state.transport.tasks);
         tasks.append(&mut new_tasks);
-        self.state.ares.tasks = tasks;
+        self.state.transport.tasks = tasks;
 
         // Phase 2: Timeout handling
-        let max_tries = self.state.ares.config.options.attempts;
-        let mut tasks = std::mem::take(&mut self.state.ares.tasks);
+        let max_tries = self.state.transport.config.options.attempts;
+        let mut tasks = std::mem::take(&mut self.state.transport.tasks);
         for task in &mut tasks {
             if task.is_expired() && task.status != Status::Completed {
                 // Invoke server_state_callback with failure for timeout
@@ -200,12 +200,12 @@ impl ChannelData {
             }
         }
         // Merge back: new tasks from callbacks/retries + processed tasks
-        let mut new_tasks = std::mem::take(&mut self.state.ares.tasks);
+        let mut new_tasks = std::mem::take(&mut self.state.transport.tasks);
         tasks.append(&mut new_tasks);
-        self.state.ares.tasks = tasks;
+        self.state.transport.tasks = tasks;
 
         // Phase 3: Cleanup completed tasks
-        self.state.ares.tasks.retain(|task| task.status != Status::Completed);
+        self.state.transport.tasks.retain(|task| task.status != Status::Completed);
 
         // Phase 4: Cleanup stale connection pool entries
         self.state.retain_pools();
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    let tasks: Vec<_> = channeldata.state.ares.tasks.drain(..).collect();
+    let tasks: Vec<_> = channeldata.state.transport.tasks.drain(..).collect();
     for task in tasks {
         if task.status != Status::Completed {
             task.userdata.callback.run(Err(ARES_ECANCELLED), &task, channeldata);
@@ -263,7 +263,7 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     if let Some(channeldata) = unsafe { channel.as_mut() } {
         // Fire callbacks with ARES_EDESTRUCTION for all pending tasks
-        let tasks: Vec<_> = channeldata.state.ares.tasks.drain(..).collect();
+        let tasks: Vec<_> = channeldata.state.transport.tasks.drain(..).collect();
         for task in tasks {
             if task.status != Status::Completed {
                 task.userdata.callback.run(Err(ARES_EDESTRUCTION), &task, channeldata);

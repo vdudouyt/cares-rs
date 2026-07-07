@@ -130,7 +130,7 @@ pub(crate) fn hosts_file_lookup<T>(
     };
 
     // Lookup in the hosts file cache
-    let lookup = st.ares.hosts().lookup(name, family_filter).ok_or(ARES_ENOTFOUND)?;
+    let lookup = st.transport.hosts().lookup(name, family_filter).ok_or(ARES_ENOTFOUND)?;
     if lookup.addrs.is_empty() {
         return Err(ARES_ENOTFOUND.into());
     }
@@ -214,13 +214,13 @@ pub(crate) fn search_start<T>(
     name_str: &str,
     retry_server_error: bool,
 ) -> Result<(SearchSm, String), AresError> {
-    if st.ares.config.nameservers.is_empty() {
+    if st.transport.config.nameservers.is_empty() {
         return Err(ARES_ENOSERVER.into());
     }
     let plan = SearchPlan::for_search(
         name_str,
-        st.ares.config.options.ndots,
-        &st.ares.config.search,
+        st.transport.config.options.ndots,
+        &st.transport.config.search,
     );
     let query_hostname = plan.current.clone();
     Ok((SearchSm::new(plan, retry_server_error), query_hostname))
@@ -228,7 +228,7 @@ pub(crate) fn search_start<T>(
 
 /// ENOSERVER guard shared by ares_query / ares_query_dnsrec / ares_send.
 pub(crate) fn no_servers<T>(st: &Client<T>) -> bool {
-    st.ares.config.nameservers.is_empty()
+    st.transport.config.nameservers.is_empty()
 }
 
 /// The ares_query_dnsrec cache probe: a fresh cached reply for

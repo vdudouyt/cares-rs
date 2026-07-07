@@ -331,10 +331,10 @@ mod tests {
         // list out from under the in-flight task — write_impl must fail gracefully
         // (WriteResult::Failed) rather than index nameservers out of bounds.
         let config = "nameserver 1.1.1.1\n".parse::<SysConfig>().unwrap();
-        let mut ares: Transport<()> = Transport::new(config, Rc::new(crate::core::socket::mock::MockFactory));
-        ares.enqueue(dns_query_payload("example.com", qtype_of(Family::Ipv4)), SocketSource::Udp, 0, ()).unwrap();
-        let mut task = ares.tasks.pop().expect("a task was pushed");
-        ares.config.nameservers.clear(); // server list shrank under the in-flight task
-        assert!(matches!(ares.write_impl(&mut task), WriteResult::Failed));
+        let mut transport: Transport<()> = Transport::new(config, Rc::new(crate::core::socket::mock::MockFactory));
+        transport.enqueue(dns_query_payload("example.com", qtype_of(Family::Ipv4)), SocketSource::Udp, 0, ()).unwrap();
+        let mut task = transport.tasks.pop().expect("a task was pushed");
+        transport.config.nameservers.clear(); // server list shrank under the in-flight task
+        assert!(matches!(transport.write_impl(&mut task), WriteResult::Failed));
     }
 }

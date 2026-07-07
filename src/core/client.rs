@@ -57,7 +57,7 @@ use crate::ffi::{
 /// bookkeeping, configuration strings, and the shared-socket pools. Generic
 /// over the per-task userdata `T`, which core never inspects.
 pub(crate) struct Client<T> {
-    pub ares: Transport<T>,
+    pub transport: Transport<T>,
     pub readbuf: Vec<u8>,
     pub server_health: ServerHealth,
     pub sortlist: Vec<SortlistEntry>,
@@ -77,10 +77,10 @@ pub(crate) struct Client<T> {
 }
 
 impl<T> Client<T> {
-    /// A fresh channel around `ares` — shared by ares_init and ares_init_options.
-    pub fn new(ares: Transport<T>) -> Self {
+    /// A fresh channel around `transport` — shared by ares_init and ares_init_options.
+    pub fn new(transport: Transport<T>) -> Self {
         Client {
-            ares,
+            transport,
             readbuf: vec![0u8; 65_535],
             server_health: ServerHealth::default(),
             sortlist: vec![],
@@ -104,10 +104,10 @@ impl<T> Client<T> {
     /// reactor state (empty query cache, no pooled connections, cleared
     /// failure timestamps — but cloned failure counts).
     pub fn duplicate(&self) -> Client<T> {
-        let mut ares = Transport::new(self.ares.config.clone(), self.ares.socket_factory.clone());
-        ares.default_udp_port = self.ares.default_udp_port;
-        ares.default_tcp_port = self.ares.default_tcp_port;
-        let mut dup = Client::new(ares);
+        let mut transport = Transport::new(self.transport.config.clone(), self.transport.socket_factory.clone());
+        transport.default_udp_port = self.transport.default_udp_port;
+        transport.default_tcp_port = self.transport.default_tcp_port;
+        let mut dup = Client::new(transport);
         dup.server_health = ServerHealth {
             failures: self.server_health.failures.clone(),
             last_failure: vec![None; self.server_health.last_failure.len()],
@@ -130,51 +130,51 @@ impl<T> Client<T> {
     pub fn apply_options(&mut self, optmask: i32, o: DecodedOptions) {
         if optmask & ARES_OPT_SERVERS != 0 {
             // Clear sysconfig servers when user explicitly provides servers
-            self.ares.config.nameservers.clear();
-            self.ares.config.tcp_ports.clear();
+            self.transport.config.nameservers.clear();
+            self.transport.config.tcp_ports.clear();
             for v4 in &o.servers {
-                self.ares.config.nameservers.push((IpAddr::V4(*v4), None));
-                self.ares.config.tcp_ports.push(None);
+                self.transport.config.nameservers.push((IpAddr::V4(*v4), None));
+                self.transport.config.tcp_ports.push(None);
             }
         }
         if optmask & ARES_OPT_UDP_PORT != 0 {
-            self.ares.default_udp_port = o.udp_port;
+            self.transport.default_udp_port = o.udp_port;
         }
         if optmask & ARES_OPT_TCP_PORT != 0 {
-            self.ares.default_tcp_port = o.tcp_port;
+            self.transport.default_tcp_port = o.tcp_port;
         }
         if optmask & ARES_OPT_TIMEOUTMS != 0 {
-            self.ares.config.options.timeout_ms = std::cmp::max(1, o.timeout as u32);
+            self.transport.config.options.timeout_ms = std::cmp::max(1, o.timeout as u32);
         }
         if optmask & ARES_OPT_TIMEOUT != 0 {
-            self.ares.config.options.timeout_ms = o.timeout as u32 * 1000;
+            self.transport.config.options.timeout_ms = o.timeout as u32 * 1000;
         }
         if optmask & ARES_OPT_TRIES != 0 {
-            self.ares.config.options.attempts = o.tries as u32;
+            self.transport.config.options.attempts = o.tries as u32;
         }
         if optmask & ARES_OPT_NDOTS != 0 {
-            self.ares.config.options.ndots = o.ndots as u32;
+            self.transport.config.options.ndots = o.ndots as u32;
         }
         if optmask & ARES_OPT_FLAGS != 0 {
             self.flags = o.flags;
-            self.ares.config.options.use_vc = (o.flags & ARES_FLAG_USEVC) != 0;
-            self.ares.config.options.edns0 = (o.flags & ARES_FLAG_EDNS) != 0;
+            self.transport.config.options.use_vc = (o.flags & ARES_FLAG_USEVC) != 0;
+            self.transport.config.options.edns0 = (o.flags & ARES_FLAG_EDNS) != 0;
             // ARES_FLAG_PRIMARY: truncate to first server only
             if (o.flags & ARES_FLAG_PRIMARY) != 0 {
-                self.ares.config.nameservers.truncate(1);
-                self.ares.config.tcp_ports.truncate(1);
+                self.transport.config.nameservers.truncate(1);
+                self.transport.config.tcp_ports.truncate(1);
             }
         }
         if optmask & ARES_OPT_DOMAINS != 0 {
             if let Some(domains) = o.domains {
-                self.ares.config.search = domains;
+                self.transport.config.search = domains;
             }
         }
         if optmask & ARES_OPT_NOROTATE != 0 {
-            self.ares.config.options.rotate = false;
+            self.transport.config.options.rotate = false;
         }
         if optmask & ARES_OPT_ROTATE != 0 {
-            self.ares.config.options.rotate = true;
+            self.transport.config.options.rotate = true;
         }
         if optmask & ARES_OPT_MAXTIMEOUTMS != 0 {
             self.maxtimeout = o.maxtimeout;
@@ -204,12 +204,12 @@ impl<T> Client<T> {
             self.server_failover_retry_chance = o.failover_retry_chance;
             self.server_failover_retry_delay = o.failover_retry_delay;
         }
-        self.server_health.reset(self.ares.config.nameservers.len());
+        self.server_health.reset(self.transport.config.nameservers.len());
     }
 
     /// The pure inverse of the cascade: read the channel back into option fields.
     pub fn saved_options(&self) -> SavedOptions {
-        let config = &self.ares.config;
+        let config = &self.transport.config;
         let opts = &config.options;
 
         let mut base_mask = ARES_OPT_FLAGS
@@ -264,8 +264,8 @@ impl<T> Client<T> {
             timeout: opts.timeout_ms as i32,
             tries: opts.attempts as i32,
             ndots: opts.ndots as i32,
-            udp_port: self.ares.default_udp_port,
-            tcp_port: self.ares.default_tcp_port,
+            udp_port: self.transport.default_udp_port,
+            tcp_port: self.transport.default_tcp_port,
             v4_servers,
             domains,
             maxtimeout,
@@ -278,41 +278,41 @@ impl<T> Client<T> {
 
     /// Install a decoded server list (ares_set_servers / ares_set_servers_ports).
     pub fn set_servers(&mut self, servers: Vec<ServerSpec>) {
-        self.ares.config.nameservers.clear();
-        self.ares.config.tcp_ports.clear();
+        self.transport.config.nameservers.clear();
+        self.transport.config.tcp_ports.clear();
         for server in servers {
-            self.ares.config.nameservers.push((server.ip, server.udp_port));
-            self.ares.config.tcp_ports.push(server.tcp_port);
+            self.transport.config.nameservers.push((server.ip, server.udp_port));
+            self.transport.config.tcp_ports.push(server.tcp_port);
         }
-        self.server_health.reset(self.ares.config.nameservers.len());
+        self.server_health.reset(self.transport.config.nameservers.len());
     }
 
     /// NULL/empty CSV clears every configured server (ares_set_servers*_csv).
     pub fn clear_servers(&mut self) {
-        self.ares.config.nameservers.clear();
-        self.ares.config.tcp_ports.clear();
+        self.transport.config.nameservers.clear();
+        self.transport.config.tcp_ports.clear();
         self.server_health.clear();
     }
 
     /// Install a parsed CSV server list (ares_set_servers_ports_csv).
     pub fn install_csv_servers(&mut self, ns: Vec<(IpAddr, Option<u16>)>) {
-        self.ares.config.tcp_ports = vec![None; ns.len()];
+        self.transport.config.tcp_ports = vec![None; ns.len()];
         self.server_health.reset(ns.len());
-        self.ares.config.nameservers = ns;
+        self.transport.config.nameservers = ns;
     }
 
     /// The configured servers with per-entry defaults applied, in order:
     /// (ip, udp_port, tcp_port) — the report behind ares_get_servers[_ports].
     pub fn server_list(&self) -> Vec<(IpAddr, u16, u16)> {
-        self.ares
+        self.transport
             .config
             .nameservers
             .iter()
             .map(|(ip, port)| {
                 (
                     *ip,
-                    port.unwrap_or(self.ares.default_udp_port),
-                    port.unwrap_or(self.ares.default_tcp_port),
+                    port.unwrap_or(self.transport.default_udp_port),
+                    port.unwrap_or(self.transport.default_tcp_port),
                 )
             })
             .collect()
@@ -320,8 +320,8 @@ impl<T> Client<T> {
 
     /// The `ip:port` CSV report behind ares_get_servers_csv (IPv6 bracketed).
     pub fn servers_csv_string(&self) -> String {
-        let default_port = self.ares.default_udp_port;
-        self.ares
+        let default_port = self.transport.default_udp_port;
+        self.transport
             .config
             .nameservers
             .iter()
@@ -339,7 +339,7 @@ impl<T> Client<T> {
     /// (fd, wants_write) for every non-completed task, in task order — the
     /// status mapping behind ares_fds and ares_getsock.
     pub fn poll_fds(&self) -> Vec<(i32, bool)> {
-        self.ares
+        self.transport
             .tasks
             .iter()
             .filter_map(|task| match task.status {
@@ -353,15 +353,15 @@ impl<T> Client<T> {
     /// The pending-query wait budget in milliseconds; None when no tasks are
     /// pending (ares_timeout then reports maxtv/NULL).
     pub fn timeout_millis(&self) -> Option<u128> {
-        if self.ares.tasks.is_empty() {
+        if self.transport.tasks.is_empty() {
             return None;
         }
-        Some(self.ares.max_wait_time().as_millis())
+        Some(self.transport.max_wait_time().as_millis())
     }
 
     /// Non-completed task count (ares_queue_active_queries).
     pub fn active_query_count(&self) -> usize {
-        self.ares
+        self.transport
             .tasks
             .iter()
             .filter(|t| t.status != Status::Completed)
@@ -399,11 +399,11 @@ impl<T> Client<T> {
     /// The `ip:port` string reported to the server-state callback (IPv6
     /// bracketed); None when the index is stale.
     pub fn server_state_string(&self, server_index: usize, is_tcp: bool) -> Option<String> {
-        let (ip, port) = self.ares.config.nameservers.get(server_index)?;
+        let (ip, port) = self.transport.config.nameservers.get(server_index)?;
         let port_val = port.unwrap_or(if is_tcp {
-            self.ares.default_tcp_port
+            self.transport.default_tcp_port
         } else {
-            self.ares.default_udp_port
+            self.transport.default_udp_port
         });
         Some(match ip {
             IpAddr::V4(v4) => format!("{}:{}", v4, port_val),
@@ -431,7 +431,7 @@ impl<T> Client<T> {
     /// batch send, the accumulated timeout count). The ffi userdata carries none
     /// of this now — the reply reads it from the `Task`.
     fn stamp(&mut self, machine: TaskMachine, family: i32, rtype: u16, timeouts: i32) {
-        if let Some(t) = self.ares.tasks.last_mut() {
+        if let Some(t) = self.transport.tasks.last_mut() {
             t.machine = machine;
             t.family = family;
             t.rtype = rtype;
@@ -443,15 +443,15 @@ impl<T> Client<T> {
     /// search flows). `Ok(fd)` of the task's socket; a socket that could not be
     /// created is `Err(ARES_ECONNREFUSED)` — the status every caller delivers —
     /// so call sites just use `?`.
-    pub(crate) fn issue(
+    pub(crate) fn enqueue(
         &mut self,
         payload: BytesMut,
         source: SocketSource,
         server: usize,
         userdata: T,
     ) -> Result<i32, AresError> {
-        self.ares.enqueue(payload, source, server, userdata).map_err(|_| AresError::from(ARES_ECONNREFUSED))?;
-        Ok(self.ares.tasks.last().expect("enqueue pushed a task").sock.as_raw_fd())
+        self.transport.enqueue(payload, source, server, userdata).map_err(|_| AresError::from(ARES_ECONNREFUSED))?;
+        Ok(self.transport.tasks.last().expect("enqueue pushed a task").sock.as_raw_fd())
     }
 
     /// Re-enqueue for a retry (TC upgrade, rcode failover, timeout): carries the
@@ -466,10 +466,10 @@ impl<T> Client<T> {
         userdata: T,
         tries: u32,
     ) -> bool {
-        if self.issue(payload, source, server, userdata).is_err() {
+        if self.enqueue(payload, source, server, userdata).is_err() {
             return false;
         }
-        self.ares.tasks.last_mut().expect("issue pushed a task").tries_remaining = tries;
+        self.transport.tasks.last_mut().expect("enqueue pushed a task").tries_remaining = tries;
         true
     }
 
@@ -491,7 +491,7 @@ impl<T> Client<T> {
         T: Copy,
     {
         let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
-        let max_tries = self.ares.config.options.attempts as usize;
+        let max_tries = self.transport.config.options.attempts as usize;
         let nservers = self.server_health.len().max(1);
         let mut si = server_index;
         let machine = || TaskMachine::HostByName(sm.clone());
@@ -500,7 +500,7 @@ impl<T> Client<T> {
         if use_tcp {
             if let Some(idx) = self.tcp_connections.iter().position(|(s, _)| *s == si) {
                 let shared_sock = self.tcp_connections[idx].1.clone();
-                let _ = self.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::transport::DnsSocket::Tcp(shared_sock)), si, binding);
+                let _ = self.transport.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::transport::DnsSocket::Tcp(shared_sock)), si, binding);
                 self.stamp(machine(), family, rtype, 0);
                 return LaunchOutcome::Launched;
             }
@@ -513,7 +513,7 @@ impl<T> Client<T> {
             if let Some(idx) = self.udp_connections.iter().position(|(s, _, c)| *s == si && *c < limit) {
                 let shared_sock = self.udp_connections[idx].1.clone();
                 self.udp_connections[idx].2 += 1;
-                let _ = self.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::transport::DnsSocket::Udp(shared_sock)), si, binding);
+                let _ = self.transport.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::transport::DnsSocket::Udp(shared_sock)), si, binding);
                 self.stamp(machine(), family, rtype, 0);
                 return LaunchOutcome::Launched;
             }
@@ -521,15 +521,15 @@ impl<T> Client<T> {
         }
 
         for _try in 0..max_tries {
-            if self.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, binding).is_ok() {
+            if self.transport.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), si, binding).is_ok() {
                 self.stamp(machine(), family, rtype, 0);
                 // Add the fresh socket to the connection pool for reuse.
                 if use_tcp {
-                    if let crate::core::transport::DnsSocket::Tcp(ref rc_sock) = self.ares.tasks.last().expect("just pushed").sock {
+                    if let crate::core::transport::DnsSocket::Tcp(ref rc_sock) = self.transport.tasks.last().expect("just pushed").sock {
                         self.tcp_connections.push((si, rc_sock.clone()));
                     }
                 } else if self.udp_max_queries > 0 {
-                    if let crate::core::transport::DnsSocket::Udp(ref rc_sock) = self.ares.tasks.last().expect("just pushed").sock {
+                    if let crate::core::transport::DnsSocket::Udp(ref rc_sock) = self.transport.tasks.last().expect("just pushed").sock {
                         self.udp_connections.push((si, rc_sock.clone(), 1));
                     }
                 }
@@ -571,7 +571,7 @@ impl<T> Client<T> {
                 AddrInfoAction::Send { name, family, tcp, server, timeouts, batch } => {
                     let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
                     let rtype = if family == libc::AF_INET { RECORD_TYPE_A } else { RECORD_TYPE_AAAA };
-                    let failed = self.ares.enqueue(dns_query_payload(&name, qtype_of(core_family)), SocketSource::fresh(tcp), server, binding).is_err();
+                    let failed = self.transport.enqueue(dns_query_payload(&name, qtype_of(core_family)), SocketSource::fresh(tcp), server, binding).is_err();
                     if !failed {
                         self.stamp(TaskMachine::AddrInfo(sm.clone()), family, rtype, timeouts);
                     }
@@ -617,8 +617,8 @@ impl<T> Client<T> {
         // Best-effort: if the probe's socket can't be created (or is refused), skip it.
         // The probe carries a copy of the lookup's binding, but `TaskMachine::Probe`
         // marks it so the reply routes to the probe handler, never the user callback.
-        if self.issue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), probe_server, probe_binding).is_ok() {
-            if let Some(t) = self.ares.tasks.last_mut() {
+        if self.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::fresh(use_tcp), probe_server, probe_binding).is_ok() {
+            if let Some(t) = self.transport.tasks.last_mut() {
                 t.machine = TaskMachine::Probe;
             }
         }
@@ -631,7 +631,7 @@ impl<T> Client<T> {
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        self.issue(dns_query_payload(name, qtype), SocketSource::Udp, 0, userdata)?;
+        self.enqueue(dns_query_payload(name, qtype), SocketSource::Udp, 0, userdata)?;
         Ok(())
     }
 
@@ -643,7 +643,7 @@ impl<T> Client<T> {
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        self.issue(BytesMut::from(query_buf), SocketSource::Udp, 0, userdata)?;
+        self.enqueue(BytesMut::from(query_buf), SocketSource::Udp, 0, userdata)?;
         Ok(())
     }
 
@@ -667,7 +667,7 @@ impl<T> Client<T> {
                 return Ok(Operation::Ready(rec));
             }
         }
-        self.issue(dns_query_payload(name_raw, qtype), SocketSource::Udp, 0, userdata)?;
+        self.enqueue(dns_query_payload(name_raw, qtype), SocketSource::Udp, 0, userdata)?;
         Ok(Operation::Pending)
     }
 
@@ -686,8 +686,8 @@ impl<T> Client<T> {
     ) -> Result<(), AresError> {
         let (sm, query_hostname) = search_start(self, name, retry_server_error)?;
         let handle = Rc::new(RefCell::new(sm));
-        self.issue(dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, binding)?;
-        if let Some(t) = self.ares.tasks.last_mut() { t.machine = TaskMachine::Search(handle); }
+        self.enqueue(dns_query_payload(&query_hostname, dnstype), SocketSource::Udp, 0, binding)?;
+        if let Some(t) = self.transport.tasks.last_mut() { t.machine = TaskMachine::Search(handle); }
         Ok(())
     }
 
@@ -716,15 +716,15 @@ impl<T> Client<T> {
         }
         let addr = buf_to_ip(addrbuf).map_err(|_| ARES_ENOTIMP)?;
         // Check hosts file first
-        if let Some(lookup) = self.ares.hosts().reverse_lookup(addr) {
+        if let Some(lookup) = self.transport.hosts().reverse_lookup(addr) {
             return Ok(Operation::Ready(Hostent::from_lookup(lookup)));
         }
         // No servers configured
-        if self.ares.config.nameservers.is_empty() {
+        if self.transport.config.nameservers.is_empty() {
             return Err(ARES_ENOSERVER.into());
         }
-        self.issue(dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
-        if let Some(t) = self.ares.tasks.last_mut() {
+        self.enqueue(dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
+        if let Some(t) = self.transport.tasks.last_mut() {
             t.queried_ip = Some(addr);
             t.family = family;
             t.rtype = RECORD_TYPE_PTR;
@@ -756,7 +756,7 @@ impl<T> Client<T> {
 
         // If only service lookup requested (no host), deliver immediately
         if want_service && !want_host {
-            return Ok(Operation::Ready(NameinfoResult::Service(get_service_string(self.ares.services(), addr.port, flags))));
+            return Ok(Operation::Ready(NameinfoResult::Service(get_service_string(self.transport.services(), addr.port, flags))));
         }
 
         // Host lookup requested (guaranteed by the defaulting above).
@@ -768,7 +768,7 @@ impl<T> Client<T> {
             }
             let node = CString::new(format_ip_with_scope(&addr.ip, addr.scope_id, flags)).unwrap();
             let service = if want_service {
-                get_service_string(self.ares.services(), addr.port, flags)
+                get_service_string(self.transport.services(), addr.port, flags)
             } else {
                 None
             };
@@ -776,7 +776,7 @@ impl<T> Client<T> {
         }
 
         // PTR lookup required.
-        self.issue(dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
+        self.enqueue(dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
         Ok(Operation::Pending)
     }
 
@@ -831,7 +831,7 @@ impl<T> Client<T> {
         }
 
         // Check hosts file
-        let hosts_result = self.ares.hosts().lookup(hostname, family_filter);
+        let hosts_result = self.transport.hosts().lookup(hostname, family_filter);
         if let Some(ref lookup) = hosts_result {
             if !lookup.addrs.is_empty() {
                 return Ok(Operation::Ready(Hostent::from_lookup(lookup.clone())));
@@ -881,7 +881,7 @@ impl<T> Client<T> {
         };
 
         // No servers configured — return ENOSERVER immediately
-        if self.ares.config.nameservers.is_empty() {
+        if self.transport.config.nameservers.is_empty() {
             return Err(ARES_ENOSERVER.into());
         }
 
@@ -923,11 +923,11 @@ impl<T> Client<T> {
         // Build the search plan + state machine, then the pooled launch and the
         // failover probe. On exhaustion the probe still runs (its health
         // bookkeeping sees the launch failures) and ECONNREFUSED is delivered.
-        let use_tcp = self.ares.config.options.use_vc;
+        let use_tcp = self.transport.config.options.use_vc;
         let plan = SearchPlan::for_gethostbyname(
             &resolved_name,
-            self.ares.config.options.ndots,
-            &self.ares.config.search,
+            self.transport.config.options.ndots,
+            &self.transport.config.search,
         );
         let query_hostname = plan.current.clone();
         let sm = HostByNameSm::new(plan, family, use_tcp);
@@ -1003,24 +1003,24 @@ impl<T> Client<T> {
             libc::AF_INET6 => AddressFamily::Ipv6,
             _ => AddressFamily::Any,
         };
-        if let Some(lookup) = self.ares.hosts().lookup(hostname, family_filter) {
+        if let Some(lookup) = self.transport.hosts().lookup(hostname, family_filter) {
             if !lookup.addrs.is_empty() {
                 return deliver(lookup.addrs, hostname.to_string());
             }
         }
 
         // No servers configured
-        if self.ares.config.nameservers.is_empty() {
+        if self.transport.config.nameservers.is_empty() {
             return Err(ARES_ENOSERVER.into());
         }
 
         // DNS path: mint the machine and drive the parallel A/AAAA batch.
         // (the raw name carries the trailing dot the plan needs to see)
-        let use_tcp = self.ares.config.options.use_vc;
+        let use_tcp = self.transport.config.options.use_vc;
         let plan = SearchPlan::for_search(
             hostname_raw,
-            self.ares.config.options.ndots,
-            &self.ares.config.search,
+            self.transport.config.options.ndots,
+            &self.transport.config.search,
         );
         let first_server = self.server_health.pick_next();
         let sm = AddrInfoSm::new(plan, ai_family, use_tcp);
@@ -1074,8 +1074,8 @@ impl<T> Client<T> {
 
         let actions = {
             let cfg = LookupCfg {
-                ndots: self.ares.config.options.ndots,
-                search: &self.ares.config.search,
+                ndots: self.transport.config.options.ndots,
+                search: &self.transport.config.search,
             };
             let mut machine = sm.borrow_mut();
             machine.step(ev, &cfg, &mut self.server_health)
@@ -1132,9 +1132,9 @@ impl<T> Client<T> {
         let action = sm.borrow_mut().step(ev);
         match action {
             SearchAction::Send(next_name) => {
-                match self.issue(dns_query_payload(&next_name, dnstype), SocketSource::Udp, 0, binding) {
+                match self.enqueue(dns_query_payload(&next_name, dnstype), SocketSource::Udp, 0, binding) {
                     Ok(_) => {
-                        if let Some(t) = self.ares.tasks.last_mut() { t.machine = TaskMachine::Search(sm.clone()); }
+                        if let Some(t) = self.transport.tasks.last_mut() { t.machine = TaskMachine::Search(sm.clone()); }
                         None
                     }
                     Err(status) => Some(SearchReplyDelivery::Fail { status, timeouts: 0 }),
