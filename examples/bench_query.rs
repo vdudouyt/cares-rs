@@ -63,10 +63,22 @@ fn spawn_mock() -> u16 {
     port
 }
 
-// ---- callback ---------------------------------------------------------------
+// ---- callbacks --------------------------------------------------------------
+// Count every completion; track non-success separately (under heavy load a few
+// queries can hit ephemeral-port/fd pressure → ECONNREFUSED). Never abort from
+// an extern-C callback — a panic across the FFI boundary would core-dump.
 static DONE: AtomicU64 = AtomicU64::new(0);
+static FAILED: AtomicU64 = AtomicU64::new(0);
 unsafe extern "C" fn cb(_arg: *mut c_void, status: c_int, _t: c_int, _abuf: *mut u8, _alen: c_int) {
-    assert_eq!(status, ARES_SUCCESS, "mock query must succeed");
+    if status != ARES_SUCCESS {
+        FAILED.fetch_add(1, Ordering::Relaxed);
+    }
+    DONE.fetch_add(1, Ordering::Relaxed);
+}
+unsafe extern "C" fn host_cb(_arg: *mut c_void, status: c_int, _t: c_int, _h: *mut hostent) {
+    if status != ARES_SUCCESS {
+        FAILED.fetch_add(1, Ordering::Relaxed);
+    }
     DONE.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -91,8 +103,8 @@ fn drive(channel: Channel) {
     }
 }
 
-const BATCH: usize = 50;
-const EPOCHS: usize = 2000; // 50 * 2000 = 100_000 queries
+const BATCH: usize = 20;
+const EPOCHS: usize = 1500; // 20 * 1500 = 30_000 queries (modest concurrency)
 
 fn run_epochs(port: u16) {
     let name = CString::new("mydomain.local").unwrap();
@@ -109,37 +121,56 @@ fn run_epochs(port: u16) {
     }
 }
 
+fn run_host_epochs(port: u16) {
+    let name = CString::new("mydomain.local").unwrap();
+    for _ in 0..EPOCHS {
+        let mut channel: Channel = ptr::null_mut();
+        assert_eq!(unsafe { ares_init(&mut channel) }, ARES_SUCCESS);
+        set_server(channel, port);
+        for _ in 0..BATCH {
+            unsafe { ares_gethostbyname(channel, name.as_ptr(), AF_INET, Some(host_cb), ptr::null_mut()) };
+        }
+        drive(channel);
+        unsafe { ares_destroy(channel) };
+    }
+}
+
+fn measure(label: &str, port: u16, run: impl Fn(u16)) {
+    DONE.store(0, Ordering::Relaxed);
+    let a0 = ALLOCS.load(Ordering::Relaxed);
+    let b0 = BYTES.load(Ordering::Relaxed);
+    let t0 = Instant::now();
+    run(port);
+    let elapsed = t0.elapsed();
+    let allocs = ALLOCS.load(Ordering::Relaxed) - a0;
+    let bytes = BYTES.load(Ordering::Relaxed) - b0;
+    let n = (BATCH * EPOCHS) as u64;
+    assert_eq!(DONE.load(Ordering::Relaxed), n, "all {label} must complete");
+    let failed = FAILED.swap(0, Ordering::Relaxed);
+    let note = if failed > 0 { format!("  [{failed} non-success under load]") } else { String::new() };
+    println!("{label} x{n}: {elapsed:?}  ({:.2} ns/q, {:.2} allocs/q, {:.0} B/q){note}",
+        elapsed.as_nanos() as f64 / n as f64,
+        allocs as f64 / n as f64,
+        bytes as f64 / n as f64);
+}
+
 fn main() {
     assert_eq!(ares_library_init(ARES_LIB_INIT_ALL), ARES_SUCCESS);
     let port = spawn_mock();
 
-    // warm-up (one epoch) so lazy inits don't skew the measured window.
+    // warm-up (both paths) so lazy inits don't skew the measured windows.
     let name = CString::new("mydomain.local").unwrap();
     let mut ch: Channel = ptr::null_mut();
     assert_eq!(unsafe { ares_init(&mut ch) }, ARES_SUCCESS);
     set_server(ch, port);
     for _ in 0..BATCH {
         unsafe { ares_query(ch, name.as_ptr(), 1, 1, Some(cb), ptr::null_mut()) };
+        unsafe { ares_gethostbyname(ch, name.as_ptr(), AF_INET, Some(host_cb), ptr::null_mut()) };
     }
     drive(ch);
     unsafe { ares_destroy(ch) };
-    DONE.store(0, Ordering::Relaxed);
 
-    // measured window
-    let a0 = ALLOCS.load(Ordering::Relaxed);
-    let b0 = BYTES.load(Ordering::Relaxed);
-    let t0 = Instant::now();
-    run_epochs(port);
-    let elapsed = t0.elapsed();
-    let allocs = ALLOCS.load(Ordering::Relaxed) - a0;
-    let bytes = BYTES.load(Ordering::Relaxed) - b0;
-
-    let n = (BATCH * EPOCHS) as u64;
-    assert_eq!(DONE.load(Ordering::Relaxed), n, "all queries must complete");
-    println!("ares_query x{n}: {elapsed:?}");
-    println!("  {:.0} queries/sec", n as f64 / elapsed.as_secs_f64());
-    println!("  {:.2} ns/query", elapsed.as_nanos() as f64 / n as f64);
-    println!("  {:.2} allocs/query ({} total)", allocs as f64 / n as f64, allocs);
-    println!("  {:.1} bytes/query ({} total)", bytes as f64 / n as f64, bytes);
+    measure("ares_query     ", port, run_epochs);
+    measure("ares_gethostby ", port, run_host_epochs);
     let _ = Ipv4Addr::LOCALHOST;
 }

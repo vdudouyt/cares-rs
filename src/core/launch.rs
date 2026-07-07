@@ -9,12 +9,12 @@
 use crate::core::transport::Status;
 use crate::core::AresError;
 
-/// How a pooled launch (gethostbyname's send path) settled.
+/// How a pooled launch (the async gethostbyname send path) settled.
 pub(crate) enum LaunchOutcome {
     Launched,
-    /// Every attempt failed; `last_error` is already recorded on the machine
-    /// and the accumulated timeout count rides along for the delivery.
-    Exhausted { timeouts: i32 },
+    /// Every attempt failed to create a socket; the future settles with
+    /// ECONNREFUSED and reports its own timeout count.
+    Exhausted,
 }
 
 /// One delivery the getaddrinfo machine owes its C callback; the shim

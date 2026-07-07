@@ -52,14 +52,6 @@ pub(crate) struct AddrInfoResult {
 /// entry-ordering exception reads from the api layer.
 pub(crate) use crate::core::preflight::search_name_check as search_precheck;
 
-/// One C-side effect a settled gethostbyname task owes its owner, in firing
-/// order relative to the other deliveries.
-pub(crate) enum HostDelivery {
-    /// Sortlist already applied and the hostent shaped; build, deliver, free.
-    Success { hostent: Hostent, timeouts: i32 },
-    Fail { status: AresError, timeouts: i32 },
-}
-
 /// The plain host-callback path (ares_gethostbyaddr's direct PTR delivery):
 /// parse under the flow's acceptance rule, add the synthetic record for the
 /// queried address, and shape the hostent.

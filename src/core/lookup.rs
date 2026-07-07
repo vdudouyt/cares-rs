@@ -19,10 +19,13 @@
 //! and returns actions (send a query, notify, cache, deliver) that
 //! `core::api`'s per-export handlers drive:
 //! - [`SearchSm`] — ares_search / ares_search_dnsrec
-//! - [`HostByNameSm`] — ares_gethostbyname's DNS phase (TC retry, failover,
-//!   search iteration, the AF_UNSPEC AAAA→A switch)
 //! - [`AddrInfoSm`] — ares_getaddrinfo's parallel A+AAAA batch with the
 //!   `pending` join counter
+//!
+//! ares_gethostbyname's DNS phase is no longer a step machine here: it is a
+//! linear `async fn` (`core::executor::hostbyname_lifecycle`) driven by the
+//! reactor's executor. Its per-query failover/TC/timeout still flow through
+//! [`on_datagram`]/[`on_timeout`] below (the task is tagged `Async`).
 //!
 //! Reactor-level policy for tasks without their own machine (plain
 //! ares_query/ares_send and the process-level TC/failover/timeout rules),
@@ -282,168 +285,12 @@ impl SearchSm {
     }
 }
 
-/// Config snapshot a state machine needs to make decisions. Borrowed from the
-/// channel's SysConfig for the duration of one `step` call.
-pub struct LookupCfg<'a> {
-    pub ndots: u32,
-    pub search: &'a [String],
-}
-
 // Address families as the C API speaks them (plain constants — the state
 // machines stay pure while still deciding between A and AAAA queries).
 pub use libc::{AF_INET, AF_INET6, AF_UNSPEC};
 
 pub(crate) const RTYPE_A: u16 = 0x01;
 pub(crate) const RTYPE_AAAA: u16 = 0x1c;
-
-/// What the gethostbyname state machine wants done next.
-#[derive(Debug, PartialEq)]
-pub enum HostAction {
-    /// Issue (or re-issue) a query. `tcp` is the transport for THIS send only:
-    /// a TC retry goes over TCP without flipping the machine's use_tcp, so a
-    /// later failover returns to the configured transport.
-    Send { name: String, family: c_int, rtype: u16, tcp: bool, server: usize },
-    /// Cache the current reply buffer under these names.
-    CacheStore { names: Vec<String>, rtype: u16 },
-    /// Reply parsed successfully — sort + build the hostent and deliver.
-    DeliverSuccess { family: c_int, timeouts: c_int },
-    DeliverFail { status: AresError, timeouts: c_int },
-}
-
-/// Input to the gethostbyname machine: a reply (with its parse outcome —
-/// parsing itself happens outside) or an I/O-level error.
-pub enum HostEvent {
-    Reply { parse: Result<(), AresError>, io_timeouts: c_int, server: usize },
-    Error { status: AresError },
-}
-
-/// State machine for ares_gethostbyname's DNS phase. One `step` per reply or
-/// I/O error; decisions in priority order: TC retry over TCP, server failover
-/// on SERVFAIL/NOTIMP/REFUSED (bounded by nservers x attempts), search-domain
-/// iteration on NXDOMAIN/NODATA, AF_UNSPEC's AAAA -> A switch, then finalize.
-#[derive(Debug)]
-pub struct HostByNameSm {
-    pub plan: SearchPlan,
-    /// Original requested family (AF_INET / AF_INET6 / AF_UNSPEC).
-    pub family: c_int,
-    /// Family currently being queried (the AF_UNSPEC machine starts on AAAA).
-    pub current_family: c_int,
-    pub expected_rtype: u16,
-    pub use_tcp: bool,
-    pub had_nodata: bool,
-    pub tried_aaaa: bool,
-    /// Timeout events accumulated across retries; reported on success as
-    /// timeouts + the delivering task's own count, on failure as-is.
-    pub timeouts: c_int,
-    pub last_error: AresError,
-}
-
-impl HostByNameSm {
-    pub fn new(plan: SearchPlan, family: c_int, use_tcp: bool) -> Self {
-        let (expected_rtype, current_family) = match family {
-            AF_INET => (RTYPE_A, AF_INET),
-            // AF_INET6, and AF_UNSPEC which tries AAAA first
-            _ => (RTYPE_AAAA, AF_INET6),
-        };
-        HostByNameSm {
-            plan,
-            family,
-            current_family,
-            expected_rtype,
-            use_tcp,
-            had_nodata: false,
-            tried_aaaa: family == AF_UNSPEC,
-            timeouts: 0,
-            last_error: ARES_ENODATA.into(),
-        }
-    }
-
-    pub fn step(&mut self, ev: HostEvent, cfg: &LookupCfg<'_>, health: &mut ServerHealth) -> Vec<HostAction> {
-        let mut actions = Vec::new();
-        match ev {
-            HostEvent::Reply { parse, io_timeouts, server } => {
-                match parse {
-                    Ok(()) => {
-                        // Success — cache under the query name and (when different)
-                        // the pre-search-domain base name, then deliver.
-                        let mut names = vec![self.plan.current.clone()];
-                        if !self.plan.base_name.is_empty() && self.plan.base_name != self.plan.current {
-                            names.push(self.plan.base_name.clone());
-                        }
-                        actions.push(HostAction::CacheStore { names, rtype: self.expected_rtype });
-                        health.record_success(server);
-                        actions.push(HostAction::DeliverSuccess {
-                            family: self.current_family,
-                            timeouts: self.timeouts + io_timeouts,
-                        });
-                        return actions;
-                    }
-                    Err(e) => {
-                        // Server-error failover is handled by the reactor
-                        // (on_datagram); the SM only sees the settled error.
-                        if e.code() == ARES_ENODATA {
-                            self.had_nodata = true;
-                        }
-                        self.last_error = e;
-                    }
-                }
-            }
-            HostEvent::Error { status } => {
-                if status.code() == ARES_ETIMEOUT {
-                    self.timeouts += 1; // Count as one query timeout event
-                }
-                self.last_error = status;
-            }
-        }
-
-        // Search domain iteration: on NXDOMAIN/ENODATA, try next search domain or bare name
-        if matches!(self.last_error.code(), ARES_ENOTFOUND | ARES_ENODATA) {
-            if let Some(next_name) = self.plan.advance() {
-                self.last_error = ARES_ENODATA.into();
-                actions.push(HostAction::Send {
-                    name: next_name,
-                    family: self.current_family,
-                    rtype: self.expected_rtype,
-                    tcp: self.use_tcp,
-                    server: health.pick_next(),
-                });
-                return actions;
-            }
-        }
-
-        // AF_UNSPEC: if we tried AAAA and failed, switch to A
-        if self.family == AF_UNSPEC && self.tried_aaaa && self.current_family == AF_INET6 {
-            self.current_family = AF_INET;
-            self.expected_rtype = RTYPE_A;
-            self.tried_aaaa = false;
-            self.last_error = ARES_ENODATA.into();
-            // Restore search domains for the A query round
-            if !self.plan.base_name.is_empty() {
-                self.plan = SearchPlan::for_gethostbyname(&self.plan.base_name, cfg.ndots, cfg.search);
-            } else {
-                // Bare-name fallback already consumed: requery the current name only
-                self.plan.domains.clear();
-            }
-            actions.push(HostAction::Send {
-                name: self.plan.current.clone(),
-                family: AF_INET,
-                rtype: RTYPE_A,
-                tcp: self.use_tcp,
-                server: health.pick_next(),
-            });
-            return actions;
-        }
-
-        // Finalize
-        let final_error = if self.had_nodata && self.last_error.code() == ARES_ENOTFOUND {
-            ARES_ENODATA.into()
-        } else {
-            self.last_error
-        };
-        actions.push(HostAction::DeliverFail { status: final_error, timeouts: self.timeouts });
-        actions
-    }
-}
 
 /// What the getaddrinfo state machine wants done next.
 #[derive(Debug, PartialEq)]

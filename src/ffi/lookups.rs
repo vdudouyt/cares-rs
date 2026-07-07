@@ -4,6 +4,8 @@
 use super::*;
 use crate::core::api;
 use crate::core::AresError;
+use crate::core::client::HostStart;
+use crate::core::hostent::Hostent;
 use crate::core::transport::{Task, TaskMachine};
 use crate::core::launch::AddrInfoDelivery;
 use crate::core::preflight::{assemble_nameinfo, service_to_port, ServicePort};
@@ -104,7 +106,10 @@ impl Callback {
             Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, task),
             Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, task),
             Self::AddrInfo(tail) => run_ares_addrinfo_callback(buf, *tail, task, channeldata),
-            Self::HostByName(tail) => run_ares_hostbyname_callback(buf, *tail, task, channeldata),
+            // gethostbyname is driven by the executor: its tasks are tagged
+            // `Async` (routed by `settle`) or `Probe` (handled above), so a
+            // HostByName binding is never dispatched through here.
+            Self::HostByName(_) => unreachable!("gethostbyname runs via the executor, not Callback::run"),
             Self::Search(tail) => run_ares_search_callback(buf, *tail, task, channeldata),
         }
     }
@@ -184,19 +189,16 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { cstr_lossy(hostname) };
-    // One plain binding (no factory closure); the failover probe reuses a copy
-    // of it, marked TaskMachine::Probe by core so its reply never fires the callback.
-    let binding = FFIData::base(Callback::HostByName(HostTail { callback, arg }));
+    let tail = HostTail { callback, arg };
+    // The binding is only used by the failover probe (tagged TaskMachine::Probe,
+    // so its reply never fires the callback); the async lifecycle carries `tail`.
+    let binding = FFIData::base(Callback::HostByName(tail));
     match channeldata.state.gethostbyname(hostname, family, Instant::now(), binding) {
-        Err(status) => {
+        HostStart::Fail(status) => {
             unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         }
-        Ok(api::Operation::Ready(bp)) => {
-            let hostent = unsafe { build_hostent(bp) };
-            unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-            unsafe { ares_free_hostent(hostent) };
-        }
-        Ok(api::Operation::Pending) => {}
+        HostStart::Ready(bp) => fire_host_success(tail, bp, 0),
+        HostStart::Launch(launch) => channeldata.spawn_hostbyname(launch, tail),
     }
 }
 
@@ -419,13 +421,22 @@ pub(crate) fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHo
 }
 
 /// The single raw `ares_callback` invocation for the query path — shared by the
-/// synchronous reply handler ([`run_ares_callback`]) and the async executor
-/// ([`ChannelData::drive_async`]), so the unsafe fire lives in exactly one place.
+/// synchronous reply handler ([`run_ares_callback`]) and the async executor,
+/// so the unsafe fire lives in exactly one place.
 pub(crate) fn fire_ares_callback(callback: AresCallback, arg: *mut c_void, res: Result<&[u8], c_int>, timeouts: c_int) {
     match res {
         Ok(buf) => unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) },
         Err(err) => unsafe { callback(arg, err, timeouts, std::ptr::null_mut(), 0) },
     }
+}
+
+/// Build a C hostent from a core one, fire the host callback with it, and free
+/// it — the single success-firing site shared by the `ares_gethostbyname` shim
+/// (synchronous hit) and the async executor's `finalize`.
+pub(crate) fn fire_host_success(tail: HostTail, hostent: Hostent, timeouts: c_int) {
+    let c_hostent = unsafe { build_hostent(hostent) };
+    unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, timeouts, c_hostent) };
+    unsafe { ares_free_hostent(c_hostent) };
 }
 
 pub(crate) fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallback, task: &Task<FFIData>) {
@@ -491,29 +502,6 @@ pub(crate) fn run_ares_search_callback(res: Result<&[u8], c_int>, tail: SearchTa
                 callback(arg, status.code(), timeouts as usize, std::ptr::null_mut());
             },
         },
-    }
-}
-
-/// Executor for a settled gethostbyname task: one core call parses, steps
-/// the machine, re-sends and cache-stores; the marshal here builds hostents
-/// and fires the C callbacks in the returned order.
-pub(crate) fn run_ares_hostbyname_callback(res: Result<&[u8], c_int>, tail: HostTail, task: &Task<FFIData>, channeldata: &mut ChannelData) {
-    let TaskMachine::HostByName(sm) = &task.machine else { unreachable!("gethostbyname task carries a HostByName machine") };
-    let deliveries = channeldata.state.on_hostbyname_reply(
-        sm, res.map_err(AresError::from), task.server_index, task.timeouts,
-        Instant::now(), task.userdata,
-    );
-    for delivery in deliveries {
-        match delivery {
-            api::HostDelivery::Success { hostent, timeouts } => {
-                let hostent = unsafe { build_hostent(hostent) };
-                unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, timeouts, hostent) };
-                unsafe { ares_free_hostent(hostent) };
-            }
-            api::HostDelivery::Fail { status, timeouts } => {
-                unsafe { (tail.callback)(tail.arg, status.code(), timeouts, std::ptr::null_mut()) };
-            }
-        }
     }
 }
 

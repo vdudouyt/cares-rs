@@ -9,25 +9,25 @@ use crate::core::sysconfig::SysConfig;
 use crate::core::hostfile::Hosts;
 use crate::core::services::Services;
 use crate::core::socket::{Socket, SocketFactory};
-use crate::core::lookup::{HostByNameSm, SearchSm, AddrInfoSm};
+use crate::core::lookup::{SearchSm, AddrInfoSm};
 
 /// The core-owned state-machine handle a task drives (moved out of the ffi
 /// `Callback` so the userdata is a plain, ffi-buildable binding — no factory
-/// closure). `None` for the stateless flows (query/send/gethostby*/nameinfo).
+/// closure). `None` for the stateless flows (query/send/nameinfo).
 #[derive(Clone, Default)]
 pub enum TaskMachine {
     #[default]
     None,
-    HostByName(Rc<RefCell<HostByNameSm>>),
     Search(Rc<RefCell<SearchSm>>),
     AddrInfo(Rc<RefCell<AddrInfoSm>>),
     /// A server-failover probe: no user callback and no state machine. The
     /// task carries a copy of the lookup's binding, but this marker routes its
     /// reply to the probe handler so the user callback is never fired.
     Probe,
-    /// An async query-future owns this task (executor spike): the reactor
-    /// deposits the settled reply into `ChannelData.async_queries[id]` and
-    /// polls that future instead of firing `task.userdata.callback`.
+    /// An async lifecycle future owns this task (ares_query/ares_send/
+    /// gethostbyname): the reactor deposits the settled reply into
+    /// `ChannelData.async_queries[id]` and polls that future instead of firing
+    /// `task.userdata.callback`.
     Async(usize),
 }
 

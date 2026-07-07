@@ -13,23 +13,20 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 
-use crate::core::api::{
-    AddrInfoResult, HostDelivery, NameinfoResult, Operation, SearchReplyDelivery,
-};
+use crate::core::api::{AddrInfoResult, NameinfoResult, Operation, SearchReplyDelivery};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::AddressFamily;
 use crate::core::launch::{AddrInfoDelivery, LaunchOutcome};
 use crate::core::lookup::{
-    is_localhost, is_onion_domain, AddrInfoAction, AddrInfoEvent, AddrInfoSm, HostAction,
-    HostByNameSm, HostEvent, LookupCfg, LookupEvent, SearchAction, SearchPlan, SearchSm,
-    ServerHealth,
+    is_localhost, is_onion_domain, AddrInfoAction, AddrInfoEvent, AddrInfoSm, LookupEvent,
+    SearchAction, SearchPlan, SearchSm, ServerHealth,
 };
 use crate::core::packets::{buf_to_ip, AddrRecord};
 use crate::core::preflight::{
     cached_reply, format_ip_with_scope, get_service_string, hosts_file_lookup, no_servers,
     search_start, AddrInfo,
 };
-use crate::core::response::{addr_reply, ParsedRRs, ParsedResponse, ReplyRequire};
+use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::socket::Socket;
 use crate::core::sortlist::{apply_sortlist, SortlistEntry};
 use crate::core::transport::{
@@ -473,10 +470,12 @@ impl<T> Client<T> {
         true
     }
 
-    /// Send executor for the gethostbyname machine: reuse a pooled socket when
+    /// Pooled send for an async gethostbyname future: reuse a pooled socket when
     /// possible, otherwise create one — retrying across servers on socket-
     /// creation or consent failure (the failure accounting is ServerHealth's).
-    #[allow(clippy::too_many_arguments)] // internal seam of gethostbyname / on_hostbyname_reply
+    /// The task is tagged `Async(id)` so the reactor routes its settled reply
+    /// back to that future. Returns `Exhausted` if no socket could be created.
+    #[allow(clippy::too_many_arguments)] // internal seam of the async gethostbyname executor
     pub(crate) fn launch_pooled(
         &mut self,
         hostname: &str,
@@ -484,7 +483,7 @@ impl<T> Client<T> {
         rtype: u16,
         use_tcp: bool,
         server_index: usize,
-        sm: &Rc<RefCell<HostByNameSm>>,
+        id: usize,
         binding: T,
     ) -> LaunchOutcome
     where
@@ -494,7 +493,7 @@ impl<T> Client<T> {
         let max_tries = self.transport.config.options.attempts as usize;
         let nservers = self.server_health.len().max(1);
         let mut si = server_index;
-        let machine = || TaskMachine::HostByName(sm.clone());
+        let machine = || TaskMachine::Async(id);
 
         // TCP connection sharing: reuse an existing TCP connection to this server.
         if use_tcp {
@@ -542,13 +541,9 @@ impl<T> Client<T> {
                 si = self.server_health.pick_next();
             }
         }
-        // All retries exhausted.
-        let timeouts = {
-            let mut machine = sm.borrow_mut();
-            machine.last_error = ARES_ECONNREFUSED.into();
-            machine.timeouts
-        };
-        LaunchOutcome::Exhausted { timeouts }
+        // All retries exhausted — the future settles with ECONNREFUSED and
+        // reports its own accumulated timeout count.
+        LaunchOutcome::Exhausted
     }
 
     /// Drive the getaddrinfo machine's action queue: perform every Send (a failed
@@ -782,18 +777,12 @@ impl<T> Client<T> {
         Ok(Operation::Pending)
     }
 
-    /// ares_gethostbyname: the full pre-DNS cascade, then the pooled launch and
-    /// the failover probe. On exhaustion the probe still runs (its health
-    /// bookkeeping sees the launch failures), and ECONNREFUSED is delivered by
-    /// the shim afterwards. A synchronous hit (IP literal / hosts file / localhost
-    /// / query cache) is `Ok(Operation::Ready(hostent))`.
-    pub(crate) fn gethostbyname(
-        &mut self,
-        hostname: &str,
-        family: i32,
-        now: Instant,
-        binding: T,
-    ) -> Result<Operation<Hostent>, AresError>
+    /// ares_gethostbyname: the full pre-DNS cascade, then (for the DNS path) the
+    /// failover probe plus a [`HostStart::Launch`] descriptor the ffi turns into
+    /// an async lifecycle future. A synchronous hit (IP literal / hosts file /
+    /// localhost / query cache) is [`HostStart::Ready`]; a rejected name or a
+    /// server-less channel is [`HostStart::Fail`].
+    pub(crate) fn gethostbyname(&mut self, hostname: &str, family: i32, now: Instant, binding: T) -> HostStart
     where
         T: Copy,
     {
@@ -805,19 +794,19 @@ impl<T> Client<T> {
 
         // Reject non-ASCII names
         if !hostname.is_ascii() {
-            return Err(ARES_EBADNAME.into());
+            return HostStart::Fail(ARES_EBADNAME.into());
         }
 
         // Reject .onion domains immediately (RFC 7686)
         if is_onion_domain(hostname) {
-            return Err(ARES_ENOTFOUND.into());
+            return HostStart::Fail(ARES_ENOTFOUND.into());
         }
 
         let family_filter = match family {
             libc::AF_INET => AddressFamily::Ipv4,
             libc::AF_INET6 => AddressFamily::Ipv6,
             libc::AF_UNSPEC => AddressFamily::Any,
-            _ => return Err(ARES_ENOTIMP.into()),
+            _ => return HostStart::Fail(ARES_ENOTIMP.into()),
         };
 
         // Check IP literal first
@@ -828,7 +817,7 @@ impl<T> Client<T> {
                 AddressFamily::Any => true,
             };
             if matches {
-                return Ok(Operation::Ready(Hostent::new(hostname.to_string(), vec![ip])));
+                return HostStart::Ready(Hostent::new(hostname.to_string(), vec![ip]));
             }
         }
 
@@ -836,7 +825,7 @@ impl<T> Client<T> {
         let hosts_result = self.transport.hosts().lookup(hostname, family_filter);
         if let Some(ref lookup) = hosts_result {
             if !lookup.addrs.is_empty() {
-                return Ok(Operation::Ready(Hostent::from_lookup(lookup.clone())));
+                return HostStart::Ready(Hostent::from_lookup(lookup.clone()));
             }
         }
 
@@ -851,7 +840,7 @@ impl<T> Client<T> {
                     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 ],
             };
-            return Ok(Operation::Ready(Hostent::new(hostname.to_string(), addrs)));
+            return HostStart::Ready(Hostent::new(hostname.to_string(), addrs));
         }
 
         // Check HOSTALIASES env var for single-label names
@@ -871,7 +860,7 @@ impl<T> Client<T> {
                         alias_found.unwrap_or_else(|| hostname_str.clone())
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        return Err(ARES_EFILE.into());
+                        return HostStart::Fail(ARES_EFILE.into());
                     }
                     Err(_) => hostname_str.clone(),
                 }
@@ -884,7 +873,7 @@ impl<T> Client<T> {
 
         // No servers configured — return ENOSERVER immediately
         if self.transport.config.nameservers.is_empty() {
-            return Err(ARES_ENOSERVER.into());
+            return HostStart::Fail(ARES_ENOSERVER.into());
         }
 
         // Check query cache
@@ -914,7 +903,7 @@ impl<T> Client<T> {
                             AddressFamily::Ipv4 => libc::AF_INET,
                             AddressFamily::Ipv6 | AddressFamily::Any => libc::AF_INET6,
                         };
-                        return Ok(Operation::Ready(Hostent::from_parsed(parsed_rrs, current_family)));
+                        return HostStart::Ready(Hostent::from_parsed(parsed_rrs, current_family));
                     }
                 } else {
                     self.query_cache.remove(&cache_key);
@@ -922,29 +911,28 @@ impl<T> Client<T> {
             }
         }
 
-        // Build the search plan + state machine, then the pooled launch and the
-        // failover probe. On exhaustion the probe still runs (its health
-        // bookkeeping sees the launch failures) and ECONNREFUSED is delivered.
+        // DNS path: launch the failover probe here (it needs `&mut self`), then
+        // hand the ffi a Launch descriptor for the async lifecycle future — which
+        // performs the primary query and drives search-iteration / AF_UNSPEC.
         let use_tcp = self.transport.config.options.use_vc;
-        let plan = SearchPlan::for_gethostbyname(
-            &resolved_name,
-            self.transport.config.options.ndots,
-            &self.transport.config.search,
-        );
-        let query_hostname = plan.current.clone();
-        let sm = HostByNameSm::new(plan, family, use_tcp);
+        let ndots = self.transport.config.options.ndots;
+        let search = self.transport.config.search.clone();
+        // Mirror the future's first query for the probe: same first plan name and
+        // family (AF_UNSPEC probes AAAA, like the future's first send).
+        let query_hostname =
+            SearchPlan::for_gethostbyname(&resolved_name, ndots, &search).current;
+        let send_family = if family == libc::AF_INET { libc::AF_INET } else { libc::AF_INET6 };
         let first_server = self.server_health.pick_next();
-
-        let (send_family, send_rtype) = (sm.current_family, sm.expected_rtype);
-        let handle = Rc::new(RefCell::new(sm));
-        let launched = self.launch_pooled(&query_hostname, send_family, send_rtype, use_tcp, first_server, &handle, binding);
-        // Server failover probing: if enabled, probe an expired-failure
-        // server in parallel with the primary query (its binding is a copy).
         self.maybe_launch_probe(&query_hostname, send_family, first_server, use_tcp, binding);
-        match launched {
-            LaunchOutcome::Launched => Ok(Operation::Pending),
-            LaunchOutcome::Exhausted { .. } => Err(ARES_ECONNREFUSED.into()),
-        }
+
+        HostStart::Launch(HostLaunch {
+            hostname: resolved_name,
+            family,
+            use_tcp,
+            ndots,
+            search,
+            cache: self.query_cache_max_ttl > 0,
+        })
     }
 
     /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
@@ -1041,79 +1029,13 @@ impl<T> Client<T> {
 
     // ===== Reply executors =====
 
-    /// A gethostbyname task settled (reply or error): parse, feed the machine,
-    /// perform its re-sends (pooled launch) and cache stores, apply the
-    /// sortlist, and return what the shim must deliver to C.
-    #[allow(clippy::too_many_arguments)] // reply-executor seam: the task's binding rides along
-    pub(crate) fn on_hostbyname_reply(
-        &mut self,
-        sm: &Rc<RefCell<HostByNameSm>>,
-        res: Result<&[u8], AresError>,
-        server: usize,
-        io_timeouts: i32,
-        now: Instant,
-        binding: T,
-    ) -> Vec<HostDelivery>
-    where
-        T: Copy,
-    {
-        // Parse outside the machine; the machine sees only the outcome.
-        let mut parsed_items: Option<ParsedRRs<AddrRecord>> = None;
-        let ev = match res {
-            Ok(buf) => {
-                let expected_rtype = sm.borrow().expected_rtype;
-                let outcome = match addr_reply(buf, expected_rtype, ReplyRequire::Items) {
-                    Ok(rrs) => {
-                        parsed_items = Some(rrs);
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                };
-                HostEvent::Reply { parse: outcome, io_timeouts, server }
-            }
-            Err(status) => HostEvent::Error { status },
-        };
-
-        let actions = {
-            let cfg = LookupCfg {
-                ndots: self.transport.config.options.ndots,
-                search: &self.transport.config.search,
-            };
-            let mut machine = sm.borrow_mut();
-            machine.step(ev, &cfg, &mut self.server_health)
-        };
-
-        let mut deliveries = Vec::new();
-        for action in actions {
-            match action {
-                HostAction::Send { name, family, rtype, tcp, server } => {
-                    if let LaunchOutcome::Exhausted { timeouts } =
-                        self.launch_pooled(&name, family, rtype, tcp, server, sm, binding)
-                    {
-                        deliveries.push(HostDelivery::Fail { status: ARES_ECONNREFUSED.into(), timeouts });
-                    }
-                }
-                HostAction::CacheStore { names, rtype } => {
-                    if self.query_cache_max_ttl > 0 {
-                        if let (Ok(buf), Some(rrs)) = (&res, &parsed_items) {
-                            let ttl = rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-                            cache_store_names(&mut self.query_cache, self.query_cache_max_ttl, names, rtype, ttl, buf, now);
-                        }
-                    }
-                }
-                HostAction::DeliverSuccess { family, timeouts } => {
-                    let Some(mut rrs) = parsed_items.take() else { continue };
-                    if !self.sortlist.is_empty() {
-                        apply_sortlist(&self.sortlist, &mut rrs.items);
-                    }
-                    deliveries.push(HostDelivery::Success { hostent: Hostent::from_parsed(rrs, family), timeouts });
-                }
-                HostAction::DeliverFail { status, timeouts } => {
-                    deliveries.push(HostDelivery::Fail { status, timeouts });
-                }
-            }
+    /// Apply an async gethostbyname `SideEffect::Cache`: store the reply under
+    /// each search name. Gated on the cache being enabled (mirrors the old
+    /// `on_hostbyname_reply` cache arm).
+    pub(crate) fn cache_named(&mut self, names: Vec<String>, rtype: u16, ttl: u32, reply: &[u8], now: Instant) {
+        if self.query_cache_max_ttl > 0 {
+            cache_store_names(&mut self.query_cache, self.query_cache_max_ttl, names, rtype, ttl, reply, now);
         }
-        deliveries
     }
 
     /// A search task settled: feed the machine, re-issue the next plan name if
@@ -1169,6 +1091,30 @@ impl<T> Client<T> {
             }
         }
     }
+}
+
+/// Outcome of the `ares_gethostbyname` pre-DNS cascade: a synchronous hit, a
+/// synchronous failure, or the descriptor for an async DNS lifecycle.
+pub(crate) enum HostStart {
+    /// IP literal / hosts file / localhost / query-cache hit — deliver now.
+    Ready(Hostent),
+    /// Rejected name or server-less channel — fail now.
+    Fail(AresError),
+    /// Proceed to DNS: the ffi spawns a `hostbyname_lifecycle` future from this.
+    Launch(HostLaunch),
+}
+
+/// Everything the async gethostbyname future needs, snapshotted from the
+/// channel config at launch time (ndots/search don't change mid-lifecycle).
+pub(crate) struct HostLaunch {
+    /// The resolved query name (post-HOSTALIASES), before search-domain append.
+    pub hostname: String,
+    pub family: i32,
+    pub use_tcp: bool,
+    pub ndots: u32,
+    pub search: Vec<String>,
+    /// Whether successful replies should be cached (query_cache_max_ttl > 0).
+    pub cache: bool,
 }
 
 /// One decoded entry of a caller-supplied server list.
