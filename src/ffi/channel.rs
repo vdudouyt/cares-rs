@@ -2,7 +2,9 @@
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
 
 use super::*;
-use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
+use crate::core::client::{getsock_mask, normalize_port, tcp_payload, Client, ServerSpec};
+use crate::core::launch::{read_tcp_frame, timeout_step};
+use super::process::carry_over;
 
 
 /// The C-visible channel: the pure core state plus the channel-level C
@@ -52,6 +54,175 @@ impl ChannelData {
     pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<CSocketFactory>) {
         self.state.ares.socket_factory = factory.clone();
         self.socket_factory = factory;
+    }
+
+    /// The 4-phase reactor loop (I/O, timeouts, task cleanup, pool cleanup) as a
+    /// safe method — the only unsafe left inside is the FD_ISSET macro and the
+    /// C-callback invokers it drives; every decision is a core verdict or a
+    /// core call.
+    pub(crate) fn process_channel(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
+        // Phase 1: I/O (write + read) processing.
+        // The receive buffer is taken out of the channel for the duration of the
+        // phase so a reply slice borrowed from it can coexist with the &mut
+        // ChannelData the callback dispatch needs. (A reentrant ares_process from
+        // a user callback simply allocates a fresh buffer.)
+        let mut readbuf = std::mem::take(&mut self.state.readbuf);
+        if readbuf.len() < 65_535 {
+            readbuf.resize(65_535, 0);
+        }
+        let mut tasks = std::mem::take(&mut self.state.ares.tasks);
+        for task in &mut tasks {
+            if task.status == Status::Completed { continue; }
+            if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), write_fds) } {
+                match self.state.ares.write_impl(task) {
+                    WriteResult::Ok => {},
+                    WriteResult::Failed => {
+                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                    },
+                    WriteResult::TryAgain => {
+                        // Leave in Writing status for next select cycle
+                    },
+                }
+            }
+            if task.status == Status::Completed { continue; }
+            let fd = task.sock.as_raw_fd();
+            let fd_readable = unsafe { libc::FD_ISSET(fd, read_fds) };
+            let has_tcp_buffered = task.sock.is_tcp() && self.state.tcp_recv_buffers.get(&fd).is_some_and(|b| b.len() >= 2);
+            if fd_readable || has_tcp_buffered {
+                // For TCP shared connections: use per-fd recv buffer with framing
+                let read_result = if task.sock.is_tcp() {
+                    let msg_data = read_tcp_frame(&mut self.state.tcp_recv_buffers, task, fd_readable);
+                    if let Some(ref msg) = msg_data {
+                        readbuf[..msg.len()].copy_from_slice(msg);
+                        Some((0, msg.len()))
+                    } else { None }
+                } else {
+                    // UDP: use existing read_impl
+                    match Transport::read_impl(task, &mut readbuf) {
+                        Ok(v) => v,
+                        Err(()) => {
+                            // recv failed (e.g. ECONNREFUSED) — fire callback
+                            task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                            continue;
+                        }
+                    }
+                };
+                if let Some((offset, len)) = read_result {
+                    let buf = &readbuf[offset..offset+len];
+                    // QID matching: verify response transaction ID matches query
+                    if !qid_matches(buf, &task.writebuf, task.sock.is_tcp()) {
+                        // QID mismatch — discard response, stay in Reading state
+                        task.status = Status::Reading;
+                        continue;
+                    }
+                    // Reactor-level verdict: rcode failover / server-health
+                    // bookkeeping / TC retry — decided in core, executed here.
+                    let summary = summarize(buf, 0);
+                    let (actions, verdict) = on_datagram(
+                        &summary,
+                        task_kind(task),
+                        task.server_index,
+                        task.sock.is_tcp(),
+                        self.state.ares.config.options.attempts,
+                        task.failover_tries,
+                        &mut self.state.server_health,
+                    );
+                    for action in actions {
+                        match action {
+                            ReactorAction::NotifyServerState { server, ok, tcp } =>
+                                self.invoke_server_state_callback(server, ok, tcp),
+                        }
+                    }
+                    match verdict {
+                        TaskVerdict::RetryNextServer { server: next_server, tries } => {
+                            let is_tcp = task.sock.is_tcp();
+                            // Strip the TCP length prefix; enqueue re-frames for the new transport.
+                            let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
+                            if self.state.reissue(payload, SocketSource::fresh(is_tcp), next_server, task.userdata, 0) {
+                                carry_over(&mut self.state, task, task.timeouts, tries);
+                            } else {
+                                // Retry socket couldn't be created — deliver the error.
+                                task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                            }
+                            task.status = Status::Completed;
+                            continue;
+                        }
+                        TaskVerdict::RetryTcp => {
+                            let si = task.server_index;
+                            if self.state.reissue(task.writebuf.clone(), SocketSource::Tcp, si, task.userdata, 0) {
+                                carry_over(&mut self.state, task, task.timeouts, task.failover_tries);
+                            } else {
+                                task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                            }
+                            task.status = Status::Completed;
+                            continue;
+                        }
+                        TaskVerdict::Deliver => {}
+                    }
+                    // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
+                    if task.userdata.callback.wants_dnsrec_cache() {
+                        self.state.cache_dnsrec_reply(buf, Instant::now());
+                    }
+                    (task.userdata.callback).run(Ok(buf), task, self);
+                }
+            }
+        }
+        self.state.readbuf = readbuf;
+        // Merge: new tasks from read/write callbacks + processed tasks
+        let mut new_tasks = std::mem::take(&mut self.state.ares.tasks);
+        tasks.append(&mut new_tasks);
+        self.state.ares.tasks = tasks;
+
+        // Phase 2: Timeout handling
+        let max_tries = self.state.ares.config.options.attempts;
+        let mut tasks = std::mem::take(&mut self.state.ares.tasks);
+        for task in &mut tasks {
+            if task.is_expired() && task.status != Status::Completed {
+                // Invoke server_state_callback with failure for timeout
+                self.invoke_server_state_callback(task.server_index, false, task.sock.is_tcp());
+                let timeout_verdict = timeout_step(task, max_tries, task.server_index, &mut self.state.server_health);
+                if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
+                    let is_tcp = task.sock.is_tcp();
+                    let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
+                    let new_timeouts = task.timeouts + 1;
+                    task.status = Status::Completed;
+                    // The retry task inherits this task's expiry count.
+                    if self.state.reissue(payload, SocketSource::fresh(is_tcp), si, task.userdata, task.tries_remaining) {
+                        carry_over(&mut self.state, task, new_timeouts, task.failover_tries);
+                    } else {
+                        // Retry socket couldn't be created — deliver the error.
+                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                    }
+                } else {
+                    task.userdata.callback.run(Err(ARES_ETIMEOUT), task, self);
+                    task.status = Status::Completed;
+                }
+            }
+        }
+        // Merge back: new tasks from callbacks/retries + processed tasks
+        let mut new_tasks = std::mem::take(&mut self.state.ares.tasks);
+        tasks.append(&mut new_tasks);
+        self.state.ares.tasks = tasks;
+
+        // Phase 3: Cleanup completed tasks
+        self.state.ares.tasks.retain(|task| task.status != Status::Completed);
+
+        // Phase 4: Cleanup stale connection pool entries
+        self.state.retain_pools();
+    }
+
+    /// Fire the server-state notification callback (if installed) for a server
+    /// index; a stale index is silently skipped.
+    pub(crate) fn invoke_server_state_callback(&self, server_index: usize, success: bool, is_tcp: bool) {
+        if let Some(cb) = self.server_state_callback {
+            let Some(server_str) = self.state.server_state_string(server_index, is_tcp) else {
+                return;
+            };
+            let c_server_str = CString::new(server_str).unwrap_or_default();
+            let success_int: c_int = if success { 1 } else { 0 };
+            let flags: c_int = if is_tcp { 1 << 1 } else { 1 << 0 }; // ARES_SERV_STATE_TCP=2, UDP=1
+            unsafe { cb(c_server_str.as_ptr(), success_int, flags, self.server_state_callback_arg) };
+        }
     }
 }
 

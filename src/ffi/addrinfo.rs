@@ -40,7 +40,7 @@ pub struct ares_addrinfo {
 
 /// Build the C node list for a synchronous (IP-literal / hosts-file)
 /// delivery — pure transcription: the family filter was already applied in
-/// core (api::getaddrinfo's DeliverAddrs arm).
+/// core (`Client::getaddrinfo`'s synchronous-deliver arm).
 pub(crate) fn addrinfo_nodes_from_addrs_port(addrs: &[IpAddr], port: u16) -> *mut ares_addrinfo_node {
     let mut head: *mut ares_addrinfo_node = std::ptr::null_mut();
     let mut tail: *mut ares_addrinfo_node = std::ptr::null_mut();

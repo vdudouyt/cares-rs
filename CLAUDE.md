@@ -54,20 +54,20 @@ The refactoring goal is a shrinking unsafe surface: any logic found in `ffi/` sh
 
 ### core module map
 
-- `api.rs` — **one handler per `ares_*` export.** Each FFI shim marshals its C args and makes exactly one call in here; preflights, launch loops, and cache policy are private details of these handlers, not seams the ffi layer reassembles. `make_userdata` factories mint the ffi userdata around core-owned state-machine handles (closures capture only `Copy`/`Rc` — never a live `RefCell` borrow).
-- `lookup.rs` — **the query state machine.** Every retry / failover / search-iteration / TC-retry / AF_UNSPEC decision lives here as pure logic. `SearchSm` (ares_search), `HostByNameSm` (gethostbyname), `AddrInfoSm` (getaddrinfo's parallel A+AAAA batch with a `pending` join counter); plus `SearchPlan` (ndots/bare-name iteration) and `ServerHealth` (lowest-failures-first selection). Machines consume events (parsed reply / I/O error) and return actions; `api.rs` drives them. Its module doc is the reading map.
-- `ares.rs` — the transport engine `Ares<T>`/`Task<T>` (UDP + TCP) over `dyn Transport`.
-- `transport.rs` — `Transport`/`TransportFactory` traits (`ffi::ares_socket` implements them).
-- `channel.rs` — `ChannelState<T>`, all pure channel state (ffi's `ChannelData` = this + the C callback fn-pointer fields).
+- `api.rs` — shared outcome types (`Operation`/`HostDelivery`/`SearchReplyDelivery`/`NameinfoResult`/`AddrInfoResult`) plus the stateless helpers that need no channel state: `on_host_reply`, `clamp_timeout`/`nfds`, and the `search_precheck` re-export. The per-export handlers themselves are methods on `Client<T>` (see `client.rs`).
+- `lookup.rs` — **the query state machine.** Every retry / failover / search-iteration / TC-retry / AF_UNSPEC decision lives here as pure logic. `SearchSm` (ares_search), `HostByNameSm` (gethostbyname), `AddrInfoSm` (getaddrinfo's parallel A+AAAA batch with a `pending` join counter); plus `SearchPlan` (ndots/bare-name iteration) and `ServerHealth` (lowest-failures-first selection). Machines consume events (parsed reply / I/O error) and return actions; the `Client<T>` methods drive them. Its module doc is the reading map.
+- `transport.rs` — the transport engine `Transport<T>`/`Task<T>` (UDP + TCP) over `dyn Socket`.
+- `socket.rs` — `Socket`/`SocketFactory` traits (`ffi::ares_socket` implements them).
+- `client.rs` — `Client<T>`, all pure channel state **plus one method per `ares_*` export** (the resolver operations + their enqueue primitives `issue`/`reissue`/`launch_pooled`/`drive_addrinfo`/`maybe_launch_probe` and the reply executors `on_hostbyname_reply`/`on_search_reply`/`on_probe_reply`). Each FFI shim marshals its C args and makes exactly one call in here; preflights, launch loops, and cache policy are private details of these methods, not seams the ffi layer reassembles. ffi's `ChannelData` = this + the C callback fn-pointer fields.
 - `preflight.rs` — entry cascades, `service_to_port`, `assemble_nameinfo`, `AddrInfo`.
-- `launch.rs` — issue/reissue/launch_pooled/drive_addrinfo/probe + reactor helpers; the `Consent` closure type.
+- `launch.rs` — the `Task`-taking reactor helpers `read_tcp_frame`/`timeout_step` + the `LaunchOutcome`/`AddrInfoDelivery` send-outcome types (the enqueue primitives and launch loops are now methods on `Client<T>`).
 - `hostent.rs` — `HostentBlueprint` (family/alias/addr decisions) + `addrttl_fill`.
 - `dns_record.rs` — the record model (`ares_dns_record_t`/`ares_dns_rr_t`) + codec + metadata tables.
 - `packets.rs` — DNS wire parsing (+ `AddrRecord`, `buf_to_ip`). `sortlist.rs`, `sysconfig.rs` (resolv.conf, `SysConfig`), `servers_csv.rs`, `hostfile.rs`, `services.rs`, `query_builder.rs`, `response.rs` — the rest of the pure surface.
 
 ### ffi module map
 
-`mod.rs` holds typedefs/consts and re-exports. `lookups.rs` = entry shims + the `Callback` enum (dispatches replies to per-type core handlers; `Probe` variant = server-failover probe with no user callback) + userdata factories. `channel.rs` = `ChannelData` wrapper + linked-list/fd_set marshal. `process.rs` = the reactor driver + `sock_consent`. `parsers.rs`, `addrinfo.rs`, `dns_record.rs` (57 shims), `convert.rs` (cstr/sockaddr), `ares_hostent.rs`/`ares_data.rs`/`ares_options.rs`/`ares_socket.rs` = marshalling + C-callback trampolines.
+`mod.rs` holds typedefs/consts and re-exports. `lookups.rs` = entry shims + the `Callback` enum (dispatches replies to per-type core handlers; `Probe` variant = server-failover probe with no user callback) + userdata factories. `channel.rs` = `ChannelData` wrapper + the reactor driver (`process_channel`) + `invoke_server_state_callback` + linked-list/fd_set marshal. `process.rs` = the `ares_process`/`ares_process_fd` entry shims + the `carry_over` retry helper. `parsers.rs`, `addrinfo.rs`, `dns_record.rs` (57 shims), `convert.rs` (cstr/sockaddr), `ares_hostent.rs`/`ares_data.rs`/`ares_options.rs`/`ares_socket.rs` = marshalling + C-callback trampolines.
 
 ### Behavior notes
 
