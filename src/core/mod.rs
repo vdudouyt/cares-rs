@@ -5,10 +5,12 @@
 
 pub mod api;
 pub mod socket;
+pub mod cache;
 pub mod client;
 pub mod dns_record;
 pub mod error;
 pub mod executor;
+pub mod hostbyname;
 pub mod launch;
 pub mod hostent;
 pub mod lookup;

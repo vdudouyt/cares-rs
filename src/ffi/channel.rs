@@ -4,12 +4,9 @@
 use super::*;
 use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
 use crate::core::query_builder::tcp_payload;
-use crate::core::executor::{
-    host_lifecycle, noop_waker, raw_lifecycle, Delivery, Effect, HostLaunch, QueryIo, RawLaunch,
-};
-use crate::core::hostent::Hostent;
+use crate::core::executor::{noop_waker, raw_lifecycle, Delivery, Effect, QueryIo, RawLaunch};
+use crate::core::hostbyname::{gethostbyname, HostCtx};
 use crate::core::launch::{read_tcp_frame, timeout_step};
-use crate::core::sortlist::apply_sortlist;
 use crate::core::transport::Task;
 use super::lookups::{fire_host_success, HostTail};
 use super::process::carry_over;
@@ -117,10 +114,11 @@ impl ChannelData {
         self.spawn(io, fut, AsyncSink::Raw(callback, arg));
     }
 
-    /// ares_gethostbyname (DNS path): spawn the search/AF_UNSPEC lifecycle.
-    pub(crate) fn spawn_host(&mut self, launch: HostLaunch, tail: HostTail) {
+    /// ares_gethostbyname: spawn the whole self-contained lifecycle — preflight
+    /// (fires re-entrantly on a synchronous hit) through the DNS phase.
+    pub(crate) fn spawn_host(&mut self, ctx: HostCtx, hostname: String, family: c_int, tail: HostTail) {
         let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(host_lifecycle(io.clone(), launch));
+        let fut = Box::pin(gethostbyname(ctx, io.clone(), hostname, family));
         self.spawn(io, fut, AsyncSink::Host(tail));
     }
 
@@ -152,9 +150,6 @@ impl ChannelData {
             match effect {
                 Effect::NotifyServerState { server, ok, tcp } => {
                     self.invoke_server_state_callback(server, ok, tcp)
-                }
-                Effect::CacheNamed { names, rtype, ttl, reply } => {
-                    self.state.cache_named(names, rtype, ttl, &reply, Instant::now())
                 }
             }
         }
@@ -206,12 +201,7 @@ impl ChannelData {
                 fire_ares_callback(callback, arg, result.as_deref().map_err(|&e| e), timeouts);
             }
             (Delivery::Host { result, timeouts }, AsyncSink::Host(tail)) => match result {
-                Ok((mut rrs, family)) => {
-                    if !self.state.sortlist.is_empty() {
-                        apply_sortlist(&self.state.sortlist, &mut rrs.items);
-                    }
-                    fire_host_success(tail, Hostent::from_parsed(rrs, family), timeouts);
-                }
+                Ok(hostent) => fire_host_success(tail, hostent, timeouts),
                 Err(status) => unsafe { (tail.callback)(tail.arg, status, timeouts, std::ptr::null_mut()) },
             },
             _ => unreachable!("async delivery/sink kind mismatch"),

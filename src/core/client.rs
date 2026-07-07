@@ -14,22 +14,22 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 
 use crate::core::api::{AddrInfoResult, NameinfoResult, Operation, SearchReplyDelivery};
+use crate::core::cache::QueryCache;
 use crate::core::executor;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::AddressFamily;
 use crate::core::launch::AddrInfoDelivery;
 use crate::core::lookup::{
-    is_localhost, is_onion_domain, AddrInfoAction, AddrInfoEvent, AddrInfoSm, LookupEvent,
-    SearchAction, SearchPlan, SearchSm, ServerHealth,
+    is_onion_domain, AddrInfoAction, AddrInfoEvent, AddrInfoSm, LookupEvent, SearchAction,
+    SearchPlan, SearchSm, ServerHealth,
 };
-use crate::core::packets::{buf_to_ip, AddrRecord};
+use crate::core::packets::buf_to_ip;
 use crate::core::preflight::{
     cached_reply, format_ip_with_scope, get_service_string, hosts_file_lookup, no_servers,
     search_start, AddrInfo,
 };
-use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::query_builder::dns_query_payload;
-use crate::core::sortlist::{apply_sortlist, SortlistEntry};
+use crate::core::sortlist::SortlistEntry;
 use crate::core::transport::{
     qtype_of, rdns_name, Family, SocketSource, Status, TaskMachine, Transport,
 };
@@ -43,8 +43,8 @@ use crate::ffi::ares_options::{
     ARES_OPT_UDP_PORT,
 };
 use crate::ffi::error::{
-    ARES_EBADFLAGS, ARES_EBADNAME, ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_EFILE, ARES_ENODATA,
-    ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP,
+    ARES_EBADFLAGS, ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_ENOSERVER, ARES_ENOTFOUND,
+    ARES_ENOTIMP,
 };
 use crate::ffi::{
     ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NUMERICHOST, RECORD_TYPE_A,
@@ -66,8 +66,9 @@ pub(crate) struct Client<T> {
     pub lookups: String,
     pub resolvconf_path: String,
     pub hosts_path: String,
-    pub query_cache: HashMap<(String, u16), (Vec<u8>, Instant)>,
-    pub query_cache_max_ttl: u32, // 0 = disabled
+    /// TTL-bounded reply cache, shared (via `Rc<RefCell<_>>`) with the async
+    /// engine (gethostbyname) and the classic dnsrec post-delivery hook.
+    pub cache: Rc<RefCell<QueryCache>>,
     pub udp_max_queries: u32, // 0 = unlimited
     /// Shared TCP connections for the async engine (parallel lookups to one
     /// server share a connection); handed to each future via its descriptor.
@@ -93,8 +94,7 @@ impl<T> Client<T> {
             lookups: String::new(),
             resolvconf_path: String::new(),
             hosts_path: String::new(),
-            query_cache: HashMap::new(),
-            query_cache_max_ttl: 0,
+            cache: Rc::new(RefCell::new(QueryCache::default())),
             udp_max_queries: 0,
             tcp_pool: Rc::new(RefCell::new(crate::core::executor::TcpPool::default())),
             endpoints: Rc::new(Vec::new()),
@@ -127,7 +127,7 @@ impl<T> Client<T> {
         dup.lookups = self.lookups.clone();
         dup.resolvconf_path = self.resolvconf_path.clone();
         dup.hosts_path = self.hosts_path.clone();
-        dup.query_cache_max_ttl = self.query_cache_max_ttl;
+        dup.cache.borrow_mut().set_max_ttl(self.cache.borrow().max_ttl());
         dup.udp_max_queries = self.udp_max_queries;
         dup.server_failover_retry_chance = self.server_failover_retry_chance;
         dup.server_failover_retry_delay = self.server_failover_retry_delay;
@@ -204,7 +204,7 @@ impl<T> Client<T> {
             }
         }
         if optmask & ARES_OPT_QUERY_CACHE != 0 {
-            self.query_cache_max_ttl = o.qcache_max_ttl;
+            self.cache.borrow_mut().set_max_ttl(o.qcache_max_ttl);
         }
         if optmask & ARES_OPT_UDP_MAX_QUERIES != 0 {
             self.udp_max_queries = o.udp_max_queries as u32;
@@ -384,9 +384,7 @@ impl<T> Client<T> {
     /// Store a dnsrec-flavored reply in the query cache (no-op when the
     /// cache is disabled) — the reactor's post-delivery hook.
     pub fn cache_dnsrec_reply(&mut self, buf: &[u8], now: Instant) {
-        if self.query_cache_max_ttl > 0 {
-            cache_reply(&mut self.query_cache, self.query_cache_max_ttl, buf, now);
-        }
+        self.cache.borrow_mut().store_reply(buf, now);
     }
 
     /// Drop the classic reactor's TCP reassembly buffers (ares_cancel). The
@@ -573,6 +571,22 @@ impl<T> Client<T> {
         }
     }
 
+    /// Bundle everything the self-contained async `gethostbyname` future owns:
+    /// the socket resources plus `Rc`/snapshot handles for the preflight (hosts
+    /// file, query cache, sortlist, ndots/search/use_vc). The one spot that reads
+    /// `Client` for the host lifecycle — the future itself names no channel.
+    pub(crate) fn host_ctx(&mut self) -> crate::core::hostbyname::HostCtx {
+        crate::core::hostbyname::HostCtx {
+            res: self.resources(),
+            hosts: self.transport.hosts(),
+            cache: self.cache.clone(),
+            sortlist: Rc::from(self.sortlist.clone()),
+            ndots: self.transport.config.options.ndots,
+            search: Rc::from(self.transport.config.search.clone()),
+            use_vc: self.transport.config.options.use_vc,
+        }
+    }
+
     // ===== Entry points (one method per ares_* export) =====
 
     /// ares_query: `no_servers` preflight, then a launch descriptor carrying the
@@ -728,151 +742,6 @@ impl<T> Client<T> {
         Ok(Operation::Pending)
     }
 
-    /// ares_gethostbyname: the full pre-DNS cascade, then (for the DNS path) the
-    /// failover probe plus a [`HostStart::Launch`] descriptor the ffi turns into
-    /// an async lifecycle future. A synchronous hit (IP literal / hosts file /
-    /// localhost / query cache) is [`HostStart::Ready`]; a rejected name or a
-    /// server-less channel is [`HostStart::Fail`].
-    pub(crate) fn gethostbyname(&mut self, hostname: &str, family: i32, now: Instant) -> HostStart {
-        // Check order is behavior (each stage may deliver before the next runs):
-        // ascii -> onion -> family-validate -> IP literal -> hosts file ->
-        // localhost -> HOSTALIASES (fs read; PermissionDenied => Deliver(EFILE)) ->
-        // no-servers -> query cache (evict expired; parse; sortlist; a cache-hit
-        // parse error falls through to DNS) -> DNS launch.
-
-        // Reject non-ASCII names
-        if !hostname.is_ascii() {
-            return HostStart::Fail(ARES_EBADNAME.into());
-        }
-
-        // Reject .onion domains immediately (RFC 7686)
-        if is_onion_domain(hostname) {
-            return HostStart::Fail(ARES_ENOTFOUND.into());
-        }
-
-        let family_filter = match family {
-            libc::AF_INET => AddressFamily::Ipv4,
-            libc::AF_INET6 => AddressFamily::Ipv6,
-            libc::AF_UNSPEC => AddressFamily::Any,
-            _ => return HostStart::Fail(ARES_ENOTIMP.into()),
-        };
-
-        // Check IP literal first
-        if let Ok(ip) = hostname.parse::<IpAddr>() {
-            let matches = match family_filter {
-                AddressFamily::Ipv4 => ip.is_ipv4(),
-                AddressFamily::Ipv6 => ip.is_ipv6(),
-                AddressFamily::Any => true,
-            };
-            if matches {
-                return HostStart::Ready(Hostent::new(hostname.to_string(), vec![ip]));
-            }
-        }
-
-        // Check hosts file
-        let hosts_result = self.transport.hosts().lookup(hostname, family_filter);
-        if let Some(ref lookup) = hosts_result {
-            if !lookup.addrs.is_empty() {
-                return HostStart::Ready(Hostent::from_lookup(lookup.clone()));
-            }
-        }
-
-        // RFC 6761 section 6.3: recognize "localhost" and any name under ".localhost"
-        // as special and always return the loopback address.
-        if is_localhost(hostname) {
-            let addrs = match family_filter {
-                AddressFamily::Ipv4 => vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
-                AddressFamily::Ipv6 => vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
-                AddressFamily::Any => vec![
-                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                ],
-            };
-            return HostStart::Ready(Hostent::new(hostname.to_string(), addrs));
-        }
-
-        // Check HOSTALIASES env var for single-label names
-        let hostname_str = hostname.to_string();
-        let resolved_name = if !hostname.contains('.') {
-            if let Ok(aliases_path) = std::env::var("HOSTALIASES") {
-                match std::fs::read_to_string(&aliases_path) {
-                    Ok(content) => {
-                        let mut alias_found = None;
-                        for line in content.lines() {
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            if parts.len() >= 2 && parts[0].eq_ignore_ascii_case(hostname) {
-                                alias_found = Some(parts[1].to_string());
-                                break;
-                            }
-                        }
-                        alias_found.unwrap_or_else(|| hostname_str.clone())
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        return HostStart::Fail(ARES_EFILE.into());
-                    }
-                    Err(_) => hostname_str.clone(),
-                }
-            } else {
-                hostname_str.clone()
-            }
-        } else {
-            hostname_str.clone()
-        };
-
-        // No servers configured — return ENOSERVER immediately
-        if self.transport.config.nameservers.is_empty() {
-            return HostStart::Fail(ARES_ENOSERVER.into());
-        }
-
-        // Check query cache
-        if self.query_cache_max_ttl > 0 {
-            let record_type = match family_filter {
-                AddressFamily::Ipv4 => RECORD_TYPE_A,
-                AddressFamily::Ipv6 | AddressFamily::Any => RECORD_TYPE_AAAA,
-            };
-            let cache_key = (resolved_name.clone(), record_type);
-            if let Some((cached_buf, expires_at)) = self.query_cache.get(&cache_key) {
-                if now < *expires_at {
-                    let cached_buf = cached_buf.clone();
-                    let parsed = (|| -> Result<ParsedRRs<AddrRecord>, AresError> {
-                        let response = ParsedResponse::from_buf(&cached_buf)?;
-                        let parsed_rrs = response.process_answers::<AddrRecord>(&cached_buf, record_type)?;
-                        if parsed_rrs.items.is_empty() {
-                            return Err(ARES_ENODATA.into());
-                        }
-                        Ok(parsed_rrs)
-                    })();
-                    // On a cache-hit parse error, fall through to a fresh DNS query.
-                    if let Ok(mut parsed_rrs) = parsed {
-                        if !self.sortlist.is_empty() {
-                            apply_sortlist(&self.sortlist, &mut parsed_rrs.items);
-                        }
-                        let current_family = match family_filter {
-                            AddressFamily::Ipv4 => libc::AF_INET,
-                            AddressFamily::Ipv6 | AddressFamily::Any => libc::AF_INET6,
-                        };
-                        return HostStart::Ready(Hostent::from_parsed(parsed_rrs, current_family));
-                    }
-                } else {
-                    self.query_cache.remove(&cache_key);
-                }
-            }
-        }
-
-        // DNS path: hand the ffi a launch descriptor for the async lifecycle
-        // future, which owns its socket(s) and runs the primary query, the
-        // failover probe, and search-iteration / AF_UNSPEC entirely itself.
-        HostStart::Launch(executor::HostLaunch {
-            res: self.resources(),
-            hostname: resolved_name,
-            family,
-            use_tcp: self.transport.config.options.use_vc,
-            ndots: self.transport.config.options.ndots,
-            search: self.transport.config.search.clone(),
-            cache: self.query_cache_max_ttl > 0,
-        })
-    }
-
     /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
     /// then mint the machine and drive the A/AAAA batch.
     pub(crate) fn getaddrinfo(
@@ -967,15 +836,6 @@ impl<T> Client<T> {
 
     // ===== Reply executors =====
 
-    /// Apply an async gethostbyname `SideEffect::Cache`: store the reply under
-    /// each search name. Gated on the cache being enabled (mirrors the old
-    /// `on_hostbyname_reply` cache arm).
-    pub(crate) fn cache_named(&mut self, names: Vec<String>, rtype: u16, ttl: u32, reply: &[u8], now: Instant) {
-        if self.query_cache_max_ttl > 0 {
-            cache_store_names(&mut self.query_cache, self.query_cache_max_ttl, names, rtype, ttl, reply, now);
-        }
-    }
-
     /// A search task settled: feed the machine, re-issue the next plan name if
     /// asked (a failed re-issue reports ECONNREFUSED with zero timeouts, as
     /// historically), or hand the delivery back to the shim.
@@ -1007,18 +867,6 @@ impl<T> Client<T> {
         }
     }
 
-}
-
-/// Outcome of the `ares_gethostbyname` pre-DNS cascade: a synchronous hit, a
-/// synchronous failure, or the descriptor for an async DNS lifecycle (the
-/// descriptor itself lives in the engine — see [`executor::HostLaunch`]).
-pub(crate) enum HostStart {
-    /// IP literal / hosts file / localhost / query-cache hit — deliver now.
-    Ready(Hostent),
-    /// Rejected name or server-less channel — fail now.
-    Fail(AresError),
-    /// Proceed to DNS: the ffi spawns a `host_lifecycle` future from this.
-    Launch(executor::HostLaunch),
 }
 
 /// One decoded entry of a caller-supplied server list.
@@ -1089,47 +937,4 @@ pub(crate) struct SavedOptions {
     pub base_mask: i32,
 }
 
-/// Store a successful reply under (qname, qtype), clamped to the minimum
-/// answer TTL and the channel limit. `from_buf` only succeeds with a
-/// non-empty answer section, so the historical `ancount > 0` guard is
-/// implied by the parse.
-pub(crate) fn cache_reply(
-    cache: &mut HashMap<(String, u16), (Vec<u8>, Instant)>,
-    max_ttl: u32,
-    buf: &[u8],
-    now: Instant,
-) {
-    // Extract query name and type from the response buffer
-    if let Ok(parsed) = ParsedResponse::from_buf(buf) {
-        let qname = parsed.query.name.join(".");
-        let qtype = parsed.query.qtype;
-        // Find minimum TTL from answers
-        let min_ttl = parsed.answers.iter().map(|a| a.ttl).min().unwrap_or(0);
-        let cache_ttl = std::cmp::min(min_ttl, max_ttl);
-        if cache_ttl > 0 {
-            let expires = now + Duration::from_secs(cache_ttl as u64);
-            cache.insert((qname, qtype), (buf.to_vec(), expires));
-        }
-    }
-}
-
-/// The HostAction::CacheStore arm: store one reply under every search name
-/// it answered, clamped to the minimum record TTL and the channel limit.
-pub(crate) fn cache_store_names(
-    cache: &mut HashMap<(String, u16), (Vec<u8>, Instant)>,
-    max_ttl: u32,
-    names: Vec<String>,
-    rtype: u16,
-    min_item_ttl: u32,
-    buf: &[u8],
-    now: Instant,
-) {
-    let cache_ttl = std::cmp::min(min_item_ttl, max_ttl);
-    if cache_ttl > 0 {
-        let expires = now + Duration::from_secs(cache_ttl as u64);
-        for name in names {
-            cache.insert((name, rtype), (buf.to_vec(), expires));
-        }
-    }
-}
 

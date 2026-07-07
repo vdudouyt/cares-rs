@@ -239,16 +239,5 @@ pub(crate) fn cached_reply<T>(
     qtype: u16,
     now: Instant,
 ) -> Option<Vec<u8>> {
-    if st.query_cache_max_ttl == 0 {
-        return None;
-    }
-    let cache_key = (name_clean.to_string(), qtype);
-    if let Some((cached_buf, expires_at)) = st.query_cache.get(&cache_key) {
-        if now < *expires_at {
-            return Some(cached_buf.clone());
-        } else {
-            st.query_cache.remove(&cache_key);
-        }
-    }
-    None
+    st.cache.borrow_mut().get(name_clean, qtype, now)
 }

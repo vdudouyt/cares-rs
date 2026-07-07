@@ -30,7 +30,7 @@ pub struct Transport<T> {
     pub config: SysConfig,
     pub socket_factory: Rc<dyn SocketFactory>,
     pub tasks: Vec<Task<T>>,
-    hosts: Option<Hosts>,
+    hosts: Option<Rc<Hosts>>,
     services: Option<Services>,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
@@ -104,8 +104,10 @@ impl<T> Transport<T> {
     pub fn from_sysconfig(transports: Rc<dyn SocketFactory>) -> Self {
         Transport::new(build_sysconfig(), transports)
     }
-    pub fn hosts(&mut self) -> &Hosts {
-        self.hosts.get_or_insert_with(|| Hosts::from_path("/etc/hosts").unwrap_or_default())
+    /// The `/etc/hosts` table as a shared `Rc` (lazily loaded once), so the ffi
+    /// can hand a clone to the async gethostbyname future.
+    pub fn hosts(&mut self) -> Rc<Hosts> {
+        self.hosts.get_or_insert_with(|| Rc::new(Hosts::from_path("/etc/hosts").unwrap_or_default())).clone()
     }
     pub fn services(&mut self) -> &Services {
         self.services.get_or_insert_with(Services::default)

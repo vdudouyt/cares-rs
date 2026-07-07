@@ -4,7 +4,6 @@
 use super::*;
 use crate::core::api;
 use crate::core::AresError;
-use crate::core::client::HostStart;
 use crate::core::hostent::Hostent;
 use crate::core::transport::{Task, TaskMachine};
 use crate::core::launch::AddrInfoDelivery;
@@ -159,13 +158,10 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let channeldata = unsafe { &mut *channel };
     let hostname = unsafe { cstr_lossy(hostname) };
     let tail = HostTail { callback, arg };
-    match channeldata.state.gethostbyname(hostname, family, Instant::now()) {
-        HostStart::Fail(status) => {
-            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
-        }
-        HostStart::Ready(bp) => fire_host_success(tail, bp, 0),
-        HostStart::Launch(launch) => channeldata.spawn_host(launch, tail),
-    }
+    // Thin wrapper: build the resource bundle, spawn the self-contained future.
+    // A synchronous preflight hit fires re-entrantly on the first `advance`.
+    let ctx = channeldata.state.host_ctx();
+    channeldata.spawn_host(ctx, hostname.to_string(), family, tail);
 }
 
 /// # Safety

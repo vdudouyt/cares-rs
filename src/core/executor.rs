@@ -29,17 +29,14 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 
+use crate::core::hostent::Hostent;
 use crate::core::lookup::{
-    extract_tcp_frame, on_datagram, on_timeout, qid_matches, summarize, ReactorAction, SearchPlan,
-    ServerHealth, TaskKind, TaskVerdict, TimeoutVerdict, AF_INET, AF_INET6, AF_UNSPEC, RTYPE_A,
-    RTYPE_AAAA,
+    extract_tcp_frame, on_datagram, on_timeout, qid_matches, summarize, ReactorAction, ServerHealth,
+    TaskKind, TaskVerdict, TimeoutVerdict,
 };
-use crate::core::packets::AddrRecord;
-use crate::core::query_builder::{dns_query_payload, frame_tcp};
-use crate::core::response::{addr_reply, ParsedRRs, ReplyRequire};
+use crate::core::query_builder::frame_tcp;
 use crate::core::socket::{Socket, SocketFactory};
-use crate::core::AresError;
-use crate::ffi::error::{ARES_ECONNREFUSED, ARES_ENODATA, ARES_ENOTFOUND, ARES_ETIMEOUT};
+use crate::ffi::error::{ARES_ECONNREFUSED, ARES_ETIMEOUT};
 
 // ===== Mailbox + await primitive =====
 
@@ -50,14 +47,12 @@ pub(crate) struct Wait {
     pub writable: bool,
 }
 
-/// A fire-and-forget side effect the ffi applies after a poll — the two things
-/// a `forbid(unsafe_code)` future cannot do itself (touch the C callback / the
-/// channel's cache).
+/// A fire-and-forget side effect the ffi applies after a poll — the one thing a
+/// `forbid(unsafe_code)` future cannot do itself: fire the C server-state
+/// callback.
 pub(crate) enum Effect {
     /// Fire the C server-state callback.
     NotifyServerState { server: usize, ok: bool, tcp: bool },
-    /// Store the reply bytes under each name (gethostbyname success).
-    CacheNamed { names: Vec<String>, rtype: u16, ttl: u32, reply: Vec<u8> },
 }
 
 /// The mailbox shared (via `Rc<RefCell<_>>`) between one lifecycle future and
@@ -140,9 +135,9 @@ fn notify(io: &Rc<RefCell<QueryIo>>, actions: Vec<ReactorAction>) {
 pub(crate) enum Delivery {
     /// ares_query / ares_send: raw reply bytes or a status code.
     Raw { result: Result<Vec<u8>, c_int>, timeouts: c_int },
-    /// ares_gethostbyname: parsed answers (+ family) to sort & build a hostent
-    /// from, or a status code.
-    Host { result: Result<(ParsedRRs<AddrRecord>, c_int), c_int>, timeouts: c_int },
+    /// ares_gethostbyname: a finished hostent (sortlist already applied) or a
+    /// status code — the ffi only builds the C hostent + fires.
+    Host { result: Result<Hostent, c_int>, timeouts: c_int },
 }
 
 // ===== Owned resources (built by the channel, held by the future) =====
@@ -176,17 +171,6 @@ pub(crate) struct Resources {
     pub opts: QueryOpts,
 }
 
-/// Descriptor the ffi turns into a `host_lifecycle` future (built by the sync
-/// `Client::gethostbyname` preflight).
-pub(crate) struct HostLaunch {
-    pub res: Resources,
-    pub hostname: String,
-    pub family: c_int,
-    pub use_tcp: bool,
-    pub ndots: u32,
-    pub search: Vec<String>,
-    pub cache: bool,
-}
 
 /// Descriptor the ffi turns into a `raw_lifecycle` future (ares_query/ares_send).
 pub(crate) struct RawLaunch {
@@ -499,7 +483,7 @@ fn settle_probe(io: &Rc<RefCell<QueryIo>>, res: &Resources, probe: &Probe, reply
 /// socket(s): create / connect / send / recv / QID-match, with TC-retry, server
 /// failover, and timeout-retry via the reused `on_datagram`/`on_timeout` truth
 /// tables, plus the concurrent probe. Returns `(reply-or-status, timeout-count)`.
-async fn resolve_query(
+pub(crate) async fn resolve_query(
     io: Rc<RefCell<QueryIo>>,
     res: Resources,
     payload: BytesMut,
@@ -685,80 +669,6 @@ fn clear_tcp_slot(primary: &Primary, qid: u16) {
 pub(crate) async fn raw_lifecycle(io: Rc<RefCell<QueryIo>>, launch: RawLaunch) -> Delivery {
     let (result, timeouts) = resolve_query(io, launch.res, launch.payload, false, None).await;
     Delivery::Raw { result, timeouts }
-}
-
-/// ares_gethostbyname's DNS phase: query the current name, and on NXDOMAIN/
-/// NODATA walk the search plan, then (for AF_UNSPEC) fall AAAA→A, then finalize.
-/// Each `resolve_query` already folded that query's own failover/TC/timeout in.
-pub(crate) async fn host_lifecycle(io: Rc<RefCell<QueryIo>>, launch: HostLaunch) -> Delivery {
-    let HostLaunch { res, hostname, family, use_tcp, ndots, search, cache } = launch;
-    let mut plan = SearchPlan::for_gethostbyname(&hostname, ndots, &search);
-    let (mut current_family, mut rtype) = match family {
-        AF_INET => (AF_INET, RTYPE_A),
-        _ => (AF_INET6, RTYPE_AAAA),
-    };
-    let mut tried_aaaa = family == AF_UNSPEC;
-    let mut timeouts: c_int = 0;
-    let mut had_nodata = false;
-    let mut first = true;
-
-    loop {
-        let payload = dns_query_payload(&plan.current, rtype);
-        // Only the first query of a lookup is eligible to spawn a probe.
-        let probe_payload = if first { Some(dns_query_payload(&plan.current, rtype)) } else { None };
-        first = false;
-        let (result, io_timeouts) = resolve_query(io.clone(), res.clone(), payload, use_tcp, probe_payload).await;
-
-        let last_error: AresError = match result {
-            Ok(buf) => match addr_reply(&buf, rtype, ReplyRequire::Items) {
-                Ok(rrs) => {
-                    if cache {
-                        let mut names = vec![plan.current.clone()];
-                        if !plan.base_name.is_empty() && plan.base_name != plan.current {
-                            names.push(plan.base_name.clone());
-                        }
-                        let ttl = rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-                        push_effect(&io, Effect::CacheNamed { names, rtype, ttl, reply: buf });
-                    }
-                    return Delivery::Host { result: Ok((rrs, current_family)), timeouts: timeouts + io_timeouts };
-                }
-                Err(e) => {
-                    if e.code() == ARES_ENODATA {
-                        had_nodata = true;
-                    }
-                    e
-                }
-            },
-            Err(status) => {
-                if status == ARES_ETIMEOUT {
-                    timeouts += 1;
-                }
-                AresError::from(status)
-            }
-        };
-
-        if matches!(last_error.code(), ARES_ENOTFOUND | ARES_ENODATA) && plan.advance().is_some() {
-            continue;
-        }
-        if family == AF_UNSPEC && tried_aaaa && current_family == AF_INET6 {
-            current_family = AF_INET;
-            rtype = RTYPE_A;
-            tried_aaaa = false;
-            plan = if !plan.base_name.is_empty() {
-                SearchPlan::for_gethostbyname(&plan.base_name, ndots, &search)
-            } else {
-                plan.domains.clear();
-                plan
-            };
-            continue;
-        }
-        let status = if had_nodata && last_error.code() == ARES_ENOTFOUND {
-            ARES_ENODATA
-        } else {
-            last_error.code()
-        };
-        return Delivery::Host { result: Err(status), timeouts };
-    }
 }
 
 // ===== Waker =====
