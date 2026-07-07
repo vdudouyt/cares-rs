@@ -4,7 +4,7 @@
 use super::*;
 use crate::core::api;
 use crate::core::AresError;
-use crate::core::ares::{Task, TaskMachine};
+use crate::core::transport::{Task, TaskMachine};
 use crate::core::launch::{drive_addrinfo, AddrInfoDelivery};
 use crate::core::preflight::{assemble_nameinfo, service_to_port, ServicePort};
 
@@ -61,7 +61,7 @@ pub(crate) enum Callback {
 }
 
 impl Callback {
-    pub(crate) fn run(&self, buf: Result<&[u8], c_int>, task: &crate::core::ares::Task<FFIData>, channeldata: &mut ChannelData) {
+    pub(crate) fn run(&self, buf: Result<&[u8], c_int>, task: &crate::core::transport::Task<FFIData>, channeldata: &mut ChannelData) {
         // A probe carries a copy of the lookup's binding but must never reach
         // the user callback: route it to the probe handler (and stay silent on
         // cancel/destroy). This is checked before the teardown dispatch below,

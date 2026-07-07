@@ -10,18 +10,18 @@ use crate::core::channel::{getsock_mask, normalize_port, ChannelState, ServerSpe
 /// callback fields are the only C-tainted residents.
 pub struct ChannelData {
     pub(crate) state: ChannelState<FFIData>,
-    /// Concrete handle to the same factory held as `Rc<dyn TransportFactory>`
+    /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
     /// in `state.ares`. The socket-state callbacks (create/configure) live in
     /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
     /// can simply share the Rc and stay independent.
-    pub(crate) socket_factory: std::rc::Rc<SocketFactory>,
+    pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
 }
 
 impl ChannelData {
     /// A fresh channel: pure state, no callbacks installed.
-    pub(crate) fn new(state: ChannelState<FFIData>, socket_factory: std::rc::Rc<SocketFactory>) -> Self {
+    pub(crate) fn new(state: ChannelState<FFIData>, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
         ChannelData {
             state,
             socket_factory,
@@ -42,14 +42,14 @@ impl ChannelData {
 
     /// A fresh channel with the default (libc) socket factory.
     pub(crate) fn new_default() -> Self {
-        let factory = std::rc::Rc::new(SocketFactory::default());
-        let state = ChannelState::new(Ares::from_sysconfig(factory.clone()));
+        let factory = std::rc::Rc::new(CSocketFactory::default());
+        let state = ChannelState::new(Transport::from_sysconfig(factory.clone()));
         ChannelData::new(state, factory)
     }
 
     /// Install a rebuilt socket factory, keeping the concrete handle and the
-    /// core's `Rc<dyn TransportFactory>` in sync (they are the same object).
-    pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<SocketFactory>) {
+    /// core's `Rc<dyn SocketFactory>` in sync (they are the same object).
+    pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<CSocketFactory>) {
         self.state.ares.socket_factory = factory.clone();
         self.socket_factory = factory;
     }

@@ -18,7 +18,7 @@ pub type ares_ssize_t = libc::ssize_t;
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
     if funcs.is_null() { return; }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    let factory = SocketFactory::with_funcs((unsafe { &*funcs }).clone(), user_data, &channeldata.socket_factory);
+    let factory = CSocketFactory::with_funcs((unsafe { &*funcs }).clone(), user_data, &channeldata.socket_factory);
     channeldata.apply_socket_factory(factory);
 }
 
@@ -51,7 +51,7 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
         asendv: None, // ex.asendto has different signature
     };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
-    let factory = SocketFactory::with_funcs(basic, user_data, &channeldata.socket_factory);
+    let factory = CSocketFactory::with_funcs(basic, user_data, &channeldata.socket_factory);
     channeldata.socket_factory = factory.clone();
     channeldata.state.ares.socket_factory = factory;
     0 // ARES_SUCCESS
@@ -153,9 +153,9 @@ fn raw_to_socket_addr(storage: &libc::sockaddr_storage, len: socklen_t) -> Optio
 }
 
 /// The channel's socket source: the (user-replaceable) C function table.
-/// Implements the core `TransportFactory` trait, so the engine never sees
+/// Implements the core `SocketFactory` trait, so the engine never sees
 /// the table or the user_data pointer.
-pub struct SocketFactory {
+pub struct CSocketFactory {
     funcs: AresSocketFunctions,
     user_data: *mut c_void,
     // Socket-state callbacks (ares_set_socket_callback / _configure_callback),
@@ -170,9 +170,9 @@ pub struct SocketFactory {
     config_arg: *mut c_void,
 }
 
-impl Default for SocketFactory {
+impl Default for CSocketFactory {
     fn default() -> Self {
-        SocketFactory {
+        CSocketFactory {
             funcs: AresSocketFunctions::default(),
             user_data: std::ptr::null_mut(),
             create_cb: None,
@@ -186,14 +186,14 @@ impl Default for SocketFactory {
 /// One socket created from a snapshot of the factory's function table. The
 /// snapshot (instead of a factory back-reference) keeps a replaced table
 /// alive for sockets that outlive an ares_set_socket_functions() swap —
-/// the same semantics the old per-socket Rc<SocketFactory> provided.
+/// the same semantics the old per-socket Rc<CSocketFactory> provided.
 struct CSocket {
     fd: ares_socket_t,
     funcs: AresSocketFunctions,
     user_data: *mut c_void,
 }
 
-impl crate::core::transport::Transport for CSocket {
+impl crate::core::socket::Socket for CSocket {
     fn as_raw_fd(&self) -> i32 {
         self.fd
     }
@@ -244,10 +244,10 @@ impl Drop for CSocket {
     }
 }
 
-impl SocketFactory {
+impl CSocketFactory {
     /// ares_set_socket_functions[_ex]: a new function table, but the
     /// socket-state callbacks are an independent setting — carry them over.
-    pub fn with_funcs(funcs: AresSocketFunctions, user_data: *mut c_void, prev: &SocketFactory) -> Rc<Self> {
+    pub fn with_funcs(funcs: AresSocketFunctions, user_data: *mut c_void, prev: &CSocketFactory) -> Rc<Self> {
         Rc::new(Self {
             funcs,
             user_data,
@@ -268,7 +268,7 @@ impl SocketFactory {
         Rc::new(Self { config_cb: cb, config_arg: arg, funcs: self.funcs.clone(), ..*self })
     }
 
-    fn create(&self, addr: SocketAddr, socket_type: c_int) -> io::Result<Rc<dyn crate::core::transport::Transport>> {
+    fn create(&self, addr: SocketAddr, socket_type: c_int) -> io::Result<Rc<dyn crate::core::socket::Socket>> {
         let domain = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
         let asocket = self.funcs.asocket.unwrap_or(default_asocket);
         let fd = unsafe { asocket(domain, socket_type, 0, self.user_data) };
@@ -297,12 +297,12 @@ impl SocketFactory {
     }
 }
 
-impl crate::core::transport::TransportFactory for SocketFactory {
-    fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::core::transport::Transport>> {
+impl crate::core::socket::SocketFactory for CSocketFactory {
+    fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::core::socket::Socket>> {
         self.create(bind, SOCK_DGRAM)
     }
 
-    fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::core::transport::Transport>> {
+    fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::core::socket::Socket>> {
         self.create(bind, SOCK_STREAM)
     }
 }

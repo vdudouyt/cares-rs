@@ -18,12 +18,12 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 
-use crate::core::ares::{dns_query_payload, rdns_name, SocketSource};
+use crate::core::transport::{dns_query_payload, rdns_name, SocketSource};
 use crate::core::channel::ChannelState;
 use crate::core::launch::{
     drive_addrinfo, issue, launch_pooled, maybe_launch_probe, AddrInfoDelivery, LaunchOutcome,
 };
-use crate::core::ares::TaskMachine;
+use crate::core::transport::TaskMachine;
 use crate::core::channel::cache_store_names;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::AddressFamily;

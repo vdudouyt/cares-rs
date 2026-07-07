@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
-pub mod ares;
+pub mod socket;
 pub mod channel;
 pub mod dns_record;
 pub mod error;

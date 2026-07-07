@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use bytes::BytesMut;
 
-use crate::core::ares::{dns_query_payload, qtype_of, Family, SocketSource, Status, TaskMachine};
+use crate::core::transport::{dns_query_payload, qtype_of, Family, SocketSource, Status, TaskMachine};
 use crate::core::channel::ChannelState;
 use crate::core::lookup::{AddrInfoAction, AddrInfoEvent, AddrInfoSm, HostByNameSm};
 use crate::core::AresError;
@@ -64,7 +64,7 @@ pub(crate) fn launch_pooled<T: Copy>(
     if use_tcp {
         if let Some(idx) = st.tcp_connections.iter().position(|(s, _)| *s == si) {
             let shared_sock = st.tcp_connections[idx].1.clone();
-            let _ = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::ares::DnsSocket::Tcp(shared_sock)), si, binding);
+            let _ = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::transport::DnsSocket::Tcp(shared_sock)), si, binding);
             stamp(st, machine(), family, rtype, 0);
             return LaunchOutcome::Launched;
         }
@@ -77,7 +77,7 @@ pub(crate) fn launch_pooled<T: Copy>(
         if let Some(idx) = st.udp_connections.iter().position(|(s, _, c)| *s == si && *c < limit) {
             let shared_sock = st.udp_connections[idx].1.clone();
             st.udp_connections[idx].2 += 1;
-            let _ = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::ares::DnsSocket::Udp(shared_sock)), si, binding);
+            let _ = st.ares.enqueue(dns_query_payload(hostname, qtype_of(core_family)), SocketSource::Shared(crate::core::transport::DnsSocket::Udp(shared_sock)), si, binding);
             stamp(st, machine(), family, rtype, 0);
             return LaunchOutcome::Launched;
         }
@@ -89,11 +89,11 @@ pub(crate) fn launch_pooled<T: Copy>(
             stamp(st, machine(), family, rtype, 0);
             // Add the fresh socket to the connection pool for reuse.
             if use_tcp {
-                if let crate::core::ares::DnsSocket::Tcp(ref rc_sock) = st.ares.tasks.last().expect("just pushed").sock {
+                if let crate::core::transport::DnsSocket::Tcp(ref rc_sock) = st.ares.tasks.last().expect("just pushed").sock {
                     st.tcp_connections.push((si, rc_sock.clone()));
                 }
             } else if st.udp_max_queries > 0 {
-                if let crate::core::ares::DnsSocket::Udp(ref rc_sock) = st.ares.tasks.last().expect("just pushed").sock {
+                if let crate::core::transport::DnsSocket::Udp(ref rc_sock) = st.ares.tasks.last().expect("just pushed").sock {
                     st.udp_connections.push((si, rc_sock.clone(), 1));
                 }
             }
@@ -170,7 +170,7 @@ pub(crate) fn drive_addrinfo<T: Copy>(
 /// extract one length-prefixed frame if complete (which settles the task).
 pub(crate) fn read_tcp_frame<T>(
     buffers: &mut std::collections::HashMap<i32, Vec<u8>>,
-    task: &mut crate::core::ares::Task<T>,
+    task: &mut crate::core::transport::Task<T>,
     fd_readable: bool,
 ) -> Option<Vec<u8>> {
     let fd = task.sock.as_raw_fd();
@@ -192,7 +192,7 @@ pub(crate) fn read_tcp_frame<T>(
 /// Phase-2 timeout bookkeeping: count the expiry on the task, then take the
 /// retry-or-fail verdict.
 pub(crate) fn timeout_step<T>(
-    task: &mut crate::core::ares::Task<T>,
+    task: &mut crate::core::transport::Task<T>,
     attempts: u32,
     server: usize,
     health: &mut crate::core::lookup::ServerHealth,

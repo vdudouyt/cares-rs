@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::core::channel::{tcp_payload, ChannelState};
-use crate::core::ares::Task;
+use crate::core::transport::Task;
 use crate::core::launch::{read_tcp_frame, reissue, timeout_step};
 
 /// Copy the core-owned per-task data (state machine, family/record-type,
@@ -91,7 +91,7 @@ pub(crate) fn process_channel(channeldata: &mut ChannelData, read_fds: &mut libc
                 } else { None }
             } else {
                 // UDP: use existing read_impl
-                match Ares::read_impl(task, &mut readbuf) {
+                match Transport::read_impl(task, &mut readbuf) {
                     Ok(v) => v,
                     Err(()) => {
                         // recv failed (e.g. ECONNREFUSED) — fire callback

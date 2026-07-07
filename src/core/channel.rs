@@ -10,11 +10,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::core::ares::{Ares, Status};
+use crate::core::transport::{Transport, Status};
 use crate::core::lookup::ServerHealth;
 use crate::core::response::ParsedResponse;
 use crate::core::sortlist::SortlistEntry;
-use crate::core::transport::Transport;
+use crate::core::socket::Socket;
 use crate::ffi::ares_options::{
     ARES_FLAG_EDNS, ARES_FLAG_PRIMARY, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_FLAGS,
     ARES_OPT_HOSTS_FILE, ARES_OPT_LOOKUPS, ARES_OPT_MAXTIMEOUTMS, ARES_OPT_NDOTS,
@@ -28,7 +28,7 @@ use crate::ffi::ares_options::{
 /// bookkeeping, configuration strings, and the shared-socket pools. Generic
 /// over the per-task userdata `T`, which core never inspects.
 pub(crate) struct ChannelState<T> {
-    pub ares: Ares<T>,
+    pub ares: Transport<T>,
     pub readbuf: Vec<u8>,
     pub server_health: ServerHealth,
     pub sortlist: Vec<SortlistEntry>,
@@ -40,8 +40,8 @@ pub(crate) struct ChannelState<T> {
     pub query_cache: HashMap<(String, u16), (Vec<u8>, Instant)>,
     pub query_cache_max_ttl: u32, // 0 = disabled
     pub udp_max_queries: u32, // 0 = unlimited
-    pub udp_connections: Vec<(usize, Rc<dyn Transport>, u32)>, // (server_index, shared_socket, query_count)
-    pub tcp_connections: Vec<(usize, Rc<dyn Transport>)>, // (server_index, shared_socket)
+    pub udp_connections: Vec<(usize, Rc<dyn Socket>, u32)>, // (server_index, shared_socket, query_count)
+    pub tcp_connections: Vec<(usize, Rc<dyn Socket>)>, // (server_index, shared_socket)
     pub tcp_recv_buffers: HashMap<i32, Vec<u8>>, // fd -> accumulated TCP receive data
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
@@ -49,7 +49,7 @@ pub(crate) struct ChannelState<T> {
 
 impl<T> ChannelState<T> {
     /// A fresh channel around `ares` — shared by ares_init and ares_init_options.
-    pub fn new(ares: Ares<T>) -> Self {
+    pub fn new(ares: Transport<T>) -> Self {
         ChannelState {
             ares,
             readbuf: vec![0u8; 65_535],
@@ -75,7 +75,7 @@ impl<T> ChannelState<T> {
     /// reactor state (empty query cache, no pooled connections, cleared
     /// failure timestamps — but cloned failure counts).
     pub fn duplicate(&self) -> ChannelState<T> {
-        let mut ares = Ares::new(self.ares.config.clone(), self.ares.socket_factory.clone());
+        let mut ares = Transport::new(self.ares.config.clone(), self.ares.socket_factory.clone());
         ares.default_udp_port = self.ares.default_udp_port;
         ares.default_tcp_port = self.ares.default_tcp_port;
         let mut dup = ChannelState::new(ares);
