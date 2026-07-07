@@ -60,6 +60,13 @@ pub(crate) enum AsyncKind {
         fut: std::pin::Pin<Box<dyn std::future::Future<Output = NameinfoReply>>>,
         tail: NameinfoTail,
     },
+    /// ares_query_dnsrec: raw reply bytes parsed into an ares_dns_record_t
+    /// (or status) to the ares_callback_dnsrec; reuses `Completed::Raw`.
+    DnsRec {
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
+        callback: AresCallbackDnsRec,
+        arg: *mut libc::c_void,
+    },
 }
 
 /// A polled-to-completion future's output, held across the mailbox-borrow drop
@@ -132,6 +139,13 @@ impl ChannelData {
         self.spawn(io, AsyncKind::Raw { fut, callback, arg });
     }
 
+    /// ares_query_dnsrec: spawn the raw lifecycle with the dns_rec callback.
+    pub(crate) fn spawn_query_dnsrec(&mut self, launch: RawLaunch, callback: AresCallbackDnsRec, arg: *mut libc::c_void) {
+        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+        let fut = Box::pin(raw_lifecycle(io.clone(), launch));
+        self.spawn(io, AsyncKind::DnsRec { fut, callback, arg });
+    }
+
     /// Fire a settled classic-task outcome (search/getaddrinfo/gethostbyaddr/
     /// nameinfo/probe). The migrated async lifecycles own their sockets and
     /// never appear here.
@@ -165,6 +179,10 @@ impl ChannelData {
                     std::task::Poll::Ready(r) => Some(Completed::Nameinfo(r)),
                     std::task::Poll::Pending => None,
                 },
+                AsyncKind::DnsRec { fut, .. } => match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(d) => Some(Completed::Raw(d)),
+                    std::task::Poll::Pending => None,
+                },
             }
         };
         let effects = {
@@ -184,6 +202,24 @@ impl ChannelData {
             match (done, slot.kind) {
                 (Completed::Raw(Delivery::Raw { result, timeouts }), AsyncKind::Raw { callback, arg, .. }) => {
                     fire_ares_callback(callback, arg, result.as_deref().map_err(|&e| e), timeouts);
+                }
+                (Completed::Raw(Delivery::Raw { result, timeouts }), AsyncKind::DnsRec { callback, arg, .. }) => {
+                    match result {
+                        Ok(ref buf) => {
+                            // Cache the raw reply (same as the old classic-reactor
+                            // `cache_dnsrec_reply` in process_channel).
+                            self.state.cache.borrow_mut().store_reply(buf, Instant::now());
+                            match crate::core::dns_record::parse_record(buf) {
+                                Ok(rec) => {
+                                    let dnsrec = Box::into_raw(Box::new(rec));
+                                    unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };
+                                    unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
+                                }
+                                Err(e) => unsafe { callback(arg, e.code(), timeouts as usize, std::ptr::null_mut()) },
+                            }
+                        }
+                        Err(status) => unsafe { callback(arg, status, timeouts as usize, std::ptr::null_mut()) },
+                    }
                 }
                 (Completed::Host(result), AsyncKind::Host { tail, .. }) => {
                     let timeouts = slot.io.borrow().timeouts;
@@ -265,6 +301,7 @@ impl ChannelData {
             AsyncKind::Raw { callback, arg, .. } => fire_ares_callback(callback, arg, Err(status), 0),
             AsyncKind::Host { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) },
             AsyncKind::Nameinfo { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) },
+            AsyncKind::DnsRec { callback, arg, .. } => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
         }
     }
 

@@ -272,18 +272,21 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     let Some(callback) = callback else { return; };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
-    let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallbackDnsRec(callback)) };
-    match channeldata.state.query_dnsrec(name, dnstype as u16, Instant::now(), ffidata) {
-        Err(status) => {
-            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
-        }
-        Ok(api::Operation::Ready(rec)) => {
+    // Cache probe: if a fresh cached reply parses, deliver synchronously.
+    let name_clean = name.strip_suffix('.').unwrap_or(&name);
+    if let Some(cached_buf) = channeldata.state.cache.borrow_mut().get(name_clean, dnstype as u16, Instant::now()) {
+        if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf) {
             let dnsrec = Box::into_raw(Box::new(rec));
             unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
-            unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
+            unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
+            return;
         }
-        Ok(api::Operation::Pending) => {}
     }
+    let launch = match channeldata.state.query_payload(&name, dnstype as u16) {
+        Ok(l) => l,
+        Err(e) => { unsafe { callback(arg, e.code(), 0, std::ptr::null_mut()) }; return; }
+    };
+    channeldata.spawn_query_dnsrec(launch, callback, arg);
 }
 
 /// # Safety

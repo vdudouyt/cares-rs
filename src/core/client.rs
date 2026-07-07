@@ -24,8 +24,7 @@ use crate::core::lookup::{
     SearchPlan, SearchSm, ServerHealth,
 };
 use crate::core::preflight::{
-    cached_reply, hosts_file_lookup, no_servers,
-    search_start,
+    hosts_file_lookup, no_servers, search_start,
 };
 use crate::core::query_builder::dns_query_payload;
 use crate::core::sortlist::SortlistEntry;
@@ -605,30 +604,6 @@ impl<T> Client<T> {
             return Err(ARES_ENOSERVER.into());
         }
         Ok(executor::RawLaunch { res: self.resources(), payload: BytesMut::from(query_buf) })
-    }
-
-    /// ares_query_dnsrec: server guard, then the query cache (keyed without the
-    /// trailing dot; a cached reply that fails to parse falls through), then a
-    /// fresh query. A cache hit is parsed right here (`Ready`); the shim boxes the
-    /// record, delivers, and destroys.
-    pub(crate) fn query_dnsrec(
-        &mut self,
-        name_raw: &str,
-        qtype: u16,
-        now: Instant,
-        userdata: T,
-    ) -> Result<Operation<crate::core::dns_record::ares_dns_record_t>, AresError> {
-        if no_servers(self) {
-            return Err(ARES_ENOSERVER.into());
-        }
-        let name_clean = name_raw.strip_suffix('.').unwrap_or(name_raw);
-        if let Some(cached_buf) = cached_reply(self, name_clean, qtype, now) {
-            if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf) {
-                return Ok(Operation::Ready(rec));
-            }
-        }
-        self.enqueue(dns_query_payload(name_raw, qtype), SocketSource::Udp, 0, userdata)?;
-        Ok(Operation::Pending)
     }
 
     /// ares_search / ares_search_dnsrec: seed the search plan, mint the shared
