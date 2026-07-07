@@ -5,7 +5,6 @@ use super::*;
 use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
 use crate::core::query_builder::tcp_payload;
 use crate::core::executor::{noop_waker, raw_lifecycle, Delivery, Effect, QueryIo, RawLaunch};
-use crate::core::hostbyname::{gethostbyname, HostCtx};
 use crate::core::launch::{read_tcp_frame, timeout_step};
 use crate::core::transport::Task;
 use super::lookups::{fire_host_success, HostTail};
@@ -40,7 +39,7 @@ struct AsyncQuery {
 /// How a completed lifecycle future is delivered to C. The future owns its
 /// socket(s), so nothing is enqueued as a `Task` — this only names the callback.
 #[derive(Clone, Copy)]
-enum AsyncSink {
+pub(crate) enum AsyncSink {
     /// ares_query / ares_send: raw reply bytes to the ares_callback.
     Raw(AresCallback, *mut libc::c_void),
     /// ares_gethostbyname: sorted answers built into a hostent for the host callback.
@@ -87,7 +86,7 @@ impl ChannelData {
     /// Register a lifecycle future + its delivery sink in a free slot and drive
     /// it once (issuing the initial send). The C callback fires when the reactor
     /// later settles the task (or in place if the launch fails immediately).
-    fn spawn(
+    pub(crate) fn spawn(
         &mut self,
         io: std::rc::Rc<std::cell::RefCell<QueryIo>>,
         fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
@@ -112,14 +111,6 @@ impl ChannelData {
         let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
         let fut = Box::pin(raw_lifecycle(io.clone(), launch));
         self.spawn(io, fut, AsyncSink::Raw(callback, arg));
-    }
-
-    /// ares_gethostbyname: spawn the whole self-contained lifecycle — preflight
-    /// (fires re-entrantly on a synchronous hit) through the DNS phase.
-    pub(crate) fn spawn_host(&mut self, ctx: HostCtx, hostname: String, family: c_int, tail: HostTail) {
-        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(gethostbyname(ctx, io.clone(), hostname, family));
-        self.spawn(io, fut, AsyncSink::Host(tail));
     }
 
     /// Fire a settled classic-task outcome (search/getaddrinfo/gethostbyaddr/
