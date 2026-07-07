@@ -6,18 +6,25 @@ use crate::core::api;
 use crate::core::AresError;
 use crate::core::executor::QueryIo;
 use crate::core::hostbyname::gethostbyname;
+use crate::core::hostbyaddr::{gethostbyaddr, HostByAddrCtx};
 use crate::core::hostent::Hostent;
 use crate::core::transport::{Task, TaskMachine};
 use crate::core::launch::AddrInfoDelivery;
 use crate::core::preflight::{assemble_nameinfo, service_to_port, ServicePort};
 
 
-/// The Copy delivery tail of an ares_gethostbyname lookup: where results go
-/// once the shared, core-minted HostByNameSm settles. Bare fn pointer +
-/// opaque arg are Copy; only *calling* them is unsafe.
+/// The Copy delivery tail of an ares_gethostbyname / ares_gethostbyaddr lookup.
+/// Bare fn pointer + opaque arg are Copy; only *calling* them is unsafe.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HostTail {
     pub(crate) callback: AresHostCallback,
+    pub(crate) arg: *mut c_void,
+}
+
+/// The Copy delivery tail of an ares_getnameinfo lookup.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NameinfoTail {
+    pub(crate) callback: AresNameinfoCallback,
     pub(crate) arg: *mut c_void,
 }
 
@@ -190,31 +197,28 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
 pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void, addrlen: c_int, family: c_int, callback: ares_host_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    // NULL/negative-length buffers report the same ENOTIMP the family check
-    // does, so guarding here first is observably identical.
     if addr.is_null() || addrlen < 0 {
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
         return;
     }
     let addrbuf = unsafe { std::slice::from_raw_parts(addr as *mut u8, addrlen as usize) };
-    // Built eagerly and passed by value — no factory closure. The queried
-    // address, family and record type are core-owned (Task.queried_ip /
-    // family / rtype), set by the handler, so they're not in the binding.
-    let userdata = FFIData {
-        arg,
-        ..FFIData::base(Callback::AresHostCallback(callback))
-    };
-    match channeldata.state.gethostbyaddr(addrbuf, family, userdata) {
-        Err(status) => {
-            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
-        }
-        Ok(api::Operation::Ready(bp)) => {
-            let hostent = unsafe { build_hostent(bp) };
-            unsafe { callback(arg, ARES_SUCCESS, 0, hostent) };
-            unsafe { ares_free_hostent(hostent) };
-        }
-        Ok(api::Operation::Pending) => {}
+    // Family validation done here (reads raw C args; stays in the shim).
+    if family != libc::AF_INET && family != libc::AF_INET6 {
+        unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
+        return;
     }
+    let Ok(ip) = crate::core::packets::buf_to_ip(addrbuf) else {
+        unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
+        return;
+    };
+    // Build the resource bundle and spawn the self-contained async future.
+    let ctx = HostByAddrCtx {
+        res: channeldata.state.resources(),
+        hosts: channeldata.state.transport.hosts(),
+    };
+    let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+    let fut = Box::pin(gethostbyaddr(ctx, io.clone(), ip, family));
+    channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
 }
 
 /// # Safety
@@ -339,37 +343,24 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
     let Some(callback) = callback else { return; };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
 
-    // Extract IP address and port from sockaddr
+    // Sockaddr unmarshal stays in the shim (reads raw C `*const sockaddr`).
     let addr_info = match extract_addr_port(sa, salen) {
         Ok(result) => result,
         Err(status) => {
-            // Call callback with error
             unsafe { callback(arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
             return;
         }
     };
 
-    // Built eagerly and passed by value — no factory closure. `flags` here is
-    // the raw request; the handler's LOOKUPHOST defaulting affects only its
-    // path choice, not the reply, so raw flags in the userdata are correct.
-    let userdata = FFIData {
-        arg, ip: Some(addr_info.ip), nameinfo_flags: flags, port: addr_info.port, scope_id: addr_info.scope_id,
-        ..FFIData::base(Callback::AresNameinfoCallback(callback))
+    // Build the resource bundle and spawn the self-contained async future. The
+    // three synchronous short-circuits (service-only / NUMERICHOST / no-servers)
+    // fire re-entrantly on the first advance.
+    let ctx = crate::core::nameinfo::NameinfoCtx {
+        res: channeldata.state.resources(),
     };
-    match channeldata.state.getnameinfo(&addr_info, flags, userdata) {
-        Err(status) => {
-            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), std::ptr::null_mut()) };
-        }
-        Ok(api::Operation::Ready(api::NameinfoResult::Service(service))) => {
-            let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
-            unsafe { callback(arg, ARES_SUCCESS, 0, std::ptr::null_mut(), service_ptr) };
-        }
-        Ok(api::Operation::Ready(api::NameinfoResult::Numeric { node, service })) => {
-            let service_ptr = service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
-            unsafe { callback(arg, ARES_SUCCESS, 0, node.into_raw(), service_ptr) };
-        }
-        Ok(api::Operation::Pending) => {}
-    }
+    let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+    let fut = Box::pin(crate::core::nameinfo::getnameinfo(ctx, io.clone(), addr_info, flags));
+    channeldata.spawn(io, AsyncKind::Nameinfo { fut, tail: NameinfoTail { callback, arg } });
 }
 
 

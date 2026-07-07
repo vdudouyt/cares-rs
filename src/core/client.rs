@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 
-use crate::core::api::{AddrInfoResult, NameinfoResult, Operation, SearchReplyDelivery};
+use crate::core::api::{AddrInfoResult, Operation, SearchReplyDelivery};
 use crate::core::cache::QueryCache;
 use crate::core::executor;
 use crate::core::hostent::Hostent;
@@ -23,15 +23,14 @@ use crate::core::lookup::{
     is_onion_domain, AddrInfoAction, AddrInfoEvent, AddrInfoSm, LookupEvent, SearchAction,
     SearchPlan, SearchSm, ServerHealth,
 };
-use crate::core::packets::buf_to_ip;
 use crate::core::preflight::{
-    cached_reply, format_ip_with_scope, get_service_string, hosts_file_lookup, no_servers,
-    search_start, AddrInfo,
+    cached_reply, hosts_file_lookup, no_servers,
+    search_start,
 };
 use crate::core::query_builder::dns_query_payload;
 use crate::core::sortlist::SortlistEntry;
 use crate::core::transport::{
-    qtype_of, rdns_name, Family, SocketSource, Status, TaskMachine, Transport,
+    qtype_of, Family, SocketSource, Status, TaskMachine, Transport,
 };
 use crate::core::AresError;
 use crate::ffi::ares_options::{
@@ -43,12 +42,11 @@ use crate::ffi::ares_options::{
     ARES_OPT_UDP_PORT,
 };
 use crate::ffi::error::{
-    ARES_EBADFLAGS, ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_ENOSERVER, ARES_ENOTFOUND,
-    ARES_ENOTIMP,
+    ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_ENOSERVER, ARES_ENOTFOUND,
 };
 use crate::ffi::{
-    ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NUMERICHOST, RECORD_TYPE_A,
-    RECORD_TYPE_AAAA, RECORD_TYPE_PTR,
+    RECORD_TYPE_A,
+    RECORD_TYPE_AAAA,
 };
 
 /// Everything a channel owns that is pure Rust: the engine, health/cache
@@ -561,7 +559,7 @@ impl<T> Client<T> {
 
     /// Bundle the owned resources an async lifecycle future carries. Cheap: all
     /// `Rc` clones (endpoints cached, rebuilt only on server change).
-    fn resources(&self) -> executor::Resources {
+    pub(crate) fn resources(&self) -> executor::Resources {
         executor::Resources {
             factory: self.transport.socket_factory.clone(),
             health: self.server_health.clone(),
@@ -658,89 +656,6 @@ impl<T> Client<T> {
         hosts_file_lookup(self, name, family).map(Hostent::from_lookup)
     }
 
-    /// ares_gethostbyaddr: preflight (family/length validation, hosts-file
-    /// reverse hit, no-servers), then the PTR query — whose fresh socket the
-    /// channel's socket callback may refuse (→ ECONNREFUSED).
-    ///
-    /// The `userdata` is a plain value the shim built eagerly (no factory
-    /// closure): the only per-task datum core computes here — the queried
-    /// address — is recorded on the `Task` itself (`queried_ip`), not stamped
-    /// into the ffi userdata, and the reply reads it back from there.
-    pub(crate) fn gethostbyaddr(
-        &mut self,
-        addrbuf: &[u8],
-        family: i32,
-        userdata: T,
-    ) -> Result<Operation<Hostent>, AresError> {
-        // family-validate -> buf_to_ip -> hosts reverse lookup -> no-servers -> PTR.
-        if family != libc::AF_INET && family != libc::AF_INET6 {
-            return Err(ARES_ENOTIMP.into());
-        }
-        let addr = buf_to_ip(addrbuf).map_err(|_| ARES_ENOTIMP)?;
-        // Check hosts file first
-        if let Some(lookup) = self.transport.hosts().reverse_lookup(addr) {
-            return Ok(Operation::Ready(Hostent::from_lookup(lookup)));
-        }
-        // No servers configured
-        if self.transport.config.nameservers.is_empty() {
-            return Err(ARES_ENOSERVER.into());
-        }
-        self.enqueue(dns_query_payload(&rdns_name(addr), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
-        if let Some(t) = self.transport.tasks.last_mut() {
-            t.queried_ip = Some(addr);
-            t.family = family;
-            t.rtype = RECORD_TYPE_PTR;
-        }
-        Ok(Operation::Pending)
-    }
-
-    /// ares_getnameinfo: flag defaulting + the numeric/service short-circuits,
-    /// then the PTR query (whose fresh socket the channel's socket callback may
-    /// refuse → ECONNREFUSED). `userdata` is built by the shim and passed by
-    /// value (no factory closure); it is consumed only on the PTR-query path.
-    /// The LOOKUPHOST default applied here affects only the path decision —
-    /// never the reply — so the shim's raw-flag userdata is correct.
-    pub(crate) fn getnameinfo(
-        &mut self,
-        addr: &AddrInfo,
-        flags: i32,
-        userdata: T,
-    ) -> Result<Operation<NameinfoResult>, AresError> {
-        // Adjust flags: if neither LOOKUPSERVICE nor LOOKUPHOST, default to LOOKUPHOST
-        let flags = if (flags & ARES_NI_LOOKUPSERVICE) == 0 && (flags & ARES_NI_LOOKUPHOST) == 0 {
-            flags | ARES_NI_LOOKUPHOST
-        } else {
-            flags
-        };
-
-        let want_host = (flags & ARES_NI_LOOKUPHOST) != 0;
-        let want_service = (flags & ARES_NI_LOOKUPSERVICE) != 0;
-
-        // If only service lookup requested (no host), deliver immediately
-        if want_service && !want_host {
-            return Ok(Operation::Ready(NameinfoResult::Service(get_service_string(self.transport.services(), addr.port, flags))));
-        }
-
-        // Host lookup requested (guaranteed by the defaulting above).
-        // Numeric host can be handled without DNS
-        if (flags & ARES_NI_NUMERICHOST) != 0 {
-            // ARES_NI_NUMERICHOST + ARES_NI_NAMEREQD is illegal (contradiction)
-            if (flags & ARES_NI_NAMEREQD) != 0 {
-                return Err(ARES_EBADFLAGS.into());
-            }
-            let node = CString::new(format_ip_with_scope(&addr.ip, addr.scope_id, flags)).unwrap();
-            let service = if want_service {
-                get_service_string(self.transport.services(), addr.port, flags)
-            } else {
-                None
-            };
-            return Ok(Operation::Ready(NameinfoResult::Numeric { node, service }));
-        }
-
-        // PTR lookup required.
-        self.enqueue(dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR), SocketSource::fresh(false), 0, userdata)?;
-        Ok(Operation::Pending)
-    }
 
     /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
     /// then mint the machine and drive the A/AAAA batch.

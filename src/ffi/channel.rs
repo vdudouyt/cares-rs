@@ -9,7 +9,8 @@ use crate::core::hostent::Hostent;
 use crate::core::launch::{read_tcp_frame, timeout_step};
 use crate::core::transport::Task;
 use crate::core::AresError;
-use super::lookups::{fire_host_success, HostTail};
+use crate::core::preflight::NameinfoReply;
+use super::lookups::{fire_host_success, HostTail, NameinfoTail};
 use super::process::carry_over;
 
 
@@ -46,11 +47,18 @@ pub(crate) enum AsyncKind {
         callback: AresCallback,
         arg: *mut libc::c_void,
     },
-    /// ares_gethostbyname: a hostent (or status) to the ares_host_callback; the
-    /// timeout count is read from the mailbox (`io.timeouts`).
+    /// ares_gethostbyname / ares_gethostbyaddr: a hostent (or status) to
+    /// the ares_host_callback; the timeout count is read from the mailbox
+    /// (`io.timeouts`).
     Host {
         fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hostent, AresError>>>>,
         tail: HostTail,
+    },
+    /// ares_getnameinfo: a node / service pair (or status) to the
+    /// ares_nameinfo_callback; the timeout count rides in `NameinfoReply.timeouts`.
+    Nameinfo {
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = NameinfoReply>>>,
+        tail: NameinfoTail,
     },
 }
 
@@ -59,6 +67,7 @@ pub(crate) enum AsyncKind {
 enum Completed {
     Raw(Delivery),
     Host(Result<Hostent, AresError>),
+    Nameinfo(NameinfoReply),
 }
 
 impl ChannelData {
@@ -152,6 +161,10 @@ impl ChannelData {
                     std::task::Poll::Ready(r) => Some(Completed::Host(r)),
                     std::task::Poll::Pending => None,
                 },
+                AsyncKind::Nameinfo { fut, .. } => match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(r) => Some(Completed::Nameinfo(r)),
+                    std::task::Poll::Pending => None,
+                },
             }
         };
         let effects = {
@@ -178,6 +191,11 @@ impl ChannelData {
                         Ok(hostent) => fire_host_success(tail, hostent, timeouts),
                         Err(e) => unsafe { (tail.callback)(tail.arg, e.code(), timeouts, std::ptr::null_mut()) },
                     }
+                }
+                (Completed::Nameinfo(reply), AsyncKind::Nameinfo { tail, .. }) => {
+                    let node_ptr = reply.node.as_ref().map(|s| s.as_ptr() as *mut c_char).unwrap_or(std::ptr::null_mut());
+                    let service_ptr = reply.service.as_ref().map(|s| s.as_ptr() as *mut c_char).unwrap_or(std::ptr::null_mut());
+                    unsafe { (tail.callback)(tail.arg, reply.status.code(), reply.timeouts, node_ptr, service_ptr) };
                 }
                 _ => unreachable!("async completion / slot kind mismatch"),
             }
@@ -246,6 +264,7 @@ impl ChannelData {
         match slot.kind {
             AsyncKind::Raw { callback, arg, .. } => fire_ares_callback(callback, arg, Err(status), 0),
             AsyncKind::Host { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) },
+            AsyncKind::Nameinfo { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) },
         }
     }
 
