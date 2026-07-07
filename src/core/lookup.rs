@@ -9,9 +9,9 @@
 //! - [`summarize`] / [`qid_matches`] / [`extract_tcp_frame`] — DNS reply
 //!   header classification, transaction-ID matching, TCP reassembly
 //! - [`is_localhost`] / [`is_onion_domain`] — special-name classification
-//! - [`SearchPlan`] — the single implementation of search-domain iteration
-//!   (ndots threshold, bare-name fallback), with the [`SearchPlan::for_search`]
-//!   and [`SearchPlan::for_gethostbyname`] flavors
+//! - [`SearchPlan`] — the search-domain iteration for ares_search / getaddrinfo
+//!   (ndots threshold, bare-name fallback), via [`SearchPlan::for_search`]
+//!   (gethostbyname inlines its own simpler walk in `core::hostbyname`)
 //! - [`ServerHealth`] — per-server failure accounting and the
 //!   lowest-failures-first server selection for failover and probing
 //!
@@ -130,21 +130,6 @@ pub struct SearchPlan {
 }
 
 impl SearchPlan {
-    /// ares_gethostbyname style plan: no trailing-dot handling, and search
-    /// domains are only walked below the `ndots` threshold (at or above it the
-    /// name is queried as-is with no fallback).
-    pub fn for_gethostbyname(name: &str, ndots: u32, search: &[String]) -> Self {
-        let dot_count = name.chars().filter(|&c| c == '.').count() as u32;
-        let mut domains: Vec<String> = Vec::new();
-        let mut current = name.to_string();
-        if dot_count < ndots && !search.is_empty() {
-            domains = search.to_vec();
-            let first_domain = domains.remove(0);
-            current = format!("{}.{}", name, first_domain);
-        }
-        SearchPlan { base_name: name.to_string(), current, domains }
-    }
-
     /// ares_search / ares_search_dnsrec style plan: a trailing dot suppresses
     /// search entirely; at or above `ndots` the bare name is tried first with
     /// the search domains as fallback; below `ndots` the first search domain

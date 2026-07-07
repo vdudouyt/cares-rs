@@ -17,7 +17,7 @@ use crate::core::executor::{resolve_query, Delivery, QueryIo, Resources};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, Hosts};
 use crate::core::lookup::{
-    is_localhost, is_onion_domain, SearchPlan, AF_INET, AF_INET6, AF_UNSPEC, RTYPE_A, RTYPE_AAAA,
+    is_localhost, is_onion_domain, AF_INET, AF_INET6, AF_UNSPEC, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::query_builder::dns_query_payload;
 use crate::core::response::{addr_reply, ReplyRequire};
@@ -119,7 +119,19 @@ pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostna
     }
 
     // ===== DNS phase =====
-    let mut plan = SearchPlan::for_gethostbyname(&resolved, ctx.ndots, &ctx.search);
+    // The candidate names to try, in order (was SearchPlan::for_gethostbyname):
+    // below ndots with a search list, each `name.domain` then the bare name;
+    // otherwise just the name. Trailing dots are kept verbatim (unlike
+    // ares_search) so the query / cache-store / cache-probe keys all match.
+    let dots = resolved.chars().filter(|&c| c == '.').count() as u32;
+    let mut names: Vec<String> = if dots < ctx.ndots && !ctx.search.is_empty() {
+        let mut v: Vec<String> = ctx.search.iter().map(|d| format!("{resolved}.{d}")).collect();
+        v.push(resolved.clone());
+        v
+    } else {
+        vec![resolved.clone()]
+    };
+    let mut idx = 0;
     let (mut current_family, mut rtype) = match family {
         AF_INET => (AF_INET, RTYPE_A),
         _ => (AF_INET6, RTYPE_AAAA),
@@ -130,24 +142,24 @@ pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostna
     let mut first = true;
 
     loop {
-        let payload = dns_query_payload(&plan.current, rtype);
+        let payload = dns_query_payload(&names[idx], rtype);
         // Only a lookup's first query is eligible to spawn a probe.
-        let probe_payload = if first { Some(dns_query_payload(&plan.current, rtype)) } else { None };
+        let probe_payload = if first { Some(dns_query_payload(&names[idx], rtype)) } else { None };
         first = false;
         let (result, io_timeouts) = resolve_query(io.clone(), ctx.res.clone(), payload, ctx.use_vc, probe_payload).await;
 
         let last_error: AresError = match result {
             Ok(buf) => match addr_reply(&buf, rtype, ReplyRequire::Items) {
                 Ok(mut rrs) => {
-                    // Cache the raw reply under the query name (+ pre-search base
-                    // name), then sort + build the hostent.
+                    // Cache the raw reply under the query name (+ the bare name,
+                    // when a search domain was appended), then sort + build.
                     if ctx.cache.borrow().enabled() {
-                        let mut names = vec![plan.current.clone()];
-                        if !plan.base_name.is_empty() && plan.base_name != plan.current {
-                            names.push(plan.base_name.clone());
+                        let mut store = vec![names[idx].clone()];
+                        if resolved != names[idx] {
+                            store.push(resolved.clone());
                         }
                         let ttl = rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-                        ctx.cache.borrow_mut().store_names(names, rtype, ttl, &buf, Instant::now());
+                        ctx.cache.borrow_mut().store_names(store, rtype, ttl, &buf, Instant::now());
                     }
                     if !ctx.sortlist.is_empty() {
                         apply_sortlist(&ctx.sortlist, &mut rrs.items);
@@ -172,21 +184,18 @@ pub(crate) async fn gethostbyname(ctx: HostCtx, io: Rc<RefCell<QueryIo>>, hostna
             }
         };
 
-        // Search-domain iteration on NXDOMAIN/NODATA.
-        if matches!(last_error.code(), ARES_ENOTFOUND | ARES_ENODATA) && plan.advance().is_some() {
+        // Next candidate name on NXDOMAIN/NODATA.
+        if matches!(last_error.code(), ARES_ENOTFOUND | ARES_ENODATA) && idx + 1 < names.len() {
+            idx += 1;
             continue;
         }
-        // AF_UNSPEC: AAAA round exhausted → restart the plan on A.
+        // AF_UNSPEC: the AAAA list is exhausted → retry just the bare name over A.
         if family == AF_UNSPEC && tried_aaaa && current_family == AF_INET6 {
             current_family = AF_INET;
             rtype = RTYPE_A;
             tried_aaaa = false;
-            plan = if !plan.base_name.is_empty() {
-                SearchPlan::for_gethostbyname(&plan.base_name, ctx.ndots, &ctx.search)
-            } else {
-                plan.domains.clear();
-                plan
-            };
+            names = vec![resolved.clone()];
+            idx = 0;
             continue;
         }
         // Finalize: NXDOMAIN after an earlier empty answer reports as ENODATA.
