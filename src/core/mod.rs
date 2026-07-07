@@ -8,6 +8,7 @@ pub mod socket;
 pub mod client;
 pub mod dns_record;
 pub mod error;
+pub mod executor;
 pub mod launch;
 pub mod hostent;
 pub mod lookup;

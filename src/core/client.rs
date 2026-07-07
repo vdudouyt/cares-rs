@@ -626,25 +626,27 @@ impl<T> Client<T> {
 
     // ===== Entry points (one method per ares_* export) =====
 
-    /// ares_query: reject server-less channels, then enqueue.
-    pub(crate) fn query(&mut self, name: &str, qtype: u16, userdata: T) -> Result<(), AresError> {
+    /// ares_query via the executor spike: run the preflight (`no_servers`) and,
+    /// if it passes, hand back the wire payload for an async query-future to
+    /// send. All policy stays here; ffi only drives the future.
+    pub(crate) fn query_payload(&self, name: &str, qtype: u16) -> Result<BytesMut, AresError> {
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        self.enqueue(dns_query_payload(name, qtype), SocketSource::Udp, 0, userdata)?;
-        Ok(())
+        Ok(dns_query_payload(name, qtype))
     }
 
-    /// ares_send: a pre-built packet must at least hold a DNS header.
-    pub(crate) fn send(&mut self, query_buf: &[u8], userdata: T) -> Result<(), AresError> {
+    /// ares_send via the executor spike: preflight a pre-built packet (min DNS
+    /// header length, then `no_servers`) and hand back its payload for an async
+    /// query-future to send, instead of enqueuing it directly.
+    pub(crate) fn send_payload(&self, query_buf: &[u8]) -> Result<BytesMut, AresError> {
         if query_buf.len() < 12 {
             return Err(ARES_EBADQUERY.into());
         }
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        self.enqueue(BytesMut::from(query_buf), SocketSource::Udp, 0, userdata)?;
-        Ok(())
+        Ok(BytesMut::from(query_buf))
     }
 
     /// ares_query_dnsrec: server guard, then the query cache (keyed without the

@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::core::client::{getsock_mask, normalize_port, tcp_payload, Client, ServerSpec};
+use crate::core::executor::{noop_waker, QueryIo, SendAndAwait, SendReq, Settled};
 use crate::core::launch::{read_tcp_frame, timeout_step};
+use crate::core::transport::{Task, TaskMachine};
 use super::process::carry_over;
 
 
@@ -19,6 +21,18 @@ pub struct ChannelData {
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
+    /// In-flight async query-futures (executor spike). The slot index is the
+    /// `TaskMachine::Async(id)` a task carries; `None` = a reaped slot.
+    async_queries: Vec<Option<AsyncQuery>>,
+}
+
+/// One in-flight async query: its mailbox, its boxed future, and the C
+/// callback to fire when the future settles.
+struct AsyncQuery {
+    io: std::rc::Rc<std::cell::RefCell<QueryIo>>,
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = Settled>>>,
+    callback: AresCallback,
+    arg: *mut libc::c_void,
 }
 
 impl ChannelData {
@@ -29,6 +43,7 @@ impl ChannelData {
             socket_factory,
             server_state_callback: None,
             server_state_callback_arg: std::ptr::null_mut(),
+            async_queries: Vec::new(),
         }
     }
 
@@ -39,6 +54,7 @@ impl ChannelData {
             socket_factory: self.socket_factory.clone(),
             server_state_callback: self.server_state_callback,
             server_state_callback_arg: self.server_state_callback_arg,
+            async_queries: Vec::new(),
         }
     }
 
@@ -54,6 +70,122 @@ impl ChannelData {
     pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<CSocketFactory>) {
         self.state.transport.socket_factory = factory.clone();
         self.socket_factory = factory;
+    }
+
+    /// Spawn an async query-future (executor spike; `ares_query`/`ares_send`).
+    /// Register its mailbox + boxed future in a free slot and drive the executor
+    /// once (which issues the initial send). The C callback fires when the
+    /// reactor later settles the task.
+    pub(crate) fn spawn_query(&mut self, payload: BytesMut, callback: AresCallback, arg: *mut libc::c_void) {
+        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Settled>>> = Box::pin(
+            SendAndAwait::new(io.clone(), SendReq { payload, source: SocketSource::Udp, server: 0 }),
+        );
+        let slot = AsyncQuery { io, fut, callback, arg };
+        let id = match self.async_queries.iter().position(|s| s.is_none()) {
+            Some(i) => {
+                self.async_queries[i] = Some(slot);
+                i
+            }
+            None => {
+                self.async_queries.push(Some(slot));
+                self.async_queries.len() - 1
+            }
+        };
+        // Poll once: the future emits its first send (enqueued here); an
+        // immediate failure resolves it in place.
+        self.advance_async(id);
+    }
+
+    /// Route a settled task outcome: an async task feeds its future's mailbox
+    /// (reply bytes cloned in, since `readbuf` is transient) and is polled to
+    /// completion right here; every other task fires its C callback as before.
+    fn settle(&mut self, task: &Task<FFIData>, res: Result<&[u8], c_int>) {
+        if let TaskMachine::Async(id) = task.machine {
+            match self.async_queries.get(id) {
+                Some(Some(aq)) => aq.io.borrow_mut().reply = Some((res.map(|b| b.to_vec()), task.timeouts)),
+                _ => return,
+            }
+            self.advance_async(id);
+        } else {
+            task.userdata.callback.run(res, task, self);
+        }
+    }
+
+    /// Advance one async future after its mailbox changed (a spawn or a settled
+    /// reply): drain any sends it emits and enqueue them (tagged `Async(id)` so
+    /// the reactor routes the reply back), fire its C callback if it completed,
+    /// and reap the slot. O(1) in the number of in-flight queries — only the one
+    /// future the event touched is polled, never the whole set.
+    fn advance_async(&mut self, id: usize) {
+        let waker = noop_waker();
+        loop {
+            if self.async_queries.get(id).and_then(|s| s.as_ref()).is_none() {
+                return;
+            }
+            let poll = {
+                let mut cx = std::task::Context::from_waker(&waker);
+                self.async_queries[id].as_mut().unwrap().fut.as_mut().poll(&mut cx)
+            };
+            let (callback, arg) = {
+                let aq = self.async_queries[id].as_ref().unwrap();
+                (aq.callback, aq.arg)
+            };
+            match poll {
+                std::task::Poll::Ready((result, timeouts)) => {
+                    self.async_queries[id] = None;
+                    fire_ares_callback(callback, arg, result.as_deref().map_err(|&e| e), timeouts);
+                    return;
+                }
+                std::task::Poll::Pending => {
+                    // Move the outbox out (reuses its allocation; no extra alloc).
+                    let reqs = {
+                        let aq = self.async_queries[id].as_ref().unwrap();
+                        std::mem::take(&mut aq.io.borrow_mut().outbox)
+                    };
+                    if reqs.is_empty() {
+                        return; // genuinely suspended, awaiting a reply
+                    }
+                    for req in reqs {
+                        // The `Async(id)` tag routes this task's reply through
+                        // `settle`, never `callback.run` — but embed the real
+                        // binding so any stray fire is still correct.
+                        let placeholder = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
+                        match self.state.enqueue(req.payload, req.source, req.server, placeholder) {
+                            Ok(_) => {
+                                if let Some(t) = self.state.transport.tasks.last_mut() {
+                                    t.machine = TaskMachine::Async(id);
+                                }
+                            }
+                            Err(_) => {
+                                // Socket couldn't be created — settle in place; the
+                                // next poll observes the reply and fires.
+                                if let Some(Some(aq)) = self.async_queries.get(id) {
+                                    aq.io.borrow_mut().reply = Some((Err(ARES_ECONNREFUSED), 0));
+                                }
+                            }
+                        }
+                    }
+                    // Loop: re-poll to observe an in-place reply (enqueue error)
+                    // or to suspend. After a successful enqueue the next poll
+                    // returns Pending with an empty outbox → return.
+                }
+            }
+        }
+    }
+
+    /// Fire `status` to every in-flight task — async futures routed through the
+    /// executor, others through their C callback — then reap. The shared safe
+    /// teardown for `ares_cancel` (ECANCELLED) / `ares_destroy` (EDESTRUCTION).
+    pub(crate) fn abort_all(&mut self, status: c_int) {
+        let tasks: Vec<_> = self.state.transport.tasks.drain(..).collect();
+        for task in tasks {
+            if task.status != Status::Completed {
+                // `settle` polls the async future to completion and fires; a
+                // plain task fires its C callback directly.
+                self.settle(&task, Err(status));
+            }
+        }
     }
 
     /// The 4-phase reactor loop (I/O, timeouts, task cleanup, pool cleanup) as a
@@ -77,7 +209,7 @@ impl ChannelData {
                 match self.state.transport.write_impl(task) {
                     WriteResult::Ok => {},
                     WriteResult::Failed => {
-                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                        self.settle(task, Err(ARES_ECONNREFUSED));
                     },
                     WriteResult::TryAgain => {
                         // Leave in Writing status for next select cycle
@@ -102,7 +234,7 @@ impl ChannelData {
                         Ok(v) => v,
                         Err(()) => {
                             // recv failed (e.g. ECONNREFUSED) — fire callback
-                            task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                            self.settle(task, Err(ARES_ECONNREFUSED));
                             continue;
                         }
                     }
@@ -142,7 +274,7 @@ impl ChannelData {
                                 carry_over(&mut self.state, task, task.timeouts, tries);
                             } else {
                                 // Retry socket couldn't be created — deliver the error.
-                                task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                                self.settle(task, Err(ARES_ECONNREFUSED));
                             }
                             task.status = Status::Completed;
                             continue;
@@ -152,7 +284,7 @@ impl ChannelData {
                             if self.state.reissue(task.writebuf.clone(), SocketSource::Tcp, si, task.userdata, 0) {
                                 carry_over(&mut self.state, task, task.timeouts, task.failover_tries);
                             } else {
-                                task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                                self.settle(task, Err(ARES_ECONNREFUSED));
                             }
                             task.status = Status::Completed;
                             continue;
@@ -163,7 +295,7 @@ impl ChannelData {
                     if task.userdata.callback.wants_dnsrec_cache() {
                         self.state.cache_dnsrec_reply(buf, Instant::now());
                     }
-                    (task.userdata.callback).run(Ok(buf), task, self);
+                    self.settle(task, Ok(buf));
                 }
             }
         }
@@ -191,10 +323,10 @@ impl ChannelData {
                         carry_over(&mut self.state, task, new_timeouts, task.failover_tries);
                     } else {
                         // Retry socket couldn't be created — deliver the error.
-                        task.userdata.callback.run(Err(ARES_ECONNREFUSED), task, self);
+                        self.settle(task, Err(ARES_ECONNREFUSED));
                     }
                 } else {
-                    task.userdata.callback.run(Err(ARES_ETIMEOUT), task, self);
+                    self.settle(task, Err(ARES_ETIMEOUT));
                     task.status = Status::Completed;
                 }
             }
@@ -248,12 +380,7 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    let tasks: Vec<_> = channeldata.state.transport.tasks.drain(..).collect();
-    for task in tasks {
-        if task.status != Status::Completed {
-            task.userdata.callback.run(Err(ARES_ECANCELLED), &task, channeldata);
-        }
-    }
+    channeldata.abort_all(ARES_ECANCELLED);
     // Clear connection pools so stale sockets don't linger
     channeldata.state.clear_pools();
 }
@@ -262,13 +389,8 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     if let Some(channeldata) = unsafe { channel.as_mut() } {
-        // Fire callbacks with ARES_EDESTRUCTION for all pending tasks
-        let tasks: Vec<_> = channeldata.state.transport.tasks.drain(..).collect();
-        for task in tasks {
-            if task.status != Status::Completed {
-                task.userdata.callback.run(Err(ARES_EDESTRUCTION), &task, channeldata);
-            }
-        }
+        // Fire callbacks with ARES_EDESTRUCTION for all pending tasks.
+        channeldata.abort_all(ARES_EDESTRUCTION);
         unsafe { drop(Box::from_raw(channel)); }
     }
 }

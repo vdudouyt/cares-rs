@@ -134,6 +134,10 @@ impl Callback {
 pub(crate) fn task_kind(task: &Task<FFIData>) -> TaskKind {
     if matches!(task.machine, TaskMachine::Probe) {
         TaskKind::Probe
+    } else if matches!(task.machine, TaskMachine::Async(_)) {
+        // An async query behaves like a plain query for reactor policy
+        // (failover / TC / timeout / server-state notification all apply).
+        TaskKind::Other
     } else {
         task.userdata.callback.kind()
     }
@@ -275,9 +279,11 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     let Some(callback) = callback else { return; };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
-    let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
-    if let Err(status) = channeldata.state.query(name, dnstype as u16, ffidata) {
-        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
+    // Executor spike: preflight in core, then let an async query-future drive
+    // the send/await/fire lifecycle (the reactor still owns failover/TC/timeout).
+    match channeldata.state.query_payload(name, dnstype as u16) {
+        Ok(payload) => channeldata.spawn_query(payload, callback, arg),
+        Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
     }
 }
 
@@ -412,11 +418,18 @@ pub(crate) fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHo
     }
 }
 
-pub(crate) fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallback, task: &Task<FFIData>) {
+/// The single raw `ares_callback` invocation for the query path — shared by the
+/// synchronous reply handler ([`run_ares_callback`]) and the async executor
+/// ([`ChannelData::drive_async`]), so the unsafe fire lives in exactly one place.
+pub(crate) fn fire_ares_callback(callback: AresCallback, arg: *mut c_void, res: Result<&[u8], c_int>, timeouts: c_int) {
     match res {
-        Ok(buf) => unsafe { callback(task.userdata.arg, ARES_SUCCESS, task.timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) },
-        Err(err) => unsafe { callback(task.userdata.arg, err, task.timeouts, std::ptr::null_mut(), 0) },
+        Ok(buf) => unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) },
+        Err(err) => unsafe { callback(arg, err, timeouts, std::ptr::null_mut(), 0) },
     }
+}
+
+pub(crate) fn run_ares_callback(res: Result<&[u8], c_int>, callback: AresCallback, task: &Task<FFIData>) {
+    fire_ares_callback(callback, task.userdata.arg, res, task.timeouts);
 }
 
 pub(crate) fn run_ares_callback_dnsrec(res: Result<&[u8], c_int>, callback: AresCallbackDnsRec, task: &Task<FFIData>) {
@@ -621,9 +634,10 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
-    let ffidata = FFIData { arg, ..FFIData::base(Callback::AresCallback(callback)) };
-    if let Err(status) = channeldata.state.send(query_buf, ffidata) {
-        unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
+    // Executor spike: preflight in core, then drive the async query-future.
+    match channeldata.state.send_payload(query_buf) {
+        Ok(payload) => channeldata.spawn_query(payload, callback, arg),
+        Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
     }
 }
 

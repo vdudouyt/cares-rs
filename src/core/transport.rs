@@ -25,6 +25,10 @@ pub enum TaskMachine {
     /// task carries a copy of the lookup's binding, but this marker routes its
     /// reply to the probe handler so the user callback is never fired.
     Probe,
+    /// An async query-future owns this task (executor spike): the reactor
+    /// deposits the settled reply into `ChannelData.async_queries[id]` and
+    /// polls that future instead of firing `task.userdata.callback`.
+    Async(usize),
 }
 
 const BIND_ADDR_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
