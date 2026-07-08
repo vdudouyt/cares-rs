@@ -74,6 +74,12 @@ pub(crate) struct QueryIo {
     /// the ffi can pass it to the C callback (the host future's `Result` output
     /// has no room for it; the raw path still carries it in `Delivery::Raw`).
     pub timeouts: c_int,
+    /// A caller-set request to stop **retrying**: `resolve_query` honours it at
+    /// its retry branches (timeout / dead socket), returning terminal instead of
+    /// re-sending. A reply already in flight still delivers. Set by
+    /// [`ParallelQueries::cancel`]; the *policy* of when to cancel lives in the
+    /// caller (e.g. getaddrinfo cancels AAAA once A returns addresses).
+    pub cancelled: bool,
 }
 
 /// The outcome of one [`WaitFds`] await: which fds fired, and whether it timed out.
@@ -579,6 +585,10 @@ pub(crate) async fn resolve_query(
                 }
                 if now >= deadline {
                     clear_tcp_slot(&primary, qid);
+                    // A caller (getaddrinfo) may have cancelled our retries.
+                    if io.borrow().cancelled {
+                        return (Err(ARES_ETIMEOUT), timeouts);
+                    }
                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                     let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
                     match verdict {
@@ -606,6 +616,9 @@ pub(crate) async fn resolve_query(
                     clear_tcp_slot(&primary, qid);
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
+                    }
+                    if io.borrow().cancelled {
+                        return (Err(ARES_ETIMEOUT), timeouts);
                     }
                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                     let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
@@ -660,6 +673,117 @@ pub(crate) async fn resolve_query(
 fn clear_tcp_slot(primary: &Primary, qid: u16) {
     if let Primary::Tcp(c) = primary {
         c.borrow_mut().inbox.remove(&qid);
+    }
+}
+
+// ===== ParallelQueries — generic concurrent-query mechanism =====
+
+/// One sub-query inside a [`ParallelQueries`] set.
+struct ParSub {
+    io: Rc<RefCell<QueryIo>>,
+    fut: Option<Pin<Box<dyn Future<Output = (Result<Vec<u8>, c_int>, c_int)>>>>,
+    result: Option<(Result<Vec<u8>, c_int>, c_int)>,
+}
+
+/// N query futures driven concurrently over one shared mailbox — the generic
+/// multiplex **mechanism** for parallel lookups (getaddrinfo's A+AAAA). This
+/// type has **no getaddrinfo knowledge**: the caller `step`s it and applies its
+/// own retry/cancel **policy** (e.g. "cancel AAAA once A returns addresses").
+///
+/// Each sub-query is a full [`resolve_query`] on its own sub-mailbox; `step`
+/// merges their published waits/effects into the outer mailbox the ffi drives,
+/// awaits it, and routes readiness back by fd + each sub's own deadline.
+pub(crate) struct ParallelQueries {
+    io: Rc<RefCell<QueryIo>>,
+    subs: Vec<ParSub>,
+}
+
+impl ParallelQueries {
+    /// Build one `resolve_query` future per `(payload, use_tcp)` (no probe).
+    pub(crate) fn new(io: Rc<RefCell<QueryIo>>, res: Resources, payloads: Vec<(BytesMut, bool)>) -> Self {
+        let subs = payloads
+            .into_iter()
+            .map(|(payload, use_tcp)| {
+                let sub_io = Rc::new(RefCell::new(QueryIo::default()));
+                let fut = Box::pin(resolve_query(sub_io.clone(), res.clone(), payload, use_tcp, None))
+                    as Pin<Box<dyn Future<Output = (Result<Vec<u8>, c_int>, c_int)>>>;
+                ParSub { io: sub_io, fut: Some(fut), result: None }
+            })
+            .collect();
+        ParallelQueries { io, subs }
+    }
+
+    /// The settled outcome of query `i`, or `None` if still running or cancelled.
+    pub(crate) fn result(&self, i: usize) -> Option<&(Result<Vec<u8>, c_int>, c_int)> {
+        self.subs[i].result.as_ref()
+    }
+
+    /// Cancel query `i`'s **retries**: it won't be re-sent after its current
+    /// attempt, but a reply already in flight still delivers. (Implemented via
+    /// the sub-mailbox `cancelled` flag `resolve_query` honours.)
+    pub(crate) fn cancel(&mut self, i: usize) {
+        self.subs[i].io.borrow_mut().cancelled = true;
+    }
+
+    /// Every query has settled.
+    pub(crate) fn all_done(&self) -> bool {
+        self.subs.iter().all(|s| s.result.is_some())
+    }
+
+    /// Advance every live sub-future one readiness cycle.
+    pub(crate) async fn step(&mut self) {
+        let waker = noop_waker();
+        {
+            let mut cx = Context::from_waker(&waker);
+            for s in &mut self.subs {
+                if let Some(fut) = &mut s.fut {
+                    if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
+                        s.result = Some(r);
+                        s.fut = None;
+                    }
+                }
+            }
+        }
+        if self.all_done() {
+            return;
+        }
+
+        // Merge every live sub's waits + earliest deadline into the outer mailbox,
+        // and lift its effects up so the ffi applies them.
+        let mut merged: Vec<Wait> = Vec::new();
+        let mut deadline: Option<Instant> = None;
+        for s in &self.subs {
+            if s.fut.is_none() {
+                continue;
+            }
+            let drained: Vec<Effect> = {
+                let mut sub = s.io.borrow_mut();
+                merged.extend(sub.waits.iter().copied());
+                if let Some(d) = sub.deadline {
+                    deadline = Some(deadline.map_or(d, |m: Instant| m.min(d)));
+                }
+                std::mem::take(&mut sub.effects)
+            };
+            self.io.borrow_mut().effects.extend(drained);
+        }
+        let deadline = match deadline {
+            Some(d) => d,
+            None => return, // nothing published a wait — avoid an unbounded await
+        };
+
+        // Await the outer mailbox (the ffi sets fired/expired against `merged`),
+        // then route readiness back to each live sub.
+        let woke = wait_io(&self.io, &merged, deadline).await;
+        let now = Instant::now();
+        for s in &self.subs {
+            if s.fut.is_none() {
+                continue;
+            }
+            let mut sub = s.io.borrow_mut();
+            let wants: Vec<i32> = sub.waits.iter().map(|w| w.fd).collect();
+            sub.fired = woke.fds.iter().copied().filter(|fd| wants.contains(fd)).collect();
+            sub.expired = sub.deadline.is_some_and(|d| now >= d);
+        }
     }
 }
 

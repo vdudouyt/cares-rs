@@ -10,7 +10,7 @@ use crate::core::launch::{read_tcp_frame, timeout_step};
 use crate::core::transport::Task;
 use crate::core::AresError;
 use crate::core::preflight::NameinfoReply;
-use super::lookups::{fire_host_success, HostTail, NameinfoTail, SearchDelivery, SearchTail};
+use super::lookups::{fire_host_success, AddrInfoTail, HostTail, NameinfoTail, SearchDelivery, SearchTail};
 use super::process::carry_over;
 
 
@@ -73,6 +73,13 @@ pub(crate) enum AsyncKind {
         fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
         tail: SearchTail,
     },
+    /// ares_getaddrinfo: the merged A+AAAA records (or status) built into an
+    /// ares_addrinfo for the ares_addrinfo_callback; the service port rides on
+    /// the tail.
+    AddrInfo {
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = crate::core::addrinfo::AddrInfoOut>>>,
+        tail: AddrInfoTail,
+    },
 }
 
 /// A polled-to-completion future's output, held across the mailbox-borrow drop
@@ -81,6 +88,7 @@ enum Completed {
     Raw(Delivery),
     Host(Result<Hostent, AresError>),
     Nameinfo(NameinfoReply),
+    AddrInfo(crate::core::addrinfo::AddrInfoOut),
 }
 
 impl ChannelData {
@@ -161,6 +169,13 @@ impl ChannelData {
         self.spawn(io, AsyncKind::Search { fut, tail });
     }
 
+    /// ares_getaddrinfo: spawn the parallel A+AAAA lifecycle.
+    pub(crate) fn spawn_addrinfo(&mut self, ctx: crate::core::addrinfo::AddrInfoCtx, hostname: String, tail: AddrInfoTail) {
+        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+        let fut = Box::pin(crate::core::addrinfo::getaddrinfo_lifecycle(ctx, io.clone(), hostname));
+        self.spawn(io, AsyncKind::AddrInfo { fut, tail });
+    }
+
     /// Fire a settled classic-task outcome (search/getaddrinfo/gethostbyaddr/
     /// nameinfo/probe). The migrated async lifecycles own their sockets and
     /// never appear here.
@@ -200,6 +215,10 @@ impl ChannelData {
                 },
                 AsyncKind::Search { fut, .. } => match fut.as_mut().poll(&mut cx) {
                     std::task::Poll::Ready(d) => Some(Completed::Raw(d)),
+                    std::task::Poll::Pending => None,
+                },
+                AsyncKind::AddrInfo { fut, .. } => match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(r) => Some(Completed::AddrInfo(r)),
                     std::task::Poll::Pending => None,
                 },
             }
@@ -275,6 +294,15 @@ impl ChannelData {
                     let service_ptr = reply.service.as_ref().map(|s| s.as_ptr() as *mut c_char).unwrap_or(std::ptr::null_mut());
                     unsafe { (tail.callback)(tail.arg, reply.status.code(), reply.timeouts, node_ptr, service_ptr) };
                 }
+                (Completed::AddrInfo(out), AsyncKind::AddrInfo { tail, .. }) => {
+                    if out.status.code() == ARES_SUCCESS {
+                        let nodes = crate::ffi::addrinfo::nodes_from_addr_records(&out.records, tail.port);
+                        let ai = crate::ffi::addrinfo::build_ares_addrinfo(&out.name, nodes);
+                        unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, 0, ai) };
+                    } else {
+                        unsafe { (tail.callback)(tail.arg, out.status.code(), 0, std::ptr::null_mut()) };
+                    }
+                }
                 _ => unreachable!("async completion / slot kind mismatch"),
             }
         }
@@ -348,6 +376,7 @@ impl ChannelData {
                 SearchDelivery::Raw { callback, arg } => unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) },
                 SearchDelivery::DnsRec { callback, arg } => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
             },
+            AsyncKind::AddrInfo { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) },
         }
     }
 

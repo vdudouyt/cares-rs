@@ -12,6 +12,7 @@ pub mod error;
 pub mod executor;
 pub mod hostbyname;
 pub mod hostbyaddr;
+pub mod addrinfo;
 pub mod launch;
 pub mod nameinfo;
 pub mod search;

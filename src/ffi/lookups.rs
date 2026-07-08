@@ -432,21 +432,18 @@ pub unsafe extern "C" fn ares_getaddrinfo(
         0
     };
 
+    // Build the resource bundle and spawn the self-contained async future. A
+    // synchronous preflight hit (IP literal / hosts file) fires re-entrantly.
     let hostname_raw = unsafe { cstr_lossy(name) };
-    let tail = AddrInfoTail { callback, arg, port };
-    let binding = FFIData::base(Callback::AddrInfo(tail));
-
-    match channeldata.state.getaddrinfo(hostname_raw, ai_family, binding) {
-        Err(status) => {
-            unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
-        }
-        Ok(api::Operation::Ready(api::AddrInfoResult { addrs, canonical })) => {
-            let nodes = addrinfo_nodes_from_addrs_port(&addrs, port);
-            let ai = build_ares_addrinfo(&canonical, nodes);
-            unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
-        }
-        Ok(api::Operation::Pending) => {}
-    }
+    let ctx = crate::core::addrinfo::AddrInfoCtx {
+        res: channeldata.state.resources(),
+        hosts: channeldata.state.transport.hosts(),
+        ndots: channeldata.state.transport.config.options.ndots,
+        search: std::rc::Rc::from(channeldata.state.transport.config.search.clone()),
+        use_vc: channeldata.state.transport.config.options.use_vc,
+        ai_family,
+    };
+    channeldata.spawn_addrinfo(ctx, hostname_raw.to_string(), AddrInfoTail { callback, arg, port });
 }
 
 /// Fire the deliveries a core drive returned: build the C node graph for a
