@@ -21,33 +21,3 @@ pub trait SocketFactory {
     fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<dyn Socket>>;
     fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<dyn Socket>>;
 }
-
-/// In-memory transports for engine unit tests: no syscalls, so the tests
-/// they back can run under Miri.
-#[cfg(test)]
-pub(crate) mod mock {
-    use super::*;
-
-    pub(crate) struct MockTransport;
-
-    impl Socket for MockTransport {
-        fn as_raw_fd(&self) -> i32 { 7 }
-        fn connect(&self, _addr: SocketAddr) -> io::Result<()> { Ok(()) }
-        fn recv(&self, _buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
-            Err(io::ErrorKind::WouldBlock.into())
-        }
-        fn send(&self, data: &[u8]) -> io::Result<usize> { Ok(data.len()) }
-    }
-
-    #[derive(Default)]
-    pub(crate) struct MockFactory;
-
-    impl SocketFactory for MockFactory {
-        fn create_udp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn Socket>> {
-            Ok(Rc::new(MockTransport))
-        }
-        fn create_tcp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn Socket>> {
-            Ok(Rc::new(MockTransport))
-        }
-    }
-}

@@ -5,32 +5,21 @@
 //! live here; the ffi shims only marshal C values in and out.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::BytesMut;
 
-use crate::core::api::{AddrInfoResult, Operation, SearchReplyDelivery};
 use crate::core::cache::QueryCache;
 use crate::core::executor;
 use crate::core::hostent::Hostent;
-use crate::core::hostfile::AddressFamily;
-use crate::core::launch::AddrInfoDelivery;
-use crate::core::lookup::{
-    is_onion_domain, AddrInfoAction, AddrInfoEvent, AddrInfoSm, LookupEvent, SearchAction,
-    SearchPlan, SearchSm, ServerHealth,
-};
-use crate::core::preflight::{
-    hosts_file_lookup, no_servers, search_start,
-};
+use crate::core::lookup::ServerHealth;
+use crate::core::preflight::{hosts_file_lookup, no_servers};
 use crate::core::query_builder::dns_query_payload;
 use crate::core::sortlist::SortlistEntry;
-use crate::core::transport::{
-    qtype_of, Family, SocketSource, Status, TaskMachine, Transport,
-};
+use crate::core::transport::Transport;
 use crate::core::AresError;
 use crate::ffi::ares_options::{
     ARES_FLAG_EDNS, ARES_FLAG_PRIMARY, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_FLAGS,
@@ -40,22 +29,15 @@ use crate::ffi::ares_options::{
     ARES_OPT_TIMEOUT, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES, ARES_OPT_UDP_MAX_QUERIES,
     ARES_OPT_UDP_PORT,
 };
-use crate::ffi::error::{
-    ARES_EBADQUERY, ARES_ECONNREFUSED, ARES_ENOSERVER, ARES_ENOTFOUND,
-};
-use crate::ffi::{
-    RECORD_TYPE_A,
-    RECORD_TYPE_AAAA,
-};
+use crate::ffi::error::{ARES_EBADQUERY, ARES_ENOSERVER};
 
-/// Everything a channel owns that is pure Rust: the engine, health/cache
-/// bookkeeping, configuration strings, and the shared-socket pools. Generic
-/// over the per-task userdata `T`, which core never inspects.
-pub(crate) struct Client<T> {
-    pub transport: Transport<T>,
-    pub readbuf: Vec<u8>,
+/// Everything a channel owns that is pure Rust: config, health/cache
+/// bookkeeping, configuration strings, and the shared-socket pools for the
+/// async engine.
+pub(crate) struct Client {
+    pub transport: Transport,
     /// Shared with the async engine's in-flight futures (`Rc<RefCell<_>>`) so
-    /// failover accounting, the probe, and the classic reactor agree.
+    /// failover accounting and the probe agree across queries.
     pub server_health: Rc<RefCell<ServerHealth>>,
     pub sortlist: Vec<SortlistEntry>,
     pub flags: i32,
@@ -73,17 +55,15 @@ pub(crate) struct Client<T> {
     /// Per-server connect endpoints, cached (rebuilt on server change) so each
     /// async launch clones an `Rc` instead of re-snapshotting the config.
     endpoints: Rc<Vec<executor::ServerEndpoint>>,
-    pub tcp_recv_buffers: HashMap<i32, Vec<u8>>, // classic reactor TCP reassembly (fd -> data)
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
 }
 
-impl<T> Client<T> {
+impl Client {
     /// A fresh channel around `transport` — shared by ares_init and ares_init_options.
-    pub fn new(transport: Transport<T>) -> Self {
+    pub fn new(transport: Transport) -> Self {
         let mut client = Client {
             transport,
-            readbuf: vec![0u8; 65_535],
             server_health: Rc::new(RefCell::new(ServerHealth::default())),
             sortlist: vec![],
             flags: 0,
@@ -95,7 +75,6 @@ impl<T> Client<T> {
             udp_max_queries: 0,
             tcp_pool: Rc::new(RefCell::new(crate::core::executor::TcpPool::default())),
             endpoints: Rc::new(Vec::new()),
-            tcp_recv_buffers: HashMap::new(),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
         };
@@ -106,7 +85,7 @@ impl<T> Client<T> {
     /// The pure body of ares_dup: clone configuration, start with a fresh
     /// reactor state (empty query cache, no pooled connections, cleared
     /// failure timestamps — but cloned failure counts).
-    pub fn duplicate(&self) -> Client<T> {
+    pub fn duplicate(&self) -> Client {
         let mut transport = Transport::new(self.transport.config.clone(), self.transport.socket_factory.clone());
         transport.default_udp_port = self.transport.default_udp_port;
         transport.default_tcp_port = self.transport.default_tcp_port;
@@ -346,50 +325,6 @@ impl<T> Client<T> {
             .join(",")
     }
 
-    /// (fd, wants_write) for every non-completed task, in task order — the
-    /// status mapping behind ares_fds and ares_getsock.
-    pub fn poll_fds(&self) -> Vec<(i32, bool)> {
-        self.transport
-            .tasks
-            .iter()
-            .filter_map(|task| match task.status {
-                Status::Writing => Some((task.sock.as_raw_fd(), true)),
-                Status::Reading => Some((task.sock.as_raw_fd(), false)),
-                Status::Completed => None,
-            })
-            .collect()
-    }
-
-    /// The pending-query wait budget in milliseconds; None when no tasks are
-    /// pending (ares_timeout then reports maxtv/NULL).
-    pub fn timeout_millis(&self) -> Option<u128> {
-        if self.transport.tasks.is_empty() {
-            return None;
-        }
-        Some(self.transport.max_wait_time().as_millis())
-    }
-
-    /// Non-completed task count (ares_queue_active_queries).
-    pub fn active_query_count(&self) -> usize {
-        self.transport
-            .tasks
-            .iter()
-            .filter(|t| t.status != Status::Completed)
-            .count()
-    }
-
-    /// Store a dnsrec-flavored reply in the query cache (no-op when the
-    /// cache is disabled) — the reactor's post-delivery hook.
-    pub fn cache_dnsrec_reply(&mut self, buf: &[u8], now: Instant) {
-        self.cache.borrow_mut().store_reply(buf, now);
-    }
-
-    /// Drop the classic reactor's TCP reassembly buffers (ares_cancel). The
-    /// async engine's shared TCP pool is cleared separately by the ffi.
-    pub fn clear_pools(&mut self) {
-        self.tcp_recv_buffers.clear();
-    }
-
     /// The `ip:port` string reported to the server-state callback (IPv6
     /// bracketed); None when the index is stale.
     pub fn server_state_string(&self, server_index: usize, is_tcp: bool) -> Option<String> {
@@ -406,112 +341,9 @@ impl<T> Client<T> {
     }
 }
 
-/// The resolver operations — one method per `ares_*` export, plus the enqueue
-/// primitives and reply executors they compose. Each ffi shim marshals its C
-/// arguments and makes exactly one call in here; preflights, launch loops and
-/// cache policy are private details of these methods, never seams the ffi
-/// layer reassembles.
-///
-/// Handlers take the ffi userdata as a plain value (a `Callback` binding the
-/// shim builds eagerly), not a factory closure: core owns the per-task data
-/// (the state-machine handle on `Task.machine`, plus family/rtype/timeouts/
-/// queried-ip), mints the machine, and clones the binding into each task — so
-/// nothing here constructs a C userdata.
-impl<T> Client<T> {
-    // ===== Enqueue primitives (formerly free fns in core::launch) =====
-
-    /// Stamp the core-owned per-task data onto the task `enqueue` just pushed:
-    /// the state-machine handle plus the query's family/record-type (and, for a
-    /// batch send, the accumulated timeout count). The ffi userdata carries none
-    /// of this now — the reply reads it from the `Task`.
-    fn stamp(&mut self, machine: TaskMachine, family: i32, rtype: u16, timeouts: i32) {
-        if let Some(t) = self.transport.tasks.last_mut() {
-            t.machine = machine;
-            t.family = family;
-            t.rtype = rtype;
-            t.timeouts = timeouts;
-        }
-    }
-
-    /// Plain enqueue (no socket-callback involvement — ares_query/ares_send/
-    /// search flows). `Ok(fd)` of the task's socket; a socket that could not be
-    /// created is `Err(ARES_ECONNREFUSED)` — the status every caller delivers —
-    /// so call sites just use `?`.
-    pub(crate) fn enqueue(
-        &mut self,
-        payload: BytesMut,
-        source: SocketSource,
-        server: usize,
-        userdata: T,
-    ) -> Result<i32, AresError> {
-        self.transport.enqueue(payload, source, server, userdata).map_err(|_| AresError::from(ARES_ECONNREFUSED))?;
-        Ok(self.transport.tasks.last().expect("enqueue pushed a task").sock.as_raw_fd())
-    }
-
-    /// Re-enqueue for a retry (TC upgrade, rcode failover, timeout): carries the
-    /// retry counter onto the new task. False when the socket could not be created
-    /// — including a callback-refused fd — in which case the caller delivers
-    /// ECONNREFUSED.
-    pub(crate) fn reissue(
-        &mut self,
-        payload: BytesMut,
-        source: SocketSource,
-        server: usize,
-        userdata: T,
-        tries: u32,
-    ) -> bool {
-        if self.enqueue(payload, source, server, userdata).is_err() {
-            return false;
-        }
-        self.transport.tasks.last_mut().expect("enqueue pushed a task").tries_remaining = tries;
-        true
-    }
-
-    /// Drive the getaddrinfo machine's action queue: perform every Send (a failed
-    /// socket — creation error or a callback-refused fd — feeds LaunchFailed for a
-    /// batch send, or ResendFailed for a re-send, back into the machine) and
-    /// collect the Deliver* actions for the shim.
-    pub(crate) fn drive_addrinfo(
-        &mut self,
-        sm: &Rc<RefCell<AddrInfoSm>>,
-        actions: Vec<AddrInfoAction>,
-        binding: T,
-    ) -> Vec<AddrInfoDelivery>
-    where
-        T: Copy,
-    {
-        let mut deliveries = Vec::new();
-        let mut queue: std::collections::VecDeque<AddrInfoAction> = actions.into();
-        while let Some(action) = queue.pop_front() {
-            match action {
-                AddrInfoAction::Send { name, family, tcp, server, timeouts, batch } => {
-                    let core_family = if family == libc::AF_INET { Family::Ipv4 } else { Family::Ipv6 };
-                    let rtype = if family == libc::AF_INET { RECORD_TYPE_A } else { RECORD_TYPE_AAAA };
-                    let failed = self.transport.enqueue(dns_query_payload(&name, qtype_of(core_family)), SocketSource::fresh(tcp), server, binding).is_err();
-                    if !failed {
-                        self.stamp(TaskMachine::AddrInfo(sm.clone()), family, rtype, timeouts);
-                    }
-                    if failed {
-                        let ev = if batch { AddrInfoEvent::LaunchFailed } else { AddrInfoEvent::ResendFailed };
-                        let more = {
-                            let mut machine = sm.borrow_mut();
-                            machine.step(ev, &mut self.server_health.borrow_mut())
-                        };
-                        queue.extend(more);
-                    }
-                }
-                AddrInfoAction::DeliverSuccess { name } => {
-                    let records = std::mem::take(&mut sm.borrow_mut().addrs);
-                    deliveries.push(AddrInfoDelivery::Success { name, records });
-                }
-                AddrInfoAction::DeliverFail { status } => {
-                    deliveries.push(AddrInfoDelivery::Fail { status });
-                }
-            }
-        }
-        deliveries
-    }
-
+/// The async-engine resource builders + the pure entry helpers the ffi shims
+/// compose (query/send payloads, the gethostbyname/getaddrinfo/... contexts).
+impl Client {
     // ===== Async-engine resource builders =====
 
     /// Rebuild the cached endpoint snapshot after a server/port change.
@@ -611,98 +443,6 @@ impl<T> Client<T> {
         hosts_file_lookup(self, name, family).map(Hostent::from_lookup)
     }
 
-
-    /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
-    /// then mint the machine and drive the A/AAAA batch.
-    pub(crate) fn getaddrinfo(
-        &mut self,
-        hostname_raw: &str,
-        ai_family: i32,
-        binding: T,
-    ) -> Result<Operation<AddrInfoResult>, AresError>
-    where
-        T: Copy,
-    {
-        // Check order is behavior: empty-name -> onion -> IP literal (family
-        // mismatch fails, no fall-through) -> hosts file -> no-servers -> DNS.
-        // The raw name keeps its trailing dot for the SearchPlan; checks and the
-        // delivered canonical name use the stripped form.
-
-        // A synchronous (IP-literal / hosts-file) hit: only addresses of the
-        // requested family reach the node list.
-        let deliver = |mut addrs: Vec<IpAddr>, canonical: String| {
-            addrs.retain(|ip| match ip {
-                IpAddr::V4(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET,
-                IpAddr::V6(_) => ai_family == libc::AF_UNSPEC || ai_family == libc::AF_INET6,
-            });
-            Ok(Operation::Ready(AddrInfoResult { addrs, canonical }))
-        };
-
-        let hostname = hostname_raw.strip_suffix('.').unwrap_or(hostname_raw);
-
-        if hostname.is_empty() {
-            return Err(ARES_ENOTFOUND.into());
-        }
-
-        // Reject .onion domains immediately (RFC 7686)
-        if is_onion_domain(hostname) {
-            return Err(ARES_ENOTFOUND.into());
-        }
-
-        // IP literal check
-        if let Ok(ip) = hostname.parse::<IpAddr>() {
-            let matches = match ai_family {
-                libc::AF_INET => ip.is_ipv4(),
-                libc::AF_INET6 => ip.is_ipv6(),
-                libc::AF_UNSPEC => true,
-                _ => false,
-            };
-            if matches {
-                return deliver(vec![ip], hostname.to_string());
-            } else {
-                return Err(ARES_ENOTFOUND.into());
-            }
-        }
-
-        // Hosts file check
-        let family_filter = match ai_family {
-            libc::AF_INET => AddressFamily::Ipv4,
-            libc::AF_INET6 => AddressFamily::Ipv6,
-            _ => AddressFamily::Any,
-        };
-        if let Some(lookup) = self.transport.hosts().lookup(hostname, family_filter) {
-            if !lookup.addrs.is_empty() {
-                return deliver(lookup.addrs, hostname.to_string());
-            }
-        }
-
-        // No servers configured
-        if self.transport.config.nameservers.is_empty() {
-            return Err(ARES_ENOSERVER.into());
-        }
-
-        // DNS path: mint the machine and drive the parallel A/AAAA batch.
-        // (the raw name carries the trailing dot the plan needs to see)
-        let use_tcp = self.transport.config.options.use_vc;
-        let plan = SearchPlan::for_search(
-            hostname_raw,
-            self.transport.config.options.ndots,
-            &self.transport.config.search,
-        );
-        let first_server = self.server_health.borrow().pick_next();
-        let sm = AddrInfoSm::new(plan, ai_family, use_tcp);
-
-        let handle = Rc::new(RefCell::new(sm));
-        let actions = handle.borrow_mut().begin_batch(first_server);
-        // At entry the batch can only yield nothing (still in flight) or a single
-        // all-sockets-refused failure — never a synchronous success, which needs a
-        // reply. `Ready` is terminal; the async result arrives via the reply path.
-        match self.drive_addrinfo(&handle, actions, binding).as_slice() {
-            [] => Ok(Operation::Pending),
-            [AddrInfoDelivery::Fail { status }] => Err(*status),
-            _ => unreachable!("getaddrinfo entry yields nothing or a single ECONNREFUSED"),
-        }
-    }
 
 }
 

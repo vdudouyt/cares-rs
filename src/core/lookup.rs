@@ -1,11 +1,8 @@
-//! The query-lifecycle state machine: every retry/failover/iteration decision
-//! the resolver makes lives in this one file, as safe pure Rust. The FFI
-//! layer only converts C arguments, performs I/O, and executes the decisions
-//! made here.
+//! The neutral DNS-reply/reactor truth tables the async engine reuses: pure,
+//! safe Rust with no I/O. The executor (`core::executor`) drives one query's
+//! socket lifecycle and consults these for its verdicts.
 //!
 //! # Map
-//!
-//! Shared building blocks:
 //! - [`summarize`] / [`qid_matches`] / [`extract_tcp_frame`] — DNS reply
 //!   header classification, transaction-ID matching, TCP reassembly
 //! - [`is_localhost`] / [`is_onion_domain`] — special-name classification
@@ -14,39 +11,11 @@
 //!   (gethostbyname inlines its own simpler walk in `core::hostbyname`)
 //! - [`ServerHealth`] — per-server failure accounting and the
 //!   lowest-failures-first server selection for failover and probing
-//!
-//! Per-flow machines — each consumes events (a parsed reply or an I/O error)
-//! and returns actions (send a query, notify, cache, deliver) that
-//! `core::api`'s per-export handlers drive:
-//! - [`SearchSm`] — ares_search / ares_search_dnsrec
-//! - [`AddrInfoSm`] — ares_getaddrinfo's parallel A+AAAA batch with the
-//!   `pending` join counter
-//!
-//! ares_gethostbyname's DNS phase is no longer a step machine here: it is a
-//! linear `async fn` (`core::executor::hostbyname_lifecycle`) driven by the
-//! reactor's executor. Its per-query failover/TC/timeout still flow through
-//! [`on_datagram`]/[`on_timeout`] below (the task is tagged `Async`).
-//!
-//! Reactor-level policy for tasks without their own machine (plain
-//! ares_query/ares_send and the process-level TC/failover/timeout rules),
-//! driven by `src/ffi/process.rs`:
-//! - [`on_datagram`] → [`TaskVerdict`] (failover / TC retry / deliver)
-//! - [`on_timeout`] → [`TimeoutVerdict`] (retry / expire)
-//!
-//! The pre-DNS short-circuits (IP literals, hosts file, localhost,
-//! HOSTALIASES, cache probes) live in `core::preflight`; the socket-launch
-//! retry loops (whose failure accounting calls back into [`ServerHealth`])
-//! in `core::launch`; and the one-call-per-export composition of all of it
-//! in `core::api`. The ffi shims only marshal C values and fire callbacks.
+//! - [`on_datagram`] → [`TaskVerdict`] (failover / TC retry / deliver) and
+//!   [`on_timeout`] → [`TimeoutVerdict`] (retry / expire): the per-query
+//!   reactor policy `resolve_query` applies.
 
-use std::ffi::c_int;
 use std::time::{Duration, Instant};
-
-use crate::core::AresError;
-use crate::ffi::error::{
-    ARES_ECANCELLED, ARES_ECONNREFUSED, ARES_EDESTRUCTION, ARES_ENODATA, ARES_ENOTFOUND,
-    ARES_ENOTIMP, ARES_EREFUSED, ARES_ESERVFAIL, ARES_ETIMEOUT,
-};
 
 /// Header-level summary of a DNS reply buffer.
 pub struct ReplySummary {
@@ -177,277 +146,11 @@ impl SearchPlan {
     }
 }
 
-/// Input to a lookup state machine: a raw DNS reply or an I/O-level error
-/// status (timeout, refused connection, cancellation...).
-pub enum LookupEvent<'a> {
-    Reply(&'a [u8]),
-    Error(AresError),
-}
-
-/// What the search state machine wants done next. The FFI executor performs
-/// the action (enqueue a query / call the C callback) — the machine only
-/// decides.
-#[derive(Debug, PartialEq)]
-pub enum SearchAction {
-    /// Issue the same query for this name.
-    Send(String),
-    /// Deliver the current reply buffer to the caller as success.
-    DeliverSuccess,
-    /// Deliver failure with this status.
-    DeliverFail(AresError),
-}
-
-/// State machine for ares_search / ares_search_dnsrec: iterate the search
-/// plan on NXDOMAIN/NODATA/timeout (and, for the dnsrec flavor only, on
-/// SERVFAIL/NOTIMP/REFUSED), deliver otherwise. NXDOMAIN after an earlier
-/// empty answer is reported as ENODATA, matching upstream.
-#[derive(Debug)]
-pub struct SearchSm {
-    pub plan: SearchPlan,
-    pub last_error: AresError,
-    pub had_nodata: bool,
-    /// dnsrec flavor also walks the search plan on server errors.
-    pub retry_server_error: bool,
-}
-
-impl SearchSm {
-    pub fn new(plan: SearchPlan, retry_server_error: bool) -> Self {
-        SearchSm { plan, last_error: ARES_ENODATA.into(), had_nodata: false, retry_server_error }
-    }
-
-    pub fn step(&mut self, ev: LookupEvent<'_>) -> SearchAction {
-        match ev {
-            LookupEvent::Reply(buf) => {
-                let summary = summarize(buf, 0);
-                match summary.rcode {
-                    3 => { // NXDOMAIN
-                        self.last_error = ARES_ENOTFOUND.into();
-                    }
-                    2 | 4 | 5 => { // SERVFAIL, NOTIMP, REFUSED
-                        self.last_error = match summary.rcode {
-                            2 => ARES_ESERVFAIL,
-                            4 => ARES_ENOTIMP,
-                            _ => ARES_EREFUSED,
-                        }.into();
-                    }
-                    0 => {
-                        if summary.ancount == 0 {
-                            self.had_nodata = true;
-                            self.last_error = ARES_ENODATA.into();
-                        } else {
-                            // Success — deliver the raw response
-                            return SearchAction::DeliverSuccess;
-                        }
-                    }
-                    _ => {
-                        self.had_nodata = true;
-                        self.last_error = ARES_ENODATA.into();
-                    }
-                }
-            }
-            LookupEvent::Error(status) => {
-                self.last_error = status;
-            }
-        }
-
-        // Search domain iteration: on NXDOMAIN/ENODATA/ETIMEOUT — and for the
-        // dnsrec flavor also on server errors — try the next name in the plan.
-        let iterate = matches!(self.last_error.code(), ARES_ENOTFOUND | ARES_ENODATA | ARES_ETIMEOUT)
-            || (self.retry_server_error
-                && matches!(self.last_error.code(), ARES_ESERVFAIL | ARES_EREFUSED | ARES_ENOTIMP));
-        if iterate {
-            if let Some(next_name) = self.plan.advance() {
-                return SearchAction::Send(next_name);
-            }
-        }
-
-        // Finalize
-        let mut status = self.last_error;
-        if self.had_nodata && status.code() == ARES_ENOTFOUND {
-            status = ARES_ENODATA.into();
-        }
-        SearchAction::DeliverFail(status)
-    }
-}
-
-// Address families as the C API speaks them (plain constants — the state
-// machines stay pure while still deciding between A and AAAA queries).
 pub use libc::{AF_INET, AF_INET6, AF_UNSPEC};
 
+/// A / AAAA DNS record types (the query rtypes the async lifecycles build).
 pub(crate) const RTYPE_A: u16 = 0x01;
 pub(crate) const RTYPE_AAAA: u16 = 0x1c;
-
-/// What the getaddrinfo state machine wants done next.
-#[derive(Debug, PartialEq)]
-pub enum AddrInfoAction {
-    /// Issue one query. `batch` marks the sends of a (re)launched A/AAAA
-    /// batch: on failure the executor feeds back `LaunchFailed` (and checks
-    /// the socket callbacks), while a TC/failover re-send feeds
-    /// `ResendFailed` (and ignores socket-callback results) — preserving the
-    /// two historical failure accounting rules.
-    Send { name: String, family: c_int, tcp: bool, server: usize, timeouts: c_int, batch: bool },
-    /// All queries settled with at least one success: build the ares_addrinfo
-    /// from the accumulated records and deliver.
-    DeliverSuccess { name: String },
-    DeliverFail { status: AresError },
-}
-
-/// Input to the getaddrinfo machine, one per settled task (or failed send).
-pub enum AddrInfoEvent {
-    Reply {
-        parse: Result<Vec<crate::core::packets::AddrRecord>, AresError>,
-        server: usize,
-    },
-    /// I/O-level error, including ECANCELLED/EDESTRUCTION (which set the
-    /// cancel flag and still participate in the pending join).
-    Error { status: AresError },
-    /// A batch launch send failed: always records ECONNREFUSED.
-    LaunchFailed,
-    /// A failover re-send failed: ECONNREFUSED is recorded only if this
-    /// was the last outstanding query.
-    ResendFailed,
-}
-
-/// State machine for ares_getaddrinfo's DNS phase. AF_UNSPEC launches A and
-/// AAAA in parallel; `pending` is pre-credited for the whole batch before any
-/// send so a per-query failure can never finalize the lookup while its
-/// sibling is still being launched. TC and failover re-sends replace their
-/// task without touching `pending`; the search plan only advances (and the
-/// lookup only finalizes) once `pending` reaches zero.
-#[derive(Debug)]
-pub struct AddrInfoSm {
-    pub plan: SearchPlan,
-    pub ai_family: c_int,
-    pub use_tcp: bool,
-    pub pending: u32,
-    pub has_success: bool,
-    pub has_cancel: bool,
-    pub last_error: AresError,
-    /// Accumulated A/AAAA answers in arrival order across the parallel
-    /// queries and any relaunches.
-    pub addrs: Vec<crate::core::packets::AddrRecord>,
-}
-
-impl AddrInfoSm {
-    pub fn new(plan: SearchPlan, ai_family: c_int, use_tcp: bool) -> Self {
-        AddrInfoSm {
-            plan,
-            ai_family,
-            use_tcp,
-            pending: 0,
-            has_success: false,
-            has_cancel: false,
-            last_error: ARES_ENODATA.into(),
-            addrs: Vec::new(),
-        }
-    }
-
-    /// Launch a fresh A/AAAA batch for the plan's current name: pre-credit
-    /// `pending` for the whole batch, then emit the sends.
-    pub fn begin_batch(&mut self, server: usize) -> Vec<AddrInfoAction> {
-        let families: &[c_int] = match self.ai_family {
-            AF_INET => &[AF_INET],
-            AF_INET6 => &[AF_INET6],
-            _ => &[AF_INET, AF_INET6], // AF_UNSPEC: launch both
-        };
-        self.pending += families.len() as u32;
-        families.iter().map(|&family| AddrInfoAction::Send {
-            name: self.plan.current.clone(),
-            family,
-            tcp: self.use_tcp,
-            server,
-            timeouts: 0,
-            batch: true,
-        }).collect()
-    }
-
-    pub fn step(&mut self, ev: AddrInfoEvent, health: &mut ServerHealth) -> Vec<AddrInfoAction> {
-        match ev {
-            AddrInfoEvent::Reply { parse, server } => {
-                match parse {
-                    Ok(records) => {
-                        // Server succeeded — reset its failure counter
-                        health.record_success(server);
-                        self.has_success = true;
-                        self.addrs.extend(records);
-                    }
-                    Err(e) => {
-                        // Server-error failover is handled by the reactor
-                        // (on_datagram); the SM only sees the settled error.
-                        self.last_error = e;
-                    }
-                }
-            }
-            AddrInfoEvent::Error { status } => {
-                if matches!(status.code(), ARES_ECANCELLED | ARES_EDESTRUCTION) {
-                    self.has_cancel = true;
-                }
-                self.last_error = status;
-            }
-            AddrInfoEvent::LaunchFailed => {
-                self.last_error = ARES_ECONNREFUSED.into();
-            }
-            AddrInfoEvent::ResendFailed => {
-                self.pending -= 1;
-                if self.pending == 0 {
-                    self.last_error = ARES_ECONNREFUSED.into();
-                    return vec![self.finalize()];
-                }
-                return vec![];
-            }
-        }
-
-        self.pending -= 1;
-        if self.pending > 0 {
-            return vec![];
-        }
-
-        // Search domain iteration: on NXDOMAIN/ENODATA/ETIMEOUT/SERVFAIL/
-        // NOTIMP/REFUSED, try the next search domain or the bare name.
-        if !self.has_success && !self.has_cancel
-            && matches!(self.last_error.code(),
-                ARES_ENOTFOUND | ARES_ENODATA | ARES_ETIMEOUT
-                | ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED)
-            && self.plan.advance().is_some()
-        {
-            self.last_error = ARES_ENODATA.into();
-            return self.begin_batch(health.pick_next());
-        }
-
-        vec![self.finalize()]
-    }
-
-    fn finalize(&mut self) -> AddrInfoAction {
-        if self.has_cancel || !self.has_success {
-            AddrInfoAction::DeliverFail { status: self.last_error }
-        } else {
-            AddrInfoAction::DeliverSuccess { name: self.plan.current.clone() }
-        }
-    }
-}
-
-/// Which lifecycle owns a task. AddrInfo and HostByName run their own
-/// failover/TC machines, so the reactor-level policies skip them.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TaskKind { AddrInfo, Search, Other }
-
-/// What a cancel/destroy teardown owes a pending task's owner.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TeardownDelivery {
-    /// Report the teardown status with an empty/NULL payload directly.
-    DeliverNull,
-    /// Run the task's normal error path (the AddrInfo machine folds the
-    /// cancel into its batch join; plain callbacks just get the status).
-    Full,
-}
-
-/// The cancel/destroy policy table, keyed by lifecycle.
-pub fn teardown_delivery(kind: TaskKind) -> TeardownDelivery {
-    match kind {
-        TaskKind::Search => TeardownDelivery::DeliverNull,
-        TaskKind::AddrInfo | TaskKind::Other => TeardownDelivery::Full,
-    }
-}
 
 /// Reactor-level side effect (executed by ares_process).
 #[derive(Debug, PartialEq)]
@@ -475,7 +178,6 @@ pub enum TaskVerdict {
 /// is retried in place rather than skipped.
 pub fn on_datagram(
     summary: &ReplySummary,
-    kind: TaskKind,
     server: usize,
     is_tcp: bool,
     attempts: u32,
@@ -485,14 +187,9 @@ pub fn on_datagram(
     let mut actions = Vec::new();
     let is_server_error = matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
     let nservers = health.len();
-    // getaddrinfo issues no server-state notifications (upstream parity); every
-    // other kind notifies on both success and server-error.
-    let notifies = kind != TaskKind::AddrInfo;
 
     if is_server_error {
-        if notifies {
-            actions.push(ReactorAction::NotifyServerState { server, ok: false, tcp: is_tcp });
-        }
+        actions.push(ReactorAction::NotifyServerState { server, ok: false, tcp: is_tcp });
         health.record_failure(server);
         if (tries as usize + 1) < nservers * attempts as usize {
             let tries = tries + 1;
@@ -500,9 +197,7 @@ pub fn on_datagram(
         }
     } else {
         // Success response — notify + reset failure counters
-        if notifies {
-            actions.push(ReactorAction::NotifyServerState { server, ok: true, tcp: is_tcp });
-        }
+        actions.push(ReactorAction::NotifyServerState { server, ok: true, tcp: is_tcp });
         health.record_success(server);
     }
 
@@ -721,32 +416,6 @@ mod tests {
         assert_eq!(p.advance(), None);
     }
 
-    #[test]
-    fn search_sm_iterates_then_enodata_rewrite() {
-        let search = vec!["a.com".to_string()];
-        let mut sm = SearchSm::new(SearchPlan::for_search("www", 1, &search), false);
-        // empty answer -> NODATA -> bare-name fallback
-        assert_eq!(sm.step(LookupEvent::Reply(&reply(0, 0))), SearchAction::Send("www".into()));
-        // NXDOMAIN after a NODATA earlier in the walk finalizes as ENODATA
-        assert_eq!(sm.step(LookupEvent::Reply(&reply(3, 0))), SearchAction::DeliverFail(ARES_ENODATA.into()));
-    }
-
-    #[test]
-    fn search_sm_server_error_only_iterates_for_dnsrec() {
-        let search = vec!["a.com".to_string()];
-        let plan = SearchPlan::for_search("www", 1, &search);
-        let mut plain = SearchSm::new(plan.clone(), false);
-        assert_eq!(plain.step(LookupEvent::Reply(&reply(2, 0))), SearchAction::DeliverFail(ARES_ESERVFAIL.into()));
-        let mut dnsrec = SearchSm::new(plan, true);
-        assert_eq!(dnsrec.step(LookupEvent::Reply(&reply(2, 0))), SearchAction::Send("www".into()));
-    }
-
-    #[test]
-    fn search_sm_success_and_timeout() {
-        let mut sm = SearchSm::new(SearchPlan::for_search("www.example.", 1, &[]), false);
-        assert_eq!(sm.step(LookupEvent::Reply(&reply(0, 1))), SearchAction::DeliverSuccess);
-        assert_eq!(sm.step(LookupEvent::Error(ARES_ETIMEOUT.into())), SearchAction::DeliverFail(ARES_ETIMEOUT.into()));
-    }
 
     #[test]
     fn pick_next_lowest_failures_then_index() {
@@ -792,35 +461,28 @@ mod tests {
         let notify_fail = |s| ReactorAction::NotifyServerState { server: s, ok: false, tcp: false };
         let notify_ok = |s| ReactorAction::NotifyServerState { server: s, ok: true, tcp: false };
 
-        // success rcode: notify-ok for everyone except AddrInfo; always Deliver
-        for (kind, notifies) in [(TaskKind::Other, true), (TaskKind::Search, true),
-                                 (TaskKind::AddrInfo, false)] {
-            let mut h = ServerHealth::default();
-            h.reset(2);
-            h.record_failure(0);
-            let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), kind, 0, false, 2, 0, &mut h);
-            assert_eq!(v, TaskVerdict::Deliver);
-            assert_eq!(a, if notifies { vec![notify_ok(0)] } else { vec![] });
-            assert_eq!(h.failures[0], 0, "success resets failures");
-        }
+        // success rcode: notify-ok, reset failures, Deliver
+        let mut h = ServerHealth::default();
+        h.reset(2);
+        h.record_failure(0);
+        let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), 0, false, 2, 0, &mut h);
+        assert_eq!(v, TaskVerdict::Deliver);
+        assert_eq!(a, vec![notify_ok(0)]);
+        assert_eq!(h.failures[0], 0, "success resets failures");
 
-        // SERVFAIL, 2 servers: every kind fails over to the next server (the
-        // reactor owns failover now); all notify server-state-fail except
-        // getaddrinfo, which issues no server-state notifications.
-        for kind in [TaskKind::Other, TaskKind::Search, TaskKind::AddrInfo] {
-            let mut h = ServerHealth::default();
-            h.reset(2);
-            let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), kind, 0, false, 2, 0, &mut h);
-            assert_eq!(v, TaskVerdict::RetryNextServer { server: 1, tries: 1 });
-            assert_eq!(a, if kind != TaskKind::AddrInfo { vec![notify_fail(0)] } else { vec![] });
-            assert_eq!(h.failures[0], 1);
-        }
+        // SERVFAIL, 2 servers: fail over to the next server, notify fail.
+        let mut h = ServerHealth::default();
+        h.reset(2);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 0, &mut h);
+        assert_eq!(v, TaskVerdict::RetryNextServer { server: 1, tries: 1 });
+        assert_eq!(a, vec![notify_fail(0)]);
+        assert_eq!(h.failures[0], 1);
 
         // SERVFAIL, single server: retried in place (pick_next returns the same
         // server), failure recorded, still notified.
         let mut h = ServerHealth::default();
         h.reset(1);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), TaskKind::Other, 0, false, 2, 0, &mut h);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 0, &mut h);
         assert_eq!(v, TaskVerdict::RetryNextServer { server: 0, tries: 1 });
         assert_eq!(a, vec![notify_fail(0)]);
         assert_eq!(h.failures[0], 1);
@@ -828,20 +490,17 @@ mod tests {
         // budget exhausted: tries+1 >= nservers*attempts falls through to Deliver
         let mut h = ServerHealth::default();
         h.reset(2);
-        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), TaskKind::Other, 0, false, 2, 3, &mut h);
+        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 3, &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
 
-        // TC flag on UDP: RetryTcp for every kind (the reactor owns TC now);
-        // already-TCP never TC-retries
+        // TC flag on UDP: RetryTcp; already-TCP never TC-retries.
         let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
-        for kind in [TaskKind::Other, TaskKind::Search, TaskKind::AddrInfo] {
-            let mut h = ServerHealth::default();
-            h.reset(1);
-            let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, false, 2, 0, &mut h);
-            assert_eq!(v, TaskVerdict::RetryTcp);
-            let (_, v) = on_datagram(&summarize(&tc, 0), kind, 0, true, 2, 0, &mut h);
-            assert_eq!(v, TaskVerdict::Deliver);
-        }
+        let mut h = ServerHealth::default();
+        h.reset(1);
+        let (_, v) = on_datagram(&summarize(&tc, 0), 0, false, 2, 0, &mut h);
+        assert_eq!(v, TaskVerdict::RetryTcp);
+        let (_, v) = on_datagram(&summarize(&tc, 0), 0, true, 2, 0, &mut h);
+        assert_eq!(v, TaskVerdict::Deliver);
     }
 
     #[test]

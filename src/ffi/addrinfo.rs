@@ -38,56 +38,6 @@ pub struct ares_addrinfo {
     pub name: *mut c_char,
 }
 
-/// Build the C node list for a synchronous (IP-literal / hosts-file)
-/// delivery — pure transcription: the family filter was already applied in
-/// core (`Client::getaddrinfo`'s synchronous-deliver arm).
-pub(crate) fn addrinfo_nodes_from_addrs_port(addrs: &[IpAddr], port: u16) -> *mut ares_addrinfo_node {
-    let mut head: *mut ares_addrinfo_node = std::ptr::null_mut();
-    let mut tail: *mut ares_addrinfo_node = std::ptr::null_mut();
-    for ip in addrs {
-        let (ai_family, ai_addrlen, ai_addr): (c_int, libc::socklen_t, *mut libc::sockaddr) = match ip {
-            IpAddr::V4(v4) => {
-                let sa = Box::new(libc::sockaddr_in {
-                    sin_family: libc::AF_INET as libc::sa_family_t,
-                    sin_port: port.to_be(),
-                    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(v4.octets()) },
-                    sin_zero: [0; 8],
-                });
-                (libc::AF_INET, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                 Box::into_raw(sa) as *mut libc::sockaddr)
-            }
-            IpAddr::V6(v6) => {
-                let sa = Box::new(libc::sockaddr_in6 {
-                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                    sin6_port: port.to_be(),
-                    sin6_flowinfo: 0,
-                    sin6_addr: libc::in6_addr { s6_addr: v6.octets() },
-                    sin6_scope_id: 0,
-                });
-                (libc::AF_INET6, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                 Box::into_raw(sa) as *mut libc::sockaddr)
-            }
-        };
-        let node = Box::into_raw(Box::new(ares_addrinfo_node {
-            ai_ttl: 0,
-            ai_flags: 0,
-            ai_family,
-            ai_socktype: 0,
-            ai_protocol: 0,
-            ai_addrlen,
-            ai_addr,
-            ai_next: std::ptr::null_mut(),
-        }));
-        if head.is_null() {
-            head = node;
-        } else {
-            unsafe { (*tail).ai_next = node };
-        }
-        tail = node;
-    }
-    head
-}
-
 /// Build the C node list from accumulated (safe) AddrRecords at delivery
 /// time — arrival order preserved, ai_ttl carried from the answer records.
 pub(crate) fn nodes_from_addr_records(records: &[AddrRecord], port: u16) -> *mut ares_addrinfo_node {

@@ -1,6 +1,6 @@
 //! The self-contained async `ares_getaddrinfo` lifecycle: preflight
 //! (empty/onion/IP-literal/hosts/no-servers), then per search-plan name a
-//! **parallel A+AAAA batch** driven by [`resolve_queries`], merging the
+//! **parallel A+AAAA batch** driven by [`ParallelQueries`], merging the
 //! address records. Returns [`AddrInfoOut`]; the FFI builds the `ares_addrinfo`
 //! node chain (the service port travels on the delivery tail).
 
@@ -141,11 +141,11 @@ pub(crate) async fn getaddrinfo_lifecycle(
         // A cancelled query has no result — it contributes nothing.
         let mut records: Vec<AddrRecord> = Vec::new();
         let mut any_success = false;
-        for i in 0..rtypes.len() {
+        for (i, &rtype) in rtypes.iter().enumerate() {
             match par.result(i) {
                 Some((Ok(buf), io_timeouts)) => {
                     timeouts += io_timeouts;
-                    match addr_reply(buf, rtypes[i], ReplyRequire::Items) {
+                    match addr_reply(buf, rtype, ReplyRequire::Items) {
                         Ok(mut rrs) => {
                             records.append(&mut rrs.items);
                             any_success = true;

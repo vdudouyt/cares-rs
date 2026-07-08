@@ -31,7 +31,7 @@ use bytes::BytesMut;
 
 use crate::core::lookup::{
     extract_tcp_frame, on_datagram, on_timeout, qid_matches, summarize, ReactorAction, ServerHealth,
-    TaskKind, TaskVerdict, TimeoutVerdict,
+    TaskVerdict, TimeoutVerdict,
 };
 use crate::core::query_builder::frame_tcp;
 use crate::core::socket::{Socket, SocketFactory};
@@ -640,7 +640,6 @@ pub(crate) async fn resolve_query(
             let summary = summarize(&buf, 0);
             let (actions, verdict) = on_datagram(
                 &summary,
-                TaskKind::Other,
                 server,
                 use_tcp,
                 res.opts.attempts,
@@ -678,11 +677,15 @@ fn clear_tcp_slot(primary: &Primary, qid: u16) {
 
 // ===== ParallelQueries — generic concurrent-query mechanism =====
 
+/// One query's `(reply-or-status, timeout-count)` outcome.
+type QueryOutcome = (Result<Vec<u8>, c_int>, c_int);
+type QueryFut = Pin<Box<dyn Future<Output = QueryOutcome>>>;
+
 /// One sub-query inside a [`ParallelQueries`] set.
 struct ParSub {
     io: Rc<RefCell<QueryIo>>,
-    fut: Option<Pin<Box<dyn Future<Output = (Result<Vec<u8>, c_int>, c_int)>>>>,
-    result: Option<(Result<Vec<u8>, c_int>, c_int)>,
+    fut: Option<QueryFut>,
+    result: Option<QueryOutcome>,
 }
 
 /// N query futures driven concurrently over one shared mailbox — the generic
@@ -705,8 +708,7 @@ impl ParallelQueries {
             .into_iter()
             .map(|(payload, use_tcp)| {
                 let sub_io = Rc::new(RefCell::new(QueryIo::default()));
-                let fut = Box::pin(resolve_query(sub_io.clone(), res.clone(), payload, use_tcp, None))
-                    as Pin<Box<dyn Future<Output = (Result<Vec<u8>, c_int>, c_int)>>>;
+                let fut = Box::pin(resolve_query(sub_io.clone(), res.clone(), payload, use_tcp, None)) as QueryFut;
                 ParSub { io: sub_io, fut: Some(fut), result: None }
             })
             .collect();
@@ -714,7 +716,7 @@ impl ParallelQueries {
     }
 
     /// The settled outcome of query `i`, or `None` if still running or cancelled.
-    pub(crate) fn result(&self, i: usize) -> Option<&(Result<Vec<u8>, c_int>, c_int)> {
+    pub(crate) fn result(&self, i: usize) -> Option<&QueryOutcome> {
         self.subs[i].result.as_ref()
     }
 

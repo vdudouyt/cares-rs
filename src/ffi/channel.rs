@@ -3,22 +3,18 @@
 
 use super::*;
 use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
-use crate::core::query_builder::tcp_payload;
 use crate::core::executor::{noop_waker, raw_lifecycle, Delivery, Effect, QueryIo, RawLaunch};
 use crate::core::hostent::Hostent;
-use crate::core::launch::{read_tcp_frame, timeout_step};
-use crate::core::transport::Task;
 use crate::core::AresError;
 use crate::core::preflight::NameinfoReply;
 use super::lookups::{fire_host_success, AddrInfoTail, HostTail, NameinfoTail, SearchDelivery, SearchTail};
-use super::process::carry_over;
 
 
 /// The C-visible channel: the pure core state plus the channel-level C
 /// callbacks. Everything the shims marshal lives behind `.state`; the six
 /// callback fields are the only C-tainted residents.
 pub struct ChannelData {
-    pub(crate) state: Client<FFIData>,
+    pub(crate) state: Client,
     /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
     /// in `state.transport`. The socket-state callbacks (create/configure) live in
     /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
@@ -26,8 +22,8 @@ pub struct ChannelData {
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
-    /// In-flight async lifecycle futures. The slot index is the
-    /// `TaskMachine::Async(id)` a task carries; `None` = a reaped slot.
+    /// In-flight async lifecycle futures (`None` = a reaped slot). Every
+    /// resolver op is one of these; the future owns its socket(s).
     async_queries: Vec<Option<AsyncQuery>>,
 }
 
@@ -93,7 +89,7 @@ enum Completed {
 
 impl ChannelData {
     /// A fresh channel: pure state, no callbacks installed.
-    pub(crate) fn new(state: Client<FFIData>, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
+    pub(crate) fn new(state: Client, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
         ChannelData {
             state,
             socket_factory,
@@ -174,13 +170,6 @@ impl ChannelData {
         let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
         let fut = Box::pin(crate::core::addrinfo::getaddrinfo_lifecycle(ctx, io.clone(), hostname));
         self.spawn(io, AsyncKind::AddrInfo { fut, tail });
-    }
-
-    /// Fire a settled classic-task outcome (search/getaddrinfo/gethostbyaddr/
-    /// nameinfo/probe). The migrated async lifecycles own their sockets and
-    /// never appear here.
-    fn settle(&mut self, task: &Task<FFIData>, res: Result<&[u8], c_int>) {
-        task.userdata.callback.run(res, task, self);
     }
 
     /// Advance one async future one step: poll it, apply the effects it emitted
@@ -347,12 +336,6 @@ impl ChannelData {
     /// future, which drops its owned sockets). The shared safe teardown for
     /// `ares_cancel` (ECANCELLED) / `ares_destroy` (EDESTRUCTION).
     pub(crate) fn abort_all(&mut self, status: c_int) {
-        let tasks: Vec<_> = self.state.transport.tasks.drain(..).collect();
-        for task in tasks {
-            if task.status != Status::Completed {
-                task.userdata.callback.run(Err(status), &task, self);
-            }
-        }
         for id in 0..self.async_queries.len() {
             self.terminate_async(id, status);
         }
@@ -380,10 +363,10 @@ impl ChannelData {
         }
     }
 
-    /// Every (fd, wants_write) the caller should select on: the classic tasks'
-    /// plus every in-flight async future's published waits.
+    /// Every (fd, wants_write) the caller should select on: each in-flight
+    /// async future's published waits.
     fn all_poll_fds(&self) -> Vec<(i32, bool)> {
-        let mut fds = self.state.poll_fds();
+        let mut fds = Vec::new();
         for aq in self.async_queries.iter().flatten() {
             for w in &aq.io.borrow().waits {
                 fds.push((w.fd, w.writable));
@@ -392,13 +375,11 @@ impl ChannelData {
         fds
     }
 
-    /// The earliest timeout (ms) across classic tasks and async futures, or
-    /// `None` when nothing is in flight. Folding the futures in is required —
-    /// `timeout_millis` only sees `transport.tasks`, so a futures-only channel
-    /// would otherwise report "no timeout" and the caller would block forever.
+    /// The earliest timeout (ms) across in-flight async futures, or `None` when
+    /// nothing is in flight.
     fn next_deadline_ms(&self) -> Option<u128> {
         let now = Instant::now();
-        let mut best = self.state.timeout_millis();
+        let mut best: Option<u128> = None;
         for aq in self.async_queries.iter().flatten() {
             if let Some(d) = aq.io.borrow().deadline {
                 let ms = d.saturating_duration_since(now).as_millis();
@@ -408,159 +389,11 @@ impl ChannelData {
         best
     }
 
-    /// The 4-phase reactor loop (I/O, timeouts, task cleanup, async drive) as a
-    /// safe method — the only unsafe left inside is the FD_ISSET macro and the
-    /// C-callback invokers it drives; every decision is a core verdict or a
-    /// core call.
+    /// One `ares_process` cycle: drive every in-flight async future whose
+    /// published socket is ready (or whose deadline passed) this cycle. Each
+    /// future owns its socket(s) and applies its own verdicts; the only unsafe
+    /// here is the `FD_ISSET` readiness check and the C-callback invokers.
     pub(crate) fn process_channel(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
-        // Phase 1: I/O (write + read) processing.
-        // The receive buffer is taken out of the channel for the duration of the
-        // phase so a reply slice borrowed from it can coexist with the &mut
-        // ChannelData the callback dispatch needs. (A reentrant ares_process from
-        // a user callback simply allocates a fresh buffer.)
-        let mut readbuf = std::mem::take(&mut self.state.readbuf);
-        if readbuf.len() < 65_535 {
-            readbuf.resize(65_535, 0);
-        }
-        let mut tasks = std::mem::take(&mut self.state.transport.tasks);
-        for task in &mut tasks {
-            if task.status == Status::Completed { continue; }
-            if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), write_fds) } {
-                match self.state.transport.write_impl(task) {
-                    WriteResult::Ok => {},
-                    WriteResult::Failed => {
-                        self.settle(task, Err(ARES_ECONNREFUSED));
-                    },
-                    WriteResult::TryAgain => {
-                        // Leave in Writing status for next select cycle
-                    },
-                }
-            }
-            if task.status == Status::Completed { continue; }
-            let fd = task.sock.as_raw_fd();
-            let fd_readable = unsafe { libc::FD_ISSET(fd, read_fds) };
-            let has_tcp_buffered = task.sock.is_tcp() && self.state.tcp_recv_buffers.get(&fd).is_some_and(|b| b.len() >= 2);
-            if fd_readable || has_tcp_buffered {
-                // For TCP shared connections: use per-fd recv buffer with framing
-                let read_result = if task.sock.is_tcp() {
-                    let msg_data = read_tcp_frame(&mut self.state.tcp_recv_buffers, task, fd_readable);
-                    if let Some(ref msg) = msg_data {
-                        readbuf[..msg.len()].copy_from_slice(msg);
-                        Some((0, msg.len()))
-                    } else { None }
-                } else {
-                    // UDP: use existing read_impl
-                    match Transport::read_impl(task, &mut readbuf) {
-                        Ok(v) => v,
-                        Err(()) => {
-                            // recv failed (e.g. ECONNREFUSED) — fire callback
-                            self.settle(task, Err(ARES_ECONNREFUSED));
-                            continue;
-                        }
-                    }
-                };
-                if let Some((offset, len)) = read_result {
-                    let buf = &readbuf[offset..offset+len];
-                    // QID matching: verify response transaction ID matches query
-                    if !qid_matches(buf, &task.writebuf, task.sock.is_tcp()) {
-                        // QID mismatch — discard response, stay in Reading state
-                        task.status = Status::Reading;
-                        continue;
-                    }
-                    // Reactor-level verdict: rcode failover / server-health
-                    // bookkeeping / TC retry — decided in core, executed here.
-                    let summary = summarize(buf, 0);
-                    let (actions, verdict) = on_datagram(
-                        &summary,
-                        task_kind(task),
-                        task.server_index,
-                        task.sock.is_tcp(),
-                        self.state.transport.config.options.attempts,
-                        task.failover_tries,
-                        &mut self.state.server_health.borrow_mut(),
-                    );
-                    for action in actions {
-                        match action {
-                            ReactorAction::NotifyServerState { server, ok, tcp } =>
-                                self.invoke_server_state_callback(server, ok, tcp),
-                        }
-                    }
-                    match verdict {
-                        TaskVerdict::RetryNextServer { server: next_server, tries } => {
-                            let is_tcp = task.sock.is_tcp();
-                            // Strip the TCP length prefix; enqueue re-frames for the new transport.
-                            let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
-                            if self.state.reissue(payload, SocketSource::fresh(is_tcp), next_server, task.userdata, 0) {
-                                carry_over(&mut self.state, task, task.timeouts, tries);
-                            } else {
-                                // Retry socket couldn't be created — deliver the error.
-                                self.settle(task, Err(ARES_ECONNREFUSED));
-                            }
-                            task.status = Status::Completed;
-                            continue;
-                        }
-                        TaskVerdict::RetryTcp => {
-                            let si = task.server_index;
-                            if self.state.reissue(task.writebuf.clone(), SocketSource::Tcp, si, task.userdata, 0) {
-                                carry_over(&mut self.state, task, task.timeouts, task.failover_tries);
-                            } else {
-                                self.settle(task, Err(ARES_ECONNREFUSED));
-                            }
-                            task.status = Status::Completed;
-                            continue;
-                        }
-                        TaskVerdict::Deliver => {}
-                    }
-                    // Cache successful responses for AresCallbackDnsRec and AresSearchCallbackDnsRec
-                    if task.userdata.callback.wants_dnsrec_cache() {
-                        self.state.cache_dnsrec_reply(buf, Instant::now());
-                    }
-                    self.settle(task, Ok(buf));
-                }
-            }
-        }
-        self.state.readbuf = readbuf;
-        // Merge: new tasks from read/write callbacks + processed tasks
-        let mut new_tasks = std::mem::take(&mut self.state.transport.tasks);
-        tasks.append(&mut new_tasks);
-        self.state.transport.tasks = tasks;
-
-        // Phase 2: Timeout handling
-        let max_tries = self.state.transport.config.options.attempts;
-        let mut tasks = std::mem::take(&mut self.state.transport.tasks);
-        for task in &mut tasks {
-            if task.is_expired() && task.status != Status::Completed {
-                // Invoke server_state_callback with failure for timeout
-                self.invoke_server_state_callback(task.server_index, false, task.sock.is_tcp());
-                let timeout_verdict = timeout_step(task, max_tries, task.server_index, &mut self.state.server_health.borrow_mut());
-                if let TimeoutVerdict::Retry { server: si } = timeout_verdict {
-                    let is_tcp = task.sock.is_tcp();
-                    let payload = BytesMut::from(tcp_payload(&task.writebuf, is_tcp));
-                    let new_timeouts = task.timeouts + 1;
-                    task.status = Status::Completed;
-                    // The retry task inherits this task's expiry count.
-                    if self.state.reissue(payload, SocketSource::fresh(is_tcp), si, task.userdata, task.tries_remaining) {
-                        carry_over(&mut self.state, task, new_timeouts, task.failover_tries);
-                    } else {
-                        // Retry socket couldn't be created — deliver the error.
-                        self.settle(task, Err(ARES_ECONNREFUSED));
-                    }
-                } else {
-                    self.settle(task, Err(ARES_ETIMEOUT));
-                    task.status = Status::Completed;
-                }
-            }
-        }
-        // Merge back: new tasks from callbacks/retries + processed tasks
-        let mut new_tasks = std::mem::take(&mut self.state.transport.tasks);
-        tasks.append(&mut new_tasks);
-        self.state.transport.tasks = tasks;
-
-        // Phase 3: Cleanup completed tasks
-        self.state.transport.tasks.retain(|task| task.status != Status::Completed);
-
-        // Phase 4: drive the fd-owning async futures whose socket is ready (or
-        // whose deadline passed) this cycle.
         self.drive_fd_futures(read_fds, write_fds);
     }
 
@@ -601,9 +434,8 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    // Aborts every in-flight future and clears the shared TCP pool.
     channeldata.abort_all(ARES_ECANCELLED);
-    // Clear connection pools so stale sockets don't linger
-    channeldata.state.clear_pools();
 }
 
 #[no_mangle]
@@ -896,8 +728,7 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 #[no_mangle]
 pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
     let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
-    let async_active = channeldata.async_queries.iter().filter(|s| s.is_some()).count();
-    (channeldata.state.active_query_count() + async_active) as c_int
+    channeldata.async_queries.iter().filter(|s| s.is_some()).count() as c_int
 }
 
 #[no_mangle]

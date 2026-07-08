@@ -1,26 +1,8 @@
-//! The reactor driver entry shims (ares_process / ares_process_fd). The
-//! 4-phase reactor loop itself and the server-state notification are
-//! `ChannelData` methods (see `ffi::channel`); the `carry_over` retry helper
-//! stays a free fn here.
+//! The reactor driver entry shims (ares_process / ares_process_fd): they
+//! marshal the C `fd_set`s and drive every in-flight async future whose socket
+//! is ready (or whose deadline passed) via `ChannelData::process_channel`.
 
 use super::*;
-use crate::core::client::Client;
-use crate::core::transport::Task;
-
-/// Copy the core-owned per-task data (state machine, family/record-type,
-/// queried ip) from a settled task onto the retry task `reissue` just pushed,
-/// stamping the accumulated timeout count — so the eventual reply is
-/// attributed just like the original send. (`enqueue` defaults these fields.)
-pub(crate) fn carry_over(state: &mut Client<FFIData>, old: &Task<FFIData>, timeouts: i32, failover_tries: u32) {
-    if let Some(t) = state.transport.tasks.last_mut() {
-        t.machine = old.machine.clone();
-        t.family = old.family;
-        t.rtype = old.rtype;
-        t.queried_ip = old.queried_ip;
-        t.timeouts = timeouts;
-        t.failover_tries = failover_tries;
-    }
-}
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]

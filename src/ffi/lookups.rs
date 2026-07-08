@@ -3,14 +3,11 @@
 
 use super::*;
 use crate::core::api;
-use crate::core::AresError;
 use crate::core::executor::QueryIo;
 use crate::core::hostbyname::gethostbyname;
 use crate::core::hostbyaddr::{gethostbyaddr, HostByAddrCtx};
 use crate::core::hostent::Hostent;
-use crate::core::transport::{Task, TaskMachine};
-use crate::core::launch::AddrInfoDelivery;
-use crate::core::preflight::{assemble_nameinfo, service_to_port, ServicePort};
+use crate::core::preflight::{service_to_port, ServicePort};
 
 
 /// The Copy delivery tail of an ares_gethostbyname / ares_gethostbyaddr lookup.
@@ -49,89 +46,7 @@ pub(crate) enum SearchDelivery {
 /// The Copy delivery tail of an ares_search / ares_search_dnsrec lookup.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SearchTail {
-    pub(crate) dnstype: u16,
     pub(crate) delivery: SearchDelivery,
-}
-
-#[derive(Debug, Clone, Copy)]
-// Variants are named after the c-ares FFI callback typedefs they dispatch to;
-// the shared `Callback` suffix is intentional for that correspondence.
-// Stateful lookups carry only their Copy C delivery tail here; the shared
-// state-machine handle lives on the core `Task` (`Task.machine`), so this
-// enum is a plain binding the shim builds and core clones per task.
-#[allow(clippy::enum_variant_names)]
-pub(crate) enum Callback {
-    AresHostCallback(AresHostCallback),
-    AresCallbackDnsRec(AresCallbackDnsRec),
-    AresNameinfoCallback(AresNameinfoCallback),
-    AddrInfo(AddrInfoTail),
-}
-
-impl Callback {
-    pub(crate) fn run(&self, buf: Result<&[u8], c_int>, task: &crate::core::transport::Task<FFIData>, channeldata: &mut ChannelData) {
-        // Cancel/destroy deliveries follow the core policy table.
-        if let Err(status) = &buf {
-            if *status == ARES_EDESTRUCTION || *status == ARES_ECANCELLED {
-                // All remaining classic variants use TeardownDelivery::Full.
-            }
-        }
-        match self {
-            Self::AresHostCallback(callback) => run_ares_host_callback(buf, *callback, task),
-            Self::AresCallbackDnsRec(callback) => run_ares_callback_dnsrec(buf, *callback, task),
-            Self::AresNameinfoCallback(callback) => run_ares_nameinfo_callback(buf, *callback, task),
-            Self::AddrInfo(tail) => run_ares_addrinfo_callback(buf, *tail, task, channeldata),
-        }
-    }
-    /// Which reactor-level policies apply to a task carrying this callback.
-    pub(crate) fn kind(&self) -> TaskKind {
-        match self {
-            Self::AddrInfo(..) => TaskKind::AddrInfo,
-            _ => TaskKind::Other,
-        }
-    }
-    pub(crate) fn wants_dnsrec_cache(&self) -> bool {
-        match self {
-            Self::AresCallbackDnsRec(_) => true,
-            _ => false,
-        }
-    }
-}
-
-/// The reactor's view of a classic task's kind — defers to its `Callback`.
-/// (The migrated async lifecycles own their sockets and never become tasks.)
-pub(crate) fn task_kind(task: &Task<FFIData>) -> TaskKind {
-    task.userdata.callback.kind()
-}
-
-/// The C-binding half of a task's userdata: only what the reply needs to
-/// fire the user's C callback. All per-task core data (state-machine handle,
-/// family/record-type, server, timeouts, queried ip) lives on the core
-/// `Task`, so this is a plain value the shim builds eagerly and core clones
-/// per task — no factory closure.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct FFIData {
-    pub(crate) callback: Callback,
-    pub(crate) arg: *mut c_void,
-    pub(crate) ip: Option<IpAddr>,
-    // nameinfo-specific fields
-    pub(crate) nameinfo_flags: c_int,
-    pub(crate) port: u16,
-    pub(crate) scope_id: u32,
-}
-
-impl FFIData {
-    /// A blank userdata around `callback` — entry shims override the fields
-    /// their flow needs via struct-update syntax.
-    pub(crate) fn base(callback: Callback) -> FFIData {
-        FFIData {
-            callback,
-            arg: std::ptr::null_mut(),
-            ip: None,
-            nameinfo_flags: 0,
-            port: 0,
-            scope_id: 0,
-        }
-    }
 }
 
 #[no_mangle]
@@ -219,7 +134,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
         search: std::rc::Rc::from(channeldata.state.transport.config.search.clone()),
         use_vc: channeldata.state.transport.config.options.use_vc,
     };
-    let tail = SearchTail { dnstype: dnstype as u16, delivery: SearchDelivery::Raw { callback, arg } };
+    let tail = SearchTail { delivery: SearchDelivery::Raw { callback, arg } };
     channeldata.spawn_search(ctx, name_str.to_string(), dnstype as u16, false, tail);
 }
 
@@ -254,7 +169,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
     // Cache probe: if a fresh cached reply parses, deliver synchronously.
-    let name_clean = name.strip_suffix('.').unwrap_or(&name);
+    let name_clean = name.strip_suffix('.').unwrap_or(name.as_ref());
     if let Some(cached_buf) = channeldata.state.cache.borrow_mut().get(name_clean, dnstype as u16, Instant::now()) {
         if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf) {
             let dnsrec = Box::into_raw(Box::new(rec));
@@ -263,7 +178,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
             return;
         }
     }
-    let launch = match channeldata.state.query_payload(&name, dnstype as u16) {
+    let launch = match channeldata.state.query_payload(name.as_ref(), dnstype as u16) {
         Ok(l) => l,
         Err(e) => { unsafe { callback(arg, e.code(), 0, std::ptr::null_mut()) }; return; }
     };
@@ -303,7 +218,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
         search: std::rc::Rc::from(channeldata.state.transport.config.search.clone()),
         use_vc: channeldata.state.transport.config.options.use_vc,
     };
-    let tail = SearchTail { dnstype: qtype as u16, delivery: SearchDelivery::DnsRec { callback, arg } };
+    let tail = SearchTail { delivery: SearchDelivery::DnsRec { callback, arg } };
     channeldata.spawn_search(ctx, name_str.to_string(), qtype as u16, true, tail);
 }
 
@@ -346,20 +261,8 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 }
 
 
-pub(crate) fn run_ares_host_callback(res: Result<&[u8], c_int>, callback: AresHostCallback, task: &Task<FFIData>) {
-    match api::on_host_reply(res.map_err(AresError::from), task.rtype, task.family, task.queried_ip) {
-        Ok(bp) => {
-            let raw_hostent = unsafe { build_hostent(bp) };
-            unsafe { callback(task.userdata.arg, ARES_SUCCESS, task.timeouts, &mut *raw_hostent) };
-            unsafe { ares_free_hostent(raw_hostent) };
-        },
-        Err(err) => unsafe { callback(task.userdata.arg, err.code(), task.timeouts, std::ptr::null_mut()) },
-    }
-}
-
-/// The single raw `ares_callback` invocation for the query path — shared by the
-/// synchronous reply handler ([`run_ares_callback`]) and the async executor,
-/// so the unsafe fire lives in exactly one place.
+/// The single raw `ares_callback` invocation for the query/send path — the one
+/// place the raw C callback is fired (from the async executor's completion).
 pub(crate) fn fire_ares_callback(callback: AresCallback, arg: *mut c_void, res: Result<&[u8], c_int>, timeouts: c_int) {
     match res {
         Ok(buf) => unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) },
@@ -374,28 +277,6 @@ pub(crate) fn fire_host_success(tail: HostTail, hostent: Hostent, timeouts: c_in
     let c_hostent = unsafe { build_hostent(hostent) };
     unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, timeouts, c_hostent) };
     unsafe { ares_free_hostent(c_hostent) };
-}
-
-pub(crate) fn run_ares_callback_dnsrec(res: Result<&[u8], c_int>, callback: AresCallbackDnsRec, task: &Task<FFIData>) {
-    match res.map_err(AresError::from).and_then(dns_record::parse_record) {
-        Ok(rec) => {
-            let dnsrec = Box::into_raw(Box::new(rec));
-            unsafe { callback(task.userdata.arg, ARES_SUCCESS, task.timeouts as usize, dnsrec) };
-            unsafe { dns_record::ares_dns_record_destroy(dnsrec) };
-        }
-        Err(status) => unsafe { callback(task.userdata.arg, status.code(), task.timeouts as usize, std::ptr::null_mut()) },
-    }
-}
-
-pub(crate) fn run_ares_nameinfo_callback(res: Result<&[u8], c_int>, callback: AresNameinfoCallback, task: &Task<FFIData>) {
-    let ffidata = &task.userdata;
-    let reply = assemble_nameinfo(
-        res.map_err(AresError::from), ffidata.ip.unwrap(), ffidata.scope_id, ffidata.port,
-        ffidata.nameinfo_flags, task.timeouts,
-    );
-    let node_ptr = reply.node.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
-    let service_ptr = reply.service.map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut());
-    unsafe { callback(ffidata.arg, reply.status.code(), reply.timeouts, node_ptr, service_ptr) };
 }
 
 #[no_mangle]
@@ -445,54 +326,6 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     };
     channeldata.spawn_addrinfo(ctx, hostname_raw.to_string(), AddrInfoTail { callback, arg, port });
 }
-
-/// Fire the deliveries a core drive returned: build the C node graph for a
-/// success, or report the failure status.
-fn fire_addrinfo_deliveries(deliveries: Vec<AddrInfoDelivery>, tail: AddrInfoTail) {
-    for delivery in deliveries {
-        match delivery {
-            AddrInfoDelivery::Success { name, records } => {
-                let nodes = nodes_from_addr_records(&records, tail.port);
-                let ai = build_ares_addrinfo(&name, nodes);
-                unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, 0, ai) };
-            }
-            AddrInfoDelivery::Fail { status } => {
-                unsafe { (tail.callback)(tail.arg, status.code(), 0, std::ptr::null_mut()) };
-            }
-        }
-    }
-}
-
-/// Executor entry for a settled getaddrinfo task: parse the reply (parsing
-/// stays ffi-side), feed the event to `AddrInfoSm::step` (borrow held for the
-/// decision only), then perform the returned actions borrow-free.
-pub(crate) fn run_ares_addrinfo_callback(res: Result<&[u8], c_int>, tail: AddrInfoTail, task: &Task<FFIData>, channeldata: &mut ChannelData) {
-    let TaskMachine::AddrInfo(sm) = &task.machine else { unreachable!("getaddrinfo task carries an AddrInfo machine") };
-    let ev = match res {
-        Ok(buf) => {
-            let parse = (|| -> Result<Vec<AddrRecord>, AresError> {
-                let response = ParsedResponse::from_buf(buf)?;
-                let parsed_rrs = response.process_answers::<AddrRecord>(buf, task.rtype)?;
-                if parsed_rrs.items.is_empty() {
-                    return Err(ARES_ENODATA.into());
-                }
-                Ok(parsed_rrs.items)
-            })();
-            AddrInfoEvent::Reply {
-                parse,
-                server: task.server_index,
-            }
-        }
-        Err(status) => AddrInfoEvent::Error { status: status.into() },
-    };
-    let actions = {
-        let mut machine = sm.borrow_mut();
-        machine.step(ev, &mut channeldata.state.server_health.borrow_mut())
-    };
-    let deliveries = channeldata.state.drive_addrinfo(sm, actions, task.userdata);
-    fire_addrinfo_deliveries(deliveries, tail);
-}
-
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: ares_callback, arg: *mut c_void) {

@@ -51,16 +51,6 @@ pub fn frame_tcp(payload: &[u8]) -> BytesMut {
     framed
 }
 
-/// Strip the 2-byte TCP length prefix, yielding the canonical UDP-form payload
-/// (used when a query moves TCP → UDP on reissue).
-pub(crate) fn tcp_payload(writebuf: &[u8], was_tcp: bool) -> &[u8] {
-    if was_tcp && writebuf.len() > 2 {
-        &writebuf[2..]
-    } else {
-        writebuf
-    }
-}
-
 /// Build a DNS query packet for `name_str`. A positive `max_udp_size`
 /// appends an EDNS OPT pseudo-RR advertising that payload size; zero or
 /// negative means "no EDNS" (the historical ares_create_query gate).

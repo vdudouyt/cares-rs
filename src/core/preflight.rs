@@ -4,17 +4,16 @@
 //! — the shim matches on the verdict, marshals, and dispatches.
 
 use std::net::IpAddr;
-use std::time::Instant;
 
 use std::ffi::CString;
 
 use crate::core::hostfile::{AddressFamily, HostLookup};
 use crate::core::services::Services;
-use crate::core::lookup::{is_onion_domain, SearchPlan, SearchSm};
+use crate::core::lookup::is_onion_domain;
 use crate::core::response::ParsedResponse;
 use crate::core::client::Client;
 use crate::core::AresError;
-use crate::ffi::error::{ARES_EBADSTR, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_SUCCESS};
+use crate::ffi::error::{ARES_EBADSTR, ARES_ENOTFOUND, ARES_SUCCESS};
 use crate::ffi::{
     ARES_NI_DGRAM, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NOFQDN, ARES_NI_NUMERICSCOPE,
     ARES_NI_NUMERICSERV, RECORD_TYPE_PTR,
@@ -116,8 +115,8 @@ pub(crate) struct AddrInfo {
 }
 
 /// The pure body of ares_gethostbyname_file: hosts-file-only lookup.
-pub(crate) fn hosts_file_lookup<T>(
-    st: &mut Client<T>,
+pub(crate) fn hosts_file_lookup(
+    st: &mut Client,
     name: &str,
     family: i32,
 ) -> Result<HostLookup, AresError> {
@@ -207,37 +206,7 @@ pub(crate) fn search_name_check(name_str: &str) -> Option<AresError> {
     None
 }
 
-/// Seed a search-domain iteration (ares_search / ares_search_dnsrec):
-/// no-servers guard, then the SearchPlan + machine.
-pub(crate) fn search_start<T>(
-    st: &mut Client<T>,
-    name_str: &str,
-    retry_server_error: bool,
-) -> Result<(SearchSm, String), AresError> {
-    if st.transport.config.nameservers.is_empty() {
-        return Err(ARES_ENOSERVER.into());
-    }
-    let plan = SearchPlan::for_search(
-        name_str,
-        st.transport.config.options.ndots,
-        &st.transport.config.search,
-    );
-    let query_hostname = plan.current.clone();
-    Ok((SearchSm::new(plan, retry_server_error), query_hostname))
-}
-
 /// ENOSERVER guard shared by ares_query / ares_query_dnsrec / ares_send.
-pub(crate) fn no_servers<T>(st: &Client<T>) -> bool {
+pub(crate) fn no_servers(st: &Client) -> bool {
     st.transport.config.nameservers.is_empty()
-}
-
-/// The ares_query_dnsrec cache probe: a fresh cached reply for
-/// (name, qtype), evicting an expired entry on the way.
-pub(crate) fn cached_reply<T>(
-    st: &mut Client<T>,
-    name_clean: &str,
-    qtype: u16,
-    now: Instant,
-) -> Option<Vec<u8>> {
-    st.cache.borrow_mut().get(name_clean, qtype, now)
 }

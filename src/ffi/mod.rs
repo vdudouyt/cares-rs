@@ -14,9 +14,8 @@ use std::ffi::{ CString, CStr };
 use std::net::IpAddr;
 use std::cmp::min;
 use std::time::Instant;
-use bytes::BytesMut;
 use crate::core::packets::*;
-use crate::core::transport::{ Transport, Status, WriteResult, SocketSource };
+use crate::core::transport::Transport;
 use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::*;
@@ -27,7 +26,6 @@ use crate::ffi::clinkedlist::*;
 use crate::ffi::error::*;
 use crate::cstr;
 pub use crate::ffi::ares_socket::{CSocketFactory, AresSocketFunctions};
-use crate::core::lookup::*;
 use crate::core::sortlist::*;
 use std::io::Cursor;
 
