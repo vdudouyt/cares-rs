@@ -44,9 +44,13 @@ use crate::ffi::{
     RECORD_TYPE_PTR,
 };
 
-/// The shared per-channel config snapshot every async lifecycle owns. All `Rc`
-/// clones + `Copy` scalars; the futures never name `Client`/`Transport`.
+/// One async lifecycle's owned context: the shared per-channel config snapshot
+/// plus this lifecycle's [`QueryIo`] mailbox. All `Rc` clones + `Copy` scalars;
+/// the futures never name `Client`/`Transport`. Built fresh per lifecycle by
+/// `Client::async_client`; the ffi grabs `self.io.clone()` to drive the same mailbox.
+/// Nested inline sub-calls (`self.clone().other(…)`) share this `io`.
 pub(crate) struct AsyncClient {
+    pub io: Rc<RefCell<QueryIo>>,
     pub res: Resources,
     pub hosts: Rc<Hosts>,
     pub cache: Rc<RefCell<QueryCache>>,
@@ -64,7 +68,6 @@ impl AsyncClient {
     /// poll; the timeout count is written to `io.timeouts` for the ffi.
     pub(crate) async fn gethostbyname(
         self: Rc<Self>,
-        io: Rc<RefCell<QueryIo>>,
         hostname: String,
         family: c_int,
     ) -> Result<Hostent, AresError> {
@@ -163,7 +166,7 @@ impl AsyncClient {
             // Only a lookup's first query is eligible to spawn a probe.
             let probe_payload = if first { Some(dns_query_payload(&names[idx], rtype)) } else { None };
             first = false;
-            let (result, io_timeouts) = resolve_query(io.clone(), self.res.clone(), payload, self.use_vc, probe_payload).await;
+            let (result, io_timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, self.use_vc, probe_payload).await;
 
             let last_error: AresError = match result {
                 Ok(buf) => match addr_reply(&buf, rtype, ReplyRequire::Items) {
@@ -181,7 +184,7 @@ impl AsyncClient {
                         if !self.sortlist.is_empty() {
                             apply_sortlist(&self.sortlist, &mut rrs.items);
                         }
-                        io.borrow_mut().timeouts = timeouts + io_timeouts;
+                        self.io.borrow_mut().timeouts = timeouts + io_timeouts;
                         return Ok(Hostent::from_parsed(rrs, current_family));
                     }
                     Err(e) => {
@@ -219,7 +222,7 @@ impl AsyncClient {
             } else {
                 last_error.code()
             };
-            io.borrow_mut().timeouts = timeouts;
+            self.io.borrow_mut().timeouts = timeouts;
             return Err(status.into());
         }
     }
@@ -228,7 +231,6 @@ impl AsyncClient {
     /// Family validation is done in the ffi shim (raw C args).
     pub(crate) async fn gethostbyaddr(
         self: Rc<Self>,
-        io: Rc<RefCell<QueryIo>>,
         ip: IpAddr,
         family: c_int,
     ) -> Result<Hostent, AresError> {
@@ -243,16 +245,16 @@ impl AsyncClient {
 
         // ===== DNS phase: single PTR query =====
         let payload = dns_query_payload(&rdns_name(ip), RECORD_TYPE_PTR);
-        let (result, io_timeouts) = resolve_query(io.clone(), self.res.clone(), payload, false, None).await;
+        let (result, io_timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, false, None).await;
 
         match result {
             Ok(buf) => {
                 let hostent = api::on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip))?;
-                io.borrow_mut().timeouts = io_timeouts;
+                self.io.borrow_mut().timeouts = io_timeouts;
                 Ok(hostent)
             }
             Err(status) => {
-                io.borrow_mut().timeouts = io_timeouts;
+                self.io.borrow_mut().timeouts = io_timeouts;
                 Err(AresError::from(status))
             }
         }
@@ -262,7 +264,6 @@ impl AsyncClient {
     /// NUMERICHOST / no-servers), else a single PTR query + `assemble_nameinfo`.
     pub(crate) async fn getnameinfo(
         self: Rc<Self>,
-        io: Rc<RefCell<QueryIo>>,
         addr: AddrInfo,
         flags: c_int,
     ) -> NameinfoReply {
@@ -302,7 +303,7 @@ impl AsyncClient {
 
         // ===== DNS phase: single PTR query =====
         let payload = dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR);
-        let (result, io_timeouts) = resolve_query(io.clone(), self.res.clone(), payload, false, None).await;
+        let (result, io_timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, false, None).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -310,7 +311,7 @@ impl AsyncClient {
         };
         let reply = assemble_nameinfo(dns_result, addr.ip, addr.scope_id, addr.port, flags, io_timeouts);
         // `assemble_nameinfo` carries io_timeouts in its `NameinfoReply.timeouts`.
-        io.borrow_mut().timeouts = reply.timeouts;
+        self.io.borrow_mut().timeouts = reply.timeouts;
         reply
     }
 
@@ -320,7 +321,6 @@ impl AsyncClient {
     /// mapping mirrors the classic `SearchSm::step`.
     pub(crate) async fn search(
         self: Rc<Self>,
-        io: Rc<RefCell<QueryIo>>,
         name: String,
         dnstype: u16,
         retry_server_error: bool,
@@ -339,7 +339,7 @@ impl AsyncClient {
             // Only the first query of a lookup is eligible to spawn a failover probe.
             let probe_payload = if first { Some(dns_query_payload(&plan.current, dnstype)) } else { None };
             first = false;
-            let (result, io_timeouts) = resolve_query(io.clone(), self.res.clone(), payload, self.use_vc, probe_payload).await;
+            let (result, io_timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, self.use_vc, probe_payload).await;
             timeouts += io_timeouts;
 
             let last_error: AresError = match result {
@@ -352,7 +352,7 @@ impl AsyncClient {
                         5 => ARES_EREFUSED.into(),   // REFUSED
                         0 if summary.ancount > 0 => {
                             // Success — deliver the raw response.
-                            io.borrow_mut().timeouts = timeouts;
+                            self.io.borrow_mut().timeouts = timeouts;
                             return Delivery::Raw { result: Ok(buf), timeouts };
                         }
                         // NOERROR-with-no-answers, or any other rcode → NODATA.
@@ -379,7 +379,7 @@ impl AsyncClient {
             if had_nodata && status.code() == ARES_ENOTFOUND {
                 status = ARES_ENODATA.into();
             }
-            io.borrow_mut().timeouts = timeouts;
+            self.io.borrow_mut().timeouts = timeouts;
             return Delivery::Raw { result: Err(status.code()), timeouts };
         }
     }
@@ -390,7 +390,6 @@ impl AsyncClient {
     /// query returns addresses, cancel the sibling AAAA query's retries.
     pub(crate) async fn getaddrinfo(
         self: Rc<Self>,
-        io: Rc<RefCell<QueryIo>>,
         hostname_raw: String,
         ai_family: c_int,
     ) -> AddrInfoOut {
@@ -461,7 +460,7 @@ impl AsyncClient {
             // the A/ipv4 query returns actual addresses, cancel the sibling AAAA
             // query — its retries stop so it isn't sent again. (ipv6 success does
             // NOT cancel A: an ipv4-only host may still need the A answer.)
-            let mut par = ParallelQueries::new(io.clone(), self.res.clone(), payloads);
+            let mut par = ParallelQueries::new(self.io.clone(), self.res.clone(), payloads);
             while !par.all_done() {
                 par.step().await;
                 if let Some(ai) = a_idx {
@@ -508,7 +507,7 @@ impl AsyncClient {
             }
 
             if any_success {
-                io.borrow_mut().timeouts = timeouts;
+                self.io.borrow_mut().timeouts = timeouts;
                 return AddrInfoOut { name: plan.current.clone(), records, status: ARES_SUCCESS.into() };
             }
 
@@ -525,7 +524,7 @@ impl AsyncClient {
 
             // Finalize: NXDOMAIN after an earlier empty answer reports as ENODATA.
             let status = if had_nodata && code == ARES_ENOTFOUND { ARES_ENODATA } else { code };
-            io.borrow_mut().timeouts = timeouts;
+            self.io.borrow_mut().timeouts = timeouts;
             return fail(status);
         }
     }

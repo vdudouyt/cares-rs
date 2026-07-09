@@ -408,6 +408,7 @@ impl Client {
     /// futures + cheap sharing for nested calls).
     pub(crate) fn async_client(&mut self) -> Rc<crate::core::async_client::AsyncClient> {
         Rc::new(crate::core::async_client::AsyncClient {
+            io: Rc::new(std::cell::RefCell::new(executor::QueryIo::default())),
             res: self.resources(),
             hosts: self.transport.hosts(),
             cache: self.cache.clone(),

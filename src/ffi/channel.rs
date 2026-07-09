@@ -160,16 +160,37 @@ impl ChannelData {
     /// lifecycle. The tail's delivery variant (Raw vs DnsRec) determines which
     /// C callback fires on completion.
     pub(crate) fn spawn_search(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, name: String, dnstype: u16, retry_server_error: bool, tail: SearchTail) {
-        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(client.search(io.clone(), name, dnstype, retry_server_error));
+        let io = client.io.clone();
+        let fut = Box::pin(client.search(name, dnstype, retry_server_error));
         self.spawn(io, AsyncKind::Search { fut, tail });
     }
 
     /// ares_getaddrinfo: spawn the parallel A+AAAA lifecycle.
     pub(crate) fn spawn_addrinfo(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, hostname: String, ai_family: c_int, tail: AddrInfoTail) {
-        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(client.getaddrinfo(io.clone(), hostname, ai_family));
+        let io = client.io.clone();
+        let fut = Box::pin(client.getaddrinfo(hostname, ai_family));
         self.spawn(io, AsyncKind::AddrInfo { fut, tail });
+    }
+
+    /// ares_gethostbyname: spawn the full pre-DNS-cascade + DNS lifecycle.
+    pub(crate) fn spawn_gethostbyname(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, hostname: String, family: c_int, tail: HostTail) {
+        let io = client.io.clone();
+        let fut = Box::pin(client.gethostbyname(hostname, family));
+        self.spawn(io, AsyncKind::Host { fut, tail });
+    }
+
+    /// ares_gethostbyaddr: spawn the reverse-lookup + PTR lifecycle (same Host tail).
+    pub(crate) fn spawn_gethostbyaddr(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, ip: std::net::IpAddr, family: c_int, tail: HostTail) {
+        let io = client.io.clone();
+        let fut = Box::pin(client.gethostbyaddr(ip, family));
+        self.spawn(io, AsyncKind::Host { fut, tail });
+    }
+
+    /// ares_getnameinfo: spawn the service/numeric-shortcut + PTR lifecycle.
+    pub(crate) fn spawn_getnameinfo(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, addr: crate::core::preflight::AddrInfo, flags: c_int, tail: NameinfoTail) {
+        let io = client.io.clone();
+        let fut = Box::pin(client.getnameinfo(addr, flags));
+        self.spawn(io, AsyncKind::Nameinfo { fut, tail });
     }
 
     /// Advance one async future one step: poll it, apply the effects it emitted

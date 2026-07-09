@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::core::api;
-use crate::core::executor::QueryIo;
 use crate::core::hostent::Hostent;
 use crate::core::preflight::{service_to_port, ServicePort};
 
@@ -59,9 +58,8 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let hostname = unsafe { cstr_lossy(hostname) };
     // Build the resource bundle + the self-contained future and register it. A
     // synchronous preflight hit fires re-entrantly on this first `advance`.
-    let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-    let fut = Box::pin(channeldata.state.async_client().gethostbyname(io.clone(), hostname.to_string(), family));
-    channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
+    let client = channeldata.state.async_client();
+    channeldata.spawn_gethostbyname(client, hostname.to_string(), family, HostTail { callback, arg });
 }
 
 /// # Safety
@@ -103,9 +101,8 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         return;
     };
     // Build the resource bundle and spawn the self-contained async future.
-    let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-    let fut = Box::pin(channeldata.state.async_client().gethostbyaddr(io.clone(), ip, family));
-    channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
+    let client = channeldata.state.async_client();
+    channeldata.spawn_gethostbyaddr(client, ip, family, HostTail { callback, arg });
 }
 
 /// # Safety
@@ -236,9 +233,8 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
     // Build the resource bundle and spawn the self-contained async future. The
     // three synchronous short-circuits (service-only / NUMERICHOST / no-servers)
     // fire re-entrantly on the first advance.
-    let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-    let fut = Box::pin(channeldata.state.async_client().getnameinfo(io.clone(), addr_info, flags));
-    channeldata.spawn(io, AsyncKind::Nameinfo { fut, tail: NameinfoTail { callback, arg } });
+    let client = channeldata.state.async_client();
+    channeldata.spawn_getnameinfo(client, addr_info, flags, NameinfoTail { callback, arg });
 }
 
 
