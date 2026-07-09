@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::core::api;
+use crate::core::executor::{raw_lifecycle, QueryIo};
 use crate::core::hostent::Hostent;
 use crate::core::preflight::{service_to_port, ServicePort};
 
@@ -59,7 +60,9 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     // Build the resource bundle + the self-contained future and register it. A
     // synchronous preflight hit fires re-entrantly on this first `advance`.
     let client = channeldata.state.async_client();
-    channeldata.spawn_gethostbyname(client, hostname.to_string(), family, HostTail { callback, arg });
+    let io = client.io.clone();
+    let fut = Box::pin(client.gethostbyname(hostname.to_string(), family));
+    channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
 }
 
 /// # Safety
@@ -102,7 +105,9 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
     };
     // Build the resource bundle and spawn the self-contained async future.
     let client = channeldata.state.async_client();
-    channeldata.spawn_gethostbyaddr(client, ip, family, HostTail { callback, arg });
+    let io = client.io.clone();
+    let fut = Box::pin(client.gethostbyaddr(ip, family));
+    channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
 }
 
 /// # Safety
@@ -121,7 +126,9 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     let _ = dnsclass;
     let client = channeldata.state.async_client();
     let tail = SearchTail { delivery: SearchDelivery::Raw { callback, arg } };
-    channeldata.spawn_search(client, name_str.to_string(), dnstype as u16, false, tail);
+    let io = client.io.clone();
+    let fut = Box::pin(client.search(name_str.to_string(), dnstype as u16, false));
+    channeldata.spawn(io, AsyncKind::Search { fut, tail });
 }
 
 /// # Safety
@@ -134,7 +141,11 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     // Preflight in core, then spawn an fd-owning async query lifecycle that
     // creates the socket, sends, and drives its own failover/TC/timeout.
     match channeldata.state.query_payload(name, dnstype as u16) {
-        Ok(launch) => channeldata.spawn_query(launch, callback, arg),
+        Ok(launch) => {
+            let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+            let fut = Box::pin(raw_lifecycle(io.clone(), launch));
+            channeldata.spawn(io, AsyncKind::Raw { fut, callback, arg });
+        }
         Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
     }
 }
@@ -168,7 +179,9 @@ pub unsafe extern "C" fn ares_query_dnsrec(
         Ok(l) => l,
         Err(e) => { unsafe { callback(arg, e.code(), 0, std::ptr::null_mut()) }; return; }
     };
-    channeldata.spawn_query_dnsrec(launch, callback, arg);
+    let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+    let fut = Box::pin(raw_lifecycle(io.clone(), launch));
+    channeldata.spawn(io, AsyncKind::DnsRec { fut, callback, arg });
 }
 
 /// # Safety
@@ -200,7 +213,9 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let client = channeldata.state.async_client();
     let tail = SearchTail { delivery: SearchDelivery::DnsRec { callback, arg } };
-    channeldata.spawn_search(client, name_str.to_string(), qtype as u16, true, tail);
+    let io = client.io.clone();
+    let fut = Box::pin(client.search(name_str.to_string(), qtype as u16, true));
+    channeldata.spawn(io, AsyncKind::Search { fut, tail });
 }
 
 /// Looks up the node name and service name for a socket address.
@@ -234,7 +249,9 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
     // three synchronous short-circuits (service-only / NUMERICHOST / no-servers)
     // fire re-entrantly on the first advance.
     let client = channeldata.state.async_client();
-    channeldata.spawn_getnameinfo(client, addr_info, flags, NameinfoTail { callback, arg });
+    let io = client.io.clone();
+    let fut = Box::pin(client.getnameinfo(addr_info, flags));
+    channeldata.spawn(io, AsyncKind::Nameinfo { fut, tail: NameinfoTail { callback, arg } });
 }
 
 
@@ -294,7 +311,9 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     // synchronous preflight hit (IP literal / hosts file) fires re-entrantly.
     let hostname_raw = unsafe { cstr_lossy(name) };
     let client = channeldata.state.async_client();
-    channeldata.spawn_addrinfo(client, hostname_raw.to_string(), ai_family, AddrInfoTail { callback, arg, port });
+    let io = client.io.clone();
+    let fut = Box::pin(client.getaddrinfo(hostname_raw.to_string(), ai_family));
+    channeldata.spawn(io, AsyncKind::AddrInfo { fut, tail: AddrInfoTail { callback, arg, port } });
 }
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
@@ -308,7 +327,11 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
     // Preflight in core, then spawn an fd-owning async query lifecycle.
     match channeldata.state.send_payload(query_buf) {
-        Ok(launch) => channeldata.spawn_query(launch, callback, arg),
+        Ok(launch) => {
+            let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
+            let fut = Box::pin(raw_lifecycle(io.clone(), launch));
+            channeldata.spawn(io, AsyncKind::Raw { fut, callback, arg });
+        }
         Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
     }
 }

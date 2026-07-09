@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
-use crate::core::executor::{noop_waker, raw_lifecycle, Delivery, Effect, QueryIo, RawLaunch};
+use crate::core::executor::{noop_waker, Delivery, Effect, QueryIo};
 use crate::core::hostent::Hostent;
 use crate::core::AresError;
 use crate::core::preflight::NameinfoReply;
@@ -124,9 +124,11 @@ impl ChannelData {
         self.socket_factory = factory;
     }
 
-    /// Register a lifecycle future + its delivery sink in a free slot and drive
-    /// it once (issuing the initial send). The C callback fires when the reactor
-    /// later settles the task (or in place if the launch fails immediately).
+    /// The single spawn path: register a lifecycle future + its mailbox + its
+    /// delivery sink (`AsyncKind`) in a free slot and drive it once (issuing the
+    /// initial send). Every ares_* entry shim builds `(io, kind)` and calls here.
+    /// The C callback fires when the reactor later settles the task (or in place
+    /// if the launch fails immediately).
     pub(crate) fn spawn(&mut self, io: std::rc::Rc<std::cell::RefCell<QueryIo>>, kind: AsyncKind) {
         let slot = AsyncQuery { io, kind };
         let id = match self.async_queries.iter().position(|s| s.is_none()) {
@@ -140,57 +142,6 @@ impl ChannelData {
             }
         };
         self.advance(id);
-    }
-
-    /// ares_query / ares_send: spawn the raw one-shot lifecycle.
-    pub(crate) fn spawn_query(&mut self, launch: RawLaunch, callback: AresCallback, arg: *mut libc::c_void) {
-        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(raw_lifecycle(io.clone(), launch));
-        self.spawn(io, AsyncKind::Raw { fut, callback, arg });
-    }
-
-    /// ares_query_dnsrec: spawn the raw lifecycle with the dns_rec callback.
-    pub(crate) fn spawn_query_dnsrec(&mut self, launch: RawLaunch, callback: AresCallbackDnsRec, arg: *mut libc::c_void) {
-        let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(raw_lifecycle(io.clone(), launch));
-        self.spawn(io, AsyncKind::DnsRec { fut, callback, arg });
-    }
-
-    /// ares_search / ares_search_dnsrec: spawn the search name-iteration
-    /// lifecycle. The tail's delivery variant (Raw vs DnsRec) determines which
-    /// C callback fires on completion.
-    pub(crate) fn spawn_search(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, name: String, dnstype: u16, retry_server_error: bool, tail: SearchTail) {
-        let io = client.io.clone();
-        let fut = Box::pin(client.search(name, dnstype, retry_server_error));
-        self.spawn(io, AsyncKind::Search { fut, tail });
-    }
-
-    /// ares_getaddrinfo: spawn the parallel A+AAAA lifecycle.
-    pub(crate) fn spawn_addrinfo(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, hostname: String, ai_family: c_int, tail: AddrInfoTail) {
-        let io = client.io.clone();
-        let fut = Box::pin(client.getaddrinfo(hostname, ai_family));
-        self.spawn(io, AsyncKind::AddrInfo { fut, tail });
-    }
-
-    /// ares_gethostbyname: spawn the full pre-DNS-cascade + DNS lifecycle.
-    pub(crate) fn spawn_gethostbyname(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, hostname: String, family: c_int, tail: HostTail) {
-        let io = client.io.clone();
-        let fut = Box::pin(client.gethostbyname(hostname, family));
-        self.spawn(io, AsyncKind::Host { fut, tail });
-    }
-
-    /// ares_gethostbyaddr: spawn the reverse-lookup + PTR lifecycle (same Host tail).
-    pub(crate) fn spawn_gethostbyaddr(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, ip: std::net::IpAddr, family: c_int, tail: HostTail) {
-        let io = client.io.clone();
-        let fut = Box::pin(client.gethostbyaddr(ip, family));
-        self.spawn(io, AsyncKind::Host { fut, tail });
-    }
-
-    /// ares_getnameinfo: spawn the service/numeric-shortcut + PTR lifecycle.
-    pub(crate) fn spawn_getnameinfo(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, addr: crate::core::preflight::AddrInfo, flags: c_int, tail: NameinfoTail) {
-        let io = client.io.clone();
-        let fut = Box::pin(client.getnameinfo(addr, flags));
-        self.spawn(io, AsyncKind::Nameinfo { fut, tail });
     }
 
     /// Advance one async future one step: poll it, apply the effects it emitted
