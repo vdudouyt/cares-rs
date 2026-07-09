@@ -57,6 +57,11 @@ pub(crate) struct Client {
     endpoints: Rc<Vec<executor::ServerEndpoint>>,
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
+    /// The channel-owned resolver client (config snapshot), built lazily and
+    /// cached; each lookup derives a fresh-mailbox copy via `with_fresh_io`.
+    /// Invalidated (`None`) on every config change — see `rebuild_endpoints`
+    /// (the chokepoint for servers/options) and `set_sortlist`.
+    async_base: Option<Rc<crate::core::async_client::AsyncClient>>,
 }
 
 impl Client {
@@ -77,6 +82,7 @@ impl Client {
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
+            async_base: None,
         };
         client.rebuild_endpoints();
         client
@@ -349,6 +355,19 @@ impl Client {
     /// Rebuild the cached endpoint snapshot after a server/port change.
     pub fn rebuild_endpoints(&mut self) {
         self.endpoints = Rc::new(self.endpoint_snapshot());
+        // The chokepoint for server/option changes (set_servers + the tail of
+        // apply_options both land here): drop the cached async base so the next
+        // lookup rebuilds it from current config.
+        self.async_base = None;
+    }
+
+    /// Replace the sortlist and invalidate the cached async base. `sortlist` is a
+    /// `pub` field mutated directly by `ares_set_sortlist` (the one config-change
+    /// path that doesn't funnel through `rebuild_endpoints`), so it needs its own
+    /// invalidation hook.
+    pub(crate) fn set_sortlist(&mut self, entries: Vec<SortlistEntry>) {
+        self.sortlist = entries;
+        self.async_base = None;
     }
 
     /// Snapshot the per-server connect endpoints from config, so an async
@@ -400,13 +419,25 @@ impl Client {
         }
     }
 
-    /// Build the shared `AsyncClient` snapshot every async lifecycle owns: the
-    /// socket resources plus `Rc`/snapshot handles for the preflight (hosts file,
-    /// query cache, sortlist, ndots/search/use_vc). The one spot that reads
-    /// `Client` for the async lifecycles; the futures themselves name no channel.
-    /// Returned as `Rc` so methods take `self: Rc<Self>` (spawnable `'static`
-    /// futures + cheap sharing for nested calls).
+    /// Hand out a per-lookup resolver client: the channel-owned `AsyncClient`
+    /// base (built lazily, cached, rebuilt on config change) derived into a copy
+    /// with its own fresh mailbox. Each lookup thus owns a distinct `QueryIo`
+    /// while sharing the config `Rc`s. The one spot that reads `Client` for the
+    /// async lifecycles; the futures themselves name no channel.
     pub(crate) fn async_client(&mut self) -> Rc<crate::core::async_client::AsyncClient> {
+        if self.async_base.is_none() {
+            let base = self.build_async_base();
+            self.async_base = Some(base);
+        }
+        self.async_base.as_ref().unwrap().with_fresh_io()
+    }
+
+    /// Build the channel-owned `AsyncClient` base: the socket resources plus
+    /// `Rc`/snapshot handles for the preflight (hosts file, query cache, sortlist,
+    /// ndots/search/use_vc). The `io` here is an inert placeholder — `async_client`
+    /// replaces it per lookup. Returned as `Rc` so methods take `self: Rc<Self>`
+    /// (spawnable `'static` futures + cheap sharing for nested calls).
+    fn build_async_base(&mut self) -> Rc<crate::core::async_client::AsyncClient> {
         Rc::new(crate::core::async_client::AsyncClient {
             io: Rc::new(std::cell::RefCell::new(executor::QueryIo::default())),
             res: self.resources(),

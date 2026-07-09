@@ -706,13 +706,13 @@ pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
 pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_char) -> c_int {
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     if sortstr.is_null() {
-        channeldata.state.sortlist.clear();
+        channeldata.state.set_sortlist(Vec::new());
         return ARES_SUCCESS;
     }
     let Some(s) = (unsafe { cstr_opt(sortstr) }) else { return ARES_EBADSTR };
     match parse_sortlist(s) {
         Ok(entries) => {
-            channeldata.state.sortlist = entries;
+            channeldata.state.set_sortlist(entries);
             ARES_SUCCESS
         }
         Err(e) => e.code(),

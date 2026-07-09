@@ -44,11 +44,15 @@ use crate::ffi::{
     RECORD_TYPE_PTR,
 };
 
-/// One async lifecycle's owned context: the shared per-channel config snapshot
-/// plus this lifecycle's [`QueryIo`] mailbox. All `Rc` clones + `Copy` scalars;
-/// the futures never name `Client`/`Transport`. Built fresh per lifecycle by
-/// `Client::async_client`; the ffi grabs `self.io.clone()` to drive the same mailbox.
-/// Nested inline sub-calls (`self.clone().other(…)`) share this `io`.
+/// The per-channel resolver client: the shared config snapshot plus a [`QueryIo`]
+/// mailbox. All `Rc` clones + `Copy` scalars; the futures never name
+/// `Client`/`Transport`. One instance is owned by the channel (`Client` caches it,
+/// rebuilding on config change); every lookup derives a cheap per-lookup copy via
+/// [`with_fresh_io`](Self::with_fresh_io) — same config `Rc`s, its own fresh
+/// mailbox — so concurrent lookups on a channel never share a `QueryIo`. The
+/// channel-owned base's `io` is an inert placeholder, replaced on each derive.
+/// The ffi grabs the derived copy's `self.io.clone()` to drive that mailbox;
+/// nested inline sub-calls (`self.clone().other(…)`) share it.
 pub(crate) struct AsyncClient {
     pub io: Rc<RefCell<QueryIo>>,
     pub res: Resources,
@@ -61,6 +65,23 @@ pub(crate) struct AsyncClient {
 }
 
 impl AsyncClient {
+    /// Derive a per-lookup copy of the channel-owned client: clone the config
+    /// `Rc`s (cheap) but mint a **fresh** mailbox, so each concurrent lookup owns
+    /// its own `QueryIo`. Cloning `self.io` here instead would make every lookup
+    /// on the channel share one mailbox — the bug this avoids.
+    pub(crate) fn with_fresh_io(&self) -> Rc<Self> {
+        Rc::new(AsyncClient {
+            io: Rc::new(RefCell::new(QueryIo::default())),
+            res: self.res.clone(),
+            hosts: self.hosts.clone(),
+            cache: self.cache.clone(),
+            sortlist: self.sortlist.clone(),
+            ndots: self.ndots,
+            search: self.search.clone(),
+            use_vc: self.use_vc,
+        })
+    }
+
     /// ares_gethostbyname: the full pre-DNS cascade (ASCII/onion/family/
     /// IP-literal/hosts/localhost/HOSTALIASES/no-servers/query-cache) then the
     /// DNS phase (search-domain iteration + AF_UNSPEC fallback). The preflight
