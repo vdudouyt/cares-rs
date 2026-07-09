@@ -96,7 +96,160 @@ impl AsyncClient {
     /// UDP-start behavior (`use_tcp = false`); unlike the resolver ops it does
     /// **not** honor `ARES_FLAG_USEVC`. (Replaces the free `raw_lifecycle`.)
     pub(crate) async fn query_raw(self: Rc<Self>, payload: BytesMut) -> Delivery {
-        let (result, timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, false, None).await;
+        // Inlined single-query driver (WET, see the module note): pick server →
+        // socket → send → recv → QID-match → TC/failover/timeout verdicts. The raw
+        // path: UDP-start (`use_tcp = false`), no probe, no USEVC. Leaf helpers
+        // (acquire_primary/send_primary/recv_primary/…) stay shared.
+        let (result, timeouts) = 'drive: {
+            let io = self.io.clone();
+            let res = self.res.clone();
+            let mut use_tcp = false;
+            let mut timeouts: c_int = 0;
+            let mut tries: u32 = 0;
+            let mut failover_tries: u32 = 0;
+            let qid = qid_of(&payload);
+            let mut server = res.health.borrow().pick_next();
+            let mut probe: Option<Probe> = None;
+            'attempt: loop {
+                let (mut primary, si) = match acquire_primary(&res, server, use_tcp) {
+                    Ok(v) => v,
+                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
+                };
+                server = si;
+                let ep = res.endpoints[server].clone();
+                let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
+                let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
+                let deadline = Instant::now() + res.opts.timeout;
+                if let Primary::Tcp(c) = &primary {
+                    c.borrow_mut().inbox.insert(qid, None);
+                }
+                if !send_primary(&io, &primary, &ep, wire, deadline).await {
+                    clear_tcp_slot(&primary, qid);
+                    if use_tcp {
+                        res.tcp_pool.borrow_mut().remove(server);
+                    }
+                    if tries + 1 < res.opts.attempts.max(1) {
+                        tries += 1;
+                        if res.health.borrow().len() > 1 {
+                            res.health.borrow_mut().record_failure(server);
+                            server = res.health.borrow().pick_next();
+                        }
+                        continue 'attempt;
+                    }
+                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                }
+                loop {
+                    let primary_wait = Wait { fd: primary.fd(), writable: false };
+                    let wake_deadline = match &probe {
+                        Some(p) => deadline.min(p.deadline),
+                        None => deadline,
+                    };
+                    let woke = match &probe {
+                        Some(p) => {
+                            wait_io(&io, &[primary_wait, Wait { fd: p.sock.fd(), writable: false }], wake_deadline).await
+                        }
+                        None => wait_io(&io, &[primary_wait], wake_deadline).await,
+                    };
+                    let probe_ready = probe.as_ref().is_some_and(|p| woke.fds.contains(&p.sock.fd()));
+                    if probe_ready {
+                        match probe.as_mut().unwrap().sock.recv_msg() {
+                            Recv::Msg(buf) => {
+                                let p = probe.as_ref().unwrap();
+                                if qid_matches(&buf, &p.payload, p.sock.is_tcp) {
+                                    let p_taken = probe.take().unwrap();
+                                    settle_probe(&io, &res, &p_taken, Some(&buf));
+                                }
+                            }
+                            Recv::Dead => probe = None,
+                            Recv::Pending => {}
+                        }
+                    }
+                    if woke.expired {
+                        let now = Instant::now();
+                        if let Some(p) = &probe {
+                            if now >= p.deadline {
+                                let p_taken = probe.take().unwrap();
+                                settle_probe(&io, &res, &p_taken, None);
+                            }
+                        }
+                        if now >= deadline {
+                            clear_tcp_slot(&primary, qid);
+                            if io.borrow().app.cancelled {
+                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                            }
+                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            match verdict {
+                                TimeoutVerdict::Retry { server: next } => {
+                                    tries += 1;
+                                    timeouts += 1;
+                                    server = next;
+                                    continue 'attempt;
+                                }
+                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                            }
+                        }
+                        continue;
+                    }
+                    if !woke.fds.contains(&primary.fd()) {
+                        continue;
+                    }
+                    let buf = match recv_primary(&mut primary, qid) {
+                        Recv::Msg(buf) => buf,
+                        Recv::Pending => continue,
+                        Recv::Dead => {
+                            clear_tcp_slot(&primary, qid);
+                            if use_tcp {
+                                res.tcp_pool.borrow_mut().remove(server);
+                            }
+                            if io.borrow().app.cancelled {
+                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                            }
+                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            match verdict {
+                                TimeoutVerdict::Retry { server: next } => {
+                                    tries += 1;
+                                    timeouts += 1;
+                                    server = next;
+                                    continue 'attempt;
+                                }
+                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                            }
+                        }
+                    };
+                    if !qid_matches(&buf, wire, use_tcp) {
+                        continue;
+                    }
+                    let summary = summarize(&buf, 0);
+                    let (actions, verdict) = on_datagram(
+                        &summary,
+                        server,
+                        use_tcp,
+                        res.opts.attempts,
+                        failover_tries,
+                        &mut res.health.borrow_mut(),
+                    );
+                    notify(&io, actions);
+                    match verdict {
+                        TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                            clear_tcp_slot(&primary, qid);
+                            server = next;
+                            failover_tries = ft;
+                            continue 'attempt;
+                        }
+                        TaskVerdict::RetryTcp => {
+                            use_tcp = true;
+                            continue 'attempt;
+                        }
+                        TaskVerdict::Deliver => {
+                            clear_tcp_slot(&primary, qid);
+                            break 'drive (Ok(buf), timeouts);
+                        }
+                    }
+                }
+            }
+        };
         Delivery::Raw { result, timeouts }
     }
 
@@ -205,7 +358,156 @@ impl AsyncClient {
             // Only a lookup's first query is eligible to spawn a probe.
             let probe_payload = if first { Some(dns_query_payload(&names[idx], rtype)) } else { None };
             first = false;
-            let (result, io_timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, self.use_vc, probe_payload).await;
+            let (result, io_timeouts) = 'drive: {
+                let io = self.io.clone();
+                let res = self.res.clone();
+                let mut use_tcp = self.use_vc;
+                let mut timeouts: c_int = 0;
+                let mut tries: u32 = 0;
+                let mut failover_tries: u32 = 0;
+                let qid = qid_of(&payload);
+                let mut server = res.health.borrow().pick_next();
+                let mut probe = probe_payload.and_then(|pp| start_probe(&res, &pp, use_tcp));
+                'attempt: loop {
+                    let (mut primary, si) = match acquire_primary(&res, server, use_tcp) {
+                        Ok(v) => v,
+                        Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
+                    };
+                    server = si;
+                    let ep = res.endpoints[server].clone();
+                    let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
+                    let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
+                    let deadline = Instant::now() + res.opts.timeout;
+                    if let Primary::Tcp(c) = &primary {
+                        c.borrow_mut().inbox.insert(qid, None);
+                    }
+                    if !send_primary(&io, &primary, &ep, wire, deadline).await {
+                        clear_tcp_slot(&primary, qid);
+                        if use_tcp {
+                            res.tcp_pool.borrow_mut().remove(server);
+                        }
+                        if tries + 1 < res.opts.attempts.max(1) {
+                            tries += 1;
+                            if res.health.borrow().len() > 1 {
+                                res.health.borrow_mut().record_failure(server);
+                                server = res.health.borrow().pick_next();
+                            }
+                            continue 'attempt;
+                        }
+                        break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                    }
+                    loop {
+                        let primary_wait = Wait { fd: primary.fd(), writable: false };
+                        let wake_deadline = match &probe {
+                            Some(p) => deadline.min(p.deadline),
+                            None => deadline,
+                        };
+                        let woke = match &probe {
+                            Some(p) => {
+                                wait_io(&io, &[primary_wait, Wait { fd: p.sock.fd(), writable: false }], wake_deadline).await
+                            }
+                            None => wait_io(&io, &[primary_wait], wake_deadline).await,
+                        };
+                        let probe_ready = probe.as_ref().is_some_and(|p| woke.fds.contains(&p.sock.fd()));
+                        if probe_ready {
+                            match probe.as_mut().unwrap().sock.recv_msg() {
+                                Recv::Msg(buf) => {
+                                    let p = probe.as_ref().unwrap();
+                                    if qid_matches(&buf, &p.payload, p.sock.is_tcp) {
+                                        let p_taken = probe.take().unwrap();
+                                        settle_probe(&io, &res, &p_taken, Some(&buf));
+                                    }
+                                }
+                                Recv::Dead => probe = None,
+                                Recv::Pending => {}
+                            }
+                        }
+                        if woke.expired {
+                            let now = Instant::now();
+                            if let Some(p) = &probe {
+                                if now >= p.deadline {
+                                    let p_taken = probe.take().unwrap();
+                                    settle_probe(&io, &res, &p_taken, None);
+                                }
+                            }
+                            if now >= deadline {
+                                clear_tcp_slot(&primary, qid);
+                                if io.borrow().app.cancelled {
+                                    break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                                }
+                                notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                                let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                match verdict {
+                                    TimeoutVerdict::Retry { server: next } => {
+                                        tries += 1;
+                                        timeouts += 1;
+                                        server = next;
+                                        continue 'attempt;
+                                    }
+                                    TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                                }
+                            }
+                            continue;
+                        }
+                        if !woke.fds.contains(&primary.fd()) {
+                            continue;
+                        }
+                        let buf = match recv_primary(&mut primary, qid) {
+                            Recv::Msg(buf) => buf,
+                            Recv::Pending => continue,
+                            Recv::Dead => {
+                                clear_tcp_slot(&primary, qid);
+                                if use_tcp {
+                                    res.tcp_pool.borrow_mut().remove(server);
+                                }
+                                if io.borrow().app.cancelled {
+                                    break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                                }
+                                notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                                let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                match verdict {
+                                    TimeoutVerdict::Retry { server: next } => {
+                                        tries += 1;
+                                        timeouts += 1;
+                                        server = next;
+                                        continue 'attempt;
+                                    }
+                                    TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                                }
+                            }
+                        };
+                        if !qid_matches(&buf, wire, use_tcp) {
+                            continue;
+                        }
+                        let summary = summarize(&buf, 0);
+                        let (actions, verdict) = on_datagram(
+                            &summary,
+                            server,
+                            use_tcp,
+                            res.opts.attempts,
+                            failover_tries,
+                            &mut res.health.borrow_mut(),
+                        );
+                        notify(&io, actions);
+                        match verdict {
+                            TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                clear_tcp_slot(&primary, qid);
+                                server = next;
+                                failover_tries = ft;
+                                continue 'attempt;
+                            }
+                            TaskVerdict::RetryTcp => {
+                                use_tcp = true;
+                                continue 'attempt;
+                            }
+                            TaskVerdict::Deliver => {
+                                clear_tcp_slot(&primary, qid);
+                                break 'drive (Ok(buf), timeouts);
+                            }
+                        }
+                    }
+                }
+            };
 
             let last_error: AresError = match result {
                 Ok(buf) => match addr_reply(&buf, rtype, ReplyRequire::Items) {
@@ -284,7 +586,156 @@ impl AsyncClient {
 
         // ===== DNS phase: single PTR query =====
         let payload = dns_query_payload(&rdns_name(ip), RECORD_TYPE_PTR);
-        let (result, io_timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, false, None).await;
+        let (result, io_timeouts) = 'drive: {
+            let io = self.io.clone();
+            let res = self.res.clone();
+            let mut use_tcp = false;
+            let mut timeouts: c_int = 0;
+            let mut tries: u32 = 0;
+            let mut failover_tries: u32 = 0;
+            let qid = qid_of(&payload);
+            let mut server = res.health.borrow().pick_next();
+            let mut probe: Option<Probe> = None;
+            'attempt: loop {
+                let (mut primary, si) = match acquire_primary(&res, server, use_tcp) {
+                    Ok(v) => v,
+                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
+                };
+                server = si;
+                let ep = res.endpoints[server].clone();
+                let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
+                let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
+                let deadline = Instant::now() + res.opts.timeout;
+                if let Primary::Tcp(c) = &primary {
+                    c.borrow_mut().inbox.insert(qid, None);
+                }
+                if !send_primary(&io, &primary, &ep, wire, deadline).await {
+                    clear_tcp_slot(&primary, qid);
+                    if use_tcp {
+                        res.tcp_pool.borrow_mut().remove(server);
+                    }
+                    if tries + 1 < res.opts.attempts.max(1) {
+                        tries += 1;
+                        if res.health.borrow().len() > 1 {
+                            res.health.borrow_mut().record_failure(server);
+                            server = res.health.borrow().pick_next();
+                        }
+                        continue 'attempt;
+                    }
+                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                }
+                loop {
+                    let primary_wait = Wait { fd: primary.fd(), writable: false };
+                    let wake_deadline = match &probe {
+                        Some(p) => deadline.min(p.deadline),
+                        None => deadline,
+                    };
+                    let woke = match &probe {
+                        Some(p) => {
+                            wait_io(&io, &[primary_wait, Wait { fd: p.sock.fd(), writable: false }], wake_deadline).await
+                        }
+                        None => wait_io(&io, &[primary_wait], wake_deadline).await,
+                    };
+                    let probe_ready = probe.as_ref().is_some_and(|p| woke.fds.contains(&p.sock.fd()));
+                    if probe_ready {
+                        match probe.as_mut().unwrap().sock.recv_msg() {
+                            Recv::Msg(buf) => {
+                                let p = probe.as_ref().unwrap();
+                                if qid_matches(&buf, &p.payload, p.sock.is_tcp) {
+                                    let p_taken = probe.take().unwrap();
+                                    settle_probe(&io, &res, &p_taken, Some(&buf));
+                                }
+                            }
+                            Recv::Dead => probe = None,
+                            Recv::Pending => {}
+                        }
+                    }
+                    if woke.expired {
+                        let now = Instant::now();
+                        if let Some(p) = &probe {
+                            if now >= p.deadline {
+                                let p_taken = probe.take().unwrap();
+                                settle_probe(&io, &res, &p_taken, None);
+                            }
+                        }
+                        if now >= deadline {
+                            clear_tcp_slot(&primary, qid);
+                            if io.borrow().app.cancelled {
+                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                            }
+                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            match verdict {
+                                TimeoutVerdict::Retry { server: next } => {
+                                    tries += 1;
+                                    timeouts += 1;
+                                    server = next;
+                                    continue 'attempt;
+                                }
+                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                            }
+                        }
+                        continue;
+                    }
+                    if !woke.fds.contains(&primary.fd()) {
+                        continue;
+                    }
+                    let buf = match recv_primary(&mut primary, qid) {
+                        Recv::Msg(buf) => buf,
+                        Recv::Pending => continue,
+                        Recv::Dead => {
+                            clear_tcp_slot(&primary, qid);
+                            if use_tcp {
+                                res.tcp_pool.borrow_mut().remove(server);
+                            }
+                            if io.borrow().app.cancelled {
+                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                            }
+                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            match verdict {
+                                TimeoutVerdict::Retry { server: next } => {
+                                    tries += 1;
+                                    timeouts += 1;
+                                    server = next;
+                                    continue 'attempt;
+                                }
+                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                            }
+                        }
+                    };
+                    if !qid_matches(&buf, wire, use_tcp) {
+                        continue;
+                    }
+                    let summary = summarize(&buf, 0);
+                    let (actions, verdict) = on_datagram(
+                        &summary,
+                        server,
+                        use_tcp,
+                        res.opts.attempts,
+                        failover_tries,
+                        &mut res.health.borrow_mut(),
+                    );
+                    notify(&io, actions);
+                    match verdict {
+                        TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                            clear_tcp_slot(&primary, qid);
+                            server = next;
+                            failover_tries = ft;
+                            continue 'attempt;
+                        }
+                        TaskVerdict::RetryTcp => {
+                            use_tcp = true;
+                            continue 'attempt;
+                        }
+                        TaskVerdict::Deliver => {
+                            clear_tcp_slot(&primary, qid);
+                            break 'drive (Ok(buf), timeouts);
+                        }
+                    }
+                }
+            }
+        };
 
         match result {
             Ok(buf) => {
@@ -342,7 +793,156 @@ impl AsyncClient {
 
         // ===== DNS phase: single PTR query =====
         let payload = dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR);
-        let (result, io_timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, false, None).await;
+        let (result, io_timeouts) = 'drive: {
+            let io = self.io.clone();
+            let res = self.res.clone();
+            let mut use_tcp = false;
+            let mut timeouts: c_int = 0;
+            let mut tries: u32 = 0;
+            let mut failover_tries: u32 = 0;
+            let qid = qid_of(&payload);
+            let mut server = res.health.borrow().pick_next();
+            let mut probe: Option<Probe> = None;
+            'attempt: loop {
+                let (mut primary, si) = match acquire_primary(&res, server, use_tcp) {
+                    Ok(v) => v,
+                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
+                };
+                server = si;
+                let ep = res.endpoints[server].clone();
+                let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
+                let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
+                let deadline = Instant::now() + res.opts.timeout;
+                if let Primary::Tcp(c) = &primary {
+                    c.borrow_mut().inbox.insert(qid, None);
+                }
+                if !send_primary(&io, &primary, &ep, wire, deadline).await {
+                    clear_tcp_slot(&primary, qid);
+                    if use_tcp {
+                        res.tcp_pool.borrow_mut().remove(server);
+                    }
+                    if tries + 1 < res.opts.attempts.max(1) {
+                        tries += 1;
+                        if res.health.borrow().len() > 1 {
+                            res.health.borrow_mut().record_failure(server);
+                            server = res.health.borrow().pick_next();
+                        }
+                        continue 'attempt;
+                    }
+                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                }
+                loop {
+                    let primary_wait = Wait { fd: primary.fd(), writable: false };
+                    let wake_deadline = match &probe {
+                        Some(p) => deadline.min(p.deadline),
+                        None => deadline,
+                    };
+                    let woke = match &probe {
+                        Some(p) => {
+                            wait_io(&io, &[primary_wait, Wait { fd: p.sock.fd(), writable: false }], wake_deadline).await
+                        }
+                        None => wait_io(&io, &[primary_wait], wake_deadline).await,
+                    };
+                    let probe_ready = probe.as_ref().is_some_and(|p| woke.fds.contains(&p.sock.fd()));
+                    if probe_ready {
+                        match probe.as_mut().unwrap().sock.recv_msg() {
+                            Recv::Msg(buf) => {
+                                let p = probe.as_ref().unwrap();
+                                if qid_matches(&buf, &p.payload, p.sock.is_tcp) {
+                                    let p_taken = probe.take().unwrap();
+                                    settle_probe(&io, &res, &p_taken, Some(&buf));
+                                }
+                            }
+                            Recv::Dead => probe = None,
+                            Recv::Pending => {}
+                        }
+                    }
+                    if woke.expired {
+                        let now = Instant::now();
+                        if let Some(p) = &probe {
+                            if now >= p.deadline {
+                                let p_taken = probe.take().unwrap();
+                                settle_probe(&io, &res, &p_taken, None);
+                            }
+                        }
+                        if now >= deadline {
+                            clear_tcp_slot(&primary, qid);
+                            if io.borrow().app.cancelled {
+                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                            }
+                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            match verdict {
+                                TimeoutVerdict::Retry { server: next } => {
+                                    tries += 1;
+                                    timeouts += 1;
+                                    server = next;
+                                    continue 'attempt;
+                                }
+                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                            }
+                        }
+                        continue;
+                    }
+                    if !woke.fds.contains(&primary.fd()) {
+                        continue;
+                    }
+                    let buf = match recv_primary(&mut primary, qid) {
+                        Recv::Msg(buf) => buf,
+                        Recv::Pending => continue,
+                        Recv::Dead => {
+                            clear_tcp_slot(&primary, qid);
+                            if use_tcp {
+                                res.tcp_pool.borrow_mut().remove(server);
+                            }
+                            if io.borrow().app.cancelled {
+                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                            }
+                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            match verdict {
+                                TimeoutVerdict::Retry { server: next } => {
+                                    tries += 1;
+                                    timeouts += 1;
+                                    server = next;
+                                    continue 'attempt;
+                                }
+                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                            }
+                        }
+                    };
+                    if !qid_matches(&buf, wire, use_tcp) {
+                        continue;
+                    }
+                    let summary = summarize(&buf, 0);
+                    let (actions, verdict) = on_datagram(
+                        &summary,
+                        server,
+                        use_tcp,
+                        res.opts.attempts,
+                        failover_tries,
+                        &mut res.health.borrow_mut(),
+                    );
+                    notify(&io, actions);
+                    match verdict {
+                        TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                            clear_tcp_slot(&primary, qid);
+                            server = next;
+                            failover_tries = ft;
+                            continue 'attempt;
+                        }
+                        TaskVerdict::RetryTcp => {
+                            use_tcp = true;
+                            continue 'attempt;
+                        }
+                        TaskVerdict::Deliver => {
+                            clear_tcp_slot(&primary, qid);
+                            break 'drive (Ok(buf), timeouts);
+                        }
+                    }
+                }
+            }
+        };
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -378,7 +978,156 @@ impl AsyncClient {
             // Only the first query of a lookup is eligible to spawn a failover probe.
             let probe_payload = if first { Some(dns_query_payload(&plan.current, dnstype)) } else { None };
             first = false;
-            let (result, io_timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, self.use_vc, probe_payload).await;
+            let (result, io_timeouts) = 'drive: {
+                let io = self.io.clone();
+                let res = self.res.clone();
+                let mut use_tcp = self.use_vc;
+                let mut timeouts: c_int = 0;
+                let mut tries: u32 = 0;
+                let mut failover_tries: u32 = 0;
+                let qid = qid_of(&payload);
+                let mut server = res.health.borrow().pick_next();
+                let mut probe = probe_payload.and_then(|pp| start_probe(&res, &pp, use_tcp));
+                'attempt: loop {
+                    let (mut primary, si) = match acquire_primary(&res, server, use_tcp) {
+                        Ok(v) => v,
+                        Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
+                    };
+                    server = si;
+                    let ep = res.endpoints[server].clone();
+                    let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
+                    let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
+                    let deadline = Instant::now() + res.opts.timeout;
+                    if let Primary::Tcp(c) = &primary {
+                        c.borrow_mut().inbox.insert(qid, None);
+                    }
+                    if !send_primary(&io, &primary, &ep, wire, deadline).await {
+                        clear_tcp_slot(&primary, qid);
+                        if use_tcp {
+                            res.tcp_pool.borrow_mut().remove(server);
+                        }
+                        if tries + 1 < res.opts.attempts.max(1) {
+                            tries += 1;
+                            if res.health.borrow().len() > 1 {
+                                res.health.borrow_mut().record_failure(server);
+                                server = res.health.borrow().pick_next();
+                            }
+                            continue 'attempt;
+                        }
+                        break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                    }
+                    loop {
+                        let primary_wait = Wait { fd: primary.fd(), writable: false };
+                        let wake_deadline = match &probe {
+                            Some(p) => deadline.min(p.deadline),
+                            None => deadline,
+                        };
+                        let woke = match &probe {
+                            Some(p) => {
+                                wait_io(&io, &[primary_wait, Wait { fd: p.sock.fd(), writable: false }], wake_deadline).await
+                            }
+                            None => wait_io(&io, &[primary_wait], wake_deadline).await,
+                        };
+                        let probe_ready = probe.as_ref().is_some_and(|p| woke.fds.contains(&p.sock.fd()));
+                        if probe_ready {
+                            match probe.as_mut().unwrap().sock.recv_msg() {
+                                Recv::Msg(buf) => {
+                                    let p = probe.as_ref().unwrap();
+                                    if qid_matches(&buf, &p.payload, p.sock.is_tcp) {
+                                        let p_taken = probe.take().unwrap();
+                                        settle_probe(&io, &res, &p_taken, Some(&buf));
+                                    }
+                                }
+                                Recv::Dead => probe = None,
+                                Recv::Pending => {}
+                            }
+                        }
+                        if woke.expired {
+                            let now = Instant::now();
+                            if let Some(p) = &probe {
+                                if now >= p.deadline {
+                                    let p_taken = probe.take().unwrap();
+                                    settle_probe(&io, &res, &p_taken, None);
+                                }
+                            }
+                            if now >= deadline {
+                                clear_tcp_slot(&primary, qid);
+                                if io.borrow().app.cancelled {
+                                    break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                                }
+                                notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                                let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                match verdict {
+                                    TimeoutVerdict::Retry { server: next } => {
+                                        tries += 1;
+                                        timeouts += 1;
+                                        server = next;
+                                        continue 'attempt;
+                                    }
+                                    TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                                }
+                            }
+                            continue;
+                        }
+                        if !woke.fds.contains(&primary.fd()) {
+                            continue;
+                        }
+                        let buf = match recv_primary(&mut primary, qid) {
+                            Recv::Msg(buf) => buf,
+                            Recv::Pending => continue,
+                            Recv::Dead => {
+                                clear_tcp_slot(&primary, qid);
+                                if use_tcp {
+                                    res.tcp_pool.borrow_mut().remove(server);
+                                }
+                                if io.borrow().app.cancelled {
+                                    break 'drive (Err(ARES_ETIMEOUT), timeouts);
+                                }
+                                notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                                let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                match verdict {
+                                    TimeoutVerdict::Retry { server: next } => {
+                                        tries += 1;
+                                        timeouts += 1;
+                                        server = next;
+                                        continue 'attempt;
+                                    }
+                                    TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                                }
+                            }
+                        };
+                        if !qid_matches(&buf, wire, use_tcp) {
+                            continue;
+                        }
+                        let summary = summarize(&buf, 0);
+                        let (actions, verdict) = on_datagram(
+                            &summary,
+                            server,
+                            use_tcp,
+                            res.opts.attempts,
+                            failover_tries,
+                            &mut res.health.borrow_mut(),
+                        );
+                        notify(&io, actions);
+                        match verdict {
+                            TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                clear_tcp_slot(&primary, qid);
+                                server = next;
+                                failover_tries = ft;
+                                continue 'attempt;
+                            }
+                            TaskVerdict::RetryTcp => {
+                                use_tcp = true;
+                                continue 'attempt;
+                            }
+                            TaskVerdict::Deliver => {
+                                clear_tcp_slot(&primary, qid);
+                                break 'drive (Ok(buf), timeouts);
+                            }
+                        }
+                    }
+                }
+            };
             timeouts += io_timeouts;
 
             let last_error: AresError = match result {
@@ -949,187 +1698,6 @@ fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, res: &Resources, probe: &Probe, re
     }
 }
 
-/// Drive one query payload to a settled reply (or a terminal error), owning the
-/// socket(s): create / connect / send / recv / QID-match, with TC-retry, server
-/// failover, and timeout-retry via the reused `on_datagram`/`on_timeout` truth
-/// tables, plus the concurrent probe. Returns `(reply-or-status, timeout-count)`.
-pub(crate) async fn resolve_query(
-    io: Rc<RefCell<DnsMailbox>>,
-    res: Resources,
-    payload: BytesMut,
-    mut use_tcp: bool,
-    probe_payload: Option<BytesMut>,
-) -> (Result<Vec<u8>, c_int>, c_int) {
-    let mut timeouts: c_int = 0;
-    let mut tries: u32 = 0; // timeout attempts used
-    let mut failover_tries: u32 = 0;
-    let qid = qid_of(&payload);
-    let mut server = res.health.borrow().pick_next();
-    let mut probe = probe_payload.and_then(|pp| start_probe(&res, &pp, use_tcp));
-
-    'attempt: loop {
-        let (mut primary, si) = match acquire_primary(&res, server, use_tcp) {
-            Ok(v) => v,
-            Err(()) => {
-                return (Err(ARES_ECONNREFUSED), timeouts);
-            }
-        };
-        server = si;
-        let ep = res.endpoints[server].clone();
-        // The wire buffer for this attempt's transport: TCP needs the framed
-        // copy, UDP sends the payload as-is (borrowed — no clone).
-        let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
-        let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-        let deadline = Instant::now() + res.opts.timeout;
-
-        // Register this qid on the shared TCP conn before sending, so a sibling
-        // future's read routes our reply into our slot.
-        if let Primary::Tcp(c) = &primary {
-            c.borrow_mut().inbox.insert(qid, None);
-        }
-        if !send_primary(&io, &primary, &ep, wire, deadline).await {
-            // Send failed (a hard socket error): recreate the socket and retry,
-            // bounded by the attempt budget — mirrors the classic write_impl's
-            // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
-            // retry succeeds.)
-            clear_tcp_slot(&primary, qid);
-            if use_tcp {
-                res.tcp_pool.borrow_mut().remove(server);
-            }
-            if tries + 1 < res.opts.attempts.max(1) {
-                tries += 1;
-                if res.health.borrow().len() > 1 {
-                    res.health.borrow_mut().record_failure(server);
-                    server = res.health.borrow().pick_next();
-                }
-                continue 'attempt;
-            }
-            return (Err(ARES_ECONNREFUSED), timeouts);
-        }
-
-        // Await the primary reply, servicing the probe socket concurrently.
-        loop {
-            let primary_wait = Wait { fd: primary.fd(), writable: false };
-            let wake_deadline = match &probe {
-                Some(p) => deadline.min(p.deadline),
-                None => deadline,
-            };
-            // Stack slice (1 or 2 waits) — no per-await heap allocation.
-            let woke = match &probe {
-                Some(p) => {
-                    wait_io(&io, &[primary_wait, Wait { fd: p.sock.fd(), writable: false }], wake_deadline).await
-                }
-                None => wait_io(&io, &[primary_wait], wake_deadline).await,
-            };
-
-            // Probe readiness.
-            let probe_ready = probe.as_ref().is_some_and(|p| woke.fds.contains(&p.sock.fd()));
-            if probe_ready {
-                match probe.as_mut().unwrap().sock.recv_msg() {
-                    Recv::Msg(buf) => {
-                        let p = probe.as_ref().unwrap();
-                        if qid_matches(&buf, &p.payload, p.sock.is_tcp) {
-                            let p_taken = probe.take().unwrap();
-                            settle_probe(&io, &res, &p_taken, Some(&buf));
-                        }
-                    }
-                    Recv::Dead => probe = None, // probe socket died — best-effort, drop it
-                    Recv::Pending => {}
-                }
-            }
-
-            if woke.expired {
-                let now = Instant::now();
-                if let Some(p) = &probe {
-                    if now >= p.deadline {
-                        let p_taken = probe.take().unwrap();
-                        settle_probe(&io, &res, &p_taken, None);
-                    }
-                }
-                if now >= deadline {
-                    clear_tcp_slot(&primary, qid);
-                    // A caller (getaddrinfo) may have cancelled our retries.
-                    if io.borrow().app.cancelled {
-                        return (Err(ARES_ETIMEOUT), timeouts);
-                    }
-                    notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                    let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
-                    match verdict {
-                        TimeoutVerdict::Retry { server: next } => {
-                            tries += 1;
-                            timeouts += 1;
-                            server = next;
-                            continue 'attempt;
-                        }
-                        TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
-                    }
-                }
-                continue; // probe-only expiry: keep awaiting the primary
-            }
-
-            if !woke.fds.contains(&primary.fd()) {
-                continue; // only the probe fired
-            }
-            let buf = match recv_primary(&mut primary, qid) {
-                Recv::Msg(buf) => buf,
-                Recv::Pending => continue, // WouldBlock / incomplete frame — keep waiting
-                Recv::Dead => {
-                    // Connection died (TCP disconnect / hard recv error): drop a
-                    // dead shared TCP conn and retry like a timeout.
-                    clear_tcp_slot(&primary, qid);
-                    if use_tcp {
-                        res.tcp_pool.borrow_mut().remove(server);
-                    }
-                    if io.borrow().app.cancelled {
-                        return (Err(ARES_ETIMEOUT), timeouts);
-                    }
-                    notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                    let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
-                    match verdict {
-                        TimeoutVerdict::Retry { server: next } => {
-                            tries += 1;
-                            timeouts += 1;
-                            server = next;
-                            continue 'attempt;
-                        }
-                        TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
-                    }
-                }
-            };
-            if !qid_matches(&buf, wire, use_tcp) {
-                continue; // stray datagram
-            }
-
-            let summary = summarize(&buf, 0);
-            let (actions, verdict) = on_datagram(
-                &summary,
-                server,
-                use_tcp,
-                res.opts.attempts,
-                failover_tries,
-                &mut res.health.borrow_mut(),
-            );
-            notify(&io, actions);
-            match verdict {
-                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                    clear_tcp_slot(&primary, qid);
-                    server = next;
-                    failover_tries = ft;
-                    continue 'attempt;
-                }
-                TaskVerdict::RetryTcp => {
-                    use_tcp = true;
-                    continue 'attempt;
-                }
-                TaskVerdict::Deliver => {
-                    clear_tcp_slot(&primary, qid);
-                    return (Ok(buf), timeouts);
-                }
-            }
-        }
-    }
-}
-
 /// Drop this future's slot on a shared TCP conn (on retry/deliver) so the
 /// connection's inbox doesn't accumulate stale entries.
 fn clear_tcp_slot(primary: &Primary, qid: u16) {
@@ -1169,7 +1737,181 @@ impl ParallelQueries {
             .into_iter()
             .map(|(payload, use_tcp)| {
                 let sub_io = Rc::new(RefCell::new(DnsMailbox::default()));
-                let fut = Box::pin(resolve_query(sub_io.clone(), res.clone(), payload, use_tcp, None)) as QueryFut;
+                // Inlined single-query driver (WET) on this sub-mailbox — the
+                // getaddrinfo A/AAAA sub-queries (no probe). In an async block
+                // `return` yields the future's output directly.
+                let io = sub_io.clone();
+                let res = res.clone();
+                let fut = Box::pin(async move {
+                    let mut use_tcp = use_tcp;
+                    let mut timeouts: c_int = 0;
+                    let mut tries: u32 = 0;
+                    let mut failover_tries: u32 = 0;
+                    let qid = qid_of(&payload);
+                    let mut server = res.health.borrow().pick_next();
+                    let mut probe: Option<Probe> = None;
+                    'attempt: loop {
+                        let (mut primary, si) = match acquire_primary(&res, server, use_tcp) {
+                            Ok(v) => v,
+                            Err(()) => {
+                                return (Err(ARES_ECONNREFUSED), timeouts);
+                            }
+                        };
+                        server = si;
+                        let ep = res.endpoints[server].clone();
+                        // The wire buffer for this attempt's transport: TCP needs the framed
+                        // copy, UDP sends the payload as-is (borrowed — no clone).
+                        let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
+                        let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
+                        let deadline = Instant::now() + res.opts.timeout;
+
+                        // Register this qid on the shared TCP conn before sending, so a sibling
+                        // future's read routes our reply into our slot.
+                        if let Primary::Tcp(c) = &primary {
+                            c.borrow_mut().inbox.insert(qid, None);
+                        }
+                        if !send_primary(&io, &primary, &ep, wire, deadline).await {
+                            // Send failed (a hard socket error): recreate the socket and retry,
+                            // bounded by the attempt budget — mirrors the classic write_impl's
+                            // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
+                            // retry succeeds.)
+                            clear_tcp_slot(&primary, qid);
+                            if use_tcp {
+                                res.tcp_pool.borrow_mut().remove(server);
+                            }
+                            if tries + 1 < res.opts.attempts.max(1) {
+                                tries += 1;
+                                if res.health.borrow().len() > 1 {
+                                    res.health.borrow_mut().record_failure(server);
+                                    server = res.health.borrow().pick_next();
+                                }
+                                continue 'attempt;
+                            }
+                            return (Err(ARES_ECONNREFUSED), timeouts);
+                        }
+
+                        // Await the primary reply, servicing the probe socket concurrently.
+                        loop {
+                            let primary_wait = Wait { fd: primary.fd(), writable: false };
+                            let wake_deadline = match &probe {
+                                Some(p) => deadline.min(p.deadline),
+                                None => deadline,
+                            };
+                            // Stack slice (1 or 2 waits) — no per-await heap allocation.
+                            let woke = match &probe {
+                                Some(p) => {
+                                    wait_io(&io, &[primary_wait, Wait { fd: p.sock.fd(), writable: false }], wake_deadline).await
+                                }
+                                None => wait_io(&io, &[primary_wait], wake_deadline).await,
+                            };
+
+                            // Probe readiness.
+                            let probe_ready = probe.as_ref().is_some_and(|p| woke.fds.contains(&p.sock.fd()));
+                            if probe_ready {
+                                match probe.as_mut().unwrap().sock.recv_msg() {
+                                    Recv::Msg(buf) => {
+                                        let p = probe.as_ref().unwrap();
+                                        if qid_matches(&buf, &p.payload, p.sock.is_tcp) {
+                                            let p_taken = probe.take().unwrap();
+                                            settle_probe(&io, &res, &p_taken, Some(&buf));
+                                        }
+                                    }
+                                    Recv::Dead => probe = None, // probe socket died — best-effort, drop it
+                                    Recv::Pending => {}
+                                }
+                            }
+
+                            if woke.expired {
+                                let now = Instant::now();
+                                if let Some(p) = &probe {
+                                    if now >= p.deadline {
+                                        let p_taken = probe.take().unwrap();
+                                        settle_probe(&io, &res, &p_taken, None);
+                                    }
+                                }
+                                if now >= deadline {
+                                    clear_tcp_slot(&primary, qid);
+                                    // A caller (getaddrinfo) may have cancelled our retries.
+                                    if io.borrow().app.cancelled {
+                                        return (Err(ARES_ETIMEOUT), timeouts);
+                                    }
+                                    notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                                    let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                    match verdict {
+                                        TimeoutVerdict::Retry { server: next } => {
+                                            tries += 1;
+                                            timeouts += 1;
+                                            server = next;
+                                            continue 'attempt;
+                                        }
+                                        TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
+                                    }
+                                }
+                                continue; // probe-only expiry: keep awaiting the primary
+                            }
+
+                            if !woke.fds.contains(&primary.fd()) {
+                                continue; // only the probe fired
+                            }
+                            let buf = match recv_primary(&mut primary, qid) {
+                                Recv::Msg(buf) => buf,
+                                Recv::Pending => continue, // WouldBlock / incomplete frame — keep waiting
+                                Recv::Dead => {
+                                    // Connection died (TCP disconnect / hard recv error): drop a
+                                    // dead shared TCP conn and retry like a timeout.
+                                    clear_tcp_slot(&primary, qid);
+                                    if use_tcp {
+                                        res.tcp_pool.borrow_mut().remove(server);
+                                    }
+                                    if io.borrow().app.cancelled {
+                                        return (Err(ARES_ETIMEOUT), timeouts);
+                                    }
+                                    notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                                    let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                    match verdict {
+                                        TimeoutVerdict::Retry { server: next } => {
+                                            tries += 1;
+                                            timeouts += 1;
+                                            server = next;
+                                            continue 'attempt;
+                                        }
+                                        TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
+                                    }
+                                }
+                            };
+                            if !qid_matches(&buf, wire, use_tcp) {
+                                continue; // stray datagram
+                            }
+
+                            let summary = summarize(&buf, 0);
+                            let (actions, verdict) = on_datagram(
+                                &summary,
+                                server,
+                                use_tcp,
+                                res.opts.attempts,
+                                failover_tries,
+                                &mut res.health.borrow_mut(),
+                            );
+                            notify(&io, actions);
+                            match verdict {
+                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                    clear_tcp_slot(&primary, qid);
+                                    server = next;
+                                    failover_tries = ft;
+                                    continue 'attempt;
+                                }
+                                TaskVerdict::RetryTcp => {
+                                    use_tcp = true;
+                                    continue 'attempt;
+                                }
+                                TaskVerdict::Deliver => {
+                                    clear_tcp_slot(&primary, qid);
+                                    return (Ok(buf), timeouts);
+                                }
+                            }
+                        }
+                    }
+                }) as QueryFut;
                 ParSub { io: sub_io, fut: Some(fut), result: None }
             })
             .collect();
