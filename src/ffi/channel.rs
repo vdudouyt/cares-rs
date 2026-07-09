@@ -73,7 +73,7 @@ pub(crate) enum AsyncKind {
     /// ares_addrinfo for the ares_addrinfo_callback; the service port rides on
     /// the tail.
     AddrInfo {
-        fut: std::pin::Pin<Box<dyn std::future::Future<Output = crate::core::addrinfo::AddrInfoOut>>>,
+        fut: std::pin::Pin<Box<dyn std::future::Future<Output = crate::core::async_client::AddrInfoOut>>>,
         tail: AddrInfoTail,
     },
 }
@@ -84,7 +84,7 @@ enum Completed {
     Raw(Delivery),
     Host(Result<Hostent, AresError>),
     Nameinfo(NameinfoReply),
-    AddrInfo(crate::core::addrinfo::AddrInfoOut),
+    AddrInfo(crate::core::async_client::AddrInfoOut),
 }
 
 impl ChannelData {
@@ -159,16 +159,16 @@ impl ChannelData {
     /// ares_search / ares_search_dnsrec: spawn the search name-iteration
     /// lifecycle. The tail's delivery variant (Raw vs DnsRec) determines which
     /// C callback fires on completion.
-    pub(crate) fn spawn_search(&mut self, ctx: crate::core::search::SearchCtx, name: String, dnstype: u16, retry_server_error: bool, tail: SearchTail) {
+    pub(crate) fn spawn_search(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, name: String, dnstype: u16, retry_server_error: bool, tail: SearchTail) {
         let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(crate::core::search::search_lifecycle(ctx, io.clone(), name, dnstype, retry_server_error));
+        let fut = Box::pin(client.search(io.clone(), name, dnstype, retry_server_error));
         self.spawn(io, AsyncKind::Search { fut, tail });
     }
 
     /// ares_getaddrinfo: spawn the parallel A+AAAA lifecycle.
-    pub(crate) fn spawn_addrinfo(&mut self, ctx: crate::core::addrinfo::AddrInfoCtx, hostname: String, tail: AddrInfoTail) {
+    pub(crate) fn spawn_addrinfo(&mut self, client: std::rc::Rc<crate::core::async_client::AsyncClient>, hostname: String, ai_family: c_int, tail: AddrInfoTail) {
         let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-        let fut = Box::pin(crate::core::addrinfo::getaddrinfo_lifecycle(ctx, io.clone(), hostname));
+        let fut = Box::pin(client.getaddrinfo(io.clone(), hostname, ai_family));
         self.spawn(io, AsyncKind::AddrInfo { fut, tail });
     }
 

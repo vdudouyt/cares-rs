@@ -400,12 +400,14 @@ impl Client {
         }
     }
 
-    /// Bundle everything the self-contained async `gethostbyname` future owns:
-    /// the socket resources plus `Rc`/snapshot handles for the preflight (hosts
-    /// file, query cache, sortlist, ndots/search/use_vc). The one spot that reads
-    /// `Client` for the host lifecycle — the future itself names no channel.
-    pub(crate) fn host_ctx(&mut self) -> crate::core::hostbyname::HostCtx {
-        crate::core::hostbyname::HostCtx {
+    /// Build the shared `AsyncClient` snapshot every async lifecycle owns: the
+    /// socket resources plus `Rc`/snapshot handles for the preflight (hosts file,
+    /// query cache, sortlist, ndots/search/use_vc). The one spot that reads
+    /// `Client` for the async lifecycles; the futures themselves name no channel.
+    /// Returned as `Rc` so methods take `self: Rc<Self>` (spawnable `'static`
+    /// futures + cheap sharing for nested calls).
+    pub(crate) fn async_client(&mut self) -> Rc<crate::core::async_client::AsyncClient> {
+        Rc::new(crate::core::async_client::AsyncClient {
             res: self.resources(),
             hosts: self.transport.hosts(),
             cache: self.cache.clone(),
@@ -413,7 +415,7 @@ impl Client {
             ndots: self.transport.config.options.ndots,
             search: Rc::from(self.transport.config.search.clone()),
             use_vc: self.transport.config.options.use_vc,
-        }
+        })
     }
 
     // ===== Entry points (one method per ares_* export) =====
