@@ -439,7 +439,7 @@ impl Client {
     /// (spawnable `'static` futures + cheap sharing for nested calls).
     fn build_async_base(&mut self) -> Rc<crate::core::async_client::AsyncClient> {
         Rc::new(crate::core::async_client::AsyncClient {
-            io: Rc::new(std::cell::RefCell::new(executor::QueryIo::default())),
+            io: Rc::new(std::cell::RefCell::new(executor::DnsMailbox::default())),
             res: self.resources(),
             hosts: self.transport.hosts(),
             cache: self.cache.clone(),
@@ -452,24 +452,24 @@ impl Client {
 
     // ===== Entry points (one method per ares_* export) =====
 
-    /// ares_query: `no_servers` preflight, then a launch descriptor carrying the
-    /// owned resources + wire payload for the async lifecycle.
-    pub(crate) fn query_payload(&self, name: &str, qtype: u16) -> Result<executor::RawLaunch, AresError> {
+    /// ares_query: `no_servers` preflight, then the wire payload for the async
+    /// lifecycle. The `AsyncClient` (built by the shim) supplies the resources.
+    pub(crate) fn query_payload(&self, name: &str, qtype: u16) -> Result<BytesMut, AresError> {
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        Ok(executor::RawLaunch { res: self.resources(), payload: dns_query_payload(name, qtype) })
+        Ok(dns_query_payload(name, qtype))
     }
 
-    /// ares_send: min-DNS-length + `no_servers` preflight, then a launch descriptor.
-    pub(crate) fn send_payload(&self, query_buf: &[u8]) -> Result<executor::RawLaunch, AresError> {
+    /// ares_send: min-DNS-length + `no_servers` preflight, then the wire payload.
+    pub(crate) fn send_payload(&self, query_buf: &[u8]) -> Result<BytesMut, AresError> {
         if query_buf.len() < 12 {
             return Err(ARES_EBADQUERY.into());
         }
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        Ok(executor::RawLaunch { res: self.resources(), payload: BytesMut::from(query_buf) })
+        Ok(BytesMut::from(query_buf))
     }
 
     /// ares_gethostbyname_file: the hosts-file-only lookup, shaped for C.

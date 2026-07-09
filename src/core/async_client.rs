@@ -18,7 +18,8 @@ use std::time::Instant;
 
 use crate::core::api;
 use crate::core::cache::QueryCache;
-use crate::core::executor::{resolve_query, Delivery, ParallelQueries, QueryIo, Resources};
+use crate::core::executor::{resolve_query, Delivery, DnsMailbox, ParallelQueries, Resources};
+use bytes::BytesMut;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, Hosts};
 use crate::core::lookup::{
@@ -54,7 +55,7 @@ use crate::ffi::{
 /// The ffi grabs the derived copy's `self.io.clone()` to drive that mailbox;
 /// nested inline sub-calls (`self.clone().other(…)`) share it.
 pub(crate) struct AsyncClient {
-    pub io: Rc<RefCell<QueryIo>>,
+    pub io: Rc<RefCell<DnsMailbox>>,
     pub res: Resources,
     pub hosts: Rc<Hosts>,
     pub cache: Rc<RefCell<QueryCache>>,
@@ -71,7 +72,7 @@ impl AsyncClient {
     /// on the channel share one mailbox — the bug this avoids.
     pub(crate) fn with_fresh_io(&self) -> Rc<Self> {
         Rc::new(AsyncClient {
-            io: Rc::new(RefCell::new(QueryIo::default())),
+            io: Rc::new(RefCell::new(DnsMailbox::default())),
             res: self.res.clone(),
             hosts: self.hosts.clone(),
             cache: self.cache.clone(),
@@ -80,6 +81,14 @@ impl AsyncClient {
             search: self.search.clone(),
             use_vc: self.use_vc,
         })
+    }
+
+    /// ares_query / ares_send: one query delivered raw. Keeps the historical
+    /// UDP-start behavior (`use_tcp = false`); unlike the resolver ops it does
+    /// **not** honor `ARES_FLAG_USEVC`. (Replaces the free `raw_lifecycle`.)
+    pub(crate) async fn query_raw(self: Rc<Self>, payload: BytesMut) -> Delivery {
+        let (result, timeouts) = resolve_query(self.io.clone(), self.res.clone(), payload, false, None).await;
+        Delivery::Raw { result, timeouts }
     }
 
     /// ares_gethostbyname: the full pre-DNS cascade (ASCII/onion/family/
@@ -205,7 +214,7 @@ impl AsyncClient {
                         if !self.sortlist.is_empty() {
                             apply_sortlist(&self.sortlist, &mut rrs.items);
                         }
-                        self.io.borrow_mut().timeouts = timeouts + io_timeouts;
+                        self.io.borrow_mut().app.timeouts = timeouts + io_timeouts;
                         return Ok(Hostent::from_parsed(rrs, current_family));
                     }
                     Err(e) => {
@@ -243,7 +252,7 @@ impl AsyncClient {
             } else {
                 last_error.code()
             };
-            self.io.borrow_mut().timeouts = timeouts;
+            self.io.borrow_mut().app.timeouts = timeouts;
             return Err(status.into());
         }
     }
@@ -271,11 +280,11 @@ impl AsyncClient {
         match result {
             Ok(buf) => {
                 let hostent = api::on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip))?;
-                self.io.borrow_mut().timeouts = io_timeouts;
+                self.io.borrow_mut().app.timeouts = io_timeouts;
                 Ok(hostent)
             }
             Err(status) => {
-                self.io.borrow_mut().timeouts = io_timeouts;
+                self.io.borrow_mut().app.timeouts = io_timeouts;
                 Err(AresError::from(status))
             }
         }
@@ -332,7 +341,7 @@ impl AsyncClient {
         };
         let reply = assemble_nameinfo(dns_result, addr.ip, addr.scope_id, addr.port, flags, io_timeouts);
         // `assemble_nameinfo` carries io_timeouts in its `NameinfoReply.timeouts`.
-        self.io.borrow_mut().timeouts = reply.timeouts;
+        self.io.borrow_mut().app.timeouts = reply.timeouts;
         reply
     }
 
@@ -373,7 +382,7 @@ impl AsyncClient {
                         5 => ARES_EREFUSED.into(),   // REFUSED
                         0 if summary.ancount > 0 => {
                             // Success — deliver the raw response.
-                            self.io.borrow_mut().timeouts = timeouts;
+                            self.io.borrow_mut().app.timeouts = timeouts;
                             return Delivery::Raw { result: Ok(buf), timeouts };
                         }
                         // NOERROR-with-no-answers, or any other rcode → NODATA.
@@ -400,7 +409,7 @@ impl AsyncClient {
             if had_nodata && status.code() == ARES_ENOTFOUND {
                 status = ARES_ENODATA.into();
             }
-            self.io.borrow_mut().timeouts = timeouts;
+            self.io.borrow_mut().app.timeouts = timeouts;
             return Delivery::Raw { result: Err(status.code()), timeouts };
         }
     }
@@ -528,7 +537,7 @@ impl AsyncClient {
             }
 
             if any_success {
-                self.io.borrow_mut().timeouts = timeouts;
+                self.io.borrow_mut().app.timeouts = timeouts;
                 return AddrInfoOut { name: plan.current.clone(), records, status: ARES_SUCCESS.into() };
             }
 
@@ -545,7 +554,7 @@ impl AsyncClient {
 
             // Finalize: NXDOMAIN after an earlier empty answer reports as ENODATA.
             let status = if had_nodata && code == ARES_ENOTFOUND { ARES_ENODATA } else { code };
-            self.io.borrow_mut().timeouts = timeouts;
+            self.io.borrow_mut().app.timeouts = timeouts;
             return fail(status);
         }
     }

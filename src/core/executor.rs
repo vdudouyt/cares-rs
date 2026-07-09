@@ -54,22 +54,13 @@ pub(crate) enum Effect {
     NotifyServerState { server: usize, ok: bool, tcp: bool },
 }
 
-/// The mailbox shared (via `Rc<RefCell<_>>`) between one lifecycle future and
-/// the ffi executor. The future publishes `waits`/`deadline` when it suspends;
-/// the executor sets `fired`/`expired` before re-polling. Nothing here names
-/// the channel, so polling the future borrows nothing of `ChannelData`.
+/// The application-owned half of the mailbox: everything the *reactor* need not
+/// understand. The reactor drives readiness (`waits`/`deadline`/`fired`/`expired`)
+/// and never touches these fields; the DNS lifecycle + the ffi do.
 #[derive(Default)]
-pub(crate) struct QueryIo {
-    /// fds the future is currently blocked on (published on suspension).
-    pub waits: Vec<Wait>,
-    /// Earliest deadline the future wants to wake at.
-    pub deadline: Option<Instant>,
-    /// Effects the executor drains + applies after every poll.
+pub(crate) struct DnsSignals {
+    /// Effects the ffi drains + applies after every poll.
     pub effects: Vec<Effect>,
-    /// Which published-wait fds are ready now (set by the executor).
-    pub fired: Vec<i32>,
-    /// Whether the deadline passed (set by the executor).
-    pub expired: bool,
     /// Accumulated timeout count, written by the future before it completes so
     /// the ffi can pass it to the C callback (the host future's `Result` output
     /// has no room for it; the raw path still carries it in `Delivery::Raw`).
@@ -82,6 +73,30 @@ pub(crate) struct QueryIo {
     pub cancelled: bool,
 }
 
+/// The mailbox shared (via `Rc<RefCell<_>>`) between one lifecycle future and
+/// the ffi executor. The future publishes `waits`/`deadline` when it suspends;
+/// the executor sets `fired`/`expired` before re-polling. Nothing here names
+/// the channel, so polling the future borrows nothing of `ChannelData`. The
+/// `app` sub-struct holds the DNS-application fields the reactor ignores.
+#[derive(Default)]
+pub(crate) struct QueryIo<A> {
+    /// fds the future is currently blocked on (published on suspension).
+    pub waits: Vec<Wait>,
+    /// Earliest deadline the future wants to wake at.
+    pub deadline: Option<Instant>,
+    /// Which published-wait fds are ready now (set by the executor).
+    pub fired: Vec<i32>,
+    /// Whether the deadline passed (set by the executor).
+    pub expired: bool,
+    /// Application signals the reactor doesn't interpret (opaque to it).
+    pub app: A,
+}
+
+/// The DNS-application instantiation of the reactor mailbox — the only one the
+/// crate builds. The reactor primitives stay generic over `A`; everything DNS
+/// speaks `DnsMailbox`.
+pub(crate) type DnsMailbox = QueryIo<DnsSignals>;
+
 /// The outcome of one [`WaitFds`] await: which fds fired, and whether it timed out.
 pub(crate) struct Woke {
     pub fds: Vec<i32>,
@@ -91,11 +106,11 @@ pub(crate) struct Woke {
 /// The await primitive: resolve once the executor reports readiness for the
 /// currently published waits. Borrows the mailbox only inside `poll`, never
 /// across `.await`.
-struct Ready1 {
-    io: Rc<RefCell<QueryIo>>,
+struct Ready1<A> {
+    io: Rc<RefCell<QueryIo<A>>>,
 }
 
-impl Future for Ready1 {
+impl<A> Future for Ready1<A> {
     type Output = Woke;
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Woke> {
         let mut io = self.io.borrow_mut();
@@ -109,7 +124,7 @@ impl Future for Ready1 {
 /// Publish the `waits` (+ `deadline`) into the mailbox — reusing its `waits`
 /// allocation, so a per-await stack slice avoids a heap allocation — then await
 /// readiness. Clears the published waits on return so a later await starts clean.
-async fn wait_io(io: &Rc<RefCell<QueryIo>>, waits: &[Wait], deadline: Instant) -> Woke {
+async fn wait_io<A>(io: &Rc<RefCell<QueryIo<A>>>, waits: &[Wait], deadline: Instant) -> Woke {
     {
         let mut m = io.borrow_mut();
         m.waits.clear();
@@ -123,11 +138,11 @@ async fn wait_io(io: &Rc<RefCell<QueryIo>>, waits: &[Wait], deadline: Instant) -
     woke
 }
 
-fn push_effect(io: &Rc<RefCell<QueryIo>>, e: Effect) {
-    io.borrow_mut().effects.push(e);
+fn push_effect(io: &Rc<RefCell<DnsMailbox>>, e: Effect) {
+    io.borrow_mut().app.effects.push(e);
 }
 
-fn notify(io: &Rc<RefCell<QueryIo>>, actions: Vec<ReactorAction>) {
+fn notify(io: &Rc<RefCell<DnsMailbox>>, actions: Vec<ReactorAction>) {
     for a in actions {
         match a {
             ReactorAction::NotifyServerState { server, ok, tcp } => {
@@ -178,12 +193,6 @@ pub(crate) struct Resources {
     pub opts: QueryOpts,
 }
 
-
-/// Descriptor the ffi turns into a `raw_lifecycle` future (ares_query/ares_send).
-pub(crate) struct RawLaunch {
-    pub res: Resources,
-    pub payload: BytesMut,
-}
 
 // ===== Sockets =====
 
@@ -383,7 +392,7 @@ fn acquire_primary(res: &Resources, start: usize, use_tcp: bool) -> Result<(Prim
 /// pending TCP connect). UDP connects before sending. Returns `false` on a hard
 /// failure or timeout.
 async fn send_primary(
-    io: &Rc<RefCell<QueryIo>>,
+    io: &Rc<RefCell<DnsMailbox>>,
     primary: &Primary,
     ep: &ServerEndpoint,
     framed: &[u8],
@@ -465,7 +474,7 @@ fn start_probe(res: &Resources, name_payload: &BytesMut, use_tcp: bool) -> Optio
 
 /// Fold a probe reply into server health (the old `on_probe_reply` verdict),
 /// emitted as effects. `None` reply = the probe timed out (failure timestamp only).
-fn settle_probe(io: &Rc<RefCell<QueryIo>>, res: &Resources, probe: &Probe, reply: Option<&[u8]>) {
+fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, res: &Resources, probe: &Probe, reply: Option<&[u8]>) {
     let mut health = res.health.borrow_mut();
     match reply {
         Some(buf) => {
@@ -491,7 +500,7 @@ fn settle_probe(io: &Rc<RefCell<QueryIo>>, res: &Resources, probe: &Probe, reply
 /// failover, and timeout-retry via the reused `on_datagram`/`on_timeout` truth
 /// tables, plus the concurrent probe. Returns `(reply-or-status, timeout-count)`.
 pub(crate) async fn resolve_query(
-    io: Rc<RefCell<QueryIo>>,
+    io: Rc<RefCell<DnsMailbox>>,
     res: Resources,
     payload: BytesMut,
     mut use_tcp: bool,
@@ -586,7 +595,7 @@ pub(crate) async fn resolve_query(
                 if now >= deadline {
                     clear_tcp_slot(&primary, qid);
                     // A caller (getaddrinfo) may have cancelled our retries.
-                    if io.borrow().cancelled {
+                    if io.borrow().app.cancelled {
                         return (Err(ARES_ETIMEOUT), timeouts);
                     }
                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -617,7 +626,7 @@ pub(crate) async fn resolve_query(
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
-                    if io.borrow().cancelled {
+                    if io.borrow().app.cancelled {
                         return (Err(ARES_ETIMEOUT), timeouts);
                     }
                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -683,7 +692,7 @@ type QueryFut = Pin<Box<dyn Future<Output = QueryOutcome>>>;
 
 /// One sub-query inside a [`ParallelQueries`] set.
 struct ParSub {
-    io: Rc<RefCell<QueryIo>>,
+    io: Rc<RefCell<DnsMailbox>>,
     fut: Option<QueryFut>,
     result: Option<QueryOutcome>,
 }
@@ -697,17 +706,17 @@ struct ParSub {
 /// merges their published waits/effects into the outer mailbox the ffi drives,
 /// awaits it, and routes readiness back by fd + each sub's own deadline.
 pub(crate) struct ParallelQueries {
-    io: Rc<RefCell<QueryIo>>,
+    io: Rc<RefCell<DnsMailbox>>,
     subs: Vec<ParSub>,
 }
 
 impl ParallelQueries {
     /// Build one `resolve_query` future per `(payload, use_tcp)` (no probe).
-    pub(crate) fn new(io: Rc<RefCell<QueryIo>>, res: Resources, payloads: Vec<(BytesMut, bool)>) -> Self {
+    pub(crate) fn new(io: Rc<RefCell<DnsMailbox>>, res: Resources, payloads: Vec<(BytesMut, bool)>) -> Self {
         let subs = payloads
             .into_iter()
             .map(|(payload, use_tcp)| {
-                let sub_io = Rc::new(RefCell::new(QueryIo::default()));
+                let sub_io = Rc::new(RefCell::new(DnsMailbox::default()));
                 let fut = Box::pin(resolve_query(sub_io.clone(), res.clone(), payload, use_tcp, None)) as QueryFut;
                 ParSub { io: sub_io, fut: Some(fut), result: None }
             })
@@ -724,7 +733,7 @@ impl ParallelQueries {
     /// attempt, but a reply already in flight still delivers. (Implemented via
     /// the sub-mailbox `cancelled` flag `resolve_query` honours.)
     pub(crate) fn cancel(&mut self, i: usize) {
-        self.subs[i].io.borrow_mut().cancelled = true;
+        self.subs[i].io.borrow_mut().app.cancelled = true;
     }
 
     /// Every query has settled.
@@ -764,9 +773,9 @@ impl ParallelQueries {
                 if let Some(d) = sub.deadline {
                     deadline = Some(deadline.map_or(d, |m: Instant| m.min(d)));
                 }
-                std::mem::take(&mut sub.effects)
+                std::mem::take(&mut sub.app.effects)
             };
-            self.io.borrow_mut().effects.extend(drained);
+            self.io.borrow_mut().app.effects.extend(drained);
         }
         let deadline = match deadline {
             Some(d) => d,
@@ -787,15 +796,6 @@ impl ParallelQueries {
             sub.expired = sub.deadline.is_some_and(|d| now >= d);
         }
     }
-}
-
-// ===== Lifecycles =====
-
-/// ares_query / ares_send: one query, delivered raw. Keeps the historical
-/// UDP-start behavior (server chosen by `pick_next`).
-pub(crate) async fn raw_lifecycle(io: Rc<RefCell<QueryIo>>, launch: RawLaunch) -> Delivery {
-    let (result, timeouts) = resolve_query(io, launch.res, launch.payload, false, None).await;
-    Delivery::Raw { result, timeouts }
 }
 
 // ===== Waker =====

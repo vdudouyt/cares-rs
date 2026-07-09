@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
-use crate::core::executor::{noop_waker, Delivery, Effect, QueryIo};
+use crate::core::executor::{noop_waker, Delivery, DnsMailbox, Effect};
 use crate::core::hostent::Hostent;
 use crate::core::AresError;
 use crate::core::preflight::NameinfoReply;
@@ -30,7 +30,7 @@ pub struct ChannelData {
 /// One in-flight async lifecycle: its mailbox plus the boxed future and its C
 /// delivery target — both differ by kind (raw reply bytes vs a hostent).
 struct AsyncQuery {
-    io: std::rc::Rc<std::cell::RefCell<QueryIo>>,
+    io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>,
     kind: AsyncKind,
 }
 
@@ -129,7 +129,7 @@ impl ChannelData {
     /// initial send). Every ares_* entry shim builds `(io, kind)` and calls here.
     /// The C callback fires when the reactor later settles the task (or in place
     /// if the launch fails immediately).
-    pub(crate) fn spawn(&mut self, io: std::rc::Rc<std::cell::RefCell<QueryIo>>, kind: AsyncKind) {
+    pub(crate) fn spawn(&mut self, io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>, kind: AsyncKind) {
         let slot = AsyncQuery { io, kind };
         let id = match self.async_queries.iter().position(|s| s.is_none()) {
             Some(i) => {
@@ -186,7 +186,7 @@ impl ChannelData {
         };
         let effects = {
             let aq = self.async_queries[id].as_ref().unwrap();
-            std::mem::take(&mut aq.io.borrow_mut().effects)
+            std::mem::take(&mut aq.io.borrow_mut().app.effects)
         };
         for effect in effects {
             match effect {
@@ -244,7 +244,7 @@ impl ChannelData {
                     }
                 }
                 (Completed::Host(result), AsyncKind::Host { tail, .. }) => {
-                    let timeouts = slot.io.borrow().timeouts;
+                    let timeouts = slot.io.borrow().app.timeouts;
                     match result {
                         Ok(hostent) => fire_host_success(tail, hostent, timeouts),
                         Err(e) => unsafe { (tail.callback)(tail.arg, e.code(), timeouts, std::ptr::null_mut()) },

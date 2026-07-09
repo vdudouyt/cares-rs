@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::core::api;
-use crate::core::executor::{raw_lifecycle, QueryIo};
 use crate::core::hostent::Hostent;
 use crate::core::preflight::{service_to_port, ServicePort};
 
@@ -141,9 +140,10 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     // Preflight in core, then spawn an fd-owning async query lifecycle that
     // creates the socket, sends, and drives its own failover/TC/timeout.
     match channeldata.state.query_payload(name, dnstype as u16) {
-        Ok(launch) => {
-            let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-            let fut = Box::pin(raw_lifecycle(io.clone(), launch));
+        Ok(payload) => {
+            let client = channeldata.state.async_client();
+            let io = client.io.clone();
+            let fut = Box::pin(client.query_raw(payload));
             channeldata.spawn(io, AsyncKind::Raw { fut, callback, arg });
         }
         Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
@@ -175,12 +175,13 @@ pub unsafe extern "C" fn ares_query_dnsrec(
             return;
         }
     }
-    let launch = match channeldata.state.query_payload(name.as_ref(), dnstype as u16) {
-        Ok(l) => l,
+    let payload = match channeldata.state.query_payload(name.as_ref(), dnstype as u16) {
+        Ok(p) => p,
         Err(e) => { unsafe { callback(arg, e.code(), 0, std::ptr::null_mut()) }; return; }
     };
-    let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-    let fut = Box::pin(raw_lifecycle(io.clone(), launch));
+    let client = channeldata.state.async_client();
+    let io = client.io.clone();
+    let fut = Box::pin(client.query_raw(payload));
     channeldata.spawn(io, AsyncKind::DnsRec { fut, callback, arg });
 }
 
@@ -327,9 +328,10 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
     // Preflight in core, then spawn an fd-owning async query lifecycle.
     match channeldata.state.send_payload(query_buf) {
-        Ok(launch) => {
-            let io = std::rc::Rc::new(std::cell::RefCell::new(QueryIo::default()));
-            let fut = Box::pin(raw_lifecycle(io.clone(), launch));
+        Ok(payload) => {
+            let client = channeldata.state.async_client();
+            let io = client.io.clone();
+            let fut = Box::pin(client.query_raw(payload));
             channeldata.spawn(io, AsyncKind::Raw { fut, callback, arg });
         }
         Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
