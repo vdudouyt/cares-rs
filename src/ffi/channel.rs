@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
-use crate::core::executor::{noop_waker, Delivery, DnsMailbox, Effect};
+use crate::core::async_client::{Delivery, DnsMailbox, Effect};
+use crate::core::executor::noop_waker;
 use crate::core::hostent::Hostent;
 use crate::core::AresError;
 use crate::core::preflight::NameinfoReply;

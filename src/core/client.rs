@@ -13,7 +13,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 
 use crate::core::cache::QueryCache;
-use crate::core::executor;
+use crate::core::async_client;
 use crate::core::hostent::Hostent;
 use crate::core::lookup::ServerHealth;
 use crate::core::preflight::{hosts_file_lookup, no_servers};
@@ -51,10 +51,10 @@ pub(crate) struct Client {
     pub udp_max_queries: u32, // 0 = unlimited
     /// Shared TCP connections for the async engine (parallel lookups to one
     /// server share a connection); handed to each future via its descriptor.
-    pub tcp_pool: Rc<RefCell<crate::core::executor::TcpPool>>,
+    pub tcp_pool: Rc<RefCell<crate::core::async_client::TcpPool>>,
     /// Per-server connect endpoints, cached (rebuilt on server change) so each
     /// async launch clones an `Rc` instead of re-snapshotting the config.
-    endpoints: Rc<Vec<executor::ServerEndpoint>>,
+    endpoints: Rc<Vec<async_client::ServerEndpoint>>,
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
     /// The channel-owned resolver client (config snapshot), built lazily and
@@ -78,7 +78,7 @@ impl Client {
             hosts_path: String::new(),
             cache: Rc::new(RefCell::new(QueryCache::default())),
             udp_max_queries: 0,
-            tcp_pool: Rc::new(RefCell::new(crate::core::executor::TcpPool::default())),
+            tcp_pool: Rc::new(RefCell::new(crate::core::async_client::TcpPool::default())),
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
@@ -372,7 +372,7 @@ impl Client {
 
     /// Snapshot the per-server connect endpoints from config, so an async
     /// lifecycle future needs no `Transport`.
-    fn endpoint_snapshot(&self) -> Vec<executor::ServerEndpoint> {
+    fn endpoint_snapshot(&self) -> Vec<async_client::ServerEndpoint> {
         let default_udp = self.transport.default_udp_port;
         let default_tcp = self.transport.default_tcp_port;
         self.transport
@@ -388,7 +388,7 @@ impl Client {
                 } else {
                     SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
                 };
-                executor::ServerEndpoint {
+                async_client::ServerEndpoint {
                     udp_addr: SocketAddr::from((ip, udp_port)),
                     tcp_addr: SocketAddr::from((ip, tcp_port)),
                     bind,
@@ -398,8 +398,8 @@ impl Client {
     }
 
     /// The retry/timeout knobs an async lifecycle needs.
-    fn query_opts(&self) -> executor::QueryOpts {
-        executor::QueryOpts {
+    fn query_opts(&self) -> async_client::QueryOpts {
+        async_client::QueryOpts {
             attempts: self.transport.config.options.attempts,
             timeout: Duration::from_millis(self.transport.config.options.timeout_ms as u64),
             failover_chance: self.server_failover_retry_chance,
@@ -409,8 +409,8 @@ impl Client {
 
     /// Bundle the owned resources an async lifecycle future carries. Cheap: all
     /// `Rc` clones (endpoints cached, rebuilt only on server change).
-    pub(crate) fn resources(&self) -> executor::Resources {
-        executor::Resources {
+    pub(crate) fn resources(&self) -> async_client::Resources {
+        async_client::Resources {
             factory: self.transport.socket_factory.clone(),
             health: self.server_health.clone(),
             endpoints: self.endpoints.clone(),
@@ -439,7 +439,7 @@ impl Client {
     /// (spawnable `'static` futures + cheap sharing for nested calls).
     fn build_async_base(&mut self) -> Rc<crate::core::async_client::AsyncClient> {
         Rc::new(crate::core::async_client::AsyncClient {
-            io: Rc::new(std::cell::RefCell::new(executor::DnsMailbox::default())),
+            io: Rc::new(std::cell::RefCell::new(async_client::DnsMailbox::default())),
             res: self.resources(),
             hosts: self.transport.hosts(),
             cache: self.cache.clone(),
