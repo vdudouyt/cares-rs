@@ -2,7 +2,7 @@
 //! over the pure-IO reactor (`async_runtime::executor`). This module knows sockets,
 //! framed streams, and mux tags; it knows **zero** about its application:
 //! like the executor it is generic over the mailbox's app-state `A`, and
-//! nothing in here names a protocol.
+//! nothing in here names a protocol or a wire format.
 //!
 //! - [`Conn`] — a query's connection. It owns its mailbox handle, so IO reads
 //!   tokio-style: `conn.send(bytes, timeout).await` /
@@ -11,11 +11,12 @@
 //!   shared stream connection; the datagram-vs-demuxed-stream asymmetry is
 //!   hidden behind the methods.
 //! - [`TcpConn`] / [`TcpPool`] — shared stream connections, keyed by an opaque
-//!   caller index so parallel queries to one peer share a socket. A stream
-//!   carries u16-BE length-prefixed frames; each is routed to a per-tag inbox
-//!   slot by the caller-supplied `tag_of` extractor. [`Conn::shared`] reserves
-//!   a tag's slot and dropping the `Conn` releases it (RAII — no manual
-//!   register/clear).
+//!   caller index so parallel queries to one peer share a socket. How the
+//!   stream's bytes delimit messages is the application's business: the caller
+//!   supplies the framer ([`FrameOf`]) that pops complete messages off the
+//!   reassembly buffer, and the [`TagOf`] extractor that routes each message
+//!   to a per-tag inbox slot. [`Conn::shared`] reserves a tag's slot and
+//!   dropping the `Conn` releases it (RAII — no manual register/clear).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,20 +37,12 @@ use crate::async_runtime::socket::{Socket, SocketFactory};
 /// handed to any awaiting slot so the application can reject it.
 pub type TagOf = fn(&[u8]) -> Option<u16>;
 
-/// Pop one complete u16-BE length-prefixed frame off a stream receive buffer,
-/// or `None` if a full frame hasn't accumulated yet.
-pub fn extract_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    if rbuf.len() < 2 {
-        return None;
-    }
-    let payload_len = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
-    if rbuf.len() < 2 + payload_len {
-        return None;
-    }
-    let msg = rbuf[2..2 + payload_len].to_vec();
-    rbuf.drain(..2 + payload_len);
-    Some(msg)
-}
+/// How a stream's bytes are cut into messages: pop one complete frame off the
+/// reassembly buffer, or `None` until more bytes arrive. Message delimiting is
+/// an application-protocol convention (a length prefix, a terminator, …) — TCP
+/// itself has none and the runtime knows no wire format, so the caller
+/// supplies this.
+pub type FrameOf = fn(&mut Vec<u8>) -> Option<Vec<u8>>;
 
 /// A shared stream connection to one peer, cooperatively driven by every
 /// future that has an outstanding query on it: a per-connection reassembly
@@ -58,6 +51,7 @@ pub struct TcpConn {
     sock: Rc<dyn Socket>,
     fd: i32,
     rbuf: Vec<u8>,
+    frame_of: FrameOf,
     tag_of: TagOf,
     /// tag -> reply slot: `None` = still awaited, `Some` = delivered, waiting
     /// to be taken by that future.
@@ -71,7 +65,7 @@ impl TcpConn {
     /// calling this after the socket is drained just no-ops.
     fn recv_and_route(&mut self) -> bool {
         let alive = recv_stream(&*self.sock, &mut self.rbuf);
-        while let Some(frame) = extract_frame(&mut self.rbuf) {
+        while let Some(frame) = (self.frame_of)(&mut self.rbuf) {
             if let Some(tag) = (self.tag_of)(&frame) {
                 if let Some(slot) = self.inbox.get_mut(&tag) {
                     *slot = Some(frame);
@@ -92,12 +86,13 @@ impl TcpConn {
 /// peer share a connection.
 pub struct TcpPool {
     conns: HashMap<usize, Rc<RefCell<TcpConn>>>,
+    frame_of: FrameOf,
     tag_of: TagOf,
 }
 
 impl TcpPool {
-    pub fn new(tag_of: TagOf) -> Self {
-        TcpPool { conns: HashMap::new(), tag_of }
+    pub fn new(frame_of: FrameOf, tag_of: TagOf) -> Self {
+        TcpPool { conns: HashMap::new(), frame_of, tag_of }
     }
 
     pub fn clear(&mut self) {
@@ -128,6 +123,7 @@ impl TcpPool {
             sock,
             fd,
             rbuf: Vec::new(),
+            frame_of: self.frame_of,
             tag_of: self.tag_of,
             inbox: HashMap::new(),
         }));
@@ -145,17 +141,25 @@ pub struct Conn<A> {
     wire: Wire,
 }
 
-/// The transport behind a [`Conn`]: an exclusively owned socket (datagram, or
-/// a one-shot stream), or this query's tag on a shared stream connection.
+/// The transport behind a [`Conn`]: an exclusively owned datagram socket, an
+/// exclusively owned one-shot stream, or this query's tag on a shared stream
+/// connection.
 enum Wire {
-    Owned { sock: Rc<dyn Socket>, is_tcp: bool, rbuf: Vec<u8> },
+    Datagram { sock: Rc<dyn Socket> },
+    Stream { sock: Rc<dyn Socket>, rbuf: Vec<u8>, frame_of: FrameOf },
     Shared(Rc<RefCell<TcpConn>>, u16),
 }
 
 impl<A> Conn<A> {
-    /// An owned socket (datagram, or a one-shot stream), already connected.
-    pub fn owned(io: Rc<RefCell<QueryIo<A>>>, sock: Rc<dyn Socket>, is_tcp: bool) -> Self {
-        Conn { io, wire: Wire::Owned { sock, is_tcp, rbuf: Vec::new() } }
+    /// An owned datagram socket, already connected. One recv = one message.
+    pub fn datagram(io: Rc<RefCell<QueryIo<A>>>, sock: Rc<dyn Socket>) -> Self {
+        Conn { io, wire: Wire::Datagram { sock } }
+    }
+
+    /// An owned one-shot stream socket, already connected; `frame_of` cuts its
+    /// bytes into messages.
+    pub fn stream(io: Rc<RefCell<QueryIo<A>>>, sock: Rc<dyn Socket>, frame_of: FrameOf) -> Self {
+        Conn { io, wire: Wire::Stream { sock, rbuf: Vec::new(), frame_of } }
     }
 
     /// A query's handle on a shared stream conn. Reserves `tag`'s inbox slot
@@ -168,16 +172,13 @@ impl<A> Conn<A> {
 
     fn fd(&self) -> i32 {
         match &self.wire {
-            Wire::Owned { sock, .. } => sock.as_raw_fd(),
+            Wire::Datagram { sock } | Wire::Stream { sock, .. } => sock.as_raw_fd(),
             Wire::Shared(c, _) => c.borrow().fd,
         }
     }
 
     pub fn is_tcp(&self) -> bool {
-        match &self.wire {
-            Wire::Owned { is_tcp, .. } => *is_tcp,
-            Wire::Shared(..) => true,
-        }
+        !matches!(&self.wire, Wire::Datagram { .. })
     }
 
     /// Await writability, then send `bytes` once (WouldBlock re-awaits). The
@@ -185,26 +186,24 @@ impl<A> Conn<A> {
     /// hard send failure, `ErrorKind::TimedOut` on timeout before writable.
     pub async fn send(&self, bytes: &[u8], timeout: Instant) -> io::Result<()> {
         let sock: Rc<dyn Socket> = match &self.wire {
-            Wire::Owned { sock, .. } => sock.clone(),
+            Wire::Datagram { sock } | Wire::Stream { sock, .. } => sock.clone(),
             Wire::Shared(c, _) => c.borrow().sock.clone(),
         };
         send_when_writable(&self.io, &*sock, bytes, timeout).await
     }
 
-    /// One non-blocking read of this conn's next message: a datagram / one-shot
-    /// stream frame (owned), or this tag's routed frame off the shared conn.
-    /// `Recv::Pending` = nothing yet (WouldBlock / incomplete).
+    /// One non-blocking read of this conn's next message: a datagram, a framed
+    /// one-shot stream message, or this tag's routed message off the shared
+    /// conn. `Recv::Pending` = nothing yet (WouldBlock / incomplete).
     fn read(&mut self) -> Recv {
         match &mut self.wire {
-            Wire::Owned { sock, is_tcp, rbuf } => {
-                if !*is_tcp {
-                    return recv_datagram(&**sock);
-                }
+            Wire::Datagram { sock } => recv_datagram(&**sock),
+            Wire::Stream { sock, rbuf, frame_of } => {
                 // One-shot stream: drain bytes, then try to pop one frame. A
                 // buffered frame delivers even on a dead socket; else a dead
                 // socket is `Dead`, a live-but-incomplete is `Pending`.
                 let alive = recv_stream(&**sock, rbuf);
-                match extract_frame(rbuf) {
+                match frame_of(rbuf) {
                     Some(frame) => Recv::Msg(frame),
                     None if !alive => Recv::Dead,
                     None => Recv::Pending,
@@ -252,23 +251,5 @@ impl<A> Drop for Conn<A> {
         if let Wire::Shared(c, tag) = &self.wire {
             c.borrow_mut().inbox.remove(tag);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extract_frame;
-
-    #[test]
-    fn frame_extraction() {
-        let mut rbuf = vec![0x00, 0x03, 1, 2, 3, 0x00];
-        assert_eq!(extract_frame(&mut rbuf), Some(vec![1, 2, 3]));
-        assert_eq!(rbuf, vec![0x00]); // partial next frame stays buffered
-        assert_eq!(extract_frame(&mut rbuf), None);
-        rbuf.push(0x02);
-        assert_eq!(extract_frame(&mut rbuf), None); // length known, payload missing
-        rbuf.extend_from_slice(&[9, 8]);
-        assert_eq!(extract_frame(&mut rbuf), Some(vec![9, 8]));
-        assert!(rbuf.is_empty());
     }
 }

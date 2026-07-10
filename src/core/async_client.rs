@@ -120,7 +120,7 @@ impl AsyncClient {
                         } else {
                             res.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
-                                Conn::owned(io.clone(), sk, false)
+                                Conn::datagram(io.clone(), sk)
                             })
                         };
                         if let Some(conn) = conn {
@@ -361,7 +361,11 @@ impl AsyncClient {
                     let framed = if use_tcp { frame_tcp(&pp) } else { pp.clone() };
                     let _ = sk.send(&framed);
                     Some(Probe {
-                        conn: Conn::owned(io.clone(), sk, use_tcp),
+                        conn: if use_tcp {
+                            Conn::stream(io.clone(), sk, dns_frame)
+                        } else {
+                            Conn::datagram(io.clone(), sk)
+                        },
                         server: pserver,
                         timeout: Instant::now() + res.opts.timeout,
                         payload: framed,
@@ -378,7 +382,7 @@ impl AsyncClient {
                             } else {
                                 res.factory.create_udp(ep.bind).ok().map(|sk| {
                                     let _ = sk.connect(ep.udp_addr);
-                                    Conn::owned(io.clone(), sk, false)
+                                    Conn::datagram(io.clone(), sk)
                                 })
                             };
                             if let Some(conn) = conn {
@@ -620,7 +624,7 @@ impl AsyncClient {
                         } else {
                             res.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
-                                Conn::owned(io.clone(), sk, false)
+                                Conn::datagram(io.clone(), sk)
                             })
                         };
                         if let Some(conn) = conn {
@@ -800,7 +804,7 @@ impl AsyncClient {
                         } else {
                             res.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
-                                Conn::owned(io.clone(), sk, false)
+                                Conn::datagram(io.clone(), sk)
                             })
                         };
                         if let Some(conn) = conn {
@@ -968,7 +972,11 @@ impl AsyncClient {
                     let framed = if use_tcp { frame_tcp(&pp) } else { pp.clone() };
                     let _ = sk.send(&framed);
                     Some(Probe {
-                        conn: Conn::owned(io.clone(), sk, use_tcp),
+                        conn: if use_tcp {
+                            Conn::stream(io.clone(), sk, dns_frame)
+                        } else {
+                            Conn::datagram(io.clone(), sk)
+                        },
                         server: pserver,
                         timeout: Instant::now() + res.opts.timeout,
                         payload: framed,
@@ -985,7 +993,7 @@ impl AsyncClient {
                             } else {
                                 res.factory.create_udp(ep.bind).ok().map(|sk| {
                                     let _ = sk.connect(ep.udp_addr);
-                                    Conn::owned(io.clone(), sk, false)
+                                    Conn::datagram(io.clone(), sk)
                                 })
                             };
                             if let Some(conn) = conn {
@@ -1453,6 +1461,24 @@ pub(crate) fn dns_tag(frame: &[u8]) -> Option<u16> {
     frame.get(0..2).map(|b| u16::from_be_bytes([b[0], b[1]]))
 }
 
+/// DNS-over-TCP message framing (RFC 1035 §4.2.2): each message is preceded
+/// by a u16-BE length. Pop one complete message off a stream's reassembly
+/// buffer, or `None` until it has accumulated. Supplied to the runtime's
+/// stream conns — the wire format is DNS's, not the runtime's. (`frame_tcp`
+/// in query_builder.rs is the encode side.)
+pub(crate) fn dns_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if rbuf.len() < 2 {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
+    if rbuf.len() < 2 + payload_len {
+        return None;
+    }
+    let msg = rbuf[2..2 + payload_len].to_vec();
+    rbuf.drain(..2 + payload_len);
+    Some(msg)
+}
+
 fn qid_of(payload: &[u8]) -> u16 {
     if payload.len() >= 2 {
         u16::from_be_bytes([payload[0], payload[1]])
@@ -1553,7 +1579,7 @@ impl ParallelQueries {
                                 } else {
                                     res.factory.create_udp(ep.bind).ok().map(|sk| {
                                         let _ = sk.connect(ep.udp_addr);
-                                        Conn::owned(io.clone(), sk, false)
+                                        Conn::datagram(io.clone(), sk)
                                     })
                                 };
                                 if let Some(conn) = conn {
@@ -1741,5 +1767,23 @@ impl ParallelQueries {
             sub.fired = woke.fds.iter().copied().filter(|fd| wants.contains(fd)).collect();
             sub.expired = sub.timeout.is_some_and(|d| now >= d);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dns_frame;
+
+    #[test]
+    fn dns_frame_extraction() {
+        let mut rbuf = vec![0x00, 0x03, 1, 2, 3, 0x00];
+        assert_eq!(dns_frame(&mut rbuf), Some(vec![1, 2, 3]));
+        assert_eq!(rbuf, vec![0x00]); // partial next frame stays buffered
+        assert_eq!(dns_frame(&mut rbuf), None);
+        rbuf.push(0x02);
+        assert_eq!(dns_frame(&mut rbuf), None); // length known, payload missing
+        rbuf.extend_from_slice(&[9, 8]);
+        assert_eq!(dns_frame(&mut rbuf), Some(vec![9, 8]));
+        assert!(rbuf.is_empty());
     }
 }

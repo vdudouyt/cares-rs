@@ -78,7 +78,10 @@ impl Client {
             hosts_path: String::new(),
             cache: Rc::new(RefCell::new(QueryCache::default())),
             udp_max_queries: 0,
-            tcp_pool: Rc::new(RefCell::new(crate::async_runtime::conn::TcpPool::new(async_client::dns_tag))),
+            tcp_pool: Rc::new(RefCell::new(crate::async_runtime::conn::TcpPool::new(
+                async_client::dns_frame,
+                async_client::dns_tag,
+            ))),
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
