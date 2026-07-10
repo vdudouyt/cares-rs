@@ -15,10 +15,10 @@
 
 use std::cell::RefCell;
 use std::future::{poll_fn, Future};
-use std::pin::{pin, Pin};
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Poll, Wake, Waker};
 use std::time::Instant;
 
 use futures_util::{select_biased, FutureExt};
@@ -45,52 +45,13 @@ pub(crate) struct QueryIo<A> {
     pub waits: Vec<Wait>,
     /// Earliest timeout the future wants to wake at.
     pub timeout: Option<Instant>,
-    /// Which published-wait fds are ready now (set by the executor).
-    pub fired: Vec<i32>,
-    /// Whether the timeout passed (set by the executor).
-    pub expired: bool,
+    /// Which published waits are ready now (set by the executor). Carries the
+    /// interest (read vs write), not just the fd, so that when two arms share
+    /// one fd with opposite interests a write-readiness isn't consumed by a
+    /// read-arm (or vice versa).
+    pub fired: Vec<Wait>,
     /// Application signals the reactor doesn't interpret (opaque to it).
     pub app: A,
-}
-
-/// The outcome of one [`wait_io`] await: which fds fired (empty = timed out).
-pub(crate) struct Woke {
-    pub fds: Vec<i32>,
-}
-
-/// The await primitive: resolve once the executor reports readiness for the
-/// currently published waits. Borrows the mailbox only inside `poll`, never
-/// across `.await`.
-struct Ready1<A> {
-    io: Rc<RefCell<QueryIo<A>>>,
-}
-
-impl<A> Future for Ready1<A> {
-    type Output = Woke;
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Woke> {
-        let mut io = self.io.borrow_mut();
-        if io.fired.is_empty() && !io.expired {
-            return Poll::Pending;
-        }
-        Poll::Ready(Woke { fds: std::mem::take(&mut io.fired) })
-    }
-}
-
-/// Publish the `waits` (+ `timeout`) into the mailbox — reusing its `waits`
-/// allocation, so a per-await stack slice avoids a heap allocation — then await
-/// readiness. Clears the published waits on return so a later await starts clean.
-pub(crate) async fn wait_io<A>(io: &Rc<RefCell<QueryIo<A>>>, waits: &[Wait], timeout: Instant) -> Woke {
-    {
-        let mut m = io.borrow_mut();
-        m.waits.clear();
-        m.waits.extend_from_slice(waits);
-        m.timeout = Some(timeout);
-        m.fired.clear();
-        m.expired = false;
-    }
-    let woke = Ready1 { io: io.clone() }.await;
-    io.borrow_mut().waits.clear();
-    woke
 }
 
 // ===== Sockets =====
@@ -186,7 +147,7 @@ pub(crate) fn poll_recv<A>(
 ) -> Poll<std::io::Result<Vec<u8>>> {
     let fired = {
         let mut m = io.borrow_mut();
-        match m.fired.iter().position(|&f| f == fd) {
+        match m.fired.iter().position(|w| w.fd == fd && !w.writable) {
             Some(pos) => {
                 m.fired.swap_remove(pos);
                 true
@@ -217,7 +178,7 @@ pub(crate) fn poll_recv<A>(
 /// readiness; otherwise register write-interest and suspend.
 fn poll_writable<A>(io: &Rc<RefCell<QueryIo<A>>>, fd: i32) -> Poll<()> {
     let mut m = io.borrow_mut();
-    match m.fired.iter().position(|&f| f == fd) {
+    match m.fired.iter().position(|w| w.fd == fd && w.writable) {
         Some(pos) => {
             m.fired.swap_remove(pos);
             Poll::Ready(())
@@ -291,10 +252,14 @@ mod tests {
         assert_eq!(io.borrow().waits.iter().map(|w| w.fd).collect::<Vec<_>>(), vec![7]);
     }
 
+    fn rd(fd: i32) -> Wait {
+        Wait { fd, writable: false }
+    }
+
     #[test]
     fn poll_recv_fired_msg_consumes_only_its_fd() {
         let io = mailbox();
-        io.borrow_mut().fired = vec![3, 7, 9];
+        io.borrow_mut().fired = vec![rd(3), rd(7), rd(9)];
         let calls = Cell::new(0);
         let p = poll_recv(&io, 7, || {
             calls.set(calls.get() + 1);
@@ -303,14 +268,31 @@ mod tests {
         assert!(matches!(p, Poll::Ready(Ok(ref b)) if b == &[42]));
         assert_eq!(calls.get(), 1);
         // Only fd 7 consumed; siblings 3 and 9 remain for their own arms.
-        let fired = io.borrow().fired.clone();
-        assert!(!fired.contains(&7) && fired.contains(&3) && fired.contains(&9));
+        let fds: Vec<i32> = io.borrow().fired.iter().map(|w| w.fd).collect();
+        assert!(!fds.contains(&7) && fds.contains(&3) && fds.contains(&9));
+    }
+
+    #[test]
+    fn poll_recv_ignores_a_write_readiness_on_its_fd() {
+        // A read-arm must not consume a *write* readiness on the same fd (that
+        // belongs to a sibling send-arm sharing the socket).
+        let io = mailbox();
+        io.borrow_mut().fired = vec![Wait { fd: 7, writable: true }];
+        let calls = Cell::new(0);
+        let p = poll_recv(&io, 7, || {
+            calls.set(calls.get() + 1);
+            Recv::Msg(vec![1])
+        });
+        assert!(matches!(p, Poll::Pending));
+        assert_eq!(calls.get(), 0); // did not read
+        // The write readiness is left intact for the send-arm.
+        assert!(io.borrow().fired.iter().any(|w| w.fd == 7 && w.writable));
     }
 
     #[test]
     fn poll_recv_wouldblock_reregisters_single_read() {
         let io = mailbox();
-        io.borrow_mut().fired = vec![7];
+        io.borrow_mut().fired = vec![rd(7)];
         let calls = Cell::new(0);
         let p = poll_recv(&io, 7, || {
             calls.set(calls.get() + 1);
@@ -325,7 +307,7 @@ mod tests {
     #[test]
     fn poll_recv_dead() {
         let io = mailbox();
-        io.borrow_mut().fired = vec![7];
+        io.borrow_mut().fired = vec![rd(7)];
         let p = poll_recv(&io, 7, || Recv::Dead);
         assert!(matches!(p, Poll::Ready(Err(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof));
     }

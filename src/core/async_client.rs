@@ -15,11 +15,9 @@
 use std::cell::RefCell;
 use std::ffi::{c_int, CString};
 use std::io;
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::{pin, Pin};
+use std::pin::pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
@@ -28,7 +26,7 @@ use rand::Rng;
 
 use crate::core::cache::QueryCache;
 use crate::async_runtime::conn::{Conn, TcpPool};
-use crate::async_runtime::executor::{noop_waker, sleep_until, wait_io, QueryIo, Wait};
+use crate::async_runtime::executor::{sleep_until, QueryIo};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
@@ -232,9 +230,6 @@ impl AsyncClient {
                             }
                         }
                         Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                            if io.borrow().app.cancelled {
-                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
-                            }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                             let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
@@ -251,9 +246,6 @@ impl AsyncClient {
                             // Dead socket (EOF / hard error).
                             if use_tcp {
                                 self.tcp_pool.borrow_mut().remove(server);
-                            }
-                            if io.borrow().app.cancelled {
-                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                             let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
@@ -504,9 +496,6 @@ impl AsyncClient {
                                     }
                                 }
                                 if now >= timeout {
-                                    if io.borrow().app.cancelled {
-                                        break 'drive (Err(ARES_ETIMEOUT), timeouts);
-                                    }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                                     let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                                     match verdict {
@@ -528,9 +517,6 @@ impl AsyncClient {
                                         // Dead socket (EOF / hard error).
                                         if use_tcp {
                                             self.tcp_pool.borrow_mut().remove(server);
-                                        }
-                                        if io.borrow().app.cancelled {
-                                            break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                         }
                                         notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                                         let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
@@ -739,9 +725,6 @@ impl AsyncClient {
                             }
                         }
                         Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                            if io.borrow().app.cancelled {
-                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
-                            }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                             let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
@@ -758,9 +741,6 @@ impl AsyncClient {
                             // Dead socket (EOF / hard error).
                             if use_tcp {
                                 self.tcp_pool.borrow_mut().remove(server);
-                            }
-                            if io.borrow().app.cancelled {
-                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                             let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
@@ -919,9 +899,6 @@ impl AsyncClient {
                             }
                         }
                         Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                            if io.borrow().app.cancelled {
-                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
-                            }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                             let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
@@ -938,9 +915,6 @@ impl AsyncClient {
                             // Dead socket (EOF / hard error).
                             if use_tcp {
                                 self.tcp_pool.borrow_mut().remove(server);
-                            }
-                            if io.borrow().app.cancelled {
-                                break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                             let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
@@ -1118,9 +1092,6 @@ impl AsyncClient {
                                     }
                                 }
                                 if now >= timeout {
-                                    if io.borrow().app.cancelled {
-                                        break 'drive (Err(ARES_ETIMEOUT), timeouts);
-                                    }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                                     let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                                     match verdict {
@@ -1142,9 +1113,6 @@ impl AsyncClient {
                                         // Dead socket (EOF / hard error).
                                         if use_tcp {
                                             self.tcp_pool.borrow_mut().remove(server);
-                                        }
-                                        if io.borrow().app.cancelled {
-                                            break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                         }
                                         notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                                         let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
@@ -1303,37 +1271,58 @@ impl AsyncClient {
                 libc::AF_INET6 => vec![RTYPE_AAAA],
                 _ => vec![RTYPE_A, RTYPE_AAAA],
             };
-            let payloads: Vec<_> =
-                rtypes.iter().map(|&rt| (dns_query_payload(&plan.current, rt), self.config.options.use_vc)).collect();
+            let use_vc = self.config.options.use_vc;
             let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
 
-            // Drive A+AAAA in parallel. Policy (here, not in the executor): once
-            // the A/ipv4 query returns actual addresses, cancel the sibling AAAA
-            // query — its retries stop so it isn't sent again. (ipv6 success does
-            // NOT cancel A: an ipv4-only host may still need the A answer.)
-            let mut par = ParallelQueries::new(self.io.clone(), self.clone(), payloads);
-            while !par.all_done() {
-                par.step().await;
-                if let Some(ai) = a_idx {
-                    if let Some((Ok(buf), _)) = par.result(ai) {
-                        let s = summarize(buf, 0);
-                        if s.rcode == 0 && s.ancount > 0 {
-                            for j in 0..rtypes.len() {
-                                if j != ai {
-                                    par.cancel(j);
+            // Drive A+AAAA on one shared mailbox (`self.io`): `poll_recv` routes
+            // each reply by fd, so the two sub-queries self-demux — no sub-mailbox
+            // merging. Policy (here, not in the executor): once the A/ipv4 query
+            // returns actual addresses, set the sibling AAAA's cancel flag — its
+            // retries stop so it isn't sent again (an in-flight reply still
+            // delivers). ipv6 success does NOT cancel A (an ipv4-only host may
+            // still need the A answer).
+            let cancels: Vec<Rc<std::cell::Cell<bool>>> =
+                rtypes.iter().map(|_| Rc::new(std::cell::Cell::new(false))).collect();
+            let mut results: Vec<Option<QueryOutcome>> = (0..rtypes.len()).map(|_| None).collect();
+
+            // `select_biased!` needs a statically-known arm count; the batch is
+            // one family (single await) or two (AF_UNSPEC — race both).
+            let sub = |i: usize| {
+                self.clone().addrinfo_subquery(
+                    dns_query_payload(&plan.current, rtypes[i]),
+                    use_vc,
+                    cancels[i].clone(),
+                )
+            };
+            if rtypes.len() == 1 {
+                results[0] = Some(sub(0).await);
+            } else {
+                let mut f0 = pin!(sub(0).fuse());
+                let mut f1 = pin!(sub(1).fuse());
+                while results.iter().any(Option::is_none) {
+                    select_biased! {
+                        r = f0 => {
+                            // A completed: cancel the AAAA sibling on a real answer.
+                            if Some(0) == a_idx {
+                                if let (Ok(buf), _) = &r {
+                                    let s = summarize(buf, 0);
+                                    if s.rcode == 0 && s.ancount > 0 {
+                                        cancels[1].set(true);
+                                    }
                                 }
                             }
+                            results[0] = Some(r);
                         }
+                        r = f1 => { results[1] = Some(r); }
                     }
                 }
             }
 
             // Merge every family's records (arrival order); note the last error.
-            // A cancelled query has no result — it contributes nothing.
             let mut records: Vec<AddrRecord> = Vec::new();
             let mut any_success = false;
             for (i, &rtype) in rtypes.iter().enumerate() {
-                match par.result(i) {
+                match results[i].as_ref() {
                     Some((Ok(buf), io_timeouts)) => {
                         timeouts += io_timeouts;
                         match addr_reply(buf, rtype, ReplyRequire::Items) {
@@ -1377,6 +1366,147 @@ impl AsyncClient {
             let status = if had_nodata && code == ARES_ENOTFOUND { ARES_ENODATA } else { code };
             self.io.borrow_mut().app.timeouts = timeouts;
             return fail(status);
+        }
+    }
+
+    /// One getaddrinfo sub-query (an A or AAAA), driven on the **shared** lookup
+    /// mailbox (`self.io`) alongside its sibling: `poll_recv` routes by fd, so
+    /// two conns on one mailbox self-demux. `cancel` is this sub's stop-retrying
+    /// flag (set by the caller when the sibling A-answer arrives): checked at the
+    /// retry branches only, so an in-flight reply still delivers. No probe.
+    /// (Was the inlined future in the deleted `ParallelQueries::new`.)
+    async fn addrinfo_subquery(
+        self: Rc<Self>,
+        payload: BytesMut,
+        mut use_tcp: bool,
+        cancel: Rc<std::cell::Cell<bool>>,
+    ) -> QueryOutcome {
+        let io = self.io.clone();
+        let opts = self.opts();
+        let mut timeouts: c_int = 0;
+        let mut tries: u32 = 0;
+        let mut failover_tries: u32 = 0;
+        let qid = qid_of(&payload);
+        let mut server = self.health.borrow().pick_next();
+        'attempt: loop {
+            // Inlined connect-with-failover (WET).
+            let (mut conn, si) = 'connect: {
+                let mut s = server;
+                for _ in 0..opts.attempts.max(1) {
+                    let Some(ep) = self.endpoints.get(s) else { break };
+                    let conn = if use_tcp {
+                        self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                    } else {
+                        self.factory.create_udp(ep.bind).ok().map(|sk| {
+                            let _ = sk.connect(ep.udp_addr);
+                            Conn::datagram(io.clone(), sk)
+                        })
+                    };
+                    if let Some(conn) = conn {
+                        break 'connect (conn, s);
+                    }
+                    if self.health.borrow().len() > 1 {
+                        self.health.borrow_mut().record_failure(s);
+                        s = self.health.borrow().pick_next();
+                    }
+                }
+                return (Err(ARES_ECONNREFUSED), timeouts);
+            };
+            server = si;
+            // The wire buffer for this attempt's transport: TCP needs the framed
+            // copy, UDP sends the payload as-is (borrowed — no clone).
+            let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
+            let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
+            let timeout = Instant::now() + opts.timeout;
+
+            if conn.send(wire, timeout).await.is_err() {
+                // Send failed (a hard socket error): recreate the socket and retry,
+                // bounded by the attempt budget — mirrors the classic write_impl's
+                // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
+                // retry succeeds.)
+                if use_tcp {
+                    self.tcp_pool.borrow_mut().remove(server);
+                }
+                if tries + 1 < opts.attempts.max(1) {
+                    tries += 1;
+                    if self.health.borrow().len() > 1 {
+                        self.health.borrow_mut().record_failure(server);
+                        server = self.health.borrow().pick_next();
+                    }
+                    continue 'attempt;
+                }
+                return (Err(ARES_ECONNREFUSED), timeouts);
+            }
+
+            loop {
+                match conn.recv(timeout).await {
+                    Ok(buf) => {
+                        if !qid_matches(&buf, wire, use_tcp) {
+                            continue; // stray datagram — await the next reply
+                        }
+                        let summary = summarize(&buf, 0);
+                        let (actions, verdict) = on_datagram(
+                            &summary,
+                            server,
+                            use_tcp,
+                            opts.attempts,
+                            failover_tries,
+                            &mut self.health.borrow_mut(),
+                        );
+                        notify(&io, actions);
+                        match verdict {
+                            TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                server = next;
+                                failover_tries = ft;
+                                continue 'attempt;
+                            }
+                            TaskVerdict::RetryTcp => {
+                                use_tcp = true;
+                                continue 'attempt;
+                            }
+                            TaskVerdict::Deliver => {
+                                return (Ok(buf), timeouts);
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                        if cancel.get() {
+                            return (Err(ARES_ETIMEOUT), timeouts);
+                        }
+                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
+                        match verdict {
+                            TimeoutVerdict::Retry { server: next } => {
+                                tries += 1;
+                                timeouts += 1;
+                                server = next;
+                                continue 'attempt;
+                            }
+                            TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
+                        }
+                    }
+                    Err(_) => {
+                        // Dead socket (EOF / hard error).
+                        if use_tcp {
+                            self.tcp_pool.borrow_mut().remove(server);
+                        }
+                        if cancel.get() {
+                            return (Err(ARES_ETIMEOUT), timeouts);
+                        }
+                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
+                        match verdict {
+                            TimeoutVerdict::Retry { server: next } => {
+                                tries += 1;
+                                timeouts += 1;
+                                server = next;
+                                continue 'attempt;
+                            }
+                            TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1443,12 +1573,6 @@ pub(crate) struct DnsSignals {
     /// the ffi can pass it to the C callback (the host future's `Result` output
     /// has no room for it; the raw path still carries it in `Delivery::Raw`).
     pub timeouts: c_int,
-    /// A caller-set request to stop **retrying**: `resolve_query` honours it at
-    /// its retry branches (timeout / dead socket), returning terminal instead of
-    /// re-sending. A reply already in flight still delivers. Set by
-    /// [`ParallelQueries::cancel`]; the *policy* of when to cancel lives in the
-    /// caller (e.g. getaddrinfo cancels AAAA once A returns addresses).
-    pub cancelled: bool,
 }
 
 /// The DNS-application instantiation of the reactor mailbox — the only one the
@@ -2431,259 +2555,6 @@ fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, health: &RefCell<ServerHealth>, pr
 
 /// One query's `(reply-or-status, timeout-count)` outcome.
 type QueryOutcome = (Result<Vec<u8>, c_int>, c_int);
-type QueryFut = Pin<Box<dyn Future<Output = QueryOutcome>>>;
-
-/// One sub-query inside a [`ParallelQueries`] set.
-struct ParSub {
-    io: Rc<RefCell<DnsMailbox>>,
-    fut: Option<QueryFut>,
-    result: Option<QueryOutcome>,
-}
-
-/// N query futures driven concurrently over one shared mailbox — the generic
-/// multiplex **mechanism** for parallel lookups (getaddrinfo's A+AAAA). This
-/// type has **no getaddrinfo knowledge**: the caller `step`s it and applies its
-/// own retry/cancel **policy** (e.g. "cancel AAAA once A returns addresses").
-///
-/// Each sub-query is a full [`resolve_query`] on its own sub-mailbox; `step`
-/// merges their published waits/effects into the outer mailbox the ffi drives,
-/// awaits it, and routes readiness back by fd + each sub's own timeout.
-pub(crate) struct ParallelQueries {
-    io: Rc<RefCell<DnsMailbox>>,
-    subs: Vec<ParSub>,
-}
-
-impl ParallelQueries {
-    /// Build one `resolve_query` future per `(payload, use_tcp)` (no probe).
-    pub(crate) fn new(io: Rc<RefCell<DnsMailbox>>, client: Rc<AsyncClient>, payloads: Vec<(BytesMut, bool)>) -> Self {
-        let subs = payloads
-            .into_iter()
-            .map(|(payload, use_tcp)| {
-                let sub_io = Rc::new(RefCell::new(DnsMailbox::default()));
-                // Inlined single-query driver (WET) on this sub-mailbox — the
-                // getaddrinfo A/AAAA sub-queries (no probe). In an async block
-                // `return` yields the future's output directly.
-                let io = sub_io.clone();
-                let client = client.clone();
-                let fut = Box::pin(async move {
-                    let opts = client.opts();
-                    let mut use_tcp = use_tcp;
-                    let mut timeouts: c_int = 0;
-                    let mut tries: u32 = 0;
-                    let mut failover_tries: u32 = 0;
-                    let qid = qid_of(&payload);
-                    let mut server = client.health.borrow().pick_next();
-                    'attempt: loop {
-                        // Inlined connect-with-failover (WET).
-                        let (mut conn, si) = 'connect: {
-                            let mut s = server;
-                            for _ in 0..opts.attempts.max(1) {
-                                let Some(ep) = client.endpoints.get(s) else { break };
-                                let conn = if use_tcp {
-                                    client.tcp_pool.borrow_mut().get_or_create(s, &client.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
-                                } else {
-                                    client.factory.create_udp(ep.bind).ok().map(|sk| {
-                                        let _ = sk.connect(ep.udp_addr);
-                                        Conn::datagram(io.clone(), sk)
-                                    })
-                                };
-                                if let Some(conn) = conn {
-                                    break 'connect (conn, s);
-                                }
-                                if client.health.borrow().len() > 1 {
-                                    client.health.borrow_mut().record_failure(s);
-                                    s = client.health.borrow().pick_next();
-                                }
-                            }
-                            return (Err(ARES_ECONNREFUSED), timeouts);
-                        };
-                        server = si;
-                        // The wire buffer for this attempt's transport: TCP needs the framed
-                        // copy, UDP sends the payload as-is (borrowed — no clone).
-                        let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
-                        let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                        let timeout = Instant::now() + opts.timeout;
-
-                        if conn.send(wire, timeout).await.is_err() {
-                            // Send failed (a hard socket error): recreate the socket and retry,
-                            // bounded by the attempt budget — mirrors the classic write_impl's
-                            // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
-                            // retry succeeds.)
-                            if use_tcp {
-                                client.tcp_pool.borrow_mut().remove(server);
-                            }
-                            if tries + 1 < opts.attempts.max(1) {
-                                tries += 1;
-                                if client.health.borrow().len() > 1 {
-                                    client.health.borrow_mut().record_failure(server);
-                                    server = client.health.borrow().pick_next();
-                                }
-                                continue 'attempt;
-                            }
-                            return (Err(ARES_ECONNREFUSED), timeouts);
-                        }
-
-                        // Await the primary reply, servicing the probe socket concurrently.
-                        loop {
-                            match conn.recv(timeout).await {
-                                Ok(buf) => {
-                                    if !qid_matches(&buf, wire, use_tcp) {
-                                        continue; // stray datagram — await the next reply
-                                    }
-                                    let summary = summarize(&buf, 0);
-                                    let (actions, verdict) = on_datagram(
-                                        &summary,
-                                        server,
-                                        use_tcp,
-                                        opts.attempts,
-                                        failover_tries,
-                                        &mut client.health.borrow_mut(),
-                                    );
-                                    notify(&io, actions);
-                                    match verdict {
-                                        TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                            server = next;
-                                            failover_tries = ft;
-                                            continue 'attempt;
-                                        }
-                                        TaskVerdict::RetryTcp => {
-                                            use_tcp = true;
-                                            continue 'attempt;
-                                        }
-                                        TaskVerdict::Deliver => {
-                                            return (Ok(buf), timeouts);
-                                        }
-                                    }
-                                }
-                                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                                    if io.borrow().app.cancelled {
-                                        return (Err(ARES_ETIMEOUT), timeouts);
-                                    }
-                                    notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                    let verdict = on_timeout(tries, opts.attempts, server, &mut client.health.borrow_mut());
-                                    match verdict {
-                                        TimeoutVerdict::Retry { server: next } => {
-                                            tries += 1;
-                                            timeouts += 1;
-                                            server = next;
-                                            continue 'attempt;
-                                        }
-                                        TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
-                                    }
-                                }
-                                Err(_) => {
-                            // Dead socket (EOF / hard error).
-                                    if use_tcp {
-                                        client.tcp_pool.borrow_mut().remove(server);
-                                    }
-                                    if io.borrow().app.cancelled {
-                                        return (Err(ARES_ETIMEOUT), timeouts);
-                                    }
-                                    notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                    let verdict = on_timeout(tries, opts.attempts, server, &mut client.health.borrow_mut());
-                                    match verdict {
-                                        TimeoutVerdict::Retry { server: next } => {
-                                            tries += 1;
-                                            timeouts += 1;
-                                            server = next;
-                                            continue 'attempt;
-                                        }
-                                        TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }) as QueryFut;
-                ParSub { io: sub_io, fut: Some(fut), result: None }
-            })
-            .collect();
-        ParallelQueries { io, subs }
-    }
-
-    /// The settled outcome of query `i`, or `None` if still running or cancelled.
-    pub(crate) fn result(&self, i: usize) -> Option<&QueryOutcome> {
-        self.subs[i].result.as_ref()
-    }
-
-    /// Cancel query `i`'s **retries**: it won't be re-sent after its current
-    /// attempt, but a reply already in flight still delivers. (Implemented via
-    /// the sub-mailbox `cancelled` flag `resolve_query` honours.)
-    pub(crate) fn cancel(&mut self, i: usize) {
-        self.subs[i].io.borrow_mut().app.cancelled = true;
-    }
-
-    /// Every query has settled.
-    pub(crate) fn all_done(&self) -> bool {
-        self.subs.iter().all(|s| s.result.is_some())
-    }
-
-    /// Advance every live sub-future one readiness cycle.
-    pub(crate) async fn step(&mut self) {
-        let waker = noop_waker();
-        {
-            let mut cx = Context::from_waker(&waker);
-            for s in &mut self.subs {
-                if let Some(fut) = &mut s.fut {
-                    // Same mailbox contract as `ChannelData::advance`: clear the
-                    // sub's published waits/timeout before polling (its
-                    // fired/expired were set by the previous step's routing), so
-                    // `select_biased!` arms re-register onto a clean slate.
-                    {
-                        let mut m = s.io.borrow_mut();
-                        m.waits.clear();
-                        m.timeout = None;
-                    }
-                    if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
-                        s.result = Some(r);
-                        s.fut = None;
-                    }
-                }
-            }
-        }
-        if self.all_done() {
-            return;
-        }
-
-        // Merge every live sub's waits + earliest timeout into the outer mailbox,
-        // and lift its effects up so the ffi applies them.
-        let mut merged: Vec<Wait> = Vec::new();
-        let mut timeout: Option<Instant> = None;
-        for s in &self.subs {
-            if s.fut.is_none() {
-                continue;
-            }
-            let drained: Vec<Effect> = {
-                let mut sub = s.io.borrow_mut();
-                merged.extend(sub.waits.iter().copied());
-                if let Some(d) = sub.timeout {
-                    timeout = Some(timeout.map_or(d, |m: Instant| m.min(d)));
-                }
-                std::mem::take(&mut sub.app.effects)
-            };
-            self.io.borrow_mut().app.effects.extend(drained);
-        }
-        let timeout = match timeout {
-            Some(d) => d,
-            None => return, // nothing published a wait — avoid an unbounded await
-        };
-
-        // Await the outer mailbox (the ffi sets fired/expired against `merged`),
-        // then route readiness back to each live sub.
-        let woke = wait_io(&self.io, &merged, timeout).await;
-        let now = Instant::now();
-        for s in &self.subs {
-            if s.fut.is_none() {
-                continue;
-            }
-            let mut sub = s.io.borrow_mut();
-            let wants: Vec<i32> = sub.waits.iter().map(|w| w.fd).collect();
-            sub.fired = woke.fds.iter().copied().filter(|fd| wants.contains(fd)).collect();
-            sub.expired = sub.timeout.is_some_and(|d| now >= d);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::dns_frame;

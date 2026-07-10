@@ -25,6 +25,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Instant;
 
 use futures_util::{select_biased, FutureExt};
@@ -194,6 +195,19 @@ impl<A> Conn<A> {
         send_when_writable(&self.io, &*sock, bytes, timeout).await
     }
 
+    /// Take a message a **sibling** already routed into this tag's inbox slot
+    /// (only possible on a shared conn: when two futures share one socket, the
+    /// one that drains it routes the other's frames into their slots). Returns
+    /// it without needing this conn's fd to fire — the draining sibling
+    /// consumed the fd's readiness. `None` for owned conns (no sibling) or an
+    /// empty slot.
+    fn take_routed_slot(&mut self) -> Option<Vec<u8>> {
+        match &self.wire {
+            Wire::Shared(c, tag) => c.borrow_mut().inbox.get_mut(tag).and_then(|slot| slot.take()),
+            _ => None,
+        }
+    }
+
     /// One non-blocking read of this conn's next message: a datagram, a framed
     /// one-shot stream message, or this tag's routed message off the shared
     /// conn. `Recv::Pending` = nothing yet (WouldBlock / incomplete).
@@ -230,7 +244,16 @@ impl<A> Conn<A> {
     pub async fn recv_msg(&mut self) -> io::Result<Vec<u8>> {
         let fd = self.fd();
         let io = self.io.clone();
-        poll_fn(move |_| poll_recv(&io, fd, || self.read())).await
+        poll_fn(move |_| {
+            // A sibling sharing this socket may have already drained it and
+            // routed our frame into our slot (consuming the fd's readiness in
+            // the process); take it without waiting for our fd to fire again.
+            if let Some(msg) = self.take_routed_slot() {
+                return Poll::Ready(Ok(msg));
+            }
+            poll_recv(&io, fd, || self.read())
+        })
+        .await
     }
 
     /// tokio-style `conn.recv(timeout).await`: await this conn's next message,

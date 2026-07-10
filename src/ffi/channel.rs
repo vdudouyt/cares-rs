@@ -294,15 +294,17 @@ impl ChannelData {
                     for w in &m.waits {
                         let set = if w.writable { &mut *write_fds } else { &mut *read_fds };
                         if unsafe { libc::FD_ISSET(w.fd, set) } {
-                            fired.push(w.fd);
+                            fired.push(*w);
                         }
                     }
+                    // Expiry gates the re-poll (a future blocked only on a
+                    // timeout still needs waking); it isn't stored — the timeout
+                    // arms read the clock directly.
                     let expired = m.timeout.is_some_and(|d| now >= d);
                     if fired.is_empty() && !expired {
                         false
                     } else {
                         m.fired = fired;
-                        m.expired = expired;
                         true
                     }
                 }
