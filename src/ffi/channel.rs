@@ -2,7 +2,7 @@
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
 
 use super::*;
-use crate::core::async_client::{getsock_mask, normalize_port, Client, ServerSpec};
+use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
 use crate::core::async_client::{Delivery, DnsMailbox, Effect};
 use crate::async_runtime::executor::noop_waker;
 use crate::core::hostent::Hostent;
@@ -15,7 +15,7 @@ use super::lookups::{fire_host_success, AddrInfoTail, HostTail, NameinfoTail, Se
 /// callbacks. Everything the shims marshal lives behind `.state`; the six
 /// callback fields are the only C-tainted residents.
 pub struct ChannelData {
-    pub(crate) state: Client,
+    pub(crate) state: AsyncClient,
     /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
     /// in `state`. The socket-state callbacks (create/configure) live in
     /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
@@ -90,7 +90,7 @@ enum Completed {
 
 impl ChannelData {
     /// A fresh channel: pure state, no callbacks installed.
-    pub(crate) fn new(state: Client, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
+    pub(crate) fn new(state: AsyncClient, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
         ChannelData {
             state,
             socket_factory,
@@ -114,7 +114,7 @@ impl ChannelData {
     /// A fresh channel with the default (libc) socket factory.
     pub(crate) fn new_default() -> Self {
         let factory = std::rc::Rc::new(CSocketFactory::default());
-        let state = Client::from_sysconfig(factory.clone());
+        let state = AsyncClient::from_sysconfig(factory.clone());
         ChannelData::new(state, factory)
     }
 
@@ -658,13 +658,13 @@ pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
 pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_char) -> c_int {
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     if sortstr.is_null() {
-        channeldata.state.set_sortlist(Vec::new());
+        channeldata.state.sortlist = Vec::new();
         return ARES_SUCCESS;
     }
     let Some(s) = (unsafe { cstr_opt(sortstr) }) else { return ARES_EBADSTR };
     match parse_sortlist(s) {
         Ok(entries) => {
-            channeldata.state.set_sortlist(entries);
+            channeldata.state.sortlist = entries;
             ARES_SUCCESS
         }
         Err(e) => e.code(),

@@ -178,7 +178,6 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
             .then(|| unsafe { CStr::from_ptr(options.resolvconf_path) }.to_string_lossy().into_owned()),
         hosts_path: (!options.hosts_path.is_null())
             .then(|| unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned()),
-        udp_max_queries: options.udp_max_queries,
         maxtimeout: options.maxtimeout,
         qcache_max_ttl: options.qcache_max_ttl,
         failover_retry_chance: options.server_failover_opts.retry_chance,

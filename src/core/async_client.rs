@@ -3,14 +3,14 @@
 //! five near-duplicate per-op context structs (`HostCtx`/`HostByAddrCtx`/
 //! `NameinfoCtx`/`SearchCtx`/`AddrInfoCtx`) and five free `async fn`s.
 //!
-//! Built by `Client::async_client` into an `Rc<AsyncClient>`. Methods take
-//! `self: Rc<Self>` so the spawned lifecycle futures are `'static` (they are
-//! `Box::pin`'d into the ffi `AsyncKind`) while still allowing cheap sharing and
-//! nested calls (`self.clone().other(…)`).
-//!
-//! This file also holds `Client` — the pure channel state the ffi
-//! `ChannelData` wraps — plus the entry preflights and wire builders; see the
-//! section markers.
+//! `AsyncClient` is also THE channel state: the ffi `ChannelData` wraps one
+//! instance (config, options, server list, shared pools), and every entry
+//! shim mints a per-lookup copy via [`AsyncClient::derive`] (fresh mailbox,
+//! shared `Rc`s). Lifecycle methods take `self: Rc<Self>` so the spawned
+//! futures are `'static` (they are `Box::pin`'d into the ffi `AsyncKind`)
+//! while still allowing cheap sharing and nested calls
+//! (`self.clone().other(…)`). Also here: the entry preflights and the DNS
+//! wire builders; see the section markers.
 
 use std::cell::RefCell;
 use std::ffi::{c_int, CString};
@@ -48,7 +48,7 @@ use crate::ffi::ares_options::{
     ARES_OPT_HOSTS_FILE, ARES_OPT_LOOKUPS, ARES_OPT_MAXTIMEOUTMS, ARES_OPT_NDOTS,
     ARES_OPT_NOROTATE, ARES_OPT_QUERY_CACHE, ARES_OPT_RESOLVCONF, ARES_OPT_ROTATE,
     ARES_OPT_SERVERS, ARES_OPT_SERVER_FAILOVER, ARES_OPT_SORTLIST, ARES_OPT_TCP_PORT,
-    ARES_OPT_TIMEOUT, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES, ARES_OPT_UDP_MAX_QUERIES,
+    ARES_OPT_TIMEOUT, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES,
     ARES_OPT_UDP_PORT,
 };
 use crate::ffi::error::{
@@ -61,42 +61,83 @@ use crate::ffi::{
     ARES_NI_NUMERICHOST, ARES_NI_NUMERICSCOPE, ARES_NI_NUMERICSERV, ARES_SUCCESS, RECORD_TYPE_PTR,
 };
 
-/// The per-channel resolver client: the shared config snapshot plus a [`QueryIo`]
-/// mailbox. All `Rc` clones + `Copy` scalars; the futures never name
-/// `Client`/`Transport`. One instance is owned by the channel (`Client` caches it,
-/// rebuilding on config change); every lookup derives a cheap per-lookup copy via
-/// [`with_fresh_io`](Self::with_fresh_io) — same config `Rc`s, its own fresh
-/// mailbox — so concurrent lookups on a channel never share a `QueryIo`. The
-/// channel-owned base's `io` is an inert placeholder, replaced on each derive.
-/// The ffi grabs the derived copy's `self.io.clone()` to drive that mailbox;
+/// THE channel: the pure channel state the ffi `ChannelData` wraps (config,
+/// health/cache bookkeeping, shared socket pools — the shims only marshal C
+/// values in and out) *and* the resolver client the async lifecycles run on.
+/// One instance is owned by the channel; every lookup runs on a per-lookup
+/// copy minted by [`derive`](Self::derive) — same shared `Rc`s, a fresh
+/// [`QueryIo`] mailbox — so concurrent lookups on a channel never share a
+/// `QueryIo`. The channel-owned instance's `io` is an inert placeholder. The
+/// ffi grabs the derived copy's `self.io.clone()` to drive that mailbox;
 /// nested inline sub-calls (`self.clone().other(…)`) share it.
 pub(crate) struct AsyncClient {
-    pub io: Rc<RefCell<DnsMailbox>>,
-    pub res: Resources,
-    pub hosts: Rc<Hosts>,
+    /// The system/user resolver config (resolv.conf shape: nameservers,
+    /// search domains, options, per-server TCP port overrides).
+    pub config: SysConfig,
+    pub factory: Rc<dyn SocketFactory>,
+    /// The `/etc/hosts` table, lazily loaded once (see [`AsyncClient::hosts`]);
+    /// always `Some` on a lookup copy ([`derive`](Self::derive) loads it).
+    hosts: Option<Rc<Hosts>>,
+    pub default_udp_port: u16,
+    pub default_tcp_port: u16,
+    /// Shared with the in-flight lookup futures (`Rc<RefCell<_>>`) so
+    /// failover accounting and the probe agree across queries.
+    pub health: Rc<RefCell<ServerHealth>>,
+    pub sortlist: Vec<SortlistEntry>,
+    pub flags: i32,
+    pub maxtimeout: i32,
+    pub lookups: String,
+    pub resolvconf_path: String,
+    pub hosts_path: String,
+    /// TTL-bounded reply cache, shared with the in-flight lookups and the
+    /// dnsrec post-delivery hook.
     pub cache: Rc<RefCell<QueryCache>>,
-    pub sortlist: Rc<[SortlistEntry]>,
-    pub ndots: u32,
-    pub search: Rc<[String]>,
-    pub use_vc: bool,
+    /// Shared TCP connections (parallel lookups to one server share a socket).
+    pub tcp_pool: Rc<RefCell<TcpPool>>,
+    /// Per-server connect endpoints, snapshotted from `config` by `derive` so
+    /// the lookup futures never re-read the config.
+    pub endpoints: Rc<Vec<ServerEndpoint>>,
+    pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
+    pub server_failover_retry_delay: u64,  // milliseconds
+    /// This lookup's mailbox (inert on the channel-owned instance).
+    pub io: Rc<RefCell<DnsMailbox>>,
 }
 
 impl AsyncClient {
-    /// Derive a per-lookup copy of the channel-owned client: clone the config
-    /// `Rc`s (cheap) but mint a **fresh** mailbox, so each concurrent lookup owns
-    /// its own `QueryIo`. Cloning `self.io` here instead would make every lookup
-    /// on the channel share one mailbox — the bug this avoids.
-    pub(crate) fn with_fresh_io(&self) -> Rc<Self> {
+    /// Mint the per-lookup copy every entry shim runs on: clone the config +
+    /// shared `Rc`s, load the hosts table, snapshot the per-server endpoints
+    /// from the current config, and mint a **fresh** mailbox so each
+    /// concurrent lookup owns its own `QueryIo`. Cloning `self.io` here
+    /// instead would make every lookup on the channel share one mailbox — the
+    /// bug this avoids.
+    pub(crate) fn derive(&mut self) -> Rc<Self> {
+        let hosts = self.hosts();
         Rc::new(AsyncClient {
-            io: Rc::new(RefCell::new(DnsMailbox::default())),
-            res: self.res.clone(),
-            hosts: self.hosts.clone(),
-            cache: self.cache.clone(),
+            config: self.config.clone(),
+            factory: self.factory.clone(),
+            hosts: Some(hosts),
+            default_udp_port: self.default_udp_port,
+            default_tcp_port: self.default_tcp_port,
+            health: self.health.clone(),
             sortlist: self.sortlist.clone(),
-            ndots: self.ndots,
-            search: self.search.clone(),
-            use_vc: self.use_vc,
+            flags: self.flags,
+            maxtimeout: self.maxtimeout,
+            lookups: self.lookups.clone(),
+            resolvconf_path: self.resolvconf_path.clone(),
+            hosts_path: self.hosts_path.clone(),
+            cache: self.cache.clone(),
+            tcp_pool: self.tcp_pool.clone(),
+            endpoints: Rc::new(self.endpoint_snapshot()),
+            server_failover_retry_chance: self.server_failover_retry_chance,
+            server_failover_retry_delay: self.server_failover_retry_delay,
+            io: Rc::new(RefCell::new(DnsMailbox::default())),
         })
+    }
+
+    /// The hosts table as seen by a lookup copy (always loaded by `derive`;
+    /// empty only on the channel-owned instance before first use).
+    fn hostsfile(&self) -> Rc<Hosts> {
+        self.hosts.clone().unwrap_or_default()
     }
 
     /// ares_query / ares_send: one query delivered raw. Keeps the historical
@@ -109,24 +150,24 @@ impl AsyncClient {
         // is a `Conn` with async `send`/`recv`; its shared-TCP slot is RAII.
         let (result, timeouts) = 'drive: {
             let io = self.io.clone();
-            let res = self.res.clone();
+            let opts = self.opts();
             let mut use_tcp = false;
             let mut timeouts: c_int = 0;
             let mut tries: u32 = 0;
             let mut failover_tries: u32 = 0;
             let qid = qid_of(&payload);
-            let mut server = res.health.borrow().pick_next();
+            let mut server = self.health.borrow().pick_next();
             'attempt: loop {
                 // Inlined connect-with-failover (WET): create + connect the socket
                 // for `server`, retrying across servers on creation failure.
                 let (mut conn, si) = 'connect: {
                     let mut s = server;
-                    for _ in 0..res.opts.attempts.max(1) {
-                        let Some(ep) = res.endpoints.get(s) else { break };
+                    for _ in 0..opts.attempts.max(1) {
+                        let Some(ep) = self.endpoints.get(s) else { break };
                         let conn = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                            self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
-                            res.factory.create_udp(ep.bind).ok().map(|sk| {
+                            self.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
                                 Conn::datagram(io.clone(), sk)
                             })
@@ -134,9 +175,9 @@ impl AsyncClient {
                         if let Some(conn) = conn {
                             break 'connect (conn, s);
                         }
-                        if res.health.borrow().len() > 1 {
-                            res.health.borrow_mut().record_failure(s);
-                            s = res.health.borrow().pick_next();
+                        if self.health.borrow().len() > 1 {
+                            self.health.borrow_mut().record_failure(s);
+                            s = self.health.borrow().pick_next();
                         }
                     }
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
@@ -144,16 +185,16 @@ impl AsyncClient {
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let timeout = Instant::now() + res.opts.timeout;
+                let timeout = Instant::now() + opts.timeout;
                 if conn.send(wire, timeout).await.is_err() {
                     if use_tcp {
-                        res.tcp_pool.borrow_mut().remove(server);
+                        self.tcp_pool.borrow_mut().remove(server);
                     }
-                    if tries + 1 < res.opts.attempts.max(1) {
+                    if tries + 1 < opts.attempts.max(1) {
                         tries += 1;
-                        if res.health.borrow().len() > 1 {
-                            res.health.borrow_mut().record_failure(server);
-                            server = res.health.borrow().pick_next();
+                        if self.health.borrow().len() > 1 {
+                            self.health.borrow_mut().record_failure(server);
+                            server = self.health.borrow().pick_next();
                         }
                         continue 'attempt;
                     }
@@ -170,9 +211,9 @@ impl AsyncClient {
                                 &summary,
                                 server,
                                 use_tcp,
-                                res.opts.attempts,
+                                opts.attempts,
                                 failover_tries,
-                                &mut res.health.borrow_mut(),
+                                &mut self.health.borrow_mut(),
                             );
                             notify(&io, actions);
                             match verdict {
@@ -195,7 +236,7 @@ impl AsyncClient {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
                                 TimeoutVerdict::Retry { server: next } => {
                                     tries += 1;
@@ -209,13 +250,13 @@ impl AsyncClient {
                         Err(_) => {
                             // Dead socket (EOF / hard error).
                             if use_tcp {
-                                res.tcp_pool.borrow_mut().remove(server);
+                                self.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
                                 TimeoutVerdict::Retry { server: next } => {
                                     tries += 1;
@@ -270,7 +311,7 @@ impl AsyncClient {
         }
 
         // Hosts file.
-        if let Some(lookup) = self.hosts.lookup(&hostname, filter) {
+        if let Some(lookup) = self.hostsfile().lookup(&hostname, filter) {
             if !lookup.addrs.is_empty() {
                 return Ok(Hostent::from_lookup(lookup));
             }
@@ -292,7 +333,7 @@ impl AsyncClient {
             Err(status) => return Err(status.into()),
         };
 
-        if self.res.endpoints.is_empty() {
+        if self.endpoints.is_empty() {
             return Err(ARES_ENOSERVER.into());
         }
 
@@ -316,8 +357,8 @@ impl AsyncClient {
         // otherwise just the name. Trailing dots are kept verbatim (unlike
         // ares_search) so the query / cache-store / cache-probe keys all match.
         let dots = resolved.chars().filter(|&c| c == '.').count() as u32;
-        let mut names: Vec<String> = if dots < self.ndots && !self.search.is_empty() {
-            let mut v: Vec<String> = self.search.iter().map(|d| format!("{resolved}.{d}")).collect();
+        let mut names: Vec<String> = if dots < self.config.options.ndots && !self.config.search.is_empty() {
+            let mut v: Vec<String> = self.config.search.iter().map(|d| format!("{resolved}.{d}")).collect();
             v.push(resolved.clone());
             v
         } else {
@@ -340,29 +381,29 @@ impl AsyncClient {
             first = false;
             let (result, io_timeouts) = 'drive: {
                 let io = self.io.clone();
-                let res = self.res.clone();
-                let mut use_tcp = self.use_vc;
+                let opts = self.opts();
+                let mut use_tcp = self.config.options.use_vc;
                 let mut timeouts: c_int = 0;
                 let mut tries: u32 = 0;
                 let mut failover_tries: u32 = 0;
                 let qid = qid_of(&payload);
-                let mut server = res.health.borrow().pick_next();
+                let mut server = self.health.borrow().pick_next();
                 let mut probe = probe_payload.and_then(|pp| {
                     // Inlined probe setup (WET): a one-shot failover probe to a stale
                     // server, raced alongside the primary. `None` if failover is off /
                     // no server is due / a socket fails.
-                    if res.opts.failover_chance == 0 {
+                    if opts.failover_chance == 0 {
                         return None;
                     }
-                    let primary_server = res.health.borrow().pick_next();
-                    let pserver = res.health.borrow().pick_probe(res.opts.failover_delay, primary_server)?;
-                    let ep = res.endpoints.get(pserver)?;
+                    let primary_server = self.health.borrow().pick_next();
+                    let pserver = self.health.borrow().pick_probe(opts.failover_delay, primary_server)?;
+                    let ep = self.endpoints.get(pserver)?;
                     let sk = if use_tcp {
-                        let sk = res.factory.create_tcp(ep.bind).ok()?;
+                        let sk = self.factory.create_tcp(ep.bind).ok()?;
                         let _ = sk.connect(ep.tcp_addr);
                         sk
                     } else {
-                        let sk = res.factory.create_udp(ep.bind).ok()?;
+                        let sk = self.factory.create_udp(ep.bind).ok()?;
                         let _ = sk.connect(ep.udp_addr);
                         sk
                     };
@@ -375,7 +416,7 @@ impl AsyncClient {
                             Conn::datagram(io.clone(), sk)
                         },
                         server: pserver,
-                        timeout: Instant::now() + res.opts.timeout,
+                        timeout: Instant::now() + opts.timeout,
                         payload: framed,
                     })
                 });
@@ -383,12 +424,12 @@ impl AsyncClient {
                     // Inlined connect-with-failover (WET).
                     let (mut conn, si) = 'connect: {
                         let mut s = server;
-                        for _ in 0..res.opts.attempts.max(1) {
-                            let Some(ep) = res.endpoints.get(s) else { break };
+                        for _ in 0..opts.attempts.max(1) {
+                            let Some(ep) = self.endpoints.get(s) else { break };
                             let conn = if use_tcp {
-                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                                self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                             } else {
-                                res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                self.factory.create_udp(ep.bind).ok().map(|sk| {
                                     let _ = sk.connect(ep.udp_addr);
                                     Conn::datagram(io.clone(), sk)
                                 })
@@ -396,9 +437,9 @@ impl AsyncClient {
                             if let Some(conn) = conn {
                                 break 'connect (conn, s);
                             }
-                            if res.health.borrow().len() > 1 {
-                                res.health.borrow_mut().record_failure(s);
-                                s = res.health.borrow().pick_next();
+                            if self.health.borrow().len() > 1 {
+                                self.health.borrow_mut().record_failure(s);
+                                s = self.health.borrow().pick_next();
                             }
                         }
                         break 'drive (Err(ARES_ECONNREFUSED), timeouts);
@@ -406,16 +447,16 @@ impl AsyncClient {
                     server = si;
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                     let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                    let timeout = Instant::now() + res.opts.timeout;
+                    let timeout = Instant::now() + opts.timeout;
                     if conn.send(wire, timeout).await.is_err() {
                         if use_tcp {
-                            res.tcp_pool.borrow_mut().remove(server);
+                            self.tcp_pool.borrow_mut().remove(server);
                         }
-                        if tries + 1 < res.opts.attempts.max(1) {
+                        if tries + 1 < opts.attempts.max(1) {
                             tries += 1;
-                            if res.health.borrow().len() > 1 {
-                                res.health.borrow_mut().record_failure(server);
-                                server = res.health.borrow().pick_next();
+                            if self.health.borrow().len() > 1 {
+                                self.health.borrow_mut().record_failure(server);
+                                server = self.health.borrow().pick_next();
                             }
                             continue 'attempt;
                         }
@@ -444,7 +485,7 @@ impl AsyncClient {
                                     Ok(buf) => {
                                         if probe.as_ref().is_some_and(|p| qid_matches(&buf, &p.payload, p.conn.is_tcp())) {
                                             let p_taken = probe.take().unwrap();
-                                            settle_probe(&io, &res, &p_taken, Some(&buf));
+                                            settle_probe(&io, &self.health, &p_taken, Some(&buf));
                                         }
                                     }
                                     Err(_) => probe = None, // probe socket died
@@ -456,7 +497,7 @@ impl AsyncClient {
                                 if let Some(p) = &probe {
                                     if now >= p.timeout {
                                         let p_taken = probe.take().unwrap();
-                                        settle_probe(&io, &res, &p_taken, None);
+                                        settle_probe(&io, &self.health, &p_taken, None);
                                     }
                                 }
                                 if now >= timeout {
@@ -464,7 +505,7 @@ impl AsyncClient {
                                         break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                    let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                    let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                                     match verdict {
                                         TimeoutVerdict::Retry { server: next } => {
                                             tries += 1;
@@ -483,13 +524,13 @@ impl AsyncClient {
                                     Err(_) => {
                                         // Dead socket (EOF / hard error).
                                         if use_tcp {
-                                            res.tcp_pool.borrow_mut().remove(server);
+                                            self.tcp_pool.borrow_mut().remove(server);
                                         }
                                         if io.borrow().app.cancelled {
                                             break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                         }
                                         notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                        let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                                         match verdict {
                                             TimeoutVerdict::Retry { server: next } => {
                                                 tries += 1;
@@ -509,9 +550,9 @@ impl AsyncClient {
                                     &summary,
                                     server,
                                     use_tcp,
-                                    res.opts.attempts,
+                                    opts.attempts,
                                     failover_tries,
-                                    &mut res.health.borrow_mut(),
+                                    &mut self.health.borrow_mut(),
                                 );
                                 notify(&io, actions);
                                 match verdict {
@@ -601,11 +642,11 @@ impl AsyncClient {
         family: c_int,
     ) -> Result<Hostent, AresError> {
         // Hosts file reverse lookup.
-        if let Some(lookup) = self.hosts.reverse_lookup(ip) {
+        if let Some(lookup) = self.hostsfile().reverse_lookup(ip) {
             return Ok(Hostent::from_lookup(lookup));
         }
 
-        if self.res.endpoints.is_empty() {
+        if self.endpoints.is_empty() {
             return Err(ARES_ENOSERVER.into());
         }
 
@@ -613,24 +654,24 @@ impl AsyncClient {
         let payload = dns_query_payload(&rdns_name(ip), RECORD_TYPE_PTR);
         let (result, io_timeouts) = 'drive: {
             let io = self.io.clone();
-            let res = self.res.clone();
+            let opts = self.opts();
             let mut use_tcp = false;
             let mut timeouts: c_int = 0;
             let mut tries: u32 = 0;
             let mut failover_tries: u32 = 0;
             let qid = qid_of(&payload);
-            let mut server = res.health.borrow().pick_next();
+            let mut server = self.health.borrow().pick_next();
             'attempt: loop {
                 // Inlined connect-with-failover (WET): create + connect the socket
                 // for `server`, retrying across servers on creation failure.
                 let (mut conn, si) = 'connect: {
                     let mut s = server;
-                    for _ in 0..res.opts.attempts.max(1) {
-                        let Some(ep) = res.endpoints.get(s) else { break };
+                    for _ in 0..opts.attempts.max(1) {
+                        let Some(ep) = self.endpoints.get(s) else { break };
                         let conn = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                            self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
-                            res.factory.create_udp(ep.bind).ok().map(|sk| {
+                            self.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
                                 Conn::datagram(io.clone(), sk)
                             })
@@ -638,9 +679,9 @@ impl AsyncClient {
                         if let Some(conn) = conn {
                             break 'connect (conn, s);
                         }
-                        if res.health.borrow().len() > 1 {
-                            res.health.borrow_mut().record_failure(s);
-                            s = res.health.borrow().pick_next();
+                        if self.health.borrow().len() > 1 {
+                            self.health.borrow_mut().record_failure(s);
+                            s = self.health.borrow().pick_next();
                         }
                     }
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
@@ -648,16 +689,16 @@ impl AsyncClient {
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let timeout = Instant::now() + res.opts.timeout;
+                let timeout = Instant::now() + opts.timeout;
                 if conn.send(wire, timeout).await.is_err() {
                     if use_tcp {
-                        res.tcp_pool.borrow_mut().remove(server);
+                        self.tcp_pool.borrow_mut().remove(server);
                     }
-                    if tries + 1 < res.opts.attempts.max(1) {
+                    if tries + 1 < opts.attempts.max(1) {
                         tries += 1;
-                        if res.health.borrow().len() > 1 {
-                            res.health.borrow_mut().record_failure(server);
-                            server = res.health.borrow().pick_next();
+                        if self.health.borrow().len() > 1 {
+                            self.health.borrow_mut().record_failure(server);
+                            server = self.health.borrow().pick_next();
                         }
                         continue 'attempt;
                     }
@@ -674,9 +715,9 @@ impl AsyncClient {
                                 &summary,
                                 server,
                                 use_tcp,
-                                res.opts.attempts,
+                                opts.attempts,
                                 failover_tries,
-                                &mut res.health.borrow_mut(),
+                                &mut self.health.borrow_mut(),
                             );
                             notify(&io, actions);
                             match verdict {
@@ -699,7 +740,7 @@ impl AsyncClient {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
                                 TimeoutVerdict::Retry { server: next } => {
                                     tries += 1;
@@ -713,13 +754,13 @@ impl AsyncClient {
                         Err(_) => {
                             // Dead socket (EOF / hard error).
                             if use_tcp {
-                                res.tcp_pool.borrow_mut().remove(server);
+                                self.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
                                 TimeoutVerdict::Retry { server: next } => {
                                     tries += 1;
@@ -785,7 +826,7 @@ impl AsyncClient {
             return NameinfoReply { status: ARES_SUCCESS.into(), node: Some(node), service, timeouts: 0 };
         }
 
-        if self.res.endpoints.is_empty() {
+        if self.endpoints.is_empty() {
             return NameinfoReply { status: ARES_ENOSERVER.into(), node: None, service: None, timeouts: 0 };
         }
 
@@ -793,24 +834,24 @@ impl AsyncClient {
         let payload = dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR);
         let (result, io_timeouts) = 'drive: {
             let io = self.io.clone();
-            let res = self.res.clone();
+            let opts = self.opts();
             let mut use_tcp = false;
             let mut timeouts: c_int = 0;
             let mut tries: u32 = 0;
             let mut failover_tries: u32 = 0;
             let qid = qid_of(&payload);
-            let mut server = res.health.borrow().pick_next();
+            let mut server = self.health.borrow().pick_next();
             'attempt: loop {
                 // Inlined connect-with-failover (WET): create + connect the socket
                 // for `server`, retrying across servers on creation failure.
                 let (mut conn, si) = 'connect: {
                     let mut s = server;
-                    for _ in 0..res.opts.attempts.max(1) {
-                        let Some(ep) = res.endpoints.get(s) else { break };
+                    for _ in 0..opts.attempts.max(1) {
+                        let Some(ep) = self.endpoints.get(s) else { break };
                         let conn = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                            self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
-                            res.factory.create_udp(ep.bind).ok().map(|sk| {
+                            self.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
                                 Conn::datagram(io.clone(), sk)
                             })
@@ -818,9 +859,9 @@ impl AsyncClient {
                         if let Some(conn) = conn {
                             break 'connect (conn, s);
                         }
-                        if res.health.borrow().len() > 1 {
-                            res.health.borrow_mut().record_failure(s);
-                            s = res.health.borrow().pick_next();
+                        if self.health.borrow().len() > 1 {
+                            self.health.borrow_mut().record_failure(s);
+                            s = self.health.borrow().pick_next();
                         }
                     }
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
@@ -828,16 +869,16 @@ impl AsyncClient {
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let timeout = Instant::now() + res.opts.timeout;
+                let timeout = Instant::now() + opts.timeout;
                 if conn.send(wire, timeout).await.is_err() {
                     if use_tcp {
-                        res.tcp_pool.borrow_mut().remove(server);
+                        self.tcp_pool.borrow_mut().remove(server);
                     }
-                    if tries + 1 < res.opts.attempts.max(1) {
+                    if tries + 1 < opts.attempts.max(1) {
                         tries += 1;
-                        if res.health.borrow().len() > 1 {
-                            res.health.borrow_mut().record_failure(server);
-                            server = res.health.borrow().pick_next();
+                        if self.health.borrow().len() > 1 {
+                            self.health.borrow_mut().record_failure(server);
+                            server = self.health.borrow().pick_next();
                         }
                         continue 'attempt;
                     }
@@ -854,9 +895,9 @@ impl AsyncClient {
                                 &summary,
                                 server,
                                 use_tcp,
-                                res.opts.attempts,
+                                opts.attempts,
                                 failover_tries,
-                                &mut res.health.borrow_mut(),
+                                &mut self.health.borrow_mut(),
                             );
                             notify(&io, actions);
                             match verdict {
@@ -879,7 +920,7 @@ impl AsyncClient {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
                                 TimeoutVerdict::Retry { server: next } => {
                                     tries += 1;
@@ -893,13 +934,13 @@ impl AsyncClient {
                         Err(_) => {
                             // Dead socket (EOF / hard error).
                             if use_tcp {
-                                res.tcp_pool.borrow_mut().remove(server);
+                                self.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
                                 TimeoutVerdict::Retry { server: next } => {
                                     tries += 1;
@@ -935,11 +976,11 @@ impl AsyncClient {
         dnstype: u16,
         retry_server_error: bool,
     ) -> Delivery {
-        if self.res.endpoints.is_empty() {
+        if self.endpoints.is_empty() {
             return Delivery::Raw { result: Err(ARES_ENOSERVER), timeouts: 0 };
         }
 
-        let mut plan = SearchPlan::for_search(&name, self.ndots, &self.search);
+        let mut plan = SearchPlan::for_search(&name, self.config.options.ndots, &self.config.search);
         let mut had_nodata = false;
         let mut timeouts: c_int = 0;
         let mut first = true;
@@ -951,29 +992,29 @@ impl AsyncClient {
             first = false;
             let (result, io_timeouts) = 'drive: {
                 let io = self.io.clone();
-                let res = self.res.clone();
-                let mut use_tcp = self.use_vc;
+                let opts = self.opts();
+                let mut use_tcp = self.config.options.use_vc;
                 let mut timeouts: c_int = 0;
                 let mut tries: u32 = 0;
                 let mut failover_tries: u32 = 0;
                 let qid = qid_of(&payload);
-                let mut server = res.health.borrow().pick_next();
+                let mut server = self.health.borrow().pick_next();
                 let mut probe = probe_payload.and_then(|pp| {
                     // Inlined probe setup (WET): a one-shot failover probe to a stale
                     // server, raced alongside the primary. `None` if failover is off /
                     // no server is due / a socket fails.
-                    if res.opts.failover_chance == 0 {
+                    if opts.failover_chance == 0 {
                         return None;
                     }
-                    let primary_server = res.health.borrow().pick_next();
-                    let pserver = res.health.borrow().pick_probe(res.opts.failover_delay, primary_server)?;
-                    let ep = res.endpoints.get(pserver)?;
+                    let primary_server = self.health.borrow().pick_next();
+                    let pserver = self.health.borrow().pick_probe(opts.failover_delay, primary_server)?;
+                    let ep = self.endpoints.get(pserver)?;
                     let sk = if use_tcp {
-                        let sk = res.factory.create_tcp(ep.bind).ok()?;
+                        let sk = self.factory.create_tcp(ep.bind).ok()?;
                         let _ = sk.connect(ep.tcp_addr);
                         sk
                     } else {
-                        let sk = res.factory.create_udp(ep.bind).ok()?;
+                        let sk = self.factory.create_udp(ep.bind).ok()?;
                         let _ = sk.connect(ep.udp_addr);
                         sk
                     };
@@ -986,7 +1027,7 @@ impl AsyncClient {
                             Conn::datagram(io.clone(), sk)
                         },
                         server: pserver,
-                        timeout: Instant::now() + res.opts.timeout,
+                        timeout: Instant::now() + opts.timeout,
                         payload: framed,
                     })
                 });
@@ -994,12 +1035,12 @@ impl AsyncClient {
                     // Inlined connect-with-failover (WET).
                     let (mut conn, si) = 'connect: {
                         let mut s = server;
-                        for _ in 0..res.opts.attempts.max(1) {
-                            let Some(ep) = res.endpoints.get(s) else { break };
+                        for _ in 0..opts.attempts.max(1) {
+                            let Some(ep) = self.endpoints.get(s) else { break };
                             let conn = if use_tcp {
-                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                                self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                             } else {
-                                res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                self.factory.create_udp(ep.bind).ok().map(|sk| {
                                     let _ = sk.connect(ep.udp_addr);
                                     Conn::datagram(io.clone(), sk)
                                 })
@@ -1007,9 +1048,9 @@ impl AsyncClient {
                             if let Some(conn) = conn {
                                 break 'connect (conn, s);
                             }
-                            if res.health.borrow().len() > 1 {
-                                res.health.borrow_mut().record_failure(s);
-                                s = res.health.borrow().pick_next();
+                            if self.health.borrow().len() > 1 {
+                                self.health.borrow_mut().record_failure(s);
+                                s = self.health.borrow().pick_next();
                             }
                         }
                         break 'drive (Err(ARES_ECONNREFUSED), timeouts);
@@ -1017,16 +1058,16 @@ impl AsyncClient {
                     server = si;
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                     let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                    let timeout = Instant::now() + res.opts.timeout;
+                    let timeout = Instant::now() + opts.timeout;
                     if conn.send(wire, timeout).await.is_err() {
                         if use_tcp {
-                            res.tcp_pool.borrow_mut().remove(server);
+                            self.tcp_pool.borrow_mut().remove(server);
                         }
-                        if tries + 1 < res.opts.attempts.max(1) {
+                        if tries + 1 < opts.attempts.max(1) {
                             tries += 1;
-                            if res.health.borrow().len() > 1 {
-                                res.health.borrow_mut().record_failure(server);
-                                server = res.health.borrow().pick_next();
+                            if self.health.borrow().len() > 1 {
+                                self.health.borrow_mut().record_failure(server);
+                                server = self.health.borrow().pick_next();
                             }
                             continue 'attempt;
                         }
@@ -1055,7 +1096,7 @@ impl AsyncClient {
                                     Ok(buf) => {
                                         if probe.as_ref().is_some_and(|p| qid_matches(&buf, &p.payload, p.conn.is_tcp())) {
                                             let p_taken = probe.take().unwrap();
-                                            settle_probe(&io, &res, &p_taken, Some(&buf));
+                                            settle_probe(&io, &self.health, &p_taken, Some(&buf));
                                         }
                                     }
                                     Err(_) => probe = None, // probe socket died
@@ -1067,7 +1108,7 @@ impl AsyncClient {
                                 if let Some(p) = &probe {
                                     if now >= p.timeout {
                                         let p_taken = probe.take().unwrap();
-                                        settle_probe(&io, &res, &p_taken, None);
+                                        settle_probe(&io, &self.health, &p_taken, None);
                                     }
                                 }
                                 if now >= timeout {
@@ -1075,7 +1116,7 @@ impl AsyncClient {
                                         break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                    let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                    let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                                     match verdict {
                                         TimeoutVerdict::Retry { server: next } => {
                                             tries += 1;
@@ -1094,13 +1135,13 @@ impl AsyncClient {
                                     Err(_) => {
                                         // Dead socket (EOF / hard error).
                                         if use_tcp {
-                                            res.tcp_pool.borrow_mut().remove(server);
+                                            self.tcp_pool.borrow_mut().remove(server);
                                         }
                                         if io.borrow().app.cancelled {
                                             break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                         }
                                         notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                        let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                                         match verdict {
                                             TimeoutVerdict::Retry { server: next } => {
                                                 tries += 1;
@@ -1120,9 +1161,9 @@ impl AsyncClient {
                                     &summary,
                                     server,
                                     use_tcp,
-                                    res.opts.attempts,
+                                    opts.attempts,
                                     failover_tries,
-                                    &mut res.health.borrow_mut(),
+                                    &mut self.health.borrow_mut(),
                                 );
                                 notify(&io, actions);
                                 match verdict {
@@ -1230,7 +1271,7 @@ impl AsyncClient {
             libc::AF_INET6 => AddressFamily::Ipv6,
             _ => AddressFamily::Any,
         };
-        if let Some(lookup) = self.hosts.lookup(hostname, family_filter) {
+        if let Some(lookup) = self.hostsfile().lookup(hostname, family_filter) {
             if !lookup.addrs.is_empty() {
                 return AddrInfoOut {
                     name: hostname.to_string(),
@@ -1240,12 +1281,12 @@ impl AsyncClient {
             }
         }
 
-        if self.res.endpoints.is_empty() {
+        if self.endpoints.is_empty() {
             return fail(ARES_ENOSERVER);
         }
 
         // ===== DNS phase: parallel A+AAAA per search-plan name =====
-        let mut plan = SearchPlan::for_search(&hostname_raw, self.ndots, &self.search);
+        let mut plan = SearchPlan::for_search(&hostname_raw, self.config.options.ndots, &self.config.search);
         let mut timeouts: c_int = 0;
         let mut last_error: AresError = ARES_ENODATA.into();
         let mut had_nodata = false;
@@ -1257,14 +1298,14 @@ impl AsyncClient {
                 _ => vec![RTYPE_A, RTYPE_AAAA],
             };
             let payloads: Vec<_> =
-                rtypes.iter().map(|&rt| (dns_query_payload(&plan.current, rt), self.use_vc)).collect();
+                rtypes.iter().map(|&rt| (dns_query_payload(&plan.current, rt), self.config.options.use_vc)).collect();
             let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
 
             // Drive A+AAAA in parallel. Policy (here, not in the executor): once
             // the A/ipv4 query returns actual addresses, cancel the sibling AAAA
             // query — its retries stop so it isn't sent again. (ipv6 success does
             // NOT cancel A: an ipv4-only host may still need the A answer.)
-            let mut par = ParallelQueries::new(self.io.clone(), self.res.clone(), payloads);
+            let mut par = ParallelQueries::new(self.io.clone(), self.clone(), payloads);
             while !par.all_done() {
                 par.step().await;
                 if let Some(ai) = a_idx {
@@ -1447,17 +1488,6 @@ pub(crate) struct QueryOpts {
     pub timeout: Duration,
     pub failover_chance: u16,
     pub failover_delay: u64,
-}
-
-/// Everything an async lifecycle owns. Cloneable `Rc` handles + a config
-/// snapshot; the future never borrows the channel.
-#[derive(Clone)]
-pub(crate) struct Resources {
-    pub factory: Rc<dyn SocketFactory>,
-    pub health: Rc<RefCell<ServerHealth>>,
-    pub endpoints: Rc<Vec<ServerEndpoint>>,
-    pub tcp_pool: Rc<RefCell<TcpPool>>,
-    pub opts: QueryOpts,
 }
 
 /// The mux tag of a DNS frame — its transaction ID (header bytes 0..2), the
@@ -1842,53 +1872,13 @@ pub(crate) fn search_name_check(name_str: &str) -> Option<AresError> {
     None
 }
 
-// ===== The channel state (wrapped by ffi::ChannelData) =====
+// ===== The channel-state methods (config/lifecycle; the ffi shims only marshal) =====
 
-/// Everything a channel owns that is pure Rust: config, health/cache
-/// bookkeeping, configuration strings, and the shared-socket pools for the
-/// async engine. The ffi shims only marshal C values in and out.
-pub(crate) struct Client {
-    /// The system/user resolver config (resolv.conf shape: nameservers,
-    /// search domains, options, per-server TCP port overrides).
-    pub config: SysConfig,
-    pub factory: Rc<dyn SocketFactory>,
-    /// The `/etc/hosts` table, lazily loaded once (see [`Client::hosts`]).
-    hosts: Option<Rc<Hosts>>,
-    pub default_udp_port: u16,
-    pub default_tcp_port: u16,
-    /// Shared with the async engine's in-flight futures (`Rc<RefCell<_>>`) so
-    /// failover accounting and the probe agree across queries.
-    pub server_health: Rc<RefCell<ServerHealth>>,
-    pub sortlist: Vec<SortlistEntry>,
-    pub flags: i32,
-    pub maxtimeout: i32,
-    pub lookups: String,
-    pub resolvconf_path: String,
-    pub hosts_path: String,
-    /// TTL-bounded reply cache, shared (via `Rc<RefCell<_>>`) with the async
-    /// engine (gethostbyname) and the classic dnsrec post-delivery hook.
-    pub cache: Rc<RefCell<QueryCache>>,
-    pub udp_max_queries: u32, // 0 = unlimited
-    /// Shared TCP connections for the async engine (parallel lookups to one
-    /// server share a connection); handed to each future via its descriptor.
-    pub tcp_pool: Rc<RefCell<TcpPool>>,
-    /// Per-server connect endpoints, cached (rebuilt on server change) so each
-    /// async launch clones an `Rc` instead of re-snapshotting the config.
-    endpoints: Rc<Vec<ServerEndpoint>>,
-    pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
-    pub server_failover_retry_delay: u64,  // milliseconds
-    /// The channel-owned resolver client (config snapshot), built lazily and
-    /// cached; each lookup derives a fresh-mailbox copy via `with_fresh_io`.
-    /// Invalidated (`None`) on every config change — see `rebuild_endpoints`
-    /// (the chokepoint for servers/options) and `set_sortlist`.
-    async_base: Option<Rc<AsyncClient>>,
-}
-
-impl Client {
+impl AsyncClient {
     /// A fresh channel from the system config (resolv.conf + env overrides) —
     /// shared by ares_init and ares_init_options.
     pub fn from_sysconfig(factory: Rc<dyn SocketFactory>) -> Self {
-        Client::build(build_sysconfig(), factory, 53, 53)
+        AsyncClient::build(build_sysconfig(), factory, 53, 53)
     }
 
     fn build(
@@ -1897,13 +1887,13 @@ impl Client {
         default_udp_port: u16,
         default_tcp_port: u16,
     ) -> Self {
-        let mut client = Client {
+        AsyncClient {
             config,
             factory,
             hosts: None,
             default_udp_port,
             default_tcp_port,
-            server_health: Rc::new(RefCell::new(ServerHealth::default())),
+            health: Rc::new(RefCell::new(ServerHealth::default())),
             sortlist: vec![],
             flags: 0,
             maxtimeout: 0,
@@ -1911,19 +1901,16 @@ impl Client {
             resolvconf_path: String::new(),
             hosts_path: String::new(),
             cache: Rc::new(RefCell::new(QueryCache::default())),
-            udp_max_queries: 0,
             tcp_pool: Rc::new(RefCell::new(TcpPool::new(dns_frame, dns_tag))),
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
-            async_base: None,
-        };
-        client.rebuild_endpoints();
-        client
+            io: Rc::new(RefCell::new(DnsMailbox::default())),
+        }
     }
 
-    /// The `/etc/hosts` table as a shared `Rc` (lazily loaded once), so the ffi
-    /// can hand a clone to the async lifecycles.
+    /// The `/etc/hosts` table as a shared `Rc` (lazily loaded once); `derive`
+    /// hands a clone to every lookup copy.
     pub fn hosts(&mut self) -> Rc<Hosts> {
         self.hosts.get_or_insert_with(|| Rc::new(Hosts::from_path("/etc/hosts").unwrap_or_default())).clone()
     }
@@ -1931,16 +1918,16 @@ impl Client {
     /// The pure body of ares_dup: clone configuration, start with a fresh
     /// reactor state (empty query cache, no pooled connections, cleared
     /// failure timestamps — but cloned failure counts).
-    pub fn duplicate(&self) -> Client {
-        let mut dup = Client::build(
+    pub fn duplicate(&self) -> AsyncClient {
+        let mut dup = AsyncClient::build(
             self.config.clone(),
             self.factory.clone(),
             self.default_udp_port,
             self.default_tcp_port,
         );
         {
-            let src = self.server_health.borrow();
-            dup.server_health = Rc::new(RefCell::new(ServerHealth {
+            let src = self.health.borrow();
+            dup.health = Rc::new(RefCell::new(ServerHealth {
                 failures: src.failures.clone(),
                 last_failure: vec![None; src.last_failure.len()],
             }));
@@ -1952,7 +1939,6 @@ impl Client {
         dup.resolvconf_path = self.resolvconf_path.clone();
         dup.hosts_path = self.hosts_path.clone();
         dup.cache.borrow_mut().set_max_ttl(self.cache.borrow().max_ttl());
-        dup.udp_max_queries = self.udp_max_queries;
         dup.server_failover_retry_chance = self.server_failover_retry_chance;
         dup.server_failover_retry_delay = self.server_failover_retry_delay;
         dup
@@ -2030,15 +2016,11 @@ impl Client {
         if optmask & ARES_OPT_QUERY_CACHE != 0 {
             self.cache.borrow_mut().set_max_ttl(o.qcache_max_ttl);
         }
-        if optmask & ARES_OPT_UDP_MAX_QUERIES != 0 {
-            self.udp_max_queries = o.udp_max_queries as u32;
-        }
         if optmask & ARES_OPT_SERVER_FAILOVER != 0 {
             self.server_failover_retry_chance = o.failover_retry_chance;
             self.server_failover_retry_delay = o.failover_retry_delay;
         }
-        self.server_health.borrow_mut().reset(self.config.nameservers.len());
-        self.rebuild_endpoints();
+        self.health.borrow_mut().reset(self.config.nameservers.len());
     }
 
     /// The pure inverse of the cascade: read the channel back into option fields.
@@ -2118,24 +2100,21 @@ impl Client {
             self.config.nameservers.push((server.ip, server.udp_port));
             self.config.tcp_ports.push(server.tcp_port);
         }
-        self.server_health.borrow_mut().reset(self.config.nameservers.len());
-        self.rebuild_endpoints();
+        self.health.borrow_mut().reset(self.config.nameservers.len());
     }
 
     /// NULL/empty CSV clears every configured server (ares_set_servers*_csv).
     pub fn clear_servers(&mut self) {
         self.config.nameservers.clear();
         self.config.tcp_ports.clear();
-        self.server_health.borrow_mut().clear();
-        self.rebuild_endpoints();
+        self.health.borrow_mut().clear();
     }
 
     /// Install a parsed CSV server list (ares_set_servers_ports_csv).
     pub fn install_csv_servers(&mut self, ns: Vec<(IpAddr, Option<u16>)>) {
         self.config.tcp_ports = vec![None; ns.len()];
-        self.server_health.borrow_mut().reset(ns.len());
+        self.health.borrow_mut().reset(ns.len());
         self.config.nameservers = ns;
-        self.rebuild_endpoints();
     }
 
     /// The configured servers with per-entry defaults applied, in order:
@@ -2187,31 +2166,11 @@ impl Client {
     }
 }
 
-/// The async-engine resource builders + the pure entry helpers the ffi shims
+/// The per-lookup snapshot builders + the pure entry helpers the ffi shims
 /// compose (query/send payloads, the gethostbyname/getaddrinfo/... contexts).
-impl Client {
-    // ===== Async-engine resource builders =====
-
-    /// Rebuild the cached endpoint snapshot after a server/port change.
-    pub fn rebuild_endpoints(&mut self) {
-        self.endpoints = Rc::new(self.endpoint_snapshot());
-        // The chokepoint for server/option changes (set_servers + the tail of
-        // apply_options both land here): drop the cached async base so the next
-        // lookup rebuilds it from current config.
-        self.async_base = None;
-    }
-
-    /// Replace the sortlist and invalidate the cached async base. `sortlist` is a
-    /// `pub` field mutated directly by `ares_set_sortlist` (the one config-change
-    /// path that doesn't funnel through `rebuild_endpoints`), so it needs its own
-    /// invalidation hook.
-    pub(crate) fn set_sortlist(&mut self, entries: Vec<SortlistEntry>) {
-        self.sortlist = entries;
-        self.async_base = None;
-    }
-
-    /// Snapshot the per-server connect endpoints from config, so an async
-    /// lifecycle future needs no channel handle.
+impl AsyncClient {
+    /// Snapshot the per-server connect endpoints from config, so a lookup
+    /// future never re-reads the config.
     fn endpoint_snapshot(&self) -> Vec<ServerEndpoint> {
         let default_udp = self.default_udp_port;
         let default_tcp = self.default_tcp_port;
@@ -2237,56 +2196,13 @@ impl Client {
     }
 
     /// The retry/timeout knobs an async lifecycle needs.
-    fn query_opts(&self) -> QueryOpts {
+    fn opts(&self) -> QueryOpts {
         QueryOpts {
             attempts: self.config.options.attempts,
             timeout: Duration::from_millis(self.config.options.timeout_ms as u64),
             failover_chance: self.server_failover_retry_chance,
             failover_delay: self.server_failover_retry_delay,
         }
-    }
-
-    /// Bundle the owned resources an async lifecycle future carries. Cheap: all
-    /// `Rc` clones (endpoints cached, rebuilt only on server change).
-    pub(crate) fn resources(&self) -> Resources {
-        Resources {
-            factory: self.factory.clone(),
-            health: self.server_health.clone(),
-            endpoints: self.endpoints.clone(),
-            tcp_pool: self.tcp_pool.clone(),
-            opts: self.query_opts(),
-        }
-    }
-
-    /// Hand out a per-lookup resolver client: the channel-owned `AsyncClient`
-    /// base (built lazily, cached, rebuilt on config change) derived into a copy
-    /// with its own fresh mailbox. Each lookup thus owns a distinct `QueryIo`
-    /// while sharing the config `Rc`s. The one spot that reads `Client` for the
-    /// async lifecycles; the futures themselves name no channel.
-    pub(crate) fn async_client(&mut self) -> Rc<AsyncClient> {
-        if self.async_base.is_none() {
-            let base = self.build_async_base();
-            self.async_base = Some(base);
-        }
-        self.async_base.as_ref().unwrap().with_fresh_io()
-    }
-
-    /// Build the channel-owned `AsyncClient` base: the socket resources plus
-    /// `Rc`/snapshot handles for the preflight (hosts file, query cache, sortlist,
-    /// ndots/search/use_vc). The `io` here is an inert placeholder — `async_client`
-    /// replaces it per lookup. Returned as `Rc` so methods take `self: Rc<Self>`
-    /// (spawnable `'static` futures + cheap sharing for nested calls).
-    fn build_async_base(&mut self) -> Rc<AsyncClient> {
-        Rc::new(AsyncClient {
-            io: Rc::new(RefCell::new(DnsMailbox::default())),
-            res: self.resources(),
-            hosts: self.hosts(),
-            cache: self.cache.clone(),
-            sortlist: Rc::from(self.sortlist.clone()),
-            ndots: self.config.options.ndots,
-            search: Rc::from(self.config.search.clone()),
-            use_vc: self.config.options.use_vc,
-        })
     }
 
     // ===== Entry points (one method per ares_* export) =====
@@ -2318,7 +2234,7 @@ impl Client {
 }
 
 /// The pure body of ares_gethostbyname_file: hosts-file-only lookup.
-fn hosts_file_lookup(st: &mut Client, name: &str, family: i32) -> Result<HostLookup, AresError> {
+fn hosts_file_lookup(st: &mut AsyncClient, name: &str, family: i32) -> Result<HostLookup, AresError> {
     // Convert C family constant to our Family enum
     let family_filter = match family {
         libc::AF_INET => AddressFamily::Ipv4,
@@ -2336,7 +2252,7 @@ fn hosts_file_lookup(st: &mut Client, name: &str, family: i32) -> Result<HostLoo
 }
 
 /// ENOSERVER guard shared by ares_query / ares_query_dnsrec / ares_send.
-fn no_servers(st: &Client) -> bool {
+fn no_servers(st: &AsyncClient) -> bool {
     st.config.nameservers.is_empty()
 }
 
@@ -2403,7 +2319,6 @@ pub(crate) struct DecodedOptions {
     pub lookups: Option<String>,
     pub resolvconf_path: Option<String>,
     pub hosts_path: Option<String>,
-    pub udp_max_queries: i32,
     pub maxtimeout: i32,
     pub qcache_max_ttl: u32,
     pub failover_retry_chance: u16,
@@ -2456,8 +2371,8 @@ struct Probe {
 
 /// Fold a probe reply into server health (the old `on_probe_reply` verdict),
 /// emitted as effects. `None` reply = the probe timed out (failure timestamp only).
-fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, res: &Resources, probe: &Probe, reply: Option<&[u8]>) {
-    let mut health = res.health.borrow_mut();
+fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, health: &RefCell<ServerHealth>, probe: &Probe, reply: Option<&[u8]>) {
+    let mut health = health.borrow_mut();
     match reply {
         Some(buf) => {
             let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0xff };
@@ -2501,7 +2416,7 @@ pub(crate) struct ParallelQueries {
 
 impl ParallelQueries {
     /// Build one `resolve_query` future per `(payload, use_tcp)` (no probe).
-    pub(crate) fn new(io: Rc<RefCell<DnsMailbox>>, res: Resources, payloads: Vec<(BytesMut, bool)>) -> Self {
+    pub(crate) fn new(io: Rc<RefCell<DnsMailbox>>, client: Rc<AsyncClient>, payloads: Vec<(BytesMut, bool)>) -> Self {
         let subs = payloads
             .into_iter()
             .map(|(payload, use_tcp)| {
@@ -2510,24 +2425,25 @@ impl ParallelQueries {
                 // getaddrinfo A/AAAA sub-queries (no probe). In an async block
                 // `return` yields the future's output directly.
                 let io = sub_io.clone();
-                let res = res.clone();
+                let client = client.clone();
                 let fut = Box::pin(async move {
+                    let opts = client.opts();
                     let mut use_tcp = use_tcp;
                     let mut timeouts: c_int = 0;
                     let mut tries: u32 = 0;
                     let mut failover_tries: u32 = 0;
                     let qid = qid_of(&payload);
-                    let mut server = res.health.borrow().pick_next();
+                    let mut server = client.health.borrow().pick_next();
                     'attempt: loop {
                         // Inlined connect-with-failover (WET).
                         let (mut conn, si) = 'connect: {
                             let mut s = server;
-                            for _ in 0..res.opts.attempts.max(1) {
-                                let Some(ep) = res.endpoints.get(s) else { break };
+                            for _ in 0..opts.attempts.max(1) {
+                                let Some(ep) = client.endpoints.get(s) else { break };
                                 let conn = if use_tcp {
-                                    res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                                    client.tcp_pool.borrow_mut().get_or_create(s, &client.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                                 } else {
-                                    res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                    client.factory.create_udp(ep.bind).ok().map(|sk| {
                                         let _ = sk.connect(ep.udp_addr);
                                         Conn::datagram(io.clone(), sk)
                                     })
@@ -2535,9 +2451,9 @@ impl ParallelQueries {
                                 if let Some(conn) = conn {
                                     break 'connect (conn, s);
                                 }
-                                if res.health.borrow().len() > 1 {
-                                    res.health.borrow_mut().record_failure(s);
-                                    s = res.health.borrow().pick_next();
+                                if client.health.borrow().len() > 1 {
+                                    client.health.borrow_mut().record_failure(s);
+                                    s = client.health.borrow().pick_next();
                                 }
                             }
                             return (Err(ARES_ECONNREFUSED), timeouts);
@@ -2547,7 +2463,7 @@ impl ParallelQueries {
                         // copy, UDP sends the payload as-is (borrowed — no clone).
                         let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                         let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                        let timeout = Instant::now() + res.opts.timeout;
+                        let timeout = Instant::now() + opts.timeout;
 
                         if conn.send(wire, timeout).await.is_err() {
                             // Send failed (a hard socket error): recreate the socket and retry,
@@ -2555,13 +2471,13 @@ impl ParallelQueries {
                             // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
                             // retry succeeds.)
                             if use_tcp {
-                                res.tcp_pool.borrow_mut().remove(server);
+                                client.tcp_pool.borrow_mut().remove(server);
                             }
-                            if tries + 1 < res.opts.attempts.max(1) {
+                            if tries + 1 < opts.attempts.max(1) {
                                 tries += 1;
-                                if res.health.borrow().len() > 1 {
-                                    res.health.borrow_mut().record_failure(server);
-                                    server = res.health.borrow().pick_next();
+                                if client.health.borrow().len() > 1 {
+                                    client.health.borrow_mut().record_failure(server);
+                                    server = client.health.borrow().pick_next();
                                 }
                                 continue 'attempt;
                             }
@@ -2580,9 +2496,9 @@ impl ParallelQueries {
                                         &summary,
                                         server,
                                         use_tcp,
-                                        res.opts.attempts,
+                                        opts.attempts,
                                         failover_tries,
-                                        &mut res.health.borrow_mut(),
+                                        &mut client.health.borrow_mut(),
                                     );
                                     notify(&io, actions);
                                     match verdict {
@@ -2605,7 +2521,7 @@ impl ParallelQueries {
                                         return (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                    let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                    let verdict = on_timeout(tries, opts.attempts, server, &mut client.health.borrow_mut());
                                     match verdict {
                                         TimeoutVerdict::Retry { server: next } => {
                                             tries += 1;
@@ -2619,13 +2535,13 @@ impl ParallelQueries {
                                 Err(_) => {
                             // Dead socket (EOF / hard error).
                                     if use_tcp {
-                                        res.tcp_pool.borrow_mut().remove(server);
+                                        client.tcp_pool.borrow_mut().remove(server);
                                     }
                                     if io.borrow().app.cancelled {
                                         return (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                    let verdict = on_timeout(tries, res.opts.attempts, server, &mut res.health.borrow_mut());
+                                    let verdict = on_timeout(tries, opts.attempts, server, &mut client.health.borrow_mut());
                                     match verdict {
                                         TimeoutVerdict::Retry { server: next } => {
                                             tries += 1;

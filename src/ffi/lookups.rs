@@ -58,7 +58,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let hostname = unsafe { cstr_lossy(hostname) };
     // Build the resource bundle + the self-contained future and register it. A
     // synchronous preflight hit fires re-entrantly on this first `advance`.
-    let client = channeldata.state.async_client();
+    let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = Box::pin(client.gethostbyname(hostname.to_string(), family));
     channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
@@ -103,7 +103,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
         return;
     };
     // Build the resource bundle and spawn the self-contained async future.
-    let client = channeldata.state.async_client();
+    let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = Box::pin(client.gethostbyaddr(ip, family));
     channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let _ = dnsclass;
-    let client = channeldata.state.async_client();
+    let client = channeldata.state.derive();
     let tail = SearchTail { delivery: SearchDelivery::Raw { callback, arg } };
     let io = client.io.clone();
     let fut = Box::pin(client.search(name_str.to_string(), dnstype as u16, false));
@@ -141,7 +141,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
     // creates the socket, sends, and drives its own failover/TC/timeout.
     match channeldata.state.query_payload(name, dnstype as u16) {
         Ok(payload) => {
-            let client = channeldata.state.async_client();
+            let client = channeldata.state.derive();
             let io = client.io.clone();
             let fut = Box::pin(client.query_raw(payload));
             channeldata.spawn(io, AsyncKind::Raw { fut, callback, arg });
@@ -179,7 +179,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
         Ok(p) => p,
         Err(e) => { unsafe { callback(arg, e.code(), 0, std::ptr::null_mut()) }; return; }
     };
-    let client = channeldata.state.async_client();
+    let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = Box::pin(client.query_raw(payload));
     channeldata.spawn(io, AsyncKind::DnsRec { fut, callback, arg });
@@ -212,7 +212,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
         return;
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    let client = channeldata.state.async_client();
+    let client = channeldata.state.derive();
     let tail = SearchTail { delivery: SearchDelivery::DnsRec { callback, arg } };
     let io = client.io.clone();
     let fut = Box::pin(client.search(name_str.to_string(), qtype as u16, true));
@@ -249,7 +249,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
     // Build the resource bundle and spawn the self-contained async future. The
     // three synchronous short-circuits (service-only / NUMERICHOST / no-servers)
     // fire re-entrantly on the first advance.
-    let client = channeldata.state.async_client();
+    let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = Box::pin(client.getnameinfo(addr_info, flags));
     channeldata.spawn(io, AsyncKind::Nameinfo { fut, tail: NameinfoTail { callback, arg } });
@@ -311,7 +311,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     // Build the resource bundle and spawn the self-contained async future. A
     // synchronous preflight hit (IP literal / hosts file) fires re-entrantly.
     let hostname_raw = unsafe { cstr_lossy(name) };
-    let client = channeldata.state.async_client();
+    let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = Box::pin(client.getaddrinfo(hostname_raw.to_string(), ai_family));
     channeldata.spawn(io, AsyncKind::AddrInfo { fut, tail: AddrInfoTail { callback, arg, port } });
@@ -329,7 +329,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     // Preflight in core, then spawn an fd-owning async query lifecycle.
     match channeldata.state.send_payload(query_buf) {
         Ok(payload) => {
-            let client = channeldata.state.async_client();
+            let client = channeldata.state.derive();
             let io = client.io.clone();
             let fut = Box::pin(client.query_raw(payload));
             channeldata.spawn(io, AsyncKind::Raw { fut, callback, arg });
