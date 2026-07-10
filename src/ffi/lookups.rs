@@ -2,7 +2,7 @@
 //! and their per-query state + callback dispatch.
 
 use super::*;
-use crate::core::api;
+use crate::core::async_client::search_precheck;
 use crate::core::hostent::Hostent;
 use crate::core::async_client::{service_to_port, ServicePort};
 
@@ -117,7 +117,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     let name_str = unsafe { cstr_lossy(name) };
     // Name sanity precedes the channel deref: a bad name reports even on a
     // NULL channel (upstream ordering).
-    if let Some(status) = api::search_precheck(name_str) {
+    if let Some(status) = search_precheck(name_str) {
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
         return;
     }
@@ -207,7 +207,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     }
     let Some(query_name) = query_name else { return; };
     let name_str = query_name.to_str().unwrap_or("");
-    if let Some(status) = api::search_precheck(name_str) {
+    if let Some(status) = search_precheck(name_str) {
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         return;
     }

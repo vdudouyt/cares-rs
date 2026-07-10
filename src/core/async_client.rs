@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 use bytes::{BufMut, BytesMut};
 use rand::Rng;
 
-use crate::core::api;
 use crate::core::cache::QueryCache;
 use crate::async_runtime::conn::{Conn, TcpPool};
 use crate::async_runtime::executor::{noop_waker, poll_timeout, select3, wait_io, QueryIo, Wait, Which3};
@@ -37,7 +36,7 @@ use crate::core::lookup::{
     AF_INET6, AF_UNSPEC, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::packets::AddrRecord;
-use crate::core::response::{addr_reply, ParsedResponse, ReplyRequire};
+use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
 use crate::async_runtime::socket::SocketFactory;
 use crate::core::sortlist::{apply_sortlist, SortlistEntry};
@@ -778,7 +777,7 @@ impl AsyncClient {
 
         match result {
             Ok(buf) => {
-                let hostent = api::on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip))?;
+                let hostent = on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip))?;
                 self.io.borrow_mut().app.timeouts = io_timeouts;
                 Ok(hostent)
             }
@@ -969,7 +968,7 @@ impl AsyncClient {
     /// ares_search / ares_search_dnsrec: iterate the search plan, retrying on
     /// NXDOMAIN/NODATA/timeout (and, for the dnsrec flavor with
     /// `retry_server_error`, also on SERVFAIL/REFUSED/NOTIMP). The rcode→status
-    /// mapping mirrors the classic `SearchSm::step`.
+    /// mapping mirrors the old search state machine step.
     pub(crate) async fn search(
         self: Rc<Self>,
         name: String,
@@ -1861,7 +1860,7 @@ pub(crate) struct AddrInfo {
 /// Empty/onion rejection shared by ares_search and ares_search_dnsrec —
 /// checked before the channel is even dereferenced (order is behavior:
 /// these fire even on a NULL channel).
-pub(crate) fn search_name_check(name_str: &str) -> Option<AresError> {
+pub(crate) fn search_precheck(name_str: &str) -> Option<AresError> {
     if name_str.is_empty() {
         return Some(ARES_ENOTFOUND.into());
     }
@@ -1870,6 +1869,39 @@ pub(crate) fn search_name_check(name_str: &str) -> Option<AresError> {
         return Some(ARES_ENOTFOUND.into());
     }
     None
+}
+
+/// The plain host-callback path (ares_gethostbyaddr's direct PTR delivery):
+/// parse under the flow's acceptance rule, add the synthetic record for the
+/// queried address, and shape the hostent.
+pub(crate) fn on_host_reply(res: Result<&[u8], AresError>, rtype: u16, family: i32, ip: Option<IpAddr>) -> Result<Hostent, AresError> {
+    let buf = res?;
+    let is_ptr = rtype == RECORD_TYPE_PTR;
+    let require = if is_ptr { ReplyRequire::ItemsOrAliases } else { ReplyRequire::Items };
+    let mut rrs = addr_reply(buf, rtype, require)?;
+    if is_ptr {
+        push_synthetic_ptr(&mut rrs, ip.expect("PTR flows carry the queried ip"));
+    }
+    Ok(Hostent::from_parsed(rrs, family))
+}
+
+/// ares_timeout's clamp decision: nothing pending → report via maxtv;
+/// otherwise write `ms` into tv and return whichever of tv/maxtv is sooner.
+pub(crate) enum TimeoutChoice {
+    NoTasks,
+    Wait { ms: u128, use_max: bool },
+}
+
+pub(crate) fn clamp_timeout(wait: Option<u128>, maxtv_ms: Option<u128>) -> TimeoutChoice {
+    match wait {
+        None => TimeoutChoice::NoTasks,
+        Some(ms) => TimeoutChoice::Wait { ms, use_max: maxtv_ms.is_some_and(|m| m < ms) },
+    }
+}
+
+/// ares_fds' nfds tally: highest fd + 1 across the pollable set.
+pub(crate) fn nfds(fds: &[(i32, bool)]) -> i32 {
+    fds.iter().map(|(fd, _)| fd + 1).max().unwrap_or(0)
 }
 
 // ===== The channel-state methods (config/lifecycle; the ffi shims only marshal) =====

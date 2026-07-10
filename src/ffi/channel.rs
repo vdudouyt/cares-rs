@@ -436,7 +436,7 @@ pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set,
             unsafe { libc::FD_SET(*fd, read_fds) };
         }
     }
-    crate::core::api::nfds(&fds)
+    crate::core::async_client::nfds(&fds)
 }
 
 #[no_mangle]
@@ -447,12 +447,12 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return std::ptr::null_mut(); };
     let maxtv_ms = (!maxtv.is_null())
         .then(|| unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 });
-    match crate::core::api::clamp_timeout(channeldata.next_timeout_ms(), maxtv_ms) {
-        crate::core::api::TimeoutChoice::NoTasks => {
+    match crate::core::async_client::clamp_timeout(channeldata.next_timeout_ms(), maxtv_ms) {
+        crate::core::async_client::TimeoutChoice::NoTasks => {
             if maxtv.is_null() { return std::ptr::null_mut(); }
             maxtv
         }
-        crate::core::api::TimeoutChoice::Wait { ms, use_max } => {
+        crate::core::async_client::TimeoutChoice::Wait { ms, use_max } => {
             unsafe {
                 (*tv).tv_sec = (ms / 1000) as i64;
                 (*tv).tv_usec = 1000 * (ms % 1000) as i64;
