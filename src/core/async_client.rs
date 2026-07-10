@@ -156,29 +156,9 @@ impl AsyncClient {
             let qid = qid_of(&payload);
             let mut server = self.health.borrow().pick_next();
             'attempt: loop {
-                // Inlined connect-with-failover (WET): create + connect the socket
-                // for `server`, retrying across servers on creation failure.
-                let (mut conn, si) = 'connect: {
-                    let mut s = server;
-                    for _ in 0..opts.attempts.max(1) {
-                        let Some(ep) = self.endpoints.get(s) else { break };
-                        let conn = if use_tcp {
-                            self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
-                        } else {
-                            self.factory.create_udp(ep.bind).ok().map(|sk| {
-                                let _ = sk.connect(ep.udp_addr);
-                                Conn::datagram(io.clone(), sk)
-                            })
-                        };
-                        if let Some(conn) = conn {
-                            break 'connect (conn, s);
-                        }
-                        if self.health.borrow().len() > 1 {
-                            self.health.borrow_mut().record_failure(s);
-                            s = self.health.borrow().pick_next();
-                        }
-                    }
-                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
+                    Ok(v) => v,
+                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
                 };
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
@@ -413,28 +393,9 @@ impl AsyncClient {
                     })
                 });
                 'attempt: loop {
-                    // Inlined connect-with-failover (WET).
-                    let (mut conn, si) = 'connect: {
-                        let mut s = server;
-                        for _ in 0..opts.attempts.max(1) {
-                            let Some(ep) = self.endpoints.get(s) else { break };
-                            let conn = if use_tcp {
-                                self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
-                            } else {
-                                self.factory.create_udp(ep.bind).ok().map(|sk| {
-                                    let _ = sk.connect(ep.udp_addr);
-                                    Conn::datagram(io.clone(), sk)
-                                })
-                            };
-                            if let Some(conn) = conn {
-                                break 'connect (conn, s);
-                            }
-                            if self.health.borrow().len() > 1 {
-                                self.health.borrow_mut().record_failure(s);
-                                s = self.health.borrow().pick_next();
-                            }
-                        }
-                        break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                    let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
+                        Ok(v) => v,
+                        Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
                     };
                     server = si;
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
@@ -651,29 +612,9 @@ impl AsyncClient {
             let qid = qid_of(&payload);
             let mut server = self.health.borrow().pick_next();
             'attempt: loop {
-                // Inlined connect-with-failover (WET): create + connect the socket
-                // for `server`, retrying across servers on creation failure.
-                let (mut conn, si) = 'connect: {
-                    let mut s = server;
-                    for _ in 0..opts.attempts.max(1) {
-                        let Some(ep) = self.endpoints.get(s) else { break };
-                        let conn = if use_tcp {
-                            self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
-                        } else {
-                            self.factory.create_udp(ep.bind).ok().map(|sk| {
-                                let _ = sk.connect(ep.udp_addr);
-                                Conn::datagram(io.clone(), sk)
-                            })
-                        };
-                        if let Some(conn) = conn {
-                            break 'connect (conn, s);
-                        }
-                        if self.health.borrow().len() > 1 {
-                            self.health.borrow_mut().record_failure(s);
-                            s = self.health.borrow().pick_next();
-                        }
-                    }
-                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
+                    Ok(v) => v,
+                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
                 };
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
@@ -825,29 +766,9 @@ impl AsyncClient {
             let qid = qid_of(&payload);
             let mut server = self.health.borrow().pick_next();
             'attempt: loop {
-                // Inlined connect-with-failover (WET): create + connect the socket
-                // for `server`, retrying across servers on creation failure.
-                let (mut conn, si) = 'connect: {
-                    let mut s = server;
-                    for _ in 0..opts.attempts.max(1) {
-                        let Some(ep) = self.endpoints.get(s) else { break };
-                        let conn = if use_tcp {
-                            self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
-                        } else {
-                            self.factory.create_udp(ep.bind).ok().map(|sk| {
-                                let _ = sk.connect(ep.udp_addr);
-                                Conn::datagram(io.clone(), sk)
-                            })
-                        };
-                        if let Some(conn) = conn {
-                            break 'connect (conn, s);
-                        }
-                        if self.health.borrow().len() > 1 {
-                            self.health.borrow_mut().record_failure(s);
-                            s = self.health.borrow().pick_next();
-                        }
-                    }
-                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
+                    Ok(v) => v,
+                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
                 };
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
@@ -1009,28 +930,9 @@ impl AsyncClient {
                     })
                 });
                 'attempt: loop {
-                    // Inlined connect-with-failover (WET).
-                    let (mut conn, si) = 'connect: {
-                        let mut s = server;
-                        for _ in 0..opts.attempts.max(1) {
-                            let Some(ep) = self.endpoints.get(s) else { break };
-                            let conn = if use_tcp {
-                                self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
-                            } else {
-                                self.factory.create_udp(ep.bind).ok().map(|sk| {
-                                    let _ = sk.connect(ep.udp_addr);
-                                    Conn::datagram(io.clone(), sk)
-                                })
-                            };
-                            if let Some(conn) = conn {
-                                break 'connect (conn, s);
-                            }
-                            if self.health.borrow().len() > 1 {
-                                self.health.borrow_mut().record_failure(s);
-                                s = self.health.borrow().pick_next();
-                            }
-                        }
-                        break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+                    let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
+                        Ok(v) => v,
+                        Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
                     };
                     server = si;
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
@@ -1391,28 +1293,9 @@ impl AsyncClient {
         let qid = qid_of(&payload);
         let mut server = self.health.borrow().pick_next();
         'attempt: loop {
-            // Inlined connect-with-failover (WET).
-            let (mut conn, si) = 'connect: {
-                let mut s = server;
-                for _ in 0..opts.attempts.max(1) {
-                    let Some(ep) = self.endpoints.get(s) else { break };
-                    let conn = if use_tcp {
-                        self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
-                    } else {
-                        self.factory.create_udp(ep.bind).ok().map(|sk| {
-                            let _ = sk.connect(ep.udp_addr);
-                            Conn::datagram(io.clone(), sk)
-                        })
-                    };
-                    if let Some(conn) = conn {
-                        break 'connect (conn, s);
-                    }
-                    if self.health.borrow().len() > 1 {
-                        self.health.borrow_mut().record_failure(s);
-                        s = self.health.borrow().pick_next();
-                    }
-                }
-                return (Err(ARES_ECONNREFUSED), timeouts);
+            let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
+                Ok(v) => v,
+                Err(()) => return (Err(ARES_ECONNREFUSED), timeouts),
             };
             server = si;
             // The wire buffer for this attempt's transport: TCP needs the framed
@@ -2368,6 +2251,34 @@ impl AsyncClient {
             failover_chance: self.server_failover_retry_chance,
             failover_delay: self.server_failover_retry_delay,
         }
+    }
+
+    /// Connect-with-failover: create + connect the socket for `start`, retrying
+    /// across servers on a creation failure (matches upstream `ares_conn.c`).
+    /// Returns the live `Conn` + the server index it landed on, or `Err(())` when
+    /// the attempt budget is spent (callers map that to `ARES_ECONNREFUSED`).
+    fn connect_failover(&self, start: usize, use_tcp: bool, qid: u16) -> Result<(Conn<DnsSignals>, usize), ()> {
+        let opts = self.opts();
+        let mut s = start;
+        for _ in 0..opts.attempts.max(1) {
+            let Some(ep) = self.endpoints.get(s) else { break };
+            let conn = if use_tcp {
+                self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(self.io.clone(), c, qid))
+            } else {
+                self.factory.create_udp(ep.bind).ok().map(|sk| {
+                    let _ = sk.connect(ep.udp_addr);
+                    Conn::datagram(self.io.clone(), sk)
+                })
+            };
+            if let Some(conn) = conn {
+                return Ok((conn, s));
+            }
+            if self.health.borrow().len() > 1 {
+                self.health.borrow_mut().record_failure(s);
+                s = self.health.borrow().pick_next();
+            }
+        }
+        Err(())
     }
 
     // ===== Entry points (one method per ares_* export) =====
