@@ -11,7 +11,6 @@
 //! `client.rs`/`transport.rs`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::{c_int, CString};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -24,14 +23,14 @@ use bytes::BytesMut;
 
 use crate::core::api;
 use crate::core::cache::QueryCache;
+use crate::core::conn::{Conn, RecvOutcome, TcpPool};
 use crate::core::executor::{
-    noop_waker, poll_deadline, poll_recv, recv_datagram, recv_stream, select2, select3,
-    send_when_writable, wait_io, QueryIo, Recv, RecvReady, Wait, Which2, Which3,
+    noop_waker, poll_deadline, select3, wait_io, QueryIo, RecvReady, Wait, Which3,
 };
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, Hosts};
 use crate::core::lookup::{
-    extract_tcp_frame, is_localhost, is_onion_domain, on_datagram, on_timeout, qid_matches,
+    is_localhost, is_onion_domain, on_datagram, on_timeout, qid_matches,
     summarize, ReactorAction, SearchPlan, ServerHealth, TaskVerdict, TimeoutVerdict, AF_INET,
     AF_INET6, AF_UNSPEC, RTYPE_A, RTYPE_AAAA,
 };
@@ -42,7 +41,7 @@ use crate::core::preflight::{
 use crate::core::query_builder::{dns_query_payload, frame_tcp};
 use crate::core::response::{addr_reply, ReplyRequire};
 use crate::core::services::Services;
-use crate::core::socket::{Socket, SocketFactory};
+use crate::core::socket::SocketFactory;
 use crate::core::sortlist::{apply_sortlist, SortlistEntry};
 use crate::core::transport::rdns_name;
 use crate::core::AresError;
@@ -118,7 +117,7 @@ impl AsyncClient {
                     for _ in 0..res.opts.attempts.max(1) {
                         let Some(ep) = res.endpoints.get(s) else { break };
                         let conn = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
                             res.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
@@ -155,7 +154,7 @@ impl AsyncClient {
                 }
                 loop {
                     match conn.recv(deadline).await {
-                        RecvOutcome::Reply(buf) => {
+                        RecvOutcome::Msg(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
                             }
@@ -371,7 +370,7 @@ impl AsyncClient {
                         for _ in 0..res.opts.attempts.max(1) {
                             let Some(ep) = res.endpoints.get(s) else { break };
                             let conn = if use_tcp {
-                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                             } else {
                                 res.factory.create_udp(ep.bind).ok().map(|sk| {
                                     let _ = sk.connect(ep.udp_addr);
@@ -419,7 +418,7 @@ impl AsyncClient {
                             }
                         } else {
                             match conn.recv(deadline).await {
-                                RecvOutcome::Reply(b) => ReplyEvent::Primary(RecvReady::Msg(b)),
+                                RecvOutcome::Msg(b) => ReplyEvent::Primary(RecvReady::Msg(b)),
                                 RecvOutcome::Timeout => ReplyEvent::Deadline,
                                 RecvOutcome::Dead => ReplyEvent::Primary(RecvReady::Dead),
                             }
@@ -609,7 +608,7 @@ impl AsyncClient {
                     for _ in 0..res.opts.attempts.max(1) {
                         let Some(ep) = res.endpoints.get(s) else { break };
                         let conn = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
                             res.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
@@ -646,7 +645,7 @@ impl AsyncClient {
                 }
                 loop {
                     match conn.recv(deadline).await {
-                        RecvOutcome::Reply(buf) => {
+                        RecvOutcome::Msg(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
                             }
@@ -784,7 +783,7 @@ impl AsyncClient {
                     for _ in 0..res.opts.attempts.max(1) {
                         let Some(ep) = res.endpoints.get(s) else { break };
                         let conn = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
                             res.factory.create_udp(ep.bind).ok().map(|sk| {
                                 let _ = sk.connect(ep.udp_addr);
@@ -821,7 +820,7 @@ impl AsyncClient {
                 }
                 loop {
                     match conn.recv(deadline).await {
-                        RecvOutcome::Reply(buf) => {
+                        RecvOutcome::Msg(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
                             }
@@ -964,7 +963,7 @@ impl AsyncClient {
                         for _ in 0..res.opts.attempts.max(1) {
                             let Some(ep) = res.endpoints.get(s) else { break };
                             let conn = if use_tcp {
-                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                             } else {
                                 res.factory.create_udp(ep.bind).ok().map(|sk| {
                                     let _ = sk.connect(ep.udp_addr);
@@ -1012,7 +1011,7 @@ impl AsyncClient {
                             }
                         } else {
                             match conn.recv(deadline).await {
-                                RecvOutcome::Reply(b) => ReplyEvent::Primary(RecvReady::Msg(b)),
+                                RecvOutcome::Msg(b) => ReplyEvent::Primary(RecvReady::Msg(b)),
                                 RecvOutcome::Timeout => ReplyEvent::Deadline,
                                 RecvOutcome::Dead => ReplyEvent::Primary(RecvReady::Dead),
                             }
@@ -1336,8 +1335,8 @@ fn resolve_hostaliases(hostname: &str) -> Result<String, c_int> {
 // ===================================================================
 // DNS resolver lifecycle (the "application" over the pure-IO reactor).
 // Moved out of executor.rs so the reactor names nothing DNS. Speaks the
-// reactor's socket primitives (send_when_writable/recv_datagram/recv_stream/
-// wait_io) + the neutral lookup.rs decision tables.
+// conn layer's async sockets (core::conn — Conn::send/recv over the reactor)
+// + the neutral lookup.rs decision tables.
 // ===================================================================
 
 /// A fire-and-forget side effect the ffi applies after a poll — the one thing a
@@ -1423,101 +1422,13 @@ pub(crate) struct Resources {
     pub opts: QueryOpts,
 }
 
-/// An owned socket (UDP, or a one-shot TCP probe) with its own TCP reassembly
-/// buffer.
-struct OwnedSock {
-    sock: Rc<dyn Socket>,
-    is_tcp: bool,
-    rbuf: Vec<u8>,
-}
-
-impl OwnedSock {
-    fn fd(&self) -> i32 {
-        self.sock.as_raw_fd()
-    }
-    fn recv_msg(&mut self) -> Recv {
-        if !self.is_tcp {
-            return recv_datagram(&*self.sock);
-        }
-        // One-shot TCP: drain bytes (IO), then try to pop one length-framed DNS
-        // message (framing is DNS). A buffered frame delivers even on a dead
-        // socket; else a dead socket is `Dead`, a live-but-incomplete is `Pending`.
-        let alive = recv_stream(&*self.sock, &mut self.rbuf);
-        match extract_tcp_frame(&mut self.rbuf) {
-            Some(frame) => Recv::Msg(frame),
-            None if !alive => Recv::Dead,
-            None => Recv::Pending,
-        }
-    }
-}
-
-/// A shared TCP connection to one server, cooperatively driven by every future
-/// that has an outstanding query on it. Ports the classic reactor's per-fd
-/// reassembly buffer + QID demux into an object the futures share.
-pub(crate) struct TcpConn {
-    sock: Rc<dyn Socket>,
-    fd: i32,
-    rbuf: Vec<u8>,
-    /// qid -> reply slot: `None` = still awaited, `Some` = delivered, waiting to
-    /// be taken by that future.
-    inbox: HashMap<u16, Option<Vec<u8>>>,
-}
-
-impl TcpConn {
-    /// Drain the socket, reassemble frames, and route each by its header QID
-    /// into `inbox` (frames with no registered waiter are dropped). Returns
-    /// `false` if the connection died (EOF / hard error). Idempotent: a sibling
-    /// future calling this after the socket is drained just no-ops.
-    fn recv_and_route(&mut self) -> bool {
-        let alive = recv_stream(&*self.sock, &mut self.rbuf);
-        while let Some(frame) = extract_tcp_frame(&mut self.rbuf) {
-            if frame.len() >= 2 {
-                let qid = u16::from_be_bytes([frame[0], frame[1]]);
-                if let Some(slot) = self.inbox.get_mut(&qid) {
-                    *slot = Some(frame);
-                }
-                // Unknown qid → drop (a stray/late reply).
-            } else if let Some((_, slot)) = self.inbox.iter_mut().find(|(_, s)| s.is_none()) {
-                // A frame too short to carry a qid (malformed): hand it to one
-                // awaiting waiter so it fails to parse (EBADRESP), matching
-                // qid_matches's acceptance of short buffers.
-                *slot = Some(frame);
-            }
-        }
-        alive
-    }
-}
-
-/// Per-server shared TCP connections. A future consults this before opening a
-/// TCP socket so parallel lookups to one server share a connection.
-#[derive(Default)]
-pub(crate) struct TcpPool(HashMap<usize, Rc<RefCell<TcpConn>>>);
-
-impl TcpPool {
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
-    }
-    /// Drop a dead connection so the next query to that server reconnects.
-    fn remove(&mut self, server: usize) {
-        self.0.remove(&server);
-    }
-    /// Reuse the live connection to `server`, else open + connect one.
-    fn get_or_create(
-        &mut self,
-        server: usize,
-        factory: &Rc<dyn SocketFactory>,
-        ep: &ServerEndpoint,
-    ) -> Result<Rc<RefCell<TcpConn>>, ()> {
-        if let Some(c) = self.0.get(&server) {
-            return Ok(c.clone());
-        }
-        let sock = factory.create_tcp(ep.bind).map_err(|_| ())?;
-        let _ = sock.connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
-        let fd = sock.as_raw_fd();
-        let conn = Rc::new(RefCell::new(TcpConn { sock, fd, rbuf: Vec::new(), inbox: HashMap::new() }));
-        self.0.insert(server, conn.clone());
-        Ok(conn)
-    }
+/// The mux tag of a DNS frame — its transaction ID (header bytes 0..2), the
+/// demux key the conn layer routes shared-TCP replies by. `None` for a frame
+/// too short to carry one: the conn layer then hands it to any awaiting
+/// waiter, which rejects it in parsing (EBADRESP) — matching `qid_matches`'s
+/// acceptance of short buffers.
+pub(crate) fn dns_tag(frame: &[u8]) -> Option<u16> {
+    frame.get(0..2).map(|b| u16::from_be_bytes([b[0], b[1]]))
 }
 
 fn qid_of(payload: &[u8]) -> u16 {
@@ -1526,117 +1437,6 @@ fn qid_of(payload: &[u8]) -> u16 {
     } else {
         0
     }
-}
-
-/// A query's connection — the socket object the handler drives, tokio-style.
-/// It **owns its mailbox** (`io`), so `send`/`recv` take no reactor handle:
-/// `conn.send(bytes, deadline).await` / `conn.recv(deadline).await`, just
-/// like `socket.recv(..).await`. `wire` is the transport: an owned socket (UDP
-/// primary, or a one-shot probe) or a shared TCP connection multiplexed by `qid`;
-/// the datagram-vs-QID-demuxed-stream asymmetry is hidden behind the methods.
-struct Conn {
-    io: Rc<RefCell<DnsMailbox>>,
-    wire: Wire,
-}
-
-enum Wire {
-    Owned(OwnedSock),
-    Shared(Rc<RefCell<TcpConn>>, u16),
-}
-
-impl Conn {
-    /// An owned socket (UDP primary, or a one-shot probe), already connected.
-    fn owned(io: Rc<RefCell<DnsMailbox>>, sock: Rc<dyn Socket>, is_tcp: bool) -> Self {
-        Conn { io, wire: Wire::Owned(OwnedSock { sock, is_tcp, rbuf: Vec::new() }) }
-    }
-
-    /// A query's handle on a shared TCP conn. Reserves `qid`'s inbox slot so a
-    /// sibling future's read routes this query's reply here; the slot is
-    /// released when the handle drops.
-    fn shared(io: Rc<RefCell<DnsMailbox>>, conn: Rc<RefCell<TcpConn>>, qid: u16) -> Self {
-        conn.borrow_mut().inbox.insert(qid, None);
-        Conn { io, wire: Wire::Shared(conn, qid) }
-    }
-
-    fn fd(&self) -> i32 {
-        match &self.wire {
-            Wire::Owned(s) => s.fd(),
-            Wire::Shared(c, _) => c.borrow().fd,
-        }
-    }
-
-    fn is_tcp(&self) -> bool {
-        match &self.wire {
-            Wire::Owned(s) => s.is_tcp,
-            Wire::Shared(..) => true,
-        }
-    }
-
-    /// Await writability, then send `framed` once (WouldBlock re-awaits, matching
-    /// the classic `Writing`→`Reading` flow). The socket was connected at
-    /// creation. `false` on a hard failure or timeout. (was `send_primary`.)
-    async fn send(&self, framed: &[u8], deadline: Instant) -> bool {
-        let sock: Rc<dyn Socket> = match &self.wire {
-            Wire::Owned(s) => s.sock.clone(),
-            Wire::Shared(c, _) => c.borrow().sock.clone(),
-        };
-        send_when_writable(&self.io, &*sock, framed, deadline).await
-    }
-
-    /// One non-blocking read of this conn's next reply: a UDP datagram / one-shot
-    /// TCP frame (owned), or this qid's routed frame off the shared TCP conn.
-    /// `Recv::Pending` = nothing yet (WouldBlock / incomplete). (was `recv_primary`.)
-    fn read(&mut self) -> Recv {
-        match &mut self.wire {
-            Wire::Owned(s) => s.recv_msg(),
-            Wire::Shared(c, qid) => {
-                let mut conn = c.borrow_mut();
-                let alive = conn.recv_and_route();
-                match conn.inbox.get_mut(qid).and_then(|slot| slot.take()) {
-                    Some(msg) => Recv::Msg(msg),
-                    None if !alive => Recv::Dead,
-                    None => Recv::Pending,
-                }
-            }
-        }
-    }
-
-    /// The readiness-driven recv arm for `select2`/`select3`: on this conn's fd
-    /// firing, do one non-blocking [`read`](Self::read). Uses the conn's own mailbox.
-    fn recv_arm(&mut self) -> std::task::Poll<RecvReady> {
-        let fd = self.fd();
-        let io = self.io.clone();
-        poll_recv(&io, fd, || self.read())
-    }
-
-    /// tokio-style `conn.recv(deadline).await`: await this conn's next reply,
-    /// bounded by `deadline` (a 2-arm select over the conn's own mailbox,
-    /// deadline-biased to match the classic expiry-preempts-read order).
-    async fn recv(&mut self, deadline: Instant) -> RecvOutcome {
-        let io = self.io.clone();
-        match select2(&io, |io| poll_deadline(io, deadline), |_| self.recv_arm()).await {
-            Which2::A(()) => RecvOutcome::Timeout,
-            Which2::B(RecvReady::Msg(b)) => RecvOutcome::Reply(b),
-            Which2::B(RecvReady::Dead) => RecvOutcome::Dead,
-        }
-    }
-}
-
-/// Dropping a query's conn releases its shared-TCP inbox slot (RAII — no manual
-/// register/clear), so retries, delivery, and abandonment can't leak slots.
-impl Drop for Conn {
-    fn drop(&mut self) {
-        if let Wire::Shared(c, qid) = &self.wire {
-            c.borrow_mut().inbox.remove(qid);
-        }
-    }
-}
-
-/// The outcome of [`Conn::recv`]: a reply's bytes, a deadline, or a dead socket.
-enum RecvOutcome {
-    Reply(Vec<u8>),
-    Timeout,
-    Dead,
 }
 
 /// One `select` result in the probe ops (`gethostbyname`/`search`): which of the
@@ -1650,7 +1450,7 @@ enum ReplyEvent {
 
 /// A one-shot failover probe running alongside the primary query.
 struct Probe {
-    conn: Conn,
+    conn: Conn<DnsSignals>,
     server: usize,
     deadline: Instant,
     payload: BytesMut, // framed form actually sent (for qid_matches)
@@ -1727,7 +1527,7 @@ impl ParallelQueries {
                             for _ in 0..res.opts.attempts.max(1) {
                                 let Some(ep) = res.endpoints.get(s) else { break };
                                 let conn = if use_tcp {
-                                    res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
+                                    res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(io.clone(), c, qid))
                                 } else {
                                     res.factory.create_udp(ep.bind).ok().map(|sk| {
                                         let _ = sk.connect(ep.udp_addr);
@@ -1773,7 +1573,7 @@ impl ParallelQueries {
                         // Await the primary reply, servicing the probe socket concurrently.
                         loop {
                             match conn.recv(deadline).await {
-                                RecvOutcome::Reply(buf) => {
+                                RecvOutcome::Msg(buf) => {
                                     if !qid_matches(&buf, wire, use_tcp) {
                                         continue; // stray datagram — await the next reply
                                     }

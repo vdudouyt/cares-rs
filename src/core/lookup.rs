@@ -3,8 +3,8 @@
 //! socket lifecycle and consults these for its verdicts.
 //!
 //! # Map
-//! - [`summarize`] / [`qid_matches`] / [`extract_tcp_frame`] — DNS reply
-//!   header classification, transaction-ID matching, TCP reassembly
+//! - [`summarize`] / [`qid_matches`] — DNS reply header classification and
+//!   transaction-ID matching
 //! - [`is_localhost`] / [`is_onion_domain`] — special-name classification
 //! - [`SearchPlan`] — the search-domain iteration for ares_search / getaddrinfo
 //!   (ndots threshold, bare-name fallback), via [`SearchPlan::for_search`]
@@ -56,21 +56,6 @@ pub fn qid_matches(resp: &[u8], writebuf: &[u8], is_tcp: bool) -> bool {
     let resp_qid = u16::from_be_bytes([resp[0], resp[1]]);
     let query_qid = u16::from_be_bytes([writebuf[query_qid_offset], writebuf[query_qid_offset + 1]]);
     resp_qid == query_qid
-}
-
-/// Pop one complete length-prefixed DNS message off a TCP receive buffer,
-/// or `None` if a full frame hasn't accumulated yet.
-pub fn extract_tcp_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    if rbuf.len() < 2 {
-        return None;
-    }
-    let payload_len = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
-    if rbuf.len() < 2 + payload_len {
-        return None;
-    }
-    let msg = rbuf[2..2 + payload_len].to_vec();
-    rbuf.drain(..2 + payload_len);
-    Some(msg)
 }
 
 /// RFC 6761 section 6.3: "localhost" or any name under ".localhost"
@@ -368,19 +353,6 @@ mod tests {
         // Too-short response or query: accepted (historical behavior)
         assert!(qid_matches(&[0xab], &query, false));
         assert!(qid_matches(&[0xab, 0xcd], &[0x00], false));
-    }
-
-    #[test]
-    fn tcp_frame_extraction() {
-        let mut rbuf = vec![0x00, 0x03, 1, 2, 3, 0x00];
-        assert_eq!(extract_tcp_frame(&mut rbuf), Some(vec![1, 2, 3]));
-        assert_eq!(rbuf, vec![0x00]); // partial next frame stays buffered
-        assert_eq!(extract_tcp_frame(&mut rbuf), None);
-        rbuf.push(0x02);
-        assert_eq!(extract_tcp_frame(&mut rbuf), None); // length known, payload missing
-        rbuf.extend_from_slice(&[9, 8]);
-        assert_eq!(extract_tcp_frame(&mut rbuf), Some(vec![9, 8]));
-        assert!(rbuf.is_empty());
     }
 
     fn reply(rcode: u8, ancount: u16) -> Vec<u8> {

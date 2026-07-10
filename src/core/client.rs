@@ -51,7 +51,7 @@ pub(crate) struct Client {
     pub udp_max_queries: u32, // 0 = unlimited
     /// Shared TCP connections for the async engine (parallel lookups to one
     /// server share a connection); handed to each future via its descriptor.
-    pub tcp_pool: Rc<RefCell<crate::core::async_client::TcpPool>>,
+    pub tcp_pool: Rc<RefCell<crate::core::conn::TcpPool>>,
     /// Per-server connect endpoints, cached (rebuilt on server change) so each
     /// async launch clones an `Rc` instead of re-snapshotting the config.
     endpoints: Rc<Vec<async_client::ServerEndpoint>>,
@@ -78,7 +78,7 @@ impl Client {
             hosts_path: String::new(),
             cache: Rc::new(RefCell::new(QueryCache::default())),
             udp_max_queries: 0,
-            tcp_pool: Rc::new(RefCell::new(crate::core::async_client::TcpPool::default())),
+            tcp_pool: Rc::new(RefCell::new(crate::core::conn::TcpPool::new(async_client::dns_tag))),
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
