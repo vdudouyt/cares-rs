@@ -679,6 +679,47 @@ impl AsyncClient {
         }
     }
 
+    /// Query `name` for each family in `rtypes` concurrently on the shared mailbox
+    /// (`poll_recv` routes each reply by fd, so the `request`s self-demux). When
+    /// there are two families, the A/ipv4 answer with real records sets the mailbox
+    /// `cancelled` flag so the AAAA sibling stops retrying (an in-flight reply still
+    /// delivers); ipv6 success does NOT cancel A. Returns one `QueryOutcome` per
+    /// family, in `rtypes` order. (≈ upstream `next_dns_lookup` + `terminate_retries`.)
+    async fn query_families(self: Rc<Self>, name: &str, rtypes: &[u16]) -> Vec<QueryOutcome> {
+        let use_vc = self.config.options.use_vc;
+        let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
+        self.io.borrow().app.cancelled.set(false);
+        let mut results: Vec<Option<QueryOutcome>> = (0..rtypes.len()).map(|_| None).collect();
+
+        // `select_biased!` needs a statically-known arm count; the batch is
+        // one family (single await) or two (AF_UNSPEC — race both).
+        let sub = |i: usize| self.clone().request(dns_query_payload(name, rtypes[i]), use_vc);
+        if rtypes.len() == 1 {
+            results[0] = Some(sub(0).await);
+        } else {
+            let mut f0 = pin!(sub(0).fuse());
+            let mut f1 = pin!(sub(1).fuse());
+            while results.iter().any(Option::is_none) {
+                select_biased! {
+                    r = f0 => {
+                        // A completed: cancel the AAAA sibling on a real answer.
+                        if Some(0) == a_idx {
+                            if let (Ok(buf), _) = &r {
+                                let s = summarize(buf, 0);
+                                if s.rcode == 0 && s.ancount > 0 {
+                                    self.io.borrow().app.cancelled.set(true);
+                                }
+                            }
+                        }
+                        results[0] = Some(r);
+                    }
+                    r = f1 => { results[1] = Some(r); }
+                }
+            }
+        }
+        results.into_iter().map(Option::unwrap).collect()
+    }
+
     /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
     /// then per search-plan name an A+AAAA batch — two [`request`](Self::request)
     /// futures on the shared mailbox raced with `select_biased!` — merging the
@@ -749,73 +790,30 @@ impl AsyncClient {
                 libc::AF_INET6 => vec![RTYPE_AAAA],
                 _ => vec![RTYPE_A, RTYPE_AAAA],
             };
-            let use_vc = self.config.options.use_vc;
-            let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
-
-            // Drive A+AAAA on one shared mailbox (`self.io`): `poll_recv` routes each
-            // reply by fd, so the two `request`s self-demux. Policy (here, not in the
-            // driver): once the A/ipv4 query returns actual addresses, set the shared
-            // mailbox `cancelled` flag — the sibling AAAA's `request` stops retrying
-            // (an in-flight reply still delivers). ipv6 success does NOT cancel A (an
-            // ipv4-only host may still need the A answer). The flag is only ever set
-            // after the A future completed, so A never re-reads it — only AAAA acts.
-            self.io.borrow().app.cancelled.set(false);
-            let mut results: Vec<Option<QueryOutcome>> = (0..rtypes.len()).map(|_| None).collect();
-
-            // `select_biased!` needs a statically-known arm count; the batch is
-            // one family (single await) or two (AF_UNSPEC — race both).
-            let sub = |i: usize| {
-                self.clone().request(dns_query_payload(&plan.current, rtypes[i]), use_vc)
-            };
-            if rtypes.len() == 1 {
-                results[0] = Some(sub(0).await);
-            } else {
-                let mut f0 = pin!(sub(0).fuse());
-                let mut f1 = pin!(sub(1).fuse());
-                while results.iter().any(Option::is_none) {
-                    select_biased! {
-                        r = f0 => {
-                            // A completed: cancel the AAAA sibling on a real answer.
-                            if Some(0) == a_idx {
-                                if let (Ok(buf), _) = &r {
-                                    let s = summarize(buf, 0);
-                                    if s.rcode == 0 && s.ancount > 0 {
-                                        self.io.borrow().app.cancelled.set(true);
-                                    }
-                                }
-                            }
-                            results[0] = Some(r);
-                        }
-                        r = f1 => { results[1] = Some(r); }
-                    }
-                }
-            }
+            let results = self.clone().query_families(&plan.current, &rtypes).await;
 
             // Merge every family's records (arrival order); note the last error.
             let mut records: Vec<AddrRecord> = Vec::new();
             let mut any_success = false;
             for (i, &rtype) in rtypes.iter().enumerate() {
-                match results[i].as_ref() {
-                    Some((Ok(buf), io_timeouts)) => {
-                        timeouts += io_timeouts;
-                        match addr_reply(buf, rtype, ReplyRequire::Items) {
-                            Ok(mut rrs) => {
-                                records.append(&mut rrs.items);
-                                any_success = true;
-                            }
-                            Err(e) => {
-                                if e.code() == ARES_ENODATA {
-                                    had_nodata = true;
-                                }
-                                last_error = e;
-                            }
+                let (result, io_timeouts) = &results[i];
+                timeouts += io_timeouts;
+                match result {
+                    Ok(buf) => match addr_reply(buf, rtype, ReplyRequire::Items) {
+                        Ok(mut rrs) => {
+                            records.append(&mut rrs.items);
+                            any_success = true;
                         }
-                    }
-                    Some((Err(status), io_timeouts)) => {
-                        timeouts += io_timeouts;
+                        Err(e) => {
+                            if e.code() == ARES_ENODATA {
+                                had_nodata = true;
+                            }
+                            last_error = e;
+                        }
+                    },
+                    Err(status) => {
                         last_error = AresError::from(*status);
                     }
-                    None => {}
                 }
             }
 
