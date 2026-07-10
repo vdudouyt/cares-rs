@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{c_int, CString};
+use std::io;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -23,10 +24,8 @@ use bytes::BytesMut;
 
 use crate::core::api;
 use crate::core::cache::QueryCache;
-use crate::core::conn::{Conn, RecvOutcome, TcpPool};
-use crate::core::executor::{
-    noop_waker, poll_timeout, select3, wait_io, QueryIo, RecvReady, Wait, Which3,
-};
+use crate::core::conn::{Conn, TcpPool};
+use crate::core::executor::{noop_waker, poll_timeout, select3, wait_io, QueryIo, Wait, Which3};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, Hosts};
 use crate::core::lookup::{
@@ -138,7 +137,7 @@ impl AsyncClient {
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                 let timeout = Instant::now() + res.opts.timeout;
-                if !conn.send(wire, timeout).await {
+                if conn.send(wire, timeout).await.is_err() {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -154,7 +153,7 @@ impl AsyncClient {
                 }
                 loop {
                     match conn.recv(timeout).await {
-                        RecvOutcome::Msg(buf) => {
+                        Ok(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
                             }
@@ -169,7 +168,8 @@ impl AsyncClient {
                             );
                             notify(&io, actions);
                             match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                    server = next;
+                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                    server = next;
                                     failover_tries = ft;
                                     continue 'attempt;
                                 }
@@ -177,11 +177,13 @@ impl AsyncClient {
                                     use_tcp = true;
                                     continue 'attempt;
                                 }
-                                TaskVerdict::Deliver => {                                    break 'drive (Ok(buf), timeouts);
+                                TaskVerdict::Deliver => {
+                                    break 'drive (Ok(buf), timeouts);
                                 }
                             }
                         }
-                        RecvOutcome::Timeout => {                            if io.borrow().app.cancelled {
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                            if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -196,7 +198,9 @@ impl AsyncClient {
                                 TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
                             }
                         }
-                        RecvOutcome::Dead => {                            if use_tcp {
+                        Err(_) => {
+                            // Dead socket (EOF / hard error).
+                            if use_tcp {
                                 res.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
@@ -391,7 +395,7 @@ impl AsyncClient {
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                     let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                     let timeout = Instant::now() + res.opts.timeout;
-                    if !conn.send(wire, timeout).await {
+                    if conn.send(wire, timeout).await.is_err() {
                         if use_tcp {
                             res.tcp_pool.borrow_mut().remove(server);
                         }
@@ -418,21 +422,20 @@ impl AsyncClient {
                             }
                         } else {
                             match conn.recv(timeout).await {
-                                RecvOutcome::Msg(b) => ReplyEvent::Primary(RecvReady::Msg(b)),
-                                RecvOutcome::Timeout => ReplyEvent::Timeout,
-                                RecvOutcome::Dead => ReplyEvent::Primary(RecvReady::Dead),
+                                Err(e) if e.kind() == io::ErrorKind::TimedOut => ReplyEvent::Timeout,
+                                r => ReplyEvent::Primary(r),
                             }
                         };
                         match event {
                             ReplyEvent::Probe(r) => {
                                 match r {
-                                    RecvReady::Msg(buf) => {
+                                    Ok(buf) => {
                                         if probe.as_ref().is_some_and(|p| qid_matches(&buf, &p.payload, p.conn.is_tcp())) {
                                             let p_taken = probe.take().unwrap();
                                             settle_probe(&io, &res, &p_taken, Some(&buf));
                                         }
                                     }
-                                    RecvReady::Dead => probe = None,
+                                    Err(_) => probe = None, // probe socket died
                                 }
                                 continue;
                             }
@@ -444,7 +447,8 @@ impl AsyncClient {
                                         settle_probe(&io, &res, &p_taken, None);
                                     }
                                 }
-                                if now >= timeout {                                    if io.borrow().app.cancelled {
+                                if now >= timeout {
+                                    if io.borrow().app.cancelled {
                                         break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -463,8 +467,10 @@ impl AsyncClient {
                             }
                             ReplyEvent::Primary(r) => {
                                 let buf = match r {
-                                    RecvReady::Msg(buf) => buf,
-                                    RecvReady::Dead => {                                        if use_tcp {
+                                    Ok(buf) => buf,
+                                    Err(_) => {
+                                        // Dead socket (EOF / hard error).
+                                        if use_tcp {
                                             res.tcp_pool.borrow_mut().remove(server);
                                         }
                                         if io.borrow().app.cancelled {
@@ -497,7 +503,8 @@ impl AsyncClient {
                                 );
                                 notify(&io, actions);
                                 match verdict {
-                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                        server = next;
+                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                        server = next;
                                         failover_tries = ft;
                                         continue 'attempt;
                                     }
@@ -505,7 +512,8 @@ impl AsyncClient {
                                         use_tcp = true;
                                         continue 'attempt;
                                     }
-                                    TaskVerdict::Deliver => {                                        break 'drive (Ok(buf), timeouts);
+                                    TaskVerdict::Deliver => {
+                                        break 'drive (Ok(buf), timeouts);
                                     }
                                 }
                             }
@@ -629,7 +637,7 @@ impl AsyncClient {
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                 let timeout = Instant::now() + res.opts.timeout;
-                if !conn.send(wire, timeout).await {
+                if conn.send(wire, timeout).await.is_err() {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -645,7 +653,7 @@ impl AsyncClient {
                 }
                 loop {
                     match conn.recv(timeout).await {
-                        RecvOutcome::Msg(buf) => {
+                        Ok(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
                             }
@@ -660,7 +668,8 @@ impl AsyncClient {
                             );
                             notify(&io, actions);
                             match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                    server = next;
+                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                    server = next;
                                     failover_tries = ft;
                                     continue 'attempt;
                                 }
@@ -668,11 +677,13 @@ impl AsyncClient {
                                     use_tcp = true;
                                     continue 'attempt;
                                 }
-                                TaskVerdict::Deliver => {                                    break 'drive (Ok(buf), timeouts);
+                                TaskVerdict::Deliver => {
+                                    break 'drive (Ok(buf), timeouts);
                                 }
                             }
                         }
-                        RecvOutcome::Timeout => {                            if io.borrow().app.cancelled {
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                            if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -687,7 +698,9 @@ impl AsyncClient {
                                 TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
                             }
                         }
-                        RecvOutcome::Dead => {                            if use_tcp {
+                        Err(_) => {
+                            // Dead socket (EOF / hard error).
+                            if use_tcp {
                                 res.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
@@ -804,7 +817,7 @@ impl AsyncClient {
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                 let timeout = Instant::now() + res.opts.timeout;
-                if !conn.send(wire, timeout).await {
+                if conn.send(wire, timeout).await.is_err() {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -820,7 +833,7 @@ impl AsyncClient {
                 }
                 loop {
                     match conn.recv(timeout).await {
-                        RecvOutcome::Msg(buf) => {
+                        Ok(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
                             }
@@ -835,7 +848,8 @@ impl AsyncClient {
                             );
                             notify(&io, actions);
                             match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                    server = next;
+                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                    server = next;
                                     failover_tries = ft;
                                     continue 'attempt;
                                 }
@@ -843,11 +857,13 @@ impl AsyncClient {
                                     use_tcp = true;
                                     continue 'attempt;
                                 }
-                                TaskVerdict::Deliver => {                                    break 'drive (Ok(buf), timeouts);
+                                TaskVerdict::Deliver => {
+                                    break 'drive (Ok(buf), timeouts);
                                 }
                             }
                         }
-                        RecvOutcome::Timeout => {                            if io.borrow().app.cancelled {
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                            if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -862,7 +878,9 @@ impl AsyncClient {
                                 TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
                             }
                         }
-                        RecvOutcome::Dead => {                            if use_tcp {
+                        Err(_) => {
+                            // Dead socket (EOF / hard error).
+                            if use_tcp {
                                 res.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
@@ -984,7 +1002,7 @@ impl AsyncClient {
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                     let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                     let timeout = Instant::now() + res.opts.timeout;
-                    if !conn.send(wire, timeout).await {
+                    if conn.send(wire, timeout).await.is_err() {
                         if use_tcp {
                             res.tcp_pool.borrow_mut().remove(server);
                         }
@@ -1011,21 +1029,20 @@ impl AsyncClient {
                             }
                         } else {
                             match conn.recv(timeout).await {
-                                RecvOutcome::Msg(b) => ReplyEvent::Primary(RecvReady::Msg(b)),
-                                RecvOutcome::Timeout => ReplyEvent::Timeout,
-                                RecvOutcome::Dead => ReplyEvent::Primary(RecvReady::Dead),
+                                Err(e) if e.kind() == io::ErrorKind::TimedOut => ReplyEvent::Timeout,
+                                r => ReplyEvent::Primary(r),
                             }
                         };
                         match event {
                             ReplyEvent::Probe(r) => {
                                 match r {
-                                    RecvReady::Msg(buf) => {
+                                    Ok(buf) => {
                                         if probe.as_ref().is_some_and(|p| qid_matches(&buf, &p.payload, p.conn.is_tcp())) {
                                             let p_taken = probe.take().unwrap();
                                             settle_probe(&io, &res, &p_taken, Some(&buf));
                                         }
                                     }
-                                    RecvReady::Dead => probe = None,
+                                    Err(_) => probe = None, // probe socket died
                                 }
                                 continue;
                             }
@@ -1037,7 +1054,8 @@ impl AsyncClient {
                                         settle_probe(&io, &res, &p_taken, None);
                                     }
                                 }
-                                if now >= timeout {                                    if io.borrow().app.cancelled {
+                                if now >= timeout {
+                                    if io.borrow().app.cancelled {
                                         break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -1056,8 +1074,10 @@ impl AsyncClient {
                             }
                             ReplyEvent::Primary(r) => {
                                 let buf = match r {
-                                    RecvReady::Msg(buf) => buf,
-                                    RecvReady::Dead => {                                        if use_tcp {
+                                    Ok(buf) => buf,
+                                    Err(_) => {
+                                        // Dead socket (EOF / hard error).
+                                        if use_tcp {
                                             res.tcp_pool.borrow_mut().remove(server);
                                         }
                                         if io.borrow().app.cancelled {
@@ -1090,7 +1110,8 @@ impl AsyncClient {
                                 );
                                 notify(&io, actions);
                                 match verdict {
-                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                        server = next;
+                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                        server = next;
                                         failover_tries = ft;
                                         continue 'attempt;
                                     }
@@ -1098,7 +1119,8 @@ impl AsyncClient {
                                         use_tcp = true;
                                         continue 'attempt;
                                     }
-                                    TaskVerdict::Deliver => {                                        break 'drive (Ok(buf), timeouts);
+                                    TaskVerdict::Deliver => {
+                                        break 'drive (Ok(buf), timeouts);
                                     }
                                 }
                             }
@@ -1443,9 +1465,9 @@ fn qid_of(payload: &[u8]) -> u16 {
 /// raced arms — the concurrent failover probe, the timeout, or the primary
 /// reply — fired. Unifies the 3-arm (probe live) and 2-arm (no probe) branches.
 enum ReplyEvent {
-    Probe(RecvReady),
+    Probe(io::Result<Vec<u8>>),
     Timeout,
-    Primary(RecvReady),
+    Primary(io::Result<Vec<u8>>),
 }
 
 /// A one-shot failover probe running alongside the primary query.
@@ -1551,7 +1573,7 @@ impl ParallelQueries {
                         let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                         let timeout = Instant::now() + res.opts.timeout;
 
-                        if !conn.send(wire, timeout).await {
+                        if conn.send(wire, timeout).await.is_err() {
                             // Send failed (a hard socket error): recreate the socket and retry,
                             // bounded by the attempt budget — mirrors the classic write_impl's
                             // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
@@ -1573,7 +1595,7 @@ impl ParallelQueries {
                         // Await the primary reply, servicing the probe socket concurrently.
                         loop {
                             match conn.recv(timeout).await {
-                                RecvOutcome::Msg(buf) => {
+                                Ok(buf) => {
                                     if !qid_matches(&buf, wire, use_tcp) {
                                         continue; // stray datagram — await the next reply
                                     }
@@ -1588,7 +1610,8 @@ impl ParallelQueries {
                                     );
                                     notify(&io, actions);
                                     match verdict {
-                                        TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                            server = next;
+                                        TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                            server = next;
                                             failover_tries = ft;
                                             continue 'attempt;
                                         }
@@ -1596,11 +1619,13 @@ impl ParallelQueries {
                                             use_tcp = true;
                                             continue 'attempt;
                                         }
-                                        TaskVerdict::Deliver => {                                            return (Ok(buf), timeouts);
+                                        TaskVerdict::Deliver => {
+                                            return (Ok(buf), timeouts);
                                         }
                                     }
                                 }
-                                RecvOutcome::Timeout => {                                    if io.borrow().app.cancelled {
+                                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                                    if io.borrow().app.cancelled {
                                         return (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -1615,7 +1640,9 @@ impl ParallelQueries {
                                         TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
                                     }
                                 }
-                                RecvOutcome::Dead => {                                    if use_tcp {
+                                Err(_) => {
+                            // Dead socket (EOF / hard error).
+                                    if use_tcp {
                                         res.tcp_pool.borrow_mut().remove(server);
                                     }
                                     if io.borrow().app.cancelled {

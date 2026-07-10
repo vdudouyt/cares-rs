@@ -110,24 +110,25 @@ pub(crate) enum Recv {
 }
 
 /// Await writability on `sock`, then send `bytes` once. Re-awaits on `WouldBlock`;
-/// returns `false` on a hard error or on timeout before writable. Generic over the
-/// mailbox app-state — the reactor never inspects `bytes`.
+/// `Err(TimedOut)` on timeout before writable, the socket's own error on a hard
+/// send failure. Generic over the mailbox app-state — the reactor never
+/// inspects `bytes`.
 pub(crate) async fn send_when_writable<A>(
     io: &Rc<RefCell<QueryIo<A>>>,
     sock: &dyn Socket,
     bytes: &[u8],
     timeout: Instant,
-) -> bool {
+) -> std::io::Result<()> {
     let fd = sock.as_raw_fd();
     loop {
         let woke = wait_io(io, &[Wait { fd, writable: true }], timeout).await;
         if woke.expired && !woke.fds.contains(&fd) {
-            return false; // timed out before writable
+            return Err(std::io::ErrorKind::TimedOut.into()); // timed out before writable
         }
         match sock.send(bytes) {
-            Ok(_) => return true,
+            Ok(_) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // re-await writable
-            Err(_) => return false,
+            Err(e) => return Err(e),
         }
     }
 }
@@ -165,23 +166,18 @@ pub(crate) fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>) -> bool {
 
 // ===== select: readiness-driven recv arms + a biased poll_fn combinator =====
 
-/// The outcome of a recv arm resolving. `WouldBlock` never escapes — the arm
-/// re-registers and suspends instead. Bytes are opaque to the reactor.
-pub(crate) enum RecvReady {
-    Msg(Vec<u8>),
-    Dead,
-}
-
 /// A per-fd recv arm for use inside [`select2`]/[`select3`]. If `fd` fired this
 /// cycle, consume **that fd's** readiness (`swap_remove`) and run `read` once;
 /// a `WouldBlock` (`Recv::Pending`) re-registers read-interest and suspends (so a
 /// sibling arm can still progress). Otherwise registers read-interest and
-/// suspends. `read` yields opaque bytes — the reactor names nothing of the app.
+/// suspends. Resolves tokio-style: `Ok(bytes)` for a message, `Err(UnexpectedEof)`
+/// for a dead socket. `read` yields opaque bytes — the reactor names nothing of
+/// the app.
 pub(crate) fn poll_recv<A>(
     io: &Rc<RefCell<QueryIo<A>>>,
     fd: i32,
     mut read: impl FnMut() -> Recv,
-) -> Poll<RecvReady> {
+) -> Poll<std::io::Result<Vec<u8>>> {
     let fired = {
         let mut m = io.borrow_mut();
         match m.fired.iter().position(|&f| f == fd) {
@@ -203,8 +199,11 @@ pub(crate) fn poll_recv<A>(
             io.borrow_mut().waits.push(Wait { fd, writable: false });
             Poll::Pending
         }
-        Recv::Msg(b) => Poll::Ready(RecvReady::Msg(b)),
-        Recv::Dead => Poll::Ready(RecvReady::Dead),
+        Recv::Msg(b) => Poll::Ready(Ok(b)),
+        Recv::Dead => Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed",
+        ))),
     }
 }
 
@@ -335,7 +334,7 @@ mod tests {
             calls.set(calls.get() + 1);
             Recv::Msg(vec![42])
         });
-        assert!(matches!(p, Poll::Ready(RecvReady::Msg(ref b)) if b == &[42]));
+        assert!(matches!(p, Poll::Ready(Ok(ref b)) if b == &[42]));
         assert_eq!(calls.get(), 1);
         // Only fd 7 consumed; siblings 3 and 9 remain for their own arms.
         let fired = io.borrow().fired.clone();
@@ -362,7 +361,7 @@ mod tests {
         let io = mailbox();
         io.borrow_mut().fired = vec![7];
         let p = poll_recv(&io, 7, || Recv::Dead);
-        assert!(matches!(p, Poll::Ready(RecvReady::Dead)));
+        assert!(matches!(p, Poll::Ready(Err(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof));
     }
 
     #[test]

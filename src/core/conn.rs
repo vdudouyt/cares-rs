@@ -19,14 +19,15 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Instant;
 
 use crate::core::executor::{
-    poll_timeout, poll_recv, recv_datagram, recv_stream, select2, send_when_writable, QueryIo,
-    Recv, RecvReady, Which2,
+    poll_recv, poll_timeout, recv_datagram, recv_stream, select2, send_when_writable, QueryIo,
+    Recv, Which2,
 };
 use crate::core::socket::{Socket, SocketFactory};
 
@@ -180,8 +181,9 @@ impl<A> Conn<A> {
     }
 
     /// Await writability, then send `bytes` once (WouldBlock re-awaits). The
-    /// socket was connected at creation. `false` on a hard failure or timeout.
-    pub async fn send(&self, bytes: &[u8], timeout: Instant) -> bool {
+    /// socket was connected at creation. Errors: the socket's own error on a
+    /// hard send failure, `ErrorKind::TimedOut` on timeout before writable.
+    pub async fn send(&self, bytes: &[u8], timeout: Instant) -> io::Result<()> {
         let sock: Rc<dyn Socket> = match &self.wire {
             Wire::Owned { sock, .. } => sock.clone(),
             Wire::Shared(c, _) => c.borrow().sock.clone(),
@@ -221,8 +223,9 @@ impl<A> Conn<A> {
     }
 
     /// The readiness-driven recv arm for `select2`/`select3`: on this conn's fd
-    /// firing, do one non-blocking [`read`](Self::read). Uses the conn's own mailbox.
-    pub fn recv_arm(&mut self) -> Poll<RecvReady> {
+    /// firing, do one non-blocking [`read`](Self::read). Uses the conn's own
+    /// mailbox. Resolves `Ok(bytes)` or `Err(UnexpectedEof)` (dead socket).
+    pub fn recv_arm(&mut self) -> Poll<io::Result<Vec<u8>>> {
         let fd = self.fd();
         let io = self.io.clone();
         poll_recv(&io, fd, || self.read())
@@ -231,12 +234,13 @@ impl<A> Conn<A> {
     /// tokio-style `conn.recv(timeout).await`: await this conn's next message,
     /// bounded by `timeout` (a 2-arm select over the conn's own mailbox,
     /// timeout-biased to match the classic expiry-preempts-read order).
-    pub async fn recv(&mut self, timeout: Instant) -> RecvOutcome {
+    /// Errors: `ErrorKind::TimedOut` on expiry, `ErrorKind::UnexpectedEof` on a
+    /// dead socket (EOF / hard recv error).
+    pub async fn recv(&mut self, timeout: Instant) -> io::Result<Vec<u8>> {
         let io = self.io.clone();
         match select2(&io, |io| poll_timeout(io, timeout), |_| self.recv_arm()).await {
-            Which2::A(()) => RecvOutcome::Timeout,
-            Which2::B(RecvReady::Msg(b)) => RecvOutcome::Msg(b),
-            Which2::B(RecvReady::Dead) => RecvOutcome::Dead,
+            Which2::A(()) => Err(io::ErrorKind::TimedOut.into()),
+            Which2::B(r) => r,
         }
     }
 }
@@ -249,13 +253,6 @@ impl<A> Drop for Conn<A> {
             c.borrow_mut().inbox.remove(tag);
         }
     }
-}
-
-/// The outcome of [`Conn::recv`]: a message's bytes, a timeout, or a dead socket.
-pub enum RecvOutcome {
-    Msg(Vec<u8>),
-    Timeout,
-    Dead,
 }
 
 #[cfg(test)]
