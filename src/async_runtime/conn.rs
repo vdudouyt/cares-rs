@@ -280,3 +280,67 @@ impl<A> Drop for Conn<A> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_runtime::executor::{noop_waker, Wait};
+    use std::future::Future;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    /// A socket that always has a datagram waiting — so a recv arm that is
+    /// polled goes `Ready(Ok(..))` immediately.
+    struct AlwaysReadable {
+        fd: i32,
+    }
+    impl Socket for AlwaysReadable {
+        fn as_raw_fd(&self) -> i32 {
+            self.fd
+        }
+        fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
+            Ok(())
+        }
+        fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+            buf[..4].copy_from_slice(&[0xAB; 4]);
+            Ok((4, None))
+        }
+        fn send(&self, data: &[u8]) -> io::Result<usize> {
+            Ok(data.len())
+        }
+    }
+
+    /// `Conn::recv` must be **timeout-biased**: when a reply and the timeout are
+    /// both ready in the same poll, expiry preempts the read. This guards the
+    /// `select_biased!` in `recv` against being weakened to an unbiased
+    /// `futures::select!` (which, given a datagram already waiting *and* an
+    /// expired timeout, would pick the reply arm ~half the time). 100 trials
+    /// make an accidental `select!` fail with probability `1 - 0.5^100` — i.e.
+    /// deterministically for any real run — while `select_biased!` passes every
+    /// trial. The scenario is constructed, not timing-raced, so this is stable.
+    #[test]
+    fn recv_is_timeout_biased_under_simultaneous_readiness() {
+        let waker = noop_waker();
+        for trial in 0..100 {
+            let io = Rc::new(RefCell::new(QueryIo::<()>::default()));
+            // Both arms ready on the first poll: the read fd is fired (a datagram
+            // is waiting) AND the deadline is already in the past.
+            io.borrow_mut().fired = vec![Wait { fd: 42, writable: false }];
+            let sock: Rc<dyn Socket> = Rc::new(AlwaysReadable { fd: 42 });
+            let mut conn = Conn::datagram(io.clone(), sock);
+            let past = Instant::now() - Duration::from_secs(1);
+
+            let mut fut = pin!(conn.recv(past));
+            let mut cx = Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(r) => assert!(
+                    r.is_err_and(|e| e.kind() == io::ErrorKind::TimedOut),
+                    "trial {trial}: recv returned a reply while the timeout was \
+                     also ready — Conn::recv must stay `select_biased!` \
+                     (timeout arm first), not an unbiased `select!`",
+                ),
+                Poll::Pending => panic!("trial {trial}: both arms ready, must resolve"),
+            }
+        }
+    }
+}
