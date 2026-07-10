@@ -12,7 +12,7 @@
 //! (`self.clone().other(…)`). Also here: the entry preflights and the DNS
 //! wire builders; see the section markers.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, CString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -141,108 +141,122 @@ impl AsyncClient {
     /// ares_query / ares_send: one query delivered raw. Keeps the historical
     /// UDP-start behavior (`use_tcp = false`); unlike the resolver ops it does
     /// **not** honor `ARES_FLAG_USEVC`. (Replaces the free `raw_lifecycle`.)
-    pub(crate) async fn query_raw(self: Rc<Self>, payload: BytesMut) -> Delivery {
-        // Inlined single-query driver (WET, see the module note): pick server →
-        // socket → send → recv → QID-match → TC/failover/timeout verdicts. The raw
-        // path: UDP-start (`use_tcp = false`), no probe, no USEVC. The connection
-        // is a `Conn` with async `send`/`recv`; its shared-TCP slot is RAII.
-        let (result, timeouts) = 'drive: {
-            let io = self.io.clone();
-            let opts = self.opts();
-            let mut use_tcp = false;
-            let mut timeouts: c_int = 0;
-            let mut tries: u32 = 0;
-            let mut failover_tries: u32 = 0;
-            let qid = qid_of(&payload);
-            let mut server = self.health.borrow().pick_next();
-            'attempt: loop {
-                let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
-                    Ok(v) => v,
-                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
-                };
-                server = si;
-                let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
-                let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let timeout = Instant::now() + opts.timeout;
-                if conn.send(wire, timeout).await.is_err() {
-                    if use_tcp {
-                        self.tcp_pool.borrow_mut().remove(server);
-                    }
-                    if tries + 1 < opts.attempts.max(1) {
-                        tries += 1;
-                        if self.health.borrow().len() > 1 {
-                            self.health.borrow_mut().record_failure(server);
-                            server = self.health.borrow().pick_next();
-                        }
-                        continue 'attempt;
-                    }
-                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
+    /// The single-query driver — **the** engine every lookup runs on: pick a
+    /// server, connect with failover, send, then loop receiving until a verdict —
+    /// a QID-matching reply → `on_datagram` (deliver / failover / TC-retry); a
+    /// timeout or dead socket → `on_timeout` (resend / expire). Returns the raw
+    /// reply (or an error status) plus the accumulated timeout count. `use_tcp` is
+    /// the starting transport (a TC reply flips it mid-flight). Cooperative cancel:
+    /// when the shared lookup mailbox's `cancelled` flag is set (only `getaddrinfo`
+    /// sets it, once its A answer lands) a give-up branch returns instead of
+    /// resending — an already in-flight reply still delivers.
+    async fn request(self: Rc<Self>, payload: BytesMut, mut use_tcp: bool) -> QueryOutcome {
+        let io = self.io.clone();
+        let opts = self.opts();
+        let mut timeouts: c_int = 0;
+        let mut tries: u32 = 0;
+        let mut failover_tries: u32 = 0;
+        let qid = qid_of(&payload);
+        let mut server = self.health.borrow().pick_next();
+        'attempt: loop {
+            let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
+                Ok(v) => v,
+                Err(()) => return (Err(ARES_ECONNREFUSED), timeouts),
+            };
+            server = si;
+            let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
+            let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
+            let timeout = Instant::now() + opts.timeout;
+            if conn.send(wire, timeout).await.is_err() {
+                if use_tcp {
+                    self.tcp_pool.borrow_mut().remove(server);
                 }
-                loop {
-                    match conn.recv(timeout).await {
-                        Ok(buf) => {
-                            if !qid_matches(&buf, wire, use_tcp) {
-                                continue; // stray datagram — await the next reply
+                if tries + 1 < opts.attempts.max(1) {
+                    tries += 1;
+                    if self.health.borrow().len() > 1 {
+                        self.health.borrow_mut().record_failure(server);
+                        server = self.health.borrow().pick_next();
+                    }
+                    continue 'attempt;
+                }
+                return (Err(ARES_ECONNREFUSED), timeouts);
+            }
+            loop {
+                match conn.recv(timeout).await {
+                    Ok(buf) => {
+                        if !qid_matches(&buf, wire, use_tcp) {
+                            continue; // stray datagram — await the next reply
+                        }
+                        let summary = summarize(&buf, 0);
+                        let (actions, verdict) = on_datagram(
+                            &summary,
+                            server,
+                            use_tcp,
+                            opts.attempts,
+                            failover_tries,
+                            &mut self.health.borrow_mut(),
+                        );
+                        notify(&io, actions);
+                        match verdict {
+                            TaskVerdict::RetryNextServer { server: next, tries: ft } => {
+                                server = next;
+                                failover_tries = ft;
+                                continue 'attempt;
                             }
-                            let summary = summarize(&buf, 0);
-                            let (actions, verdict) = on_datagram(
-                                &summary,
-                                server,
-                                use_tcp,
-                                opts.attempts,
-                                failover_tries,
-                                &mut self.health.borrow_mut(),
-                            );
-                            notify(&io, actions);
-                            match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                    server = next;
-                                    failover_tries = ft;
-                                    continue 'attempt;
-                                }
-                                TaskVerdict::RetryTcp => {
-                                    use_tcp = true;
-                                    continue 'attempt;
-                                }
-                                TaskVerdict::Deliver => {
-                                    break 'drive (Ok(buf), timeouts);
-                                }
+                            TaskVerdict::RetryTcp => {
+                                use_tcp = true;
+                                continue 'attempt;
+                            }
+                            TaskVerdict::Deliver => {
+                                return (Ok(buf), timeouts);
                             }
                         }
-                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                            match verdict {
-                                TimeoutVerdict::Retry { server: next } => {
-                                    tries += 1;
-                                    timeouts += 1;
-                                    server = next;
-                                    continue 'attempt;
-                                }
-                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                            }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                        if io.borrow().app.cancelled.get() {
+                            return (Err(ARES_ETIMEOUT), timeouts);
                         }
-                        Err(_) => {
-                            // Dead socket (EOF / hard error).
-                            if use_tcp {
-                                self.tcp_pool.borrow_mut().remove(server);
+                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
+                        match verdict {
+                            TimeoutVerdict::Retry { server: next } => {
+                                tries += 1;
+                                timeouts += 1;
+                                server = next;
+                                continue 'attempt;
                             }
-                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                            match verdict {
-                                TimeoutVerdict::Retry { server: next } => {
-                                    tries += 1;
-                                    timeouts += 1;
-                                    server = next;
-                                    continue 'attempt;
-                                }
-                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
+                            TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
+                        }
+                    }
+                    Err(_) => {
+                        // Dead socket (EOF / hard error).
+                        if use_tcp {
+                            self.tcp_pool.borrow_mut().remove(server);
+                        }
+                        if io.borrow().app.cancelled.get() {
+                            return (Err(ARES_ETIMEOUT), timeouts);
+                        }
+                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
+                        match verdict {
+                            TimeoutVerdict::Retry { server: next } => {
+                                tries += 1;
+                                timeouts += 1;
+                                server = next;
+                                continue 'attempt;
                             }
+                            TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
                         }
                     }
                 }
             }
-        };
+        }
+    }
+
+    /// ares_query / ares_send: the raw single query (UDP-start, no probe/USEVC),
+    /// wrapping [`request`](Self::request) into the ffi's `Delivery::Raw`.
+    pub(crate) async fn query_raw(self: Rc<Self>, payload: BytesMut) -> Delivery {
+        let (result, timeouts) = self.request(payload, false).await;
         Delivery::Raw { result, timeouts }
     }
 
@@ -602,103 +616,7 @@ impl AsyncClient {
 
         // ===== DNS phase: single PTR query =====
         let payload = dns_query_payload(&rdns_name(ip), RECORD_TYPE_PTR);
-        let (result, io_timeouts) = 'drive: {
-            let io = self.io.clone();
-            let opts = self.opts();
-            let mut use_tcp = false;
-            let mut timeouts: c_int = 0;
-            let mut tries: u32 = 0;
-            let mut failover_tries: u32 = 0;
-            let qid = qid_of(&payload);
-            let mut server = self.health.borrow().pick_next();
-            'attempt: loop {
-                let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
-                    Ok(v) => v,
-                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
-                };
-                server = si;
-                let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
-                let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let timeout = Instant::now() + opts.timeout;
-                if conn.send(wire, timeout).await.is_err() {
-                    if use_tcp {
-                        self.tcp_pool.borrow_mut().remove(server);
-                    }
-                    if tries + 1 < opts.attempts.max(1) {
-                        tries += 1;
-                        if self.health.borrow().len() > 1 {
-                            self.health.borrow_mut().record_failure(server);
-                            server = self.health.borrow().pick_next();
-                        }
-                        continue 'attempt;
-                    }
-                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
-                }
-                loop {
-                    match conn.recv(timeout).await {
-                        Ok(buf) => {
-                            if !qid_matches(&buf, wire, use_tcp) {
-                                continue; // stray datagram — await the next reply
-                            }
-                            let summary = summarize(&buf, 0);
-                            let (actions, verdict) = on_datagram(
-                                &summary,
-                                server,
-                                use_tcp,
-                                opts.attempts,
-                                failover_tries,
-                                &mut self.health.borrow_mut(),
-                            );
-                            notify(&io, actions);
-                            match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                    server = next;
-                                    failover_tries = ft;
-                                    continue 'attempt;
-                                }
-                                TaskVerdict::RetryTcp => {
-                                    use_tcp = true;
-                                    continue 'attempt;
-                                }
-                                TaskVerdict::Deliver => {
-                                    break 'drive (Ok(buf), timeouts);
-                                }
-                            }
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                            match verdict {
-                                TimeoutVerdict::Retry { server: next } => {
-                                    tries += 1;
-                                    timeouts += 1;
-                                    server = next;
-                                    continue 'attempt;
-                                }
-                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                            }
-                        }
-                        Err(_) => {
-                            // Dead socket (EOF / hard error).
-                            if use_tcp {
-                                self.tcp_pool.borrow_mut().remove(server);
-                            }
-                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                            match verdict {
-                                TimeoutVerdict::Retry { server: next } => {
-                                    tries += 1;
-                                    timeouts += 1;
-                                    server = next;
-                                    continue 'attempt;
-                                }
-                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                            }
-                        }
-                    }
-                }
-            }
-        };
+        let (result, io_timeouts) = self.clone().request(payload, false).await;
 
         match result {
             Ok(buf) => {
@@ -756,103 +674,7 @@ impl AsyncClient {
 
         // ===== DNS phase: single PTR query =====
         let payload = dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR);
-        let (result, io_timeouts) = 'drive: {
-            let io = self.io.clone();
-            let opts = self.opts();
-            let mut use_tcp = false;
-            let mut timeouts: c_int = 0;
-            let mut tries: u32 = 0;
-            let mut failover_tries: u32 = 0;
-            let qid = qid_of(&payload);
-            let mut server = self.health.borrow().pick_next();
-            'attempt: loop {
-                let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
-                    Ok(v) => v,
-                    Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
-                };
-                server = si;
-                let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
-                let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let timeout = Instant::now() + opts.timeout;
-                if conn.send(wire, timeout).await.is_err() {
-                    if use_tcp {
-                        self.tcp_pool.borrow_mut().remove(server);
-                    }
-                    if tries + 1 < opts.attempts.max(1) {
-                        tries += 1;
-                        if self.health.borrow().len() > 1 {
-                            self.health.borrow_mut().record_failure(server);
-                            server = self.health.borrow().pick_next();
-                        }
-                        continue 'attempt;
-                    }
-                    break 'drive (Err(ARES_ECONNREFUSED), timeouts);
-                }
-                loop {
-                    match conn.recv(timeout).await {
-                        Ok(buf) => {
-                            if !qid_matches(&buf, wire, use_tcp) {
-                                continue; // stray datagram — await the next reply
-                            }
-                            let summary = summarize(&buf, 0);
-                            let (actions, verdict) = on_datagram(
-                                &summary,
-                                server,
-                                use_tcp,
-                                opts.attempts,
-                                failover_tries,
-                                &mut self.health.borrow_mut(),
-                            );
-                            notify(&io, actions);
-                            match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                    server = next;
-                                    failover_tries = ft;
-                                    continue 'attempt;
-                                }
-                                TaskVerdict::RetryTcp => {
-                                    use_tcp = true;
-                                    continue 'attempt;
-                                }
-                                TaskVerdict::Deliver => {
-                                    break 'drive (Ok(buf), timeouts);
-                                }
-                            }
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                            match verdict {
-                                TimeoutVerdict::Retry { server: next } => {
-                                    tries += 1;
-                                    timeouts += 1;
-                                    server = next;
-                                    continue 'attempt;
-                                }
-                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                            }
-                        }
-                        Err(_) => {
-                            // Dead socket (EOF / hard error).
-                            if use_tcp {
-                                self.tcp_pool.borrow_mut().remove(server);
-                            }
-                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                            match verdict {
-                                TimeoutVerdict::Retry { server: next } => {
-                                    tries += 1;
-                                    timeouts += 1;
-                                    server = next;
-                                    continue 'attempt;
-                                }
-                                TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                            }
-                        }
-                    }
-                }
-            }
-        };
+        let (result, io_timeouts) = self.clone().request(payload, false).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -1106,12 +928,11 @@ impl AsyncClient {
     }
 
     /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
-    /// then per search-plan name an A+AAAA batch — two [`addrinfo_subquery`] futures
-    /// on the shared mailbox raced with `select_biased!` — merging the address
-    /// records. Policy (not the executor): once the A/ipv4 query returns
-    /// addresses, set the sibling AAAA query's cancel flag (stop its retries).
-    ///
-    /// [`addrinfo_subquery`]: Self::addrinfo_subquery
+    /// then per search-plan name an A+AAAA batch — two [`request`](Self::request)
+    /// futures on the shared mailbox raced with `select_biased!` — merging the
+    /// address records. Policy (not the driver): once the A/ipv4 query returns
+    /// addresses, set the shared mailbox `cancelled` flag so the sibling AAAA
+    /// `request` stops retrying.
     pub(crate) async fn getaddrinfo(
         self: Rc<Self>,
         hostname_raw: String,
@@ -1179,25 +1000,20 @@ impl AsyncClient {
             let use_vc = self.config.options.use_vc;
             let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
 
-            // Drive A+AAAA on one shared mailbox (`self.io`): `poll_recv` routes
-            // each reply by fd, so the two sub-queries self-demux — no sub-mailbox
-            // merging. Policy (here, not in the executor): once the A/ipv4 query
-            // returns actual addresses, set the sibling AAAA's cancel flag — its
-            // retries stop so it isn't sent again (an in-flight reply still
-            // delivers). ipv6 success does NOT cancel A (an ipv4-only host may
-            // still need the A answer).
-            let cancels: Vec<Rc<std::cell::Cell<bool>>> =
-                rtypes.iter().map(|_| Rc::new(std::cell::Cell::new(false))).collect();
+            // Drive A+AAAA on one shared mailbox (`self.io`): `poll_recv` routes each
+            // reply by fd, so the two `request`s self-demux. Policy (here, not in the
+            // driver): once the A/ipv4 query returns actual addresses, set the shared
+            // mailbox `cancelled` flag — the sibling AAAA's `request` stops retrying
+            // (an in-flight reply still delivers). ipv6 success does NOT cancel A (an
+            // ipv4-only host may still need the A answer). The flag is only ever set
+            // after the A future completed, so A never re-reads it — only AAAA acts.
+            self.io.borrow().app.cancelled.set(false);
             let mut results: Vec<Option<QueryOutcome>> = (0..rtypes.len()).map(|_| None).collect();
 
             // `select_biased!` needs a statically-known arm count; the batch is
             // one family (single await) or two (AF_UNSPEC — race both).
             let sub = |i: usize| {
-                self.clone().addrinfo_subquery(
-                    dns_query_payload(&plan.current, rtypes[i]),
-                    use_vc,
-                    cancels[i].clone(),
-                )
+                self.clone().request(dns_query_payload(&plan.current, rtypes[i]), use_vc)
             };
             if rtypes.len() == 1 {
                 results[0] = Some(sub(0).await);
@@ -1212,7 +1028,7 @@ impl AsyncClient {
                                 if let (Ok(buf), _) = &r {
                                     let s = summarize(buf, 0);
                                     if s.rcode == 0 && s.ancount > 0 {
-                                        cancels[1].set(true);
+                                        self.io.borrow().app.cancelled.set(true);
                                     }
                                 }
                             }
@@ -1271,127 +1087,6 @@ impl AsyncClient {
             let status = if had_nodata && code == ARES_ENOTFOUND { ARES_ENODATA } else { code };
             self.io.borrow_mut().app.timeouts = timeouts;
             return fail(status);
-        }
-    }
-
-    /// One getaddrinfo sub-query (an A or AAAA), driven on the **shared** lookup
-    /// mailbox (`self.io`) alongside its sibling: `poll_recv` routes by fd, so
-    /// two conns on one mailbox self-demux. `cancel` is this sub's stop-retrying
-    /// flag (set by the caller when the sibling A-answer arrives): checked at the
-    /// retry branches only, so an in-flight reply still delivers. No probe.
-    async fn addrinfo_subquery(
-        self: Rc<Self>,
-        payload: BytesMut,
-        mut use_tcp: bool,
-        cancel: Rc<std::cell::Cell<bool>>,
-    ) -> QueryOutcome {
-        let io = self.io.clone();
-        let opts = self.opts();
-        let mut timeouts: c_int = 0;
-        let mut tries: u32 = 0;
-        let mut failover_tries: u32 = 0;
-        let qid = qid_of(&payload);
-        let mut server = self.health.borrow().pick_next();
-        'attempt: loop {
-            let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
-                Ok(v) => v,
-                Err(()) => return (Err(ARES_ECONNREFUSED), timeouts),
-            };
-            server = si;
-            // The wire buffer for this attempt's transport: TCP needs the framed
-            // copy, UDP sends the payload as-is (borrowed — no clone).
-            let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
-            let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-            let timeout = Instant::now() + opts.timeout;
-
-            if conn.send(wire, timeout).await.is_err() {
-                // Send failed (a hard socket error): recreate the socket and retry,
-                // bounded by the attempt budget — mirrors the classic write_impl's
-                // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
-                // retry succeeds.)
-                if use_tcp {
-                    self.tcp_pool.borrow_mut().remove(server);
-                }
-                if tries + 1 < opts.attempts.max(1) {
-                    tries += 1;
-                    if self.health.borrow().len() > 1 {
-                        self.health.borrow_mut().record_failure(server);
-                        server = self.health.borrow().pick_next();
-                    }
-                    continue 'attempt;
-                }
-                return (Err(ARES_ECONNREFUSED), timeouts);
-            }
-
-            loop {
-                match conn.recv(timeout).await {
-                    Ok(buf) => {
-                        if !qid_matches(&buf, wire, use_tcp) {
-                            continue; // stray datagram — await the next reply
-                        }
-                        let summary = summarize(&buf, 0);
-                        let (actions, verdict) = on_datagram(
-                            &summary,
-                            server,
-                            use_tcp,
-                            opts.attempts,
-                            failover_tries,
-                            &mut self.health.borrow_mut(),
-                        );
-                        notify(&io, actions);
-                        match verdict {
-                            TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                server = next;
-                                failover_tries = ft;
-                                continue 'attempt;
-                            }
-                            TaskVerdict::RetryTcp => {
-                                use_tcp = true;
-                                continue 'attempt;
-                            }
-                            TaskVerdict::Deliver => {
-                                return (Ok(buf), timeouts);
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                        if cancel.get() {
-                            return (Err(ARES_ETIMEOUT), timeouts);
-                        }
-                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                        match verdict {
-                            TimeoutVerdict::Retry { server: next } => {
-                                tries += 1;
-                                timeouts += 1;
-                                server = next;
-                                continue 'attempt;
-                            }
-                            TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
-                        }
-                    }
-                    Err(_) => {
-                        // Dead socket (EOF / hard error).
-                        if use_tcp {
-                            self.tcp_pool.borrow_mut().remove(server);
-                        }
-                        if cancel.get() {
-                            return (Err(ARES_ETIMEOUT), timeouts);
-                        }
-                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                        match verdict {
-                            TimeoutVerdict::Retry { server: next } => {
-                                tries += 1;
-                                timeouts += 1;
-                                server = next;
-                                continue 'attempt;
-                            }
-                            TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -1458,6 +1153,11 @@ pub(crate) struct DnsSignals {
     /// the ffi can pass it to the C callback (the host future's `Result` output
     /// has no room for it; the raw path still carries it in `Delivery::Raw`).
     pub timeouts: c_int,
+    /// Intra-lookup coordination (not ffi-facing): `getaddrinfo` sets this once its
+    /// A/ipv4 answer has real records so the sibling AAAA `request` gives up
+    /// retrying (checked at its timeout / dead-socket branches — an in-flight reply
+    /// still delivers). Fresh per lookup, so it starts `false`.
+    pub cancelled: Cell<bool>,
 }
 
 /// The DNS-application instantiation of the reactor mailbox — the only one the
