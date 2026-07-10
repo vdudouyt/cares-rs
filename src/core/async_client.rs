@@ -24,8 +24,8 @@ use bytes::BytesMut;
 
 use crate::core::api;
 use crate::core::cache::QueryCache;
-use crate::core::conn::{Conn, TcpPool};
-use crate::core::executor::{noop_waker, poll_timeout, select3, wait_io, QueryIo, Wait, Which3};
+use crate::async_runtime::conn::{Conn, TcpPool};
+use crate::async_runtime::executor::{noop_waker, poll_timeout, select3, wait_io, QueryIo, Wait, Which3};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, Hosts};
 use crate::core::lookup::{
@@ -40,7 +40,7 @@ use crate::core::preflight::{
 use crate::core::query_builder::{dns_query_payload, frame_tcp};
 use crate::core::response::{addr_reply, ReplyRequire};
 use crate::core::services::Services;
-use crate::core::socket::SocketFactory;
+use crate::async_runtime::socket::SocketFactory;
 use crate::core::sortlist::{apply_sortlist, SortlistEntry};
 use crate::core::transport::rdns_name;
 use crate::core::AresError;
@@ -1357,7 +1357,7 @@ fn resolve_hostaliases(hostname: &str) -> Result<String, c_int> {
 // ===================================================================
 // DNS resolver lifecycle (the "application" over the pure-IO reactor).
 // Moved out of executor.rs so the reactor names nothing DNS. Speaks the
-// conn layer's async sockets (core::conn — Conn::send/recv over the reactor)
+// conn layer's async sockets (async_runtime::conn — Conn::send/recv over the reactor)
 // + the neutral lookup.rs decision tables.
 // ===================================================================
 

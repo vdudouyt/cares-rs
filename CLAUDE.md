@@ -45,10 +45,11 @@ When you change the FFI surface, regenerate and re-baseline: `cargo build`, then
 
 ## Architecture
 
-The crate is split into two halves by a hard safety boundary, enforced by the compiler:
+The crate is split into three sections by hard boundaries, enforced by the compiler:
 
-- **`src/core/`** — `#![forbid(unsafe_code)]`. All resolver logic — DNS wire codec, transport/reactor engine, system config, and the entire query-lifecycle state machine — as pure safe Rust behind pointer-free signatures. This is where behavior lives and where you make decisions.
-- **`src/ffi/`** — every `unsafe` line in the crate. Marshals C arguments, performs raw I/O, and *executes* the decisions core returns. Shims, builders, trampolines only — no policy. `src/lib.rs` sets `#![deny(unsafe_op_in_unsafe_fn)]` and re-exports `ffi::*` as the public API.
+- **`src/async_runtime/`** — `#![forbid(unsafe_code)]`. The protocol-agnostic async IO runtime: the `Socket`/`SocketFactory` traits (`socket.rs`), the pure-IO reactor with its generic `QueryIo<A>` mailbox + select toolkit (`executor.rs`), and tokio-style async connections with length-prefix framing and tag-demuxed shared streams (`conn.rs`). Imports **std only** — nothing here names DNS or `crate::core` (grep-enforced wall).
+- **`src/core/`** — `#![forbid(unsafe_code)]`. All resolver logic — DNS wire codec, system config, and the query lifecycles (self-contained async fns on `AsyncClient` driving `async_runtime` sockets) — as pure safe Rust behind pointer-free signatures. This is where behavior lives and where you make decisions.
+- **`src/ffi/`** — every `unsafe` line in the crate. Marshals C arguments, implements the `Socket` traits over the C socket-function table, drives the reactor from `ares_process`, and *executes* the decisions core returns. Shims, builders, trampolines only — no policy. `src/lib.rs` sets `#![deny(unsafe_op_in_unsafe_fn)]` and re-exports `ffi::*` as the public API.
 
 The refactoring goal is a shrinking unsafe surface: any logic found in `ffi/` should move into a `forbid(unsafe_code)` core function. The ratchet gate protects this.
 
@@ -56,8 +57,7 @@ The refactoring goal is a shrinking unsafe surface: any logic found in `ffi/` sh
 
 - `api.rs` — shared outcome types (`Operation`/`HostDelivery`/`SearchReplyDelivery`/`NameinfoResult`/`AddrInfoResult`) plus the stateless helpers that need no channel state: `on_host_reply`, `clamp_timeout`/`nfds`, and the `search_precheck` re-export. The per-export handlers themselves are methods on `Client<T>` (see `client.rs`).
 - `lookup.rs` — **the query state machine.** Every retry / failover / search-iteration / TC-retry / AF_UNSPEC decision lives here as pure logic. `SearchSm` (ares_search), `HostByNameSm` (gethostbyname), `AddrInfoSm` (getaddrinfo's parallel A+AAAA batch with a `pending` join counter); plus `SearchPlan` (ndots/bare-name iteration) and `ServerHealth` (lowest-failures-first selection). Machines consume events (parsed reply / I/O error) and return actions; the `Client<T>` methods drive them. Its module doc is the reading map.
-- `transport.rs` — the transport engine `Transport<T>`/`Task<T>` (UDP + TCP) over `dyn Socket`.
-- `socket.rs` — `Socket`/`SocketFactory` traits (`ffi::ares_socket` implements them).
+- `transport.rs` — the transport engine `Transport<T>`/`Task<T>` (UDP + TCP) over `dyn Socket` (the trait lives in `async_runtime::socket`).
 - `client.rs` — `Client<T>`, all pure channel state **plus one method per `ares_*` export** (the resolver operations + their enqueue primitives `issue`/`reissue`/`launch_pooled`/`drive_addrinfo`/`maybe_launch_probe` and the reply executors `on_hostbyname_reply`/`on_search_reply`/`on_probe_reply`). Each FFI shim marshals its C args and makes exactly one call in here; preflights, launch loops, and cache policy are private details of these methods, not seams the ffi layer reassembles. ffi's `ChannelData` = this + the C callback fn-pointer fields.
 - `preflight.rs` — entry cascades, `service_to_port`, `assemble_nameinfo`, `AddrInfo`.
 - `launch.rs` — the `Task`-taking reactor helpers `read_tcp_frame`/`timeout_step` + the `LaunchOutcome`/`AddrInfoDelivery` send-outcome types (the enqueue primitives and launch loops are now methods on `Client<T>`).

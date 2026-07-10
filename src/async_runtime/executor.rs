@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 
-use crate::core::socket::Socket;
+use crate::async_runtime::socket::Socket;
 
 // ===== Mailbox + await primitive =====
 

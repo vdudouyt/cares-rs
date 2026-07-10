@@ -1,5 +1,5 @@
 //! The neutral DNS-reply/reactor truth tables the async engine reuses: pure,
-//! safe Rust with no I/O. The executor (`core::executor`) drives one query's
+//! safe Rust with no I/O. The executor (`async_runtime::executor`) drives one query's
 //! socket lifecycle and consults these for its verdicts.
 //!
 //! # Map

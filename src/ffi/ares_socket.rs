@@ -193,7 +193,7 @@ struct CSocket {
     user_data: *mut c_void,
 }
 
-impl crate::core::socket::Socket for CSocket {
+impl crate::async_runtime::socket::Socket for CSocket {
     fn as_raw_fd(&self) -> i32 {
         self.fd
     }
@@ -268,7 +268,7 @@ impl CSocketFactory {
         Rc::new(Self { config_cb: cb, config_arg: arg, funcs: self.funcs.clone(), ..*self })
     }
 
-    fn create(&self, addr: SocketAddr, socket_type: c_int) -> io::Result<Rc<dyn crate::core::socket::Socket>> {
+    fn create(&self, addr: SocketAddr, socket_type: c_int) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
         let domain = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
         let asocket = self.funcs.asocket.unwrap_or(default_asocket);
         let fd = unsafe { asocket(domain, socket_type, 0, self.user_data) };
@@ -297,12 +297,12 @@ impl CSocketFactory {
     }
 }
 
-impl crate::core::socket::SocketFactory for CSocketFactory {
-    fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::core::socket::Socket>> {
+impl crate::async_runtime::socket::SocketFactory for CSocketFactory {
+    fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
         self.create(bind, SOCK_DGRAM)
     }
 
-    fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::core::socket::Socket>> {
+    fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
         self.create(bind, SOCK_STREAM)
     }
 }

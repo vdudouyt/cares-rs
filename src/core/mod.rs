@@ -4,13 +4,10 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
-pub mod socket;
 pub mod cache;
 pub mod client;
 pub mod dns_record;
 pub mod error;
-pub mod executor;
-pub mod conn;
 pub mod async_client;
 pub mod hostent;
 pub mod lookup;

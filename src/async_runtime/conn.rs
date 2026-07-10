@@ -1,5 +1,5 @@
 //! The async socket layer the resolver ops drive — tokio-style connections
-//! over the pure-IO reactor (`core::executor`). This module knows sockets,
+//! over the pure-IO reactor (`async_runtime::executor`). This module knows sockets,
 //! framed streams, and mux tags; it knows **zero** about its application:
 //! like the executor it is generic over the mailbox's app-state `A`, and
 //! nothing in here names a protocol.
@@ -25,11 +25,11 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Instant;
 
-use crate::core::executor::{
+use crate::async_runtime::executor::{
     poll_recv, poll_timeout, recv_datagram, recv_stream, select2, send_when_writable, QueryIo,
     Recv, Which2,
 };
-use crate::core::socket::{Socket, SocketFactory};
+use crate::async_runtime::socket::{Socket, SocketFactory};
 
 /// How a shared stream picks the inbox slot for an incoming frame: the frame's
 /// mux tag. `None` = the frame is too short/malformed to carry one; it is

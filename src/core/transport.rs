@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::rc::Rc;
 
 use crate::core::hostfile::Hosts;
-use crate::core::socket::SocketFactory;
+use crate::async_runtime::socket::SocketFactory;
 use crate::core::sysconfig::SysConfig;
 
 /// The channel's config + socket factory. The async lifecycles snapshot the
