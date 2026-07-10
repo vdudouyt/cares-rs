@@ -1204,9 +1204,12 @@ impl AsyncClient {
     }
 
     /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
-    /// then per search-plan name a parallel A+AAAA batch via [`ParallelQueries`],
-    /// merging the address records. Policy (not the executor): once the A/ipv4
-    /// query returns addresses, cancel the sibling AAAA query's retries.
+    /// then per search-plan name an A+AAAA batch — two [`addrinfo_subquery`] futures
+    /// on the shared mailbox raced with `select_biased!` — merging the address
+    /// records. Policy (not the executor): once the A/ipv4 query returns
+    /// addresses, set the sibling AAAA query's cancel flag (stop its retries).
+    ///
+    /// [`addrinfo_subquery`]: Self::addrinfo_subquery
     pub(crate) async fn getaddrinfo(
         self: Rc<Self>,
         hostname_raw: String,
@@ -1374,7 +1377,6 @@ impl AsyncClient {
     /// two conns on one mailbox self-demux. `cancel` is this sub's stop-retrying
     /// flag (set by the caller when the sibling A-answer arrives): checked at the
     /// retry branches only, so an in-flight reply still delivers. No probe.
-    /// (Was the inlined future in the deleted `ParallelQueries::new`.)
     async fn addrinfo_subquery(
         self: Rc<Self>,
         payload: BytesMut,

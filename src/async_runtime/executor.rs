@@ -1,12 +1,27 @@
-//! The pure-IO reactor: a mailbox + await primitive + socket byte-pumps.
+//! The pure-IO reactor: a mailbox + readiness-arm primitives + socket byte-pumps.
 //!
 //! This module knows **only** IO — file descriptors, readiness, timeouts, and
 //! opaque bytes on a [`Socket`]. It has zero knowledge of what the bytes mean:
 //! no DNS, no QID, no framing, no server health. A future publishes the fds it
 //! is blocked on (+ an earliest timeout) into its [`QueryIo`] mailbox; the ffi
-//! executor (driven by `ares_process`) sets which fds fired (or that the
+//! executor (driven by `ares_process`) sets which waits fired (or that the
 //! timeout passed) and re-polls the one future. The waker is a no-op —
 //! readiness is driven, not scheduled.
+//!
+//! **The mailbox contract (why the combinators here are hand-shaped):** the
+//! executor clears `waits`/`timeout` right before each poll, and every pending
+//! arm ([`poll_recv`], `poll_writable`, [`poll_timeout`]) *re-registers* its
+//! interest on every poll. So an arm is level-ish: polled repeatedly, it
+//! republishes what it is blocked on each time.
+//!
+//! Because of the no-op waker, futures compose **only** with combinators that
+//! re-poll every non-terminated child on every poll: `futures::select_biased!`
+//! and plain sequential `.await` are safe. Waker-gated combinators
+//! (`FuturesUnordered`, `StreamExt::for_each_concurrent`, anything that only
+//! re-polls a child whose waker fired) will poll a child once and then wedge —
+//! **do not use them here.** Parallel lookups fan out by running each
+//! sub-future on the same shared mailbox and racing them with `select_biased!`
+//! (see `core::async_client::getaddrinfo`), not by a stream combinator.
 //!
 //! The mailbox is generic over an opaque application-state type `A`
 //! ([`QueryIo<A>`]); the reactor never inspects it. The DNS resolver lifecycle
@@ -74,7 +89,7 @@ pub(crate) enum Recv {
 /// Await writability on `sock`, then send `bytes` once. Re-awaits on `WouldBlock`;
 /// `Err(TimedOut)` on timeout before writable, the socket's own error on a hard
 /// send failure. The writable arm is polled first — a fd that fired in the same
-/// cycle the timeout passed still sends (the historical wait_io preference).
+/// cycle the timeout passed still sends (writable preempts expiry).
 /// Generic over the mailbox app-state — the reactor never inspects `bytes`.
 pub(crate) async fn send_when_writable<A>(
     io: &Rc<RefCell<QueryIo<A>>>,
@@ -133,13 +148,15 @@ pub(crate) fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>) -> bool {
 
 // ===== select: readiness-driven recv arms + a biased poll_fn combinator =====
 
-/// A per-fd recv arm for use inside [`select2`]/[`select3`]. If `fd` fired this
-/// cycle, consume **that fd's** readiness (`swap_remove`) and run `read` once;
-/// a `WouldBlock` (`Recv::Pending`) re-registers read-interest and suspends (so a
-/// sibling arm can still progress). Otherwise registers read-interest and
-/// suspends. Resolves tokio-style: `Ok(bytes)` for a message, `Err(UnexpectedEof)`
-/// for a dead socket. `read` yields opaque bytes — the reactor names nothing of
-/// the app.
+/// The poll body of a recv arm (`conn.recv_msg()`, raced with `select_biased!`).
+/// If `fd`'s **read** readiness fired this cycle, consume that entry
+/// (`swap_remove`) and run `read` once; a `WouldBlock` (`Recv::Pending`)
+/// re-registers read-interest and suspends (so a sibling arm can still
+/// progress). Otherwise registers read-interest and suspends. Matches only
+/// read-readiness, so a sibling send-arm's write-readiness on the same fd is
+/// left alone. Resolves tokio-style: `Ok(bytes)` for a message,
+/// `Err(UnexpectedEof)` for a dead socket. `read` yields opaque bytes — the
+/// reactor names nothing of the app.
 pub(crate) fn poll_recv<A>(
     io: &Rc<RefCell<QueryIo<A>>>,
     fd: i32,
