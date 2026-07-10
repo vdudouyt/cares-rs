@@ -129,6 +129,19 @@ impl SearchPlan {
             None
         }
     }
+
+    /// The full ordered candidate list (`current`, then each `advance`) — for the
+    /// address lifecycles that iterate names via [`AsyncClient::resolve_addrinfo`]
+    /// over a materialized `Vec` rather than lazily.
+    ///
+    /// [`AsyncClient::resolve_addrinfo`]: crate::core::async_client::AsyncClient
+    pub fn into_names(mut self) -> Vec<String> {
+        let mut names = vec![self.current.clone()];
+        while let Some(n) = self.advance() {
+            names.push(n);
+        }
+        names
+    }
 }
 
 pub use libc::{AF_INET, AF_INET6, AF_UNSPEC};

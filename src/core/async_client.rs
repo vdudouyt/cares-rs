@@ -35,7 +35,7 @@ use crate::core::lookup::{
     AF_INET6, AF_UNSPEC, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::packets::AddrRecord;
-use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedResponse, ReplyRequire};
+use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedRRs, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
 use crate::async_runtime::socket::SocketFactory;
 use crate::core::sortlist::{apply_sortlist, SortlistEntry};
@@ -720,12 +720,91 @@ impl AsyncClient {
         results.into_iter().map(Option::unwrap).collect()
     }
 
-    /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers),
-    /// then per search-plan name an A+AAAA batch — two [`request`](Self::request)
-    /// futures on the shared mailbox raced with `select_biased!` — merging the
-    /// address records. Policy (not the driver): once the A/ipv4 query returns
-    /// addresses, set the shared mailbox `cancelled` flag so the sibling AAAA
-    /// `request` stops retrying.
+    /// The shared address-resolution DNS phase for `gethostbyname` and
+    /// `getaddrinfo` (≈ upstream `ares_getaddrinfo`'s `next_dns_lookup` +
+    /// `host_callback` + `end_hquery`). Try each candidate `name` in order: query
+    /// its `rtypes` via [`query_families`](Self::query_families), racing a one-shot
+    /// failover probe alongside the batch on the lookup's first name when `probe`;
+    /// parse each reply (`addr_reply`). A name succeeds if any family yields records
+    /// → return those [`FamilyReply`]s. Otherwise advance while the aggregate code
+    /// is retryable, then finalize NODATA-after-NXDOMAIN. Timeout count follows the
+    /// gethostbyname scheme: a successful family adds its `io_timeouts`, a family
+    /// that timed out adds 1, anything else adds 0 (getaddrinfo's count is unpinned).
+    async fn resolve_addrinfo(self: Rc<Self>, names: &[String], rtypes: &[u16], probe: bool) -> AddrLookup {
+        let use_vc = self.config.options.use_vc;
+        let mut timeouts: c_int = 0;
+        let mut last_error: AresError = ARES_ENODATA.into();
+        let mut had_nodata = false;
+
+        for (i, name) in names.iter().enumerate() {
+            // Query this name's families; on the lookup's first name, race a
+            // one-shot failover probe alongside the batch (biased probe → batch;
+            // the probe folds into ServerHealth then terminates).
+            let batch = self.clone().query_families(name, rtypes);
+            let results = if probe && i == 0 {
+                let mut b = pin!(batch.fuse());
+                let mut p = pin!(self.clone().run_probe(dns_query_payload(name, rtypes[0]), use_vc).fuse());
+                loop {
+                    select_biased! {
+                        _ = p => continue,
+                        r = b => break r,
+                    }
+                }
+            } else {
+                batch.await
+            };
+
+            // Parse each family; collect the ones that yielded records.
+            let mut replies: Vec<FamilyReply> = Vec::new();
+            for (&rtype, (result, io_timeouts)) in rtypes.iter().zip(results) {
+                match result {
+                    Ok(buf) => match addr_reply(&buf, rtype, ReplyRequire::Items) {
+                        Ok(rrs) => {
+                            timeouts += io_timeouts;
+                            replies.push(FamilyReply { rrs });
+                        }
+                        Err(e) => {
+                            if e.code() == ARES_ENODATA {
+                                had_nodata = true;
+                            }
+                            last_error = e;
+                        }
+                    },
+                    Err(status) => {
+                        if status == ARES_ETIMEOUT {
+                            timeouts += 1;
+                        }
+                        last_error = AresError::from(status);
+                    }
+                }
+            }
+
+            if !replies.is_empty() {
+                return AddrLookup { name: name.clone(), replies, status: ARES_SUCCESS.into(), timeouts };
+            }
+
+            // All families failed for this name — advance while retryable.
+            let code = last_error.code();
+            let retryable = matches!(
+                code,
+                ARES_ENODATA | ARES_ENOTFOUND | ARES_ETIMEOUT | ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED
+            );
+            if !(retryable && i + 1 < names.len()) {
+                break;
+            }
+            last_error = ARES_ENODATA.into();
+        }
+
+        // Finalize: NXDOMAIN after an earlier empty answer reports as ENODATA.
+        let code = last_error.code();
+        let status = if had_nodata && code == ARES_ENOTFOUND { ARES_ENODATA } else { code };
+        let name = names.last().cloned().unwrap_or_default();
+        AddrLookup { name, replies: Vec::new(), status: status.into(), timeouts }
+    }
+
+    /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers), then
+    /// the shared [`resolve_addrinfo`](Self::resolve_addrinfo) DNS phase (parallel
+    /// A+AAAA per search name, no probe), merging every family's records.
     pub(crate) async fn getaddrinfo(
         self: Rc<Self>,
         hostname_raw: String,
@@ -778,67 +857,40 @@ impl AsyncClient {
             return fail(ARES_ENOSERVER);
         }
 
-        // ===== DNS phase: parallel A+AAAA per search-plan name =====
-        let mut plan = SearchPlan::for_search(&hostname_raw, self.config.options.ndots, &self.config.search);
-        let mut timeouts: c_int = 0;
-        let mut last_error: AresError = ARES_ENODATA.into();
-        let mut had_nodata = false;
-
-        loop {
-            let rtypes: Vec<u16> = match ai_family {
-                libc::AF_INET => vec![RTYPE_A],
-                libc::AF_INET6 => vec![RTYPE_AAAA],
-                _ => vec![RTYPE_A, RTYPE_AAAA],
-            };
-            let results = self.clone().query_families(&plan.current, &rtypes).await;
-
-            // Merge every family's records (arrival order); note the last error.
-            let mut records: Vec<AddrRecord> = Vec::new();
-            let mut any_success = false;
-            for (i, &rtype) in rtypes.iter().enumerate() {
-                let (result, io_timeouts) = &results[i];
-                timeouts += io_timeouts;
-                match result {
-                    Ok(buf) => match addr_reply(buf, rtype, ReplyRequire::Items) {
-                        Ok(mut rrs) => {
-                            records.append(&mut rrs.items);
-                            any_success = true;
-                        }
-                        Err(e) => {
-                            if e.code() == ARES_ENODATA {
-                                had_nodata = true;
-                            }
-                            last_error = e;
-                        }
-                    },
-                    Err(status) => {
-                        last_error = AresError::from(*status);
-                    }
-                }
-            }
-
-            if any_success {
-                self.io.borrow_mut().app.timeouts = timeouts;
-                return AddrInfoOut { name: plan.current.clone(), records, status: ARES_SUCCESS.into() };
-            }
-
-            // All families failed for this name — try the next search domain.
-            let code = last_error.code();
-            let retryable = matches!(
-                code,
-                ARES_ENODATA | ARES_ENOTFOUND | ARES_ETIMEOUT | ARES_ESERVFAIL | ARES_ENOTIMP | ARES_EREFUSED
-            );
-            if retryable && plan.advance().is_some() {
-                last_error = ARES_ENODATA.into();
-                continue;
-            }
-
-            // Finalize: NXDOMAIN after an earlier empty answer reports as ENODATA.
-            let status = if had_nodata && code == ARES_ENOTFOUND { ARES_ENODATA } else { code };
-            self.io.borrow_mut().app.timeouts = timeouts;
-            return fail(status);
+        // ===== DNS phase: the shared resolver, parallel A+AAAA, no probe =====
+        let rtypes: Vec<u16> = match ai_family {
+            libc::AF_INET => vec![RTYPE_A],
+            libc::AF_INET6 => vec![RTYPE_AAAA],
+            _ => vec![RTYPE_A, RTYPE_AAAA],
+        };
+        let names =
+            SearchPlan::for_search(&hostname_raw, self.config.options.ndots, &self.config.search).into_names();
+        let lookup = self.clone().resolve_addrinfo(&names, &rtypes, false).await;
+        self.io.borrow_mut().app.timeouts = lookup.timeouts;
+        if lookup.replies.is_empty() {
+            return fail(lookup.status.code());
         }
+        // Merge every family's records (rtypes order).
+        let records = lookup.replies.into_iter().flat_map(|f| f.rrs.items).collect();
+        AddrInfoOut { name: lookup.name, records, status: ARES_SUCCESS.into() }
     }
+}
+
+/// One family's reply within an address lookup: the parsed address records.
+/// (gethostbyname will also want the raw reply + rtype — added when it lands.)
+struct FamilyReply {
+    rrs: ParsedRRs<AddrRecord>,
+}
+
+/// The outcome of the shared address-resolution DNS phase
+/// ([`AsyncClient::resolve_addrinfo`]): the name that produced records (or the last
+/// tried), one [`FamilyReply`] per family that yielded records (empty on failure),
+/// the status, and the accumulated timeout count.
+struct AddrLookup {
+    name: String,
+    replies: Vec<FamilyReply>,
+    status: AresError,
+    timeouts: c_int,
 }
 
 /// The safe result the FFI turns into an `ares_addrinfo`: the canonical name,
