@@ -400,109 +400,51 @@ impl AsyncClient {
         }
 
         // ===== DNS phase =====
-        // The candidate names to try, in order (was SearchPlan::for_gethostbyname):
-        // below ndots with a search list, each `name.domain` then the bare name;
-        // otherwise just the name. Trailing dots are kept verbatim (unlike
-        // ares_search) so the query / cache-store / cache-probe keys all match.
+        // Candidate names, in order (trailing dots kept verbatim, unlike ares_search,
+        // so the query / cache-store / cache-probe keys all match): below ndots with a
+        // search list, each `name.domain` then the bare name; otherwise just the name.
         let dots = resolved.chars().filter(|&c| c == '.').count() as u32;
-        let mut names: Vec<String> = if dots < self.config.options.ndots && !self.config.search.is_empty() {
+        let names: Vec<String> = if dots < self.config.options.ndots && !self.config.search.is_empty() {
             let mut v: Vec<String> = self.config.search.iter().map(|d| format!("{resolved}.{d}")).collect();
             v.push(resolved.clone());
             v
         } else {
             vec![resolved.clone()]
         };
-        let mut idx = 0;
-        let (mut current_family, mut rtype) = match family {
-            AF_INET => (AF_INET, RTYPE_A),
-            _ => (AF_INET6, RTYPE_AAAA),
+        // AF_UNSPEC resolves A+AAAA in parallel via the shared core (like getaddrinfo,
+        // matching upstream where gethostbyname is a shell over getaddrinfo). The
+        // Hostent holds a single family — preferring IPv6 when it has records. The
+        // first-query failover probe is spawned by the core (`probe = true`).
+        let rtypes: Vec<u16> = match family {
+            AF_INET => vec![RTYPE_A],
+            AF_INET6 => vec![RTYPE_AAAA],
+            _ => vec![RTYPE_A, RTYPE_AAAA],
         };
-        let mut tried_aaaa = family == AF_UNSPEC;
-        let mut timeouts: c_int = 0;
-        let mut had_nodata = false;
-        let mut first = true;
-
-        loop {
-            let payload = dns_query_payload(&names[idx], rtype);
-            // Only a lookup's first query is eligible to spawn a probe.
-            let probe_payload = if first { Some(dns_query_payload(&names[idx], rtype)) } else { None };
-            first = false;
-            let use_vc = self.config.options.use_vc;
-            // Race the primary query against a one-shot failover probe (first query
-            // of a lookup only; biased probe → primary). The probe folds itself into
-            // ServerHealth and terminates; if the primary finishes first the probe
-            // is dropped un-settled.
-            let mut primary = pin!(self.clone().request(payload, use_vc).fuse());
-            let (result, io_timeouts) = match probe_payload {
-                Some(pp) => {
-                    let mut probe = pin!(self.clone().run_probe(pp, use_vc).fuse());
-                    loop {
-                        select_biased! {
-                            _ = probe => continue,
-                            r = primary => break r,
-                        }
-                    }
-                }
-                None => primary.await,
-            };
-
-            let last_error: AresError = match result {
-                Ok(buf) => match addr_reply(&buf, rtype, ReplyRequire::Items) {
-                    Ok(mut rrs) => {
-                        // Cache the raw reply under the query name (+ the bare
-                        // name, when a search domain was appended), then sort + build.
-                        if self.cache.borrow().enabled() {
-                            let mut store = vec![names[idx].clone()];
-                            if resolved != names[idx] {
-                                store.push(resolved.clone());
-                            }
-                            let ttl = rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-                            self.cache.borrow_mut().store_names(store, rtype, ttl, &buf, Instant::now());
-                        }
-                        if !self.sortlist.is_empty() {
-                            apply_sortlist(&self.sortlist, &mut rrs.items);
-                        }
-                        self.io.borrow_mut().app.timeouts = timeouts + io_timeouts;
-                        return Ok(Hostent::from_parsed(rrs, current_family));
-                    }
-                    Err(e) => {
-                        if e.code() == ARES_ENODATA {
-                            had_nodata = true;
-                        }
-                        e
-                    }
-                },
-                Err(status) => {
-                    if status == ARES_ETIMEOUT {
-                        timeouts += 1;
-                    }
-                    AresError::from(status)
-                }
-            };
-
-            // Next candidate name on NXDOMAIN/NODATA.
-            if matches!(last_error.code(), ARES_ENOTFOUND | ARES_ENODATA) && idx + 1 < names.len() {
-                idx += 1;
-                continue;
-            }
-            // AF_UNSPEC: the AAAA list is exhausted → retry just the bare name over A.
-            if family == AF_UNSPEC && tried_aaaa && current_family == AF_INET6 {
-                current_family = AF_INET;
-                rtype = RTYPE_A;
-                tried_aaaa = false;
-                names = vec![resolved.clone()];
-                idx = 0;
-                continue;
-            }
-            // Finalize: NXDOMAIN after an earlier empty answer reports as ENODATA.
-            let status = if had_nodata && last_error.code() == ARES_ENOTFOUND {
-                ARES_ENODATA
-            } else {
-                last_error.code()
-            };
-            self.io.borrow_mut().app.timeouts = timeouts;
-            return Err(status.into());
+        let lookup = self.clone().resolve_addrinfo(&names, &rtypes, true).await;
+        self.io.borrow_mut().app.timeouts = lookup.timeouts;
+        if lookup.replies.is_empty() {
+            return Err(lookup.status);
         }
+        // Pick one family for the Hostent — IPv6 (AAAA) if present, else the first.
+        let pick = lookup.replies.iter().position(|f| f.rtype == RTYPE_AAAA).unwrap_or(0);
+        let reply = lookup.replies.into_iter().nth(pick).unwrap();
+        let hfamily = if reply.rtype == RTYPE_AAAA { AF_INET6 } else { AF_INET };
+
+        // Cache the chosen family's raw reply under the winning name (+ the bare name
+        // when a search domain was appended), then sortlist + build the Hostent.
+        if self.cache.borrow().enabled() {
+            let mut store = vec![lookup.name.clone()];
+            if resolved != lookup.name {
+                store.push(resolved.clone());
+            }
+            let ttl = reply.rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
+            self.cache.borrow_mut().store_names(store, reply.rtype, ttl, &reply.buf, Instant::now());
+        }
+        let mut rrs = reply.rrs;
+        if !self.sortlist.is_empty() {
+            apply_sortlist(&self.sortlist, &mut rrs.items);
+        }
+        Ok(Hostent::from_parsed(rrs, hfamily))
     }
 
     /// ares_gethostbyaddr: hosts-file reverse lookup, then a single PTR query.
@@ -761,7 +703,7 @@ impl AsyncClient {
                     Ok(buf) => match addr_reply(&buf, rtype, ReplyRequire::Items) {
                         Ok(rrs) => {
                             timeouts += io_timeouts;
-                            replies.push(FamilyReply { rrs });
+                            replies.push(FamilyReply { rtype, buf, rrs });
                         }
                         Err(e) => {
                             if e.code() == ARES_ENODATA {
@@ -876,9 +818,11 @@ impl AsyncClient {
     }
 }
 
-/// One family's reply within an address lookup: the parsed address records.
-/// (gethostbyname will also want the raw reply + rtype — added when it lands.)
+/// One family's reply within an address lookup: the wire type, the raw reply
+/// (kept for the gethostbyname query cache), and the parsed address records.
 struct FamilyReply {
+    rtype: u16,
+    buf: Vec<u8>,
     rrs: ParsedRRs<AddrRecord>,
 }
 
