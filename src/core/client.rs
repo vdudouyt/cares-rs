@@ -15,8 +15,8 @@ use bytes::BytesMut;
 use crate::core::cache::QueryCache;
 use crate::core::async_client;
 use crate::core::hostent::Hostent;
+use crate::core::hostfile::{AddressFamily, HostLookup};
 use crate::core::lookup::ServerHealth;
-use crate::core::preflight::{hosts_file_lookup, no_servers};
 use crate::core::async_client::dns_query_payload;
 use crate::core::sortlist::SortlistEntry;
 use crate::core::transport::Transport;
@@ -29,7 +29,7 @@ use crate::ffi::ares_options::{
     ARES_OPT_TIMEOUT, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES, ARES_OPT_UDP_MAX_QUERIES,
     ARES_OPT_UDP_PORT,
 };
-use crate::ffi::error::{ARES_EBADQUERY, ARES_ENOSERVER};
+use crate::ffi::error::{ARES_EBADQUERY, ARES_ENOSERVER, ARES_ENOTFOUND};
 
 /// Everything a channel owns that is pure Rust: config, health/cache
 /// bookkeeping, configuration strings, and the shared-socket pools for the
@@ -481,6 +481,29 @@ impl Client {
     }
 
 
+}
+
+/// The pure body of ares_gethostbyname_file: hosts-file-only lookup.
+fn hosts_file_lookup(st: &mut Client, name: &str, family: i32) -> Result<HostLookup, AresError> {
+    // Convert C family constant to our Family enum
+    let family_filter = match family {
+        libc::AF_INET => AddressFamily::Ipv4,
+        libc::AF_INET6 => AddressFamily::Ipv6,
+        libc::AF_UNSPEC => AddressFamily::Any,
+        _ => return Err(ARES_ENOTFOUND.into()),
+    };
+
+    // Lookup in the hosts file cache
+    let lookup = st.transport.hosts().lookup(name, family_filter).ok_or(ARES_ENOTFOUND)?;
+    if lookup.addrs.is_empty() {
+        return Err(ARES_ENOTFOUND.into());
+    }
+    Ok(lookup)
+}
+
+/// ENOSERVER guard shared by ares_query / ares_query_dnsrec / ares_send.
+fn no_servers(st: &Client) -> bool {
+    st.transport.config.nameservers.is_empty()
 }
 
 /// One decoded entry of a caller-supplied server list.

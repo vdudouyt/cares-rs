@@ -35,22 +35,19 @@ use crate::core::lookup::{
     AF_INET6, AF_UNSPEC, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::packets::AddrRecord;
-use crate::core::preflight::{
-    assemble_nameinfo, format_ip_with_scope, get_service_string, AddrInfo, NameinfoReply,
-};
-use crate::core::response::{addr_reply, ReplyRequire};
+use crate::core::response::{addr_reply, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
 use crate::async_runtime::socket::SocketFactory;
 use crate::core::sortlist::{apply_sortlist, SortlistEntry};
 use crate::core::transport::rdns_name;
 use crate::core::AresError;
 use crate::ffi::error::{
-    ARES_ECONNREFUSED, ARES_EBADFLAGS, ARES_EBADNAME, ARES_EFILE, ARES_ENODATA, ARES_ENOSERVER,
-    ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED, ARES_ESERVFAIL, ARES_ETIMEOUT,
+    ARES_ECONNREFUSED, ARES_EBADFLAGS, ARES_EBADNAME, ARES_EBADSTR, ARES_EFILE, ARES_ENODATA,
+    ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED, ARES_ESERVFAIL, ARES_ETIMEOUT,
 };
 use crate::ffi::{
-    ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NUMERICHOST, ARES_SUCCESS,
-    RECORD_TYPE_PTR,
+    ARES_NI_DGRAM, ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NOFQDN,
+    ARES_NI_NUMERICHOST, ARES_NI_NUMERICSCOPE, ARES_NI_NUMERICSERV, ARES_SUCCESS, RECORD_TYPE_PTR,
 };
 
 /// The per-channel resolver client: the shared config snapshot plus a [`QueryIo`]
@@ -1665,6 +1662,173 @@ fn unescape_label(label: &str) -> Vec<u8> {
         }
     }
     result
+}
+
+// ===== Entry preflights + nameinfo assembly (pure, no channel state) =====
+
+/// Everything getnameinfo's PTR delivery needs, assembled per the NI flag
+/// semantics: NOFQDN truncation, the ENOTFOUND+!NAMEREQD numeric fallback,
+/// and the LOOKUPSERVICE gate. Error deliveries carry zero timeouts (as
+/// historically); success carries the task's accumulated count.
+pub(crate) struct NameinfoReply {
+    pub status: AresError,
+    pub node: Option<CString>,
+    pub service: Option<CString>,
+    pub timeouts: i32,
+}
+
+pub(crate) fn assemble_nameinfo(
+    res: Result<&[u8], AresError>,
+    ip: IpAddr,
+    scope_id: u32,
+    port: u16,
+    flags: i32,
+    io_timeouts: i32,
+) -> NameinfoReply {
+    let services = Services::default();
+    let want_service = (flags & ARES_NI_LOOKUPSERVICE) != 0;
+
+    let hostname_result = (|| -> Result<CString, AresError> {
+        let buf = res?;
+        let parsed = ParsedResponse::from_buf(buf)?;
+        let ptr_records = parsed.process_answers::<CString>(buf, RECORD_TYPE_PTR)?;
+
+        if ptr_records.aliases.is_empty() {
+            return Err(ARES_ENOTFOUND.into());
+        }
+
+        let mut name = ptr_records.name;
+
+        if flags & ARES_NI_NOFQDN != 0 {
+            let name_str = name.to_string_lossy();
+            if let Some(dot_pos) = name_str.find('.') {
+                name = CString::new(&name_str[..dot_pos]).map_err(|_| AresError::from(ARES_EBADSTR))?;
+            }
+        }
+
+        Ok(name)
+    })();
+
+    let (status, node): (AresError, _) = match hostname_result {
+        Ok(name) => (ARES_SUCCESS.into(), Some(name)),
+        Err(err) => {
+            if err.code() == ARES_ENOTFOUND && (flags & ARES_NI_NAMEREQD) == 0 {
+                let ip_str = format_ip_with_scope(&ip, scope_id, flags);
+                match CString::new(ip_str) {
+                    Ok(name) => (ARES_SUCCESS.into(), Some(name)),
+                    Err(_) => return NameinfoReply { status: ARES_EBADSTR.into(), node: None, service: None, timeouts: 0 },
+                }
+            } else {
+                return NameinfoReply { status: err, node: None, service: None, timeouts: 0 };
+            }
+        }
+    };
+
+    let service = if want_service {
+        get_service_string(&services, port, flags)
+    } else {
+        None
+    };
+
+    NameinfoReply { status, node, service, timeouts: io_timeouts }
+}
+
+/// Format an IP address with scope ID for IPv6 (e.g., "fe80::1%0")
+pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: i32) -> String {
+    match ip {
+        // The scope id is currently appended regardless of the flag/scope_id
+        // check; the branches are intentionally identical for now.
+        #[allow(clippy::if_same_then_else)]
+        IpAddr::V6(_) => {
+            if flags & ARES_NI_NUMERICSCOPE != 0 || scope_id != 0 {
+                format!("{}%{}", ip, scope_id)
+            } else {
+                format!("{}%{}", ip, scope_id)
+            }
+        }
+        IpAddr::V4(_) => ip.to_string(),
+    }
+}
+
+/// Get the service string based on flags
+pub(crate) fn get_service_string(services: &Services, port: u16, flags: i32) -> Option<CString> {
+    if port == 0 {
+        return None;
+    }
+
+    if flags & ARES_NI_NUMERICSERV != 0 {
+        // Return numeric port
+        return Some(CString::new(port.to_string()).unwrap());
+    }
+
+    // Determine protocol preference based on flags
+    let prefer_udp = (flags & ARES_NI_DGRAM) != 0;
+
+    // Try to look up the service name
+    if let Some(name) = services.lookup_any(port, prefer_udp) {
+        Some(CString::new(name).unwrap())
+    } else {
+        // Fall back to numeric port
+        Some(CString::new(port.to_string()).unwrap())
+    }
+}
+
+/// How a getaddrinfo service string resolves to a port.
+pub(crate) enum ServicePort {
+    Port(u16),
+    /// Not numeric and not in the well-known table: the shim asks the system
+    /// resolver (getservbyname — inherently a C call), defaulting to 0.
+    NeedSystemLookup,
+}
+
+/// Service→port resolution order: numeric, then the built-in well-known
+/// table, then the system services database.
+pub(crate) fn service_to_port(svc: &str) -> ServicePort {
+    if let Ok(p) = svc.parse::<u16>() {
+        return ServicePort::Port(p);
+    }
+    if let Some(p) = well_known_port(svc) {
+        return ServicePort::Port(p);
+    }
+    ServicePort::NeedSystemLookup
+}
+
+/// The well-known service table ares_getaddrinfo consults before falling
+/// back to libc::getservbyname (which stays in the shim).
+fn well_known_port(svc: &str) -> Option<u16> {
+    Some(match svc {
+        "http" => 80,
+        "https" => 443,
+        "ftp" => 21,
+        "ssh" => 22,
+        "smtp" => 25,
+        "dns" => 53,
+        "pop3" => 110,
+        "imap" => 143,
+        _ => return None,
+    })
+}
+
+/// A decoded socket address (the pure result of the shim-side sockaddr
+/// unmarshal): what getnameinfo works from.
+pub(crate) struct AddrInfo {
+    pub(crate) ip: IpAddr,
+    pub(crate) port: u16,
+    pub(crate) scope_id: u32,
+}
+
+/// Empty/onion rejection shared by ares_search and ares_search_dnsrec —
+/// checked before the channel is even dereferenced (order is behavior:
+/// these fire even on a NULL channel).
+pub(crate) fn search_name_check(name_str: &str) -> Option<AresError> {
+    if name_str.is_empty() {
+        return Some(ARES_ENOTFOUND.into());
+    }
+    // Reject .onion domains immediately (RFC 7686)
+    if is_onion_domain(name_str) {
+        return Some(ARES_ENOTFOUND.into());
+    }
+    None
 }
 
 fn qid_of(payload: &[u8]) -> u16 {

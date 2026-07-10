@@ -7,7 +7,7 @@ use crate::core::async_client::{Delivery, DnsMailbox, Effect};
 use crate::async_runtime::executor::noop_waker;
 use crate::core::hostent::Hostent;
 use crate::core::AresError;
-use crate::core::preflight::NameinfoReply;
+use crate::core::async_client::NameinfoReply;
 use super::lookups::{fire_host_success, AddrInfoTail, HostTail, NameinfoTail, SearchDelivery, SearchTail};
 
 

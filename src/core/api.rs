@@ -11,7 +11,7 @@ use crate::ffi::RECORD_TYPE_PTR;
 
 /// ares_search's shim-side pre-check, re-exported so the shim's single
 /// entry-ordering exception reads from the api layer.
-pub(crate) use crate::core::preflight::search_name_check as search_precheck;
+pub(crate) use crate::core::async_client::search_name_check as search_precheck;
 
 /// The plain host-callback path (ares_gethostbyaddr's direct PTR delivery):
 /// parse under the flow's acceptance rule, add the synthetic record for the

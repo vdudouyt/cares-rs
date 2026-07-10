@@ -13,7 +13,6 @@ pub mod hostent;
 pub mod lookup;
 pub mod transport;
 pub mod packets;
-pub mod preflight;
 pub mod response;
 pub mod sortlist;
 pub mod sysconfig;

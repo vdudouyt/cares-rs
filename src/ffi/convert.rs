@@ -73,7 +73,7 @@ where F: FnOnce() -> Result<*mut T, c_int>
     }
 }
 
-use crate::core::preflight::AddrInfo;
+use crate::core::async_client::AddrInfo;
 
 /// Validate + decode a caller-supplied `sockaddr`/`salen` pair.
 /// Error codes match upstream getnameinfo: NULL/short → ENOMEM, unknown

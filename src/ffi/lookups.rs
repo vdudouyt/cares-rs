@@ -4,7 +4,7 @@
 use super::*;
 use crate::core::api;
 use crate::core::hostent::Hostent;
-use crate::core::preflight::{service_to_port, ServicePort};
+use crate::core::async_client::{service_to_port, ServicePort};
 
 
 /// The Copy delivery tail of an ares_gethostbyname / ares_gethostbyaddr lookup.
