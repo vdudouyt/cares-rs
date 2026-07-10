@@ -2,7 +2,7 @@
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
 
 use super::*;
-use crate::core::client::{getsock_mask, normalize_port, Client, ServerSpec};
+use crate::core::async_client::{getsock_mask, normalize_port, Client, ServerSpec};
 use crate::core::async_client::{Delivery, DnsMailbox, Effect};
 use crate::async_runtime::executor::noop_waker;
 use crate::core::hostent::Hostent;
@@ -17,7 +17,7 @@ use super::lookups::{fire_host_success, AddrInfoTail, HostTail, NameinfoTail, Se
 pub struct ChannelData {
     pub(crate) state: Client,
     /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
-    /// in `state.transport`. The socket-state callbacks (create/configure) live in
+    /// in `state`. The socket-state callbacks (create/configure) live in
     /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
     /// can simply share the Rc and stay independent.
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
@@ -114,14 +114,14 @@ impl ChannelData {
     /// A fresh channel with the default (libc) socket factory.
     pub(crate) fn new_default() -> Self {
         let factory = std::rc::Rc::new(CSocketFactory::default());
-        let state = Client::new(Transport::from_sysconfig(factory.clone()));
+        let state = Client::from_sysconfig(factory.clone());
         ChannelData::new(state, factory)
     }
 
     /// Install a rebuilt socket factory, keeping the concrete handle and the
     /// core's `Rc<dyn SocketFactory>` in sync (they are the same object).
     pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<CSocketFactory>) {
-        self.state.transport.socket_factory = factory.clone();
+        self.state.factory = factory.clone();
         self.socket_factory = factory;
     }
 

@@ -15,7 +15,6 @@ use std::net::IpAddr;
 use std::cmp::min;
 use std::time::Instant;
 use crate::core::packets::*;
-use crate::core::transport::Transport;
 use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::*;

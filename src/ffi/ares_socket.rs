@@ -53,7 +53,7 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
     let factory = CSocketFactory::with_funcs(basic, user_data, &channeldata.socket_factory);
     channeldata.socket_factory = factory.clone();
-    channeldata.state.transport.socket_factory = factory;
+    channeldata.state.factory = factory;
     0 // ARES_SUCCESS
 }
 

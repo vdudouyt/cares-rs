@@ -5,13 +5,11 @@
 
 pub mod api;
 pub mod cache;
-pub mod client;
 pub mod dns_record;
 pub mod error;
 pub mod async_client;
 pub mod hostent;
 pub mod lookup;
-pub mod transport;
 pub mod packets;
 pub mod response;
 pub mod sortlist;
