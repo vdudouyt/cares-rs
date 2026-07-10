@@ -17,7 +17,7 @@ use crate::core::async_client;
 use crate::core::hostent::Hostent;
 use crate::core::lookup::ServerHealth;
 use crate::core::preflight::{hosts_file_lookup, no_servers};
-use crate::core::query_builder::dns_query_payload;
+use crate::core::async_client::dns_query_payload;
 use crate::core::sortlist::SortlistEntry;
 use crate::core::transport::Transport;
 use crate::core::AresError;

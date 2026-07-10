@@ -46,7 +46,7 @@ impl AddrTTL for ares_addr6ttl {
 
 pub use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::hostent::{addrttl_fill, Hostent};
-use crate::core::query_builder::build_query;
+use crate::core::async_client::build_query;
 use crate::core::response::{
     addr_reply, empty_chain_status, expand_name_at, expand_string_at, push_synthetic_ptr,
     soa_status, txt_ext_items, ReplyRequire,
