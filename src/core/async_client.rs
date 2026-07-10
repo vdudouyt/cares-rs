@@ -260,6 +260,68 @@ impl AsyncClient {
         Delivery::Raw { result, timeouts }
     }
 
+    /// A one-shot failover probe to a stale server, run concurrently with the
+    /// primary [`request`](Self::request) (a lookup's first query only) and raced
+    /// against it with `select_biased!` by the caller. Picks a due server
+    /// (`pick_probe`), sends once, then races the reply against the probe timeout —
+    /// **reply-biased**, looping past stray (non-QID) datagrams — and folds the
+    /// outcome into `ServerHealth` via `settle_probe`: a matching reply →
+    /// rcode-based success/failure; a timeout → failure timestamp; a dead socket →
+    /// nothing. Returns nothing (its only effect is health); if the primary
+    /// finishes first this future is dropped un-settled.
+    async fn run_probe(self: Rc<Self>, probe_payload: BytesMut, use_tcp: bool) {
+        let io = self.io.clone();
+        let opts = self.opts();
+        if opts.failover_chance == 0 {
+            return;
+        }
+        let primary_server = self.health.borrow().pick_next();
+        let Some(pserver) = self.health.borrow().pick_probe(opts.failover_delay, primary_server) else {
+            return;
+        };
+        let Some(ep) = self.endpoints.get(pserver) else {
+            return;
+        };
+        let sk = if use_tcp {
+            let Ok(sk) = self.factory.create_tcp(ep.bind) else { return };
+            let _ = sk.connect(ep.tcp_addr);
+            sk
+        } else {
+            let Ok(sk) = self.factory.create_udp(ep.bind) else { return };
+            let _ = sk.connect(ep.udp_addr);
+            sk
+        };
+        let framed = if use_tcp { frame_tcp(&probe_payload) } else { probe_payload.clone() };
+        let _ = sk.send(&framed);
+        let mut conn = if use_tcp {
+            Conn::stream(io.clone(), sk, dns_frame)
+        } else {
+            Conn::datagram(io.clone(), sk)
+        };
+        let is_tcp = conn.is_tcp();
+        let timeout = Instant::now() + opts.timeout;
+        loop {
+            let mut reply = pin!(conn.recv_msg().fuse());
+            let mut t = pin!(sleep_until(&io, timeout).fuse());
+            select_biased! {
+                r = reply => match r {
+                    Ok(buf) => {
+                        if qid_matches(&buf, &framed, use_tcp) {
+                            settle_probe(&io, &self.health, pserver, is_tcp, Some(&buf));
+                            return;
+                        }
+                        // stray datagram — keep waiting for a matching reply
+                    }
+                    Err(_) => return, // probe socket died
+                },
+                _ = t => {
+                    settle_probe(&io, &self.health, pserver, is_tcp, None);
+                    return;
+                }
+            }
+        }
+    }
+
     /// ares_gethostbyname: the full pre-DNS cascade (ASCII/onion/family/
     /// IP-literal/hosts/localhost/HOSTALIASES/no-servers/query-cache) then the
     /// DNS phase (search-domain iteration + AF_UNSPEC fallback). The preflight
@@ -365,178 +427,23 @@ impl AsyncClient {
             // Only a lookup's first query is eligible to spawn a probe.
             let probe_payload = if first { Some(dns_query_payload(&names[idx], rtype)) } else { None };
             first = false;
-            let (result, io_timeouts) = 'drive: {
-                let io = self.io.clone();
-                let opts = self.opts();
-                let mut use_tcp = self.config.options.use_vc;
-                let mut timeouts: c_int = 0;
-                let mut tries: u32 = 0;
-                let mut failover_tries: u32 = 0;
-                let qid = qid_of(&payload);
-                let mut server = self.health.borrow().pick_next();
-                let mut probe = probe_payload.and_then(|pp| {
-                    // Inlined probe setup (WET): a one-shot failover probe to a stale
-                    // server, raced alongside the primary. `None` if failover is off /
-                    // no server is due / a socket fails.
-                    if opts.failover_chance == 0 {
-                        return None;
-                    }
-                    let primary_server = self.health.borrow().pick_next();
-                    let pserver = self.health.borrow().pick_probe(opts.failover_delay, primary_server)?;
-                    let ep = self.endpoints.get(pserver)?;
-                    let sk = if use_tcp {
-                        let sk = self.factory.create_tcp(ep.bind).ok()?;
-                        let _ = sk.connect(ep.tcp_addr);
-                        sk
-                    } else {
-                        let sk = self.factory.create_udp(ep.bind).ok()?;
-                        let _ = sk.connect(ep.udp_addr);
-                        sk
-                    };
-                    let framed = if use_tcp { frame_tcp(&pp) } else { pp.clone() };
-                    let _ = sk.send(&framed);
-                    Some(Probe {
-                        conn: if use_tcp {
-                            Conn::stream(io.clone(), sk, dns_frame)
-                        } else {
-                            Conn::datagram(io.clone(), sk)
-                        },
-                        server: pserver,
-                        timeout: Instant::now() + opts.timeout,
-                        payload: framed,
-                    })
-                });
-                'attempt: loop {
-                    let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
-                        Ok(v) => v,
-                        Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
-                    };
-                    server = si;
-                    let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
-                    let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                    let timeout = Instant::now() + opts.timeout;
-                    if conn.send(wire, timeout).await.is_err() {
-                        if use_tcp {
-                            self.tcp_pool.borrow_mut().remove(server);
-                        }
-                        if tries + 1 < opts.attempts.max(1) {
-                            tries += 1;
-                            if self.health.borrow().len() > 1 {
-                                self.health.borrow_mut().record_failure(server);
-                                server = self.health.borrow().pick_next();
-                            }
-                            continue 'attempt;
-                        }
-                        break 'drive (Err(ARES_ECONNREFUSED), timeouts);
-                    }
+            let use_vc = self.config.options.use_vc;
+            // Race the primary query against a one-shot failover probe (first query
+            // of a lookup only; biased probe → primary). The probe folds itself into
+            // ServerHealth and terminates; if the primary finishes first the probe
+            // is dropped un-settled.
+            let mut primary = pin!(self.clone().request(payload, use_vc).fuse());
+            let (result, io_timeouts) = match probe_payload {
+                Some(pp) => {
+                    let mut probe = pin!(self.clone().run_probe(pp, use_vc).fuse());
                     loop {
-                        // Race the live probe, the timeout, and the primary reply.
-                        // Biased probe -> timeout -> primary (expiry preempts a
-                        // same-cycle primary read, as before). No probe => 2-arm recv.
-                        let event = if let Some(p) = probe.as_mut() {
-                            let wake_timeout = timeout.min(p.timeout);
-                            let mut probe_r = pin!(p.conn.recv_msg().fuse());
-                            let mut t = pin!(sleep_until(&io, wake_timeout).fuse());
-                            let mut primary_r = pin!(conn.recv_msg().fuse());
-                            select_biased! {
-                                r = probe_r => ReplyEvent::Probe(r),
-                                _ = t => ReplyEvent::Timeout,
-                                r = primary_r => ReplyEvent::Primary(r),
-                            }
-                        } else {
-                            match conn.recv(timeout).await {
-                                Err(e) if e.kind() == io::ErrorKind::TimedOut => ReplyEvent::Timeout,
-                                r => ReplyEvent::Primary(r),
-                            }
-                        };
-                        match event {
-                            ReplyEvent::Probe(r) => {
-                                match r {
-                                    Ok(buf) => {
-                                        if probe.as_ref().is_some_and(|p| qid_matches(&buf, &p.payload, p.conn.is_tcp())) {
-                                            let p_taken = probe.take().unwrap();
-                                            settle_probe(&io, &self.health, &p_taken, Some(&buf));
-                                        }
-                                    }
-                                    Err(_) => probe = None, // probe socket died
-                                }
-                                continue;
-                            }
-                            ReplyEvent::Timeout => {
-                                let now = Instant::now();
-                                if let Some(p) = &probe {
-                                    if now >= p.timeout {
-                                        let p_taken = probe.take().unwrap();
-                                        settle_probe(&io, &self.health, &p_taken, None);
-                                    }
-                                }
-                                if now >= timeout {
-                                    notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                    let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                                    match verdict {
-                                        TimeoutVerdict::Retry { server: next } => {
-                                            tries += 1;
-                                            timeouts += 1;
-                                            server = next;
-                                            continue 'attempt;
-                                        }
-                                        TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                                    }
-                                }
-                                continue;
-                            }
-                            ReplyEvent::Primary(r) => {
-                                let buf = match r {
-                                    Ok(buf) => buf,
-                                    Err(_) => {
-                                        // Dead socket (EOF / hard error).
-                                        if use_tcp {
-                                            self.tcp_pool.borrow_mut().remove(server);
-                                        }
-                                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                                        match verdict {
-                                            TimeoutVerdict::Retry { server: next } => {
-                                                tries += 1;
-                                                timeouts += 1;
-                                                server = next;
-                                                continue 'attempt;
-                                            }
-                                            TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                                        }
-                                    }
-                                };
-                                if !qid_matches(&buf, wire, use_tcp) {
-                                    continue;
-                                }
-                                let summary = summarize(&buf, 0);
-                                let (actions, verdict) = on_datagram(
-                                    &summary,
-                                    server,
-                                    use_tcp,
-                                    opts.attempts,
-                                    failover_tries,
-                                    &mut self.health.borrow_mut(),
-                                );
-                                notify(&io, actions);
-                                match verdict {
-                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                        server = next;
-                                        failover_tries = ft;
-                                        continue 'attempt;
-                                    }
-                                    TaskVerdict::RetryTcp => {
-                                        use_tcp = true;
-                                        continue 'attempt;
-                                    }
-                                    TaskVerdict::Deliver => {
-                                        break 'drive (Ok(buf), timeouts);
-                                    }
-                                }
-                            }
+                        select_biased! {
+                            _ = probe => continue,
+                            r = primary => break r,
                         }
                     }
                 }
+                None => primary.await,
             };
 
             let last_error: AresError = match result {
@@ -710,178 +617,23 @@ impl AsyncClient {
             // Only the first query of a lookup is eligible to spawn a failover probe.
             let probe_payload = if first { Some(dns_query_payload(&plan.current, dnstype)) } else { None };
             first = false;
-            let (result, io_timeouts) = 'drive: {
-                let io = self.io.clone();
-                let opts = self.opts();
-                let mut use_tcp = self.config.options.use_vc;
-                let mut timeouts: c_int = 0;
-                let mut tries: u32 = 0;
-                let mut failover_tries: u32 = 0;
-                let qid = qid_of(&payload);
-                let mut server = self.health.borrow().pick_next();
-                let mut probe = probe_payload.and_then(|pp| {
-                    // Inlined probe setup (WET): a one-shot failover probe to a stale
-                    // server, raced alongside the primary. `None` if failover is off /
-                    // no server is due / a socket fails.
-                    if opts.failover_chance == 0 {
-                        return None;
-                    }
-                    let primary_server = self.health.borrow().pick_next();
-                    let pserver = self.health.borrow().pick_probe(opts.failover_delay, primary_server)?;
-                    let ep = self.endpoints.get(pserver)?;
-                    let sk = if use_tcp {
-                        let sk = self.factory.create_tcp(ep.bind).ok()?;
-                        let _ = sk.connect(ep.tcp_addr);
-                        sk
-                    } else {
-                        let sk = self.factory.create_udp(ep.bind).ok()?;
-                        let _ = sk.connect(ep.udp_addr);
-                        sk
-                    };
-                    let framed = if use_tcp { frame_tcp(&pp) } else { pp.clone() };
-                    let _ = sk.send(&framed);
-                    Some(Probe {
-                        conn: if use_tcp {
-                            Conn::stream(io.clone(), sk, dns_frame)
-                        } else {
-                            Conn::datagram(io.clone(), sk)
-                        },
-                        server: pserver,
-                        timeout: Instant::now() + opts.timeout,
-                        payload: framed,
-                    })
-                });
-                'attempt: loop {
-                    let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
-                        Ok(v) => v,
-                        Err(()) => break 'drive (Err(ARES_ECONNREFUSED), timeouts),
-                    };
-                    server = si;
-                    let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
-                    let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                    let timeout = Instant::now() + opts.timeout;
-                    if conn.send(wire, timeout).await.is_err() {
-                        if use_tcp {
-                            self.tcp_pool.borrow_mut().remove(server);
-                        }
-                        if tries + 1 < opts.attempts.max(1) {
-                            tries += 1;
-                            if self.health.borrow().len() > 1 {
-                                self.health.borrow_mut().record_failure(server);
-                                server = self.health.borrow().pick_next();
-                            }
-                            continue 'attempt;
-                        }
-                        break 'drive (Err(ARES_ECONNREFUSED), timeouts);
-                    }
+            let use_vc = self.config.options.use_vc;
+            // Race the primary query against a one-shot failover probe (first query
+            // of a lookup only; biased probe → primary). The probe folds itself into
+            // ServerHealth and terminates; if the primary finishes first the probe
+            // is dropped un-settled.
+            let mut primary = pin!(self.clone().request(payload, use_vc).fuse());
+            let (result, io_timeouts) = match probe_payload {
+                Some(pp) => {
+                    let mut probe = pin!(self.clone().run_probe(pp, use_vc).fuse());
                     loop {
-                        // Race the live probe, the timeout, and the primary reply.
-                        // Biased probe -> timeout -> primary (expiry preempts a
-                        // same-cycle primary read, as before). No probe => 2-arm recv.
-                        let event = if let Some(p) = probe.as_mut() {
-                            let wake_timeout = timeout.min(p.timeout);
-                            let mut probe_r = pin!(p.conn.recv_msg().fuse());
-                            let mut t = pin!(sleep_until(&io, wake_timeout).fuse());
-                            let mut primary_r = pin!(conn.recv_msg().fuse());
-                            select_biased! {
-                                r = probe_r => ReplyEvent::Probe(r),
-                                _ = t => ReplyEvent::Timeout,
-                                r = primary_r => ReplyEvent::Primary(r),
-                            }
-                        } else {
-                            match conn.recv(timeout).await {
-                                Err(e) if e.kind() == io::ErrorKind::TimedOut => ReplyEvent::Timeout,
-                                r => ReplyEvent::Primary(r),
-                            }
-                        };
-                        match event {
-                            ReplyEvent::Probe(r) => {
-                                match r {
-                                    Ok(buf) => {
-                                        if probe.as_ref().is_some_and(|p| qid_matches(&buf, &p.payload, p.conn.is_tcp())) {
-                                            let p_taken = probe.take().unwrap();
-                                            settle_probe(&io, &self.health, &p_taken, Some(&buf));
-                                        }
-                                    }
-                                    Err(_) => probe = None, // probe socket died
-                                }
-                                continue;
-                            }
-                            ReplyEvent::Timeout => {
-                                let now = Instant::now();
-                                if let Some(p) = &probe {
-                                    if now >= p.timeout {
-                                        let p_taken = probe.take().unwrap();
-                                        settle_probe(&io, &self.health, &p_taken, None);
-                                    }
-                                }
-                                if now >= timeout {
-                                    notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                    let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                                    match verdict {
-                                        TimeoutVerdict::Retry { server: next } => {
-                                            tries += 1;
-                                            timeouts += 1;
-                                            server = next;
-                                            continue 'attempt;
-                                        }
-                                        TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                                    }
-                                }
-                                continue;
-                            }
-                            ReplyEvent::Primary(r) => {
-                                let buf = match r {
-                                    Ok(buf) => buf,
-                                    Err(_) => {
-                                        // Dead socket (EOF / hard error).
-                                        if use_tcp {
-                                            self.tcp_pool.borrow_mut().remove(server);
-                                        }
-                                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
-                                        let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
-                                        match verdict {
-                                            TimeoutVerdict::Retry { server: next } => {
-                                                tries += 1;
-                                                timeouts += 1;
-                                                server = next;
-                                                continue 'attempt;
-                                            }
-                                            TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
-                                        }
-                                    }
-                                };
-                                if !qid_matches(&buf, wire, use_tcp) {
-                                    continue;
-                                }
-                                let summary = summarize(&buf, 0);
-                                let (actions, verdict) = on_datagram(
-                                    &summary,
-                                    server,
-                                    use_tcp,
-                                    opts.attempts,
-                                    failover_tries,
-                                    &mut self.health.borrow_mut(),
-                                );
-                                notify(&io, actions);
-                                match verdict {
-                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                        server = next;
-                                        failover_tries = ft;
-                                        continue 'attempt;
-                                    }
-                                    TaskVerdict::RetryTcp => {
-                                        use_tcp = true;
-                                        continue 'attempt;
-                                    }
-                                    TaskVerdict::Deliver => {
-                                        break 'drive (Ok(buf), timeouts);
-                                    }
-                                }
-                            }
+                        select_biased! {
+                            _ = probe => continue,
+                            r = primary => break r,
                         }
                     }
                 }
+                None => primary.await,
             };
             timeouts += io_timeouts;
 
@@ -2128,41 +1880,24 @@ fn qid_of(payload: &[u8]) -> u16 {
     }
 }
 
-/// One `select` result in the probe ops (`gethostbyname`/`search`): which of the
-/// raced arms — the concurrent failover probe, the timeout, or the primary
-/// reply — fired. Unifies the 3-arm (probe live) and 2-arm (no probe) branches.
-enum ReplyEvent {
-    Probe(io::Result<Vec<u8>>),
-    Timeout,
-    Primary(io::Result<Vec<u8>>),
-}
-
-/// A one-shot failover probe running alongside the primary query.
-struct Probe {
-    conn: Conn<DnsSignals>,
-    server: usize,
-    timeout: Instant,
-    payload: BytesMut, // framed form actually sent (for qid_matches)
-}
-
 /// Fold a probe reply into server health (the old `on_probe_reply` verdict),
 /// emitted as effects. `None` reply = the probe timed out (failure timestamp only).
-fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, health: &RefCell<ServerHealth>, probe: &Probe, reply: Option<&[u8]>) {
+fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, health: &RefCell<ServerHealth>, server: usize, is_tcp: bool, reply: Option<&[u8]>) {
     let mut health = health.borrow_mut();
     match reply {
         Some(buf) => {
             let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0xff };
             if rcode == 0 || rcode == 3 {
-                if health.record_success(probe.server) {
+                if health.record_success(server) {
                     drop(health);
-                    push_effect(io, Effect::NotifyServerState { server: probe.server, ok: true, tcp: probe.conn.is_tcp() });
+                    push_effect(io, Effect::NotifyServerState { server, ok: true, tcp: is_tcp });
                 }
-            } else if health.record_failure(probe.server) {
+            } else if health.record_failure(server) {
                 drop(health);
-                push_effect(io, Effect::NotifyServerState { server: probe.server, ok: false, tcp: probe.conn.is_tcp() });
+                push_effect(io, Effect::NotifyServerState { server, ok: false, tcp: is_tcp });
             }
         }
-        None => health.record_failure_time(probe.server),
+        None => health.record_failure_time(server),
     }
 }
 

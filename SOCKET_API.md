@@ -57,9 +57,12 @@ Standard `io::Result` error contract, tokio/std-style:
 - `recv_msg`: the un-timed recv (`Ok(bytes)` / `UnexpectedEof`), so it can be a
   bare `select_biased!` arm. `recv` = `recv_msg` raced against `sleep_until`.
 
-## Racing a concurrent second socket (the failover probe)
-To await the primary reply, a concurrent probe, and the timeout together, race
-the arms with `select_biased!` (biased top-to-bottom):
+## Racing concurrent futures on one mailbox (probe / dual-family)
+The mailbox is shared, so several whole-lifecycle futures can run on it at once —
+`poll_recv` routes each reply by fd, so they self-demux. The DNS side uses this two
+ways: a one-shot failover probe raced against the primary query, and getaddrinfo's
+A+AAAA pair. Each peer does its own `recv`/`sleep_until` internally; the caller just
+races the peers with `select_biased!`. `sleep_until` is the timeout as a bare arm:
 ```rust
 fn sleep_until<A>(io, timeout: Instant) -> impl Future<Output = ()>;  // the timeout, as an arm
 ```
@@ -81,16 +84,33 @@ loop {
 }
 ```
 
-### Race a concurrent probe
+### Race peer futures (a probe alongside the primary)
 ```rust
-let wake_timeout = timeout.min(probe.timeout);
-let mut probe_r  = pin!(probe.conn.recv_msg().fuse());
-let mut t        = pin!(sleep_until(&io, wake_timeout).fuse());
-let mut primary  = pin!(conn.recv_msg().fuse());
-select_biased! {            // biased: probe → timeout → primary
-    r = probe_r => { /* probe reply */ }
-    _ = t       => { /* timeout */ }
-    r = primary => { /* primary reply */ }
+// Each peer is self-contained: it does its own recv/timeout loop internally (the
+// primary is one query lifecycle; the probe sends once, folds its reply into shared
+// health, and terminates). Race the peers at the composition layer:
+let mut primary = pin!(self.clone().request(payload, use_tcp).fuse());
+let outcome = match probe_payload {
+    Some(pp) => {
+        let mut probe = pin!(self.clone().run_probe(pp, use_tcp).fuse());
+        loop {
+            select_biased! {           // biased: probe → primary
+                _ = probe   => continue,   // probe settled; fused → skipped next poll
+                r = primary => break r,    // primary delivered/failed → done
+            }
+        }
+    }
+    None => primary.await,
+};
+```
+Inside such a future, race one socket's reply against its timeout (reply- or
+timeout-biased as the caller needs):
+```rust
+let mut reply = pin!(conn.recv_msg().fuse());
+let mut t     = pin!(sleep_until(&io, timeout).fuse());
+select_biased! {            // reply-biased
+    r = reply => { /* reply */ }
+    _ = t     => { /* timeout */ }
 }
 ```
 (Pin with std's `pin!` — `futures::pin_mut!` expands to `unsafe`, forbidden here.)
