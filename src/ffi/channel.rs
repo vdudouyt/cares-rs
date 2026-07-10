@@ -154,6 +154,16 @@ impl ChannelData {
             return;
         }
         let waker = noop_waker();
+        // The mailbox contract: published waits/timeout are valid until the next
+        // poll; every pending arm re-registers during the poll. Clear here (after
+        // drive_fd_futures computed `fired` from them) so registrations start
+        // fresh — generic combinators (`select_biased!`) can't clear for us.
+        {
+            let io = &self.async_queries[id].as_ref().unwrap().io;
+            let mut m = io.borrow_mut();
+            m.waits.clear();
+            m.timeout = None;
+        }
         // Poll the kind's future, capturing its output (if it completed) to fire
         // after the mailbox borrow is released.
         let done: Option<Completed> = {

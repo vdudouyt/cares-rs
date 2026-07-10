@@ -17,17 +17,18 @@ use std::ffi::{c_int, CString};
 use std::io;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
+use futures_util::{select_biased, FutureExt};
 use rand::Rng;
 
 use crate::core::cache::QueryCache;
 use crate::async_runtime::conn::{Conn, TcpPool};
-use crate::async_runtime::executor::{noop_waker, poll_timeout, select3, wait_io, QueryIo, Wait, Which3};
+use crate::async_runtime::executor::{noop_waker, sleep_until, wait_io, QueryIo, Wait};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
@@ -467,10 +468,13 @@ impl AsyncClient {
                         // same-cycle primary read, as before). No probe => 2-arm recv.
                         let event = if let Some(p) = probe.as_mut() {
                             let wake_timeout = timeout.min(p.timeout);
-                            match select3(&io, |_| p.conn.recv_arm(), |io| poll_timeout(io, wake_timeout), |_| conn.recv_arm()).await {
-                                Which3::A(r) => ReplyEvent::Probe(r),
-                                Which3::B(()) => ReplyEvent::Timeout,
-                                Which3::C(r) => ReplyEvent::Primary(r),
+                            let mut probe_r = pin!(p.conn.recv_msg().fuse());
+                            let mut t = pin!(sleep_until(&io, wake_timeout).fuse());
+                            let mut primary_r = pin!(conn.recv_msg().fuse());
+                            select_biased! {
+                                r = probe_r => ReplyEvent::Probe(r),
+                                _ = t => ReplyEvent::Timeout,
+                                r = primary_r => ReplyEvent::Primary(r),
                             }
                         } else {
                             match conn.recv(timeout).await {
@@ -1078,10 +1082,13 @@ impl AsyncClient {
                         // same-cycle primary read, as before). No probe => 2-arm recv.
                         let event = if let Some(p) = probe.as_mut() {
                             let wake_timeout = timeout.min(p.timeout);
-                            match select3(&io, |_| p.conn.recv_arm(), |io| poll_timeout(io, wake_timeout), |_| conn.recv_arm()).await {
-                                Which3::A(r) => ReplyEvent::Probe(r),
-                                Which3::B(()) => ReplyEvent::Timeout,
-                                Which3::C(r) => ReplyEvent::Primary(r),
+                            let mut probe_r = pin!(p.conn.recv_msg().fuse());
+                            let mut t = pin!(sleep_until(&io, wake_timeout).fuse());
+                            let mut primary_r = pin!(conn.recv_msg().fuse());
+                            select_biased! {
+                                r = probe_r => ReplyEvent::Probe(r),
+                                _ = t => ReplyEvent::Timeout,
+                                r = primary_r => ReplyEvent::Primary(r),
                             }
                         } else {
                             match conn.recv(timeout).await {
@@ -2618,6 +2625,15 @@ impl ParallelQueries {
             let mut cx = Context::from_waker(&waker);
             for s in &mut self.subs {
                 if let Some(fut) = &mut s.fut {
+                    // Same mailbox contract as `ChannelData::advance`: clear the
+                    // sub's published waits/timeout before polling (its
+                    // fired/expired were set by the previous step's routing), so
+                    // `select_biased!` arms re-register onto a clean slate.
+                    {
+                        let mut m = s.io.borrow_mut();
+                        m.waits.clear();
+                        m.timeout = None;
+                    }
                     if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
                         s.result = Some(r);
                         s.fut = None;

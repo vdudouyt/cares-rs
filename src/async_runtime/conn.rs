@@ -20,15 +20,17 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::rc::Rc;
-use std::task::Poll;
 use std::time::Instant;
 
+use futures_util::{select_biased, FutureExt};
+
 use crate::async_runtime::executor::{
-    poll_recv, poll_timeout, recv_datagram, recv_stream, select2, send_when_writable, QueryIo,
-    Recv, Which2,
+    poll_recv, recv_datagram, recv_stream, send_when_writable, sleep_until, QueryIo, Recv,
 };
 use crate::async_runtime::socket::{Socket, SocketFactory};
 
@@ -221,25 +223,27 @@ impl<A> Conn<A> {
         }
     }
 
-    /// The readiness-driven recv arm for `select2`/`select3`: on this conn's fd
-    /// firing, do one non-blocking [`read`](Self::read). Uses the conn's own
-    /// mailbox. Resolves `Ok(bytes)` or `Err(UnexpectedEof)` (dead socket).
-    pub fn recv_arm(&mut self) -> Poll<io::Result<Vec<u8>>> {
+    /// Await this conn's next message with no timeout bound — usable directly
+    /// as a `select_biased!` arm. On this conn's fd firing, does one
+    /// non-blocking [`read`](Self::read) (a `WouldBlock` re-registers and
+    /// suspends). Resolves `Ok(bytes)` or `Err(UnexpectedEof)` (dead socket).
+    pub async fn recv_msg(&mut self) -> io::Result<Vec<u8>> {
         let fd = self.fd();
         let io = self.io.clone();
-        poll_recv(&io, fd, || self.read())
+        poll_fn(move |_| poll_recv(&io, fd, || self.read())).await
     }
 
     /// tokio-style `conn.recv(timeout).await`: await this conn's next message,
-    /// bounded by `timeout` (a 2-arm select over the conn's own mailbox,
-    /// timeout-biased to match the classic expiry-preempts-read order).
-    /// Errors: `ErrorKind::TimedOut` on expiry, `ErrorKind::UnexpectedEof` on a
-    /// dead socket (EOF / hard recv error).
+    /// bounded by `timeout` (timeout arm first — the classic
+    /// expiry-preempts-read order). Errors: `ErrorKind::TimedOut` on expiry,
+    /// `ErrorKind::UnexpectedEof` on a dead socket (EOF / hard recv error).
     pub async fn recv(&mut self, timeout: Instant) -> io::Result<Vec<u8>> {
         let io = self.io.clone();
-        match select2(&io, |io| poll_timeout(io, timeout), |_| self.recv_arm()).await {
-            Which2::A(()) => Err(io::ErrorKind::TimedOut.into()),
-            Which2::B(r) => r,
+        let mut t = pin!(sleep_until(&io, timeout).fuse());
+        let mut r = pin!(self.recv_msg().fuse());
+        select_biased! {
+            _ = t => Err(io::ErrorKind::TimedOut.into()),
+            r = r => r,
         }
     }
 }

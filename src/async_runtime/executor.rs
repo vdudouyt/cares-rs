@@ -14,12 +14,14 @@
 //! `core::async_client`. Everything here is safe (`forbid(unsafe_code)`).
 
 use std::cell::RefCell;
-use std::future::Future;
-use std::pin::Pin;
+use std::future::{poll_fn, Future};
+use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
+
+use futures_util::{select_biased, FutureExt};
 
 use crate::async_runtime::socket::Socket;
 
@@ -51,10 +53,9 @@ pub(crate) struct QueryIo<A> {
     pub app: A,
 }
 
-/// The outcome of one [`wait_io`] await: which fds fired, and whether it timed out.
+/// The outcome of one [`wait_io`] await: which fds fired (empty = timed out).
 pub(crate) struct Woke {
     pub fds: Vec<i32>,
-    pub expired: bool,
 }
 
 /// The await primitive: resolve once the executor reports readiness for the
@@ -71,7 +72,7 @@ impl<A> Future for Ready1<A> {
         if io.fired.is_empty() && !io.expired {
             return Poll::Pending;
         }
-        Poll::Ready(Woke { fds: std::mem::take(&mut io.fired), expired: io.expired })
+        Poll::Ready(Woke { fds: std::mem::take(&mut io.fired) })
     }
 }
 
@@ -111,8 +112,9 @@ pub(crate) enum Recv {
 
 /// Await writability on `sock`, then send `bytes` once. Re-awaits on `WouldBlock`;
 /// `Err(TimedOut)` on timeout before writable, the socket's own error on a hard
-/// send failure. Generic over the mailbox app-state — the reactor never
-/// inspects `bytes`.
+/// send failure. The writable arm is polled first — a fd that fired in the same
+/// cycle the timeout passed still sends (the historical wait_io preference).
+/// Generic over the mailbox app-state — the reactor never inspects `bytes`.
 pub(crate) async fn send_when_writable<A>(
     io: &Rc<RefCell<QueryIo<A>>>,
     sock: &dyn Socket,
@@ -121,9 +123,13 @@ pub(crate) async fn send_when_writable<A>(
 ) -> std::io::Result<()> {
     let fd = sock.as_raw_fd();
     loop {
-        let woke = wait_io(io, &[Wait { fd, writable: true }], timeout).await;
-        if woke.expired && !woke.fds.contains(&fd) {
-            return Err(std::io::ErrorKind::TimedOut.into()); // timed out before writable
+        {
+            let mut writable = pin!(poll_fn(|_| poll_writable(io, fd)).fuse());
+            let mut t = pin!(sleep_until(io, timeout).fuse());
+            select_biased! {
+                _ = writable => {}
+                _ = t => return Err(std::io::ErrorKind::TimedOut.into()), // timed out before writable
+            }
         }
         match sock.send(bytes) {
             Ok(_) => return Ok(()),
@@ -207,9 +213,25 @@ pub(crate) fn poll_recv<A>(
     }
 }
 
+/// A writability arm: if `fd` fired this cycle, consume **that fd's**
+/// readiness; otherwise register write-interest and suspend.
+fn poll_writable<A>(io: &Rc<RefCell<QueryIo<A>>>, fd: i32) -> Poll<()> {
+    let mut m = io.borrow_mut();
+    match m.fired.iter().position(|&f| f == fd) {
+        Some(pos) => {
+            m.fired.swap_remove(pos);
+            Poll::Ready(())
+        }
+        None => {
+            m.waits.push(Wait { fd, writable: true });
+            Poll::Pending
+        }
+    }
+}
+
 /// A timeout arm: resolves once wall-clock passes `timeout`; otherwise mins
 /// `timeout` into the mailbox and suspends. Reads `Instant::now()` directly
-/// (ignores `io.expired`) so several timeout arms self-demux.
+/// so several timeout arms on one mailbox self-demux.
 pub(crate) fn poll_timeout<A>(io: &Rc<RefCell<QueryIo<A>>>, timeout: Instant) -> Poll<()> {
     if Instant::now() >= timeout {
         return Poll::Ready(());
@@ -219,69 +241,13 @@ pub(crate) fn poll_timeout<A>(io: &Rc<RefCell<QueryIo<A>>>, timeout: Instant) ->
     Poll::Pending
 }
 
-/// Which arm of a [`select2`] resolved.
-pub(crate) enum Which2<A, B> {
-    A(A),
-    B(B),
-}
-/// Which arm of a [`select3`] resolved.
-pub(crate) enum Which3<A, B, C> {
-    A(A),
-    B(B),
-    C(C),
-}
-
-/// Race two arms over the single mailbox, **biased** to `a`. Clears the mailbox's
-/// `waits`/`timeout` once at the top of each poll cycle; each pending arm
-/// re-registers. The first arm to return `Ready` wins (the others aren't polled
-/// further this cycle). Pending propagates up so the ffi re-polls on readiness.
-pub(crate) async fn select2<St, RA, RB>(
-    io: &Rc<RefCell<QueryIo<St>>>,
-    mut a: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RA>,
-    mut b: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RB>,
-) -> Which2<RA, RB> {
-    std::future::poll_fn(|_cx| {
-        {
-            let mut m = io.borrow_mut();
-            m.waits.clear();
-            m.timeout = None;
-        }
-        if let Poll::Ready(v) = a(io) {
-            return Poll::Ready(Which2::A(v));
-        }
-        if let Poll::Ready(v) = b(io) {
-            return Poll::Ready(Which2::B(v));
-        }
-        Poll::Pending
-    })
-    .await
-}
-
-/// Race three arms over the single mailbox, biased `a` → `b` → `c`. See [`select2`].
-pub(crate) async fn select3<St, RA, RB, RC>(
-    io: &Rc<RefCell<QueryIo<St>>>,
-    mut a: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RA>,
-    mut b: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RB>,
-    mut c: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RC>,
-) -> Which3<RA, RB, RC> {
-    std::future::poll_fn(|_cx| {
-        {
-            let mut m = io.borrow_mut();
-            m.waits.clear();
-            m.timeout = None;
-        }
-        if let Poll::Ready(v) = a(io) {
-            return Poll::Ready(Which3::A(v));
-        }
-        if let Poll::Ready(v) = b(io) {
-            return Poll::Ready(Which3::B(v));
-        }
-        if let Poll::Ready(v) = c(io) {
-            return Poll::Ready(Which3::C(v));
-        }
-        Poll::Pending
-    })
-    .await
+/// Sleep until `timeout` (tokio-style), as a future usable directly as a
+/// `select_biased!` arm.
+pub(crate) fn sleep_until<A>(
+    io: &Rc<RefCell<QueryIo<A>>>,
+    timeout: Instant,
+) -> impl Future<Output = ()> + '_ {
+    poll_fn(move |_| poll_timeout(io, timeout))
 }
 
 // ===== Waker =====
