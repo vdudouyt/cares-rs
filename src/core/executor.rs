@@ -163,6 +163,128 @@ pub(crate) fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>) -> bool {
     })
 }
 
+// ===== select: readiness-driven recv arms + a biased poll_fn combinator =====
+
+/// The outcome of a recv arm resolving. `WouldBlock` never escapes — the arm
+/// re-registers and suspends instead. Bytes are opaque to the reactor.
+pub(crate) enum RecvReady {
+    Msg(Vec<u8>),
+    Dead,
+}
+
+/// A per-fd recv arm for use inside [`select2`]/[`select3`]. If `fd` fired this
+/// cycle, consume **that fd's** readiness (`swap_remove`) and run `read` once;
+/// a `WouldBlock` (`Recv::Pending`) re-registers read-interest and suspends (so a
+/// sibling arm can still progress). Otherwise registers read-interest and
+/// suspends. `read` yields opaque bytes — the reactor names nothing of the app.
+pub(crate) fn poll_recv<A>(
+    io: &Rc<RefCell<QueryIo<A>>>,
+    fd: i32,
+    mut read: impl FnMut() -> Recv,
+) -> Poll<RecvReady> {
+    let fired = {
+        let mut m = io.borrow_mut();
+        match m.fired.iter().position(|&f| f == fd) {
+            Some(pos) => {
+                m.fired.swap_remove(pos);
+                true
+            }
+            None => {
+                m.waits.push(Wait { fd, writable: false });
+                false
+            }
+        }
+    };
+    if !fired {
+        return Poll::Pending;
+    }
+    match read() {
+        Recv::Pending => {
+            io.borrow_mut().waits.push(Wait { fd, writable: false });
+            Poll::Pending
+        }
+        Recv::Msg(b) => Poll::Ready(RecvReady::Msg(b)),
+        Recv::Dead => Poll::Ready(RecvReady::Dead),
+    }
+}
+
+/// A deadline arm: resolves once wall-clock passes `deadline`; otherwise mins
+/// `deadline` into the mailbox and suspends. Reads `Instant::now()` directly
+/// (ignores `io.expired`) so several deadline arms self-demux.
+pub(crate) fn poll_deadline<A>(io: &Rc<RefCell<QueryIo<A>>>, deadline: Instant) -> Poll<()> {
+    if Instant::now() >= deadline {
+        return Poll::Ready(());
+    }
+    let mut m = io.borrow_mut();
+    m.deadline = Some(m.deadline.map_or(deadline, |d| d.min(deadline)));
+    Poll::Pending
+}
+
+/// Which arm of a [`select2`] resolved.
+pub(crate) enum Which2<A, B> {
+    A(A),
+    B(B),
+}
+/// Which arm of a [`select3`] resolved.
+pub(crate) enum Which3<A, B, C> {
+    A(A),
+    B(B),
+    C(C),
+}
+
+/// Race two arms over the single mailbox, **biased** to `a`. Clears the mailbox's
+/// `waits`/`deadline` once at the top of each poll cycle; each pending arm
+/// re-registers. The first arm to return `Ready` wins (the others aren't polled
+/// further this cycle). Pending propagates up so the ffi re-polls on readiness.
+pub(crate) async fn select2<St, RA, RB>(
+    io: &Rc<RefCell<QueryIo<St>>>,
+    mut a: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RA>,
+    mut b: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RB>,
+) -> Which2<RA, RB> {
+    std::future::poll_fn(|_cx| {
+        {
+            let mut m = io.borrow_mut();
+            m.waits.clear();
+            m.deadline = None;
+        }
+        if let Poll::Ready(v) = a(io) {
+            return Poll::Ready(Which2::A(v));
+        }
+        if let Poll::Ready(v) = b(io) {
+            return Poll::Ready(Which2::B(v));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Race three arms over the single mailbox, biased `a` → `b` → `c`. See [`select2`].
+pub(crate) async fn select3<St, RA, RB, RC>(
+    io: &Rc<RefCell<QueryIo<St>>>,
+    mut a: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RA>,
+    mut b: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RB>,
+    mut c: impl FnMut(&Rc<RefCell<QueryIo<St>>>) -> Poll<RC>,
+) -> Which3<RA, RB, RC> {
+    std::future::poll_fn(|_cx| {
+        {
+            let mut m = io.borrow_mut();
+            m.waits.clear();
+            m.deadline = None;
+        }
+        if let Poll::Ready(v) = a(io) {
+            return Poll::Ready(Which3::A(v));
+        }
+        if let Poll::Ready(v) = b(io) {
+            return Poll::Ready(Which3::B(v));
+        }
+        if let Poll::Ready(v) = c(io) {
+            return Poll::Ready(Which3::C(v));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 // ===== Waker =====
 
 /// Readiness is executor-driven, so waking need do nothing.
@@ -179,4 +301,86 @@ thread_local! {
 /// a cached instance.
 pub(crate) fn noop_waker() -> Waker {
     NOOP_WAKER.with(|w| w.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    fn mailbox() -> Rc<RefCell<QueryIo<()>>> {
+        Rc::new(RefCell::new(QueryIo::default()))
+    }
+
+    #[test]
+    fn poll_recv_not_fired_registers_wait() {
+        let io = mailbox();
+        let calls = Cell::new(0);
+        let p = poll_recv(&io, 7, || {
+            calls.set(calls.get() + 1);
+            Recv::Msg(vec![1])
+        });
+        assert!(matches!(p, Poll::Pending));
+        assert_eq!(calls.get(), 0); // read not attempted before readiness
+        assert_eq!(io.borrow().waits.iter().map(|w| w.fd).collect::<Vec<_>>(), vec![7]);
+    }
+
+    #[test]
+    fn poll_recv_fired_msg_consumes_only_its_fd() {
+        let io = mailbox();
+        io.borrow_mut().fired = vec![3, 7, 9];
+        let calls = Cell::new(0);
+        let p = poll_recv(&io, 7, || {
+            calls.set(calls.get() + 1);
+            Recv::Msg(vec![42])
+        });
+        assert!(matches!(p, Poll::Ready(RecvReady::Msg(ref b)) if b == &[42]));
+        assert_eq!(calls.get(), 1);
+        // Only fd 7 consumed; siblings 3 and 9 remain for their own arms.
+        let fired = io.borrow().fired.clone();
+        assert!(!fired.contains(&7) && fired.contains(&3) && fired.contains(&9));
+    }
+
+    #[test]
+    fn poll_recv_wouldblock_reregisters_single_read() {
+        let io = mailbox();
+        io.borrow_mut().fired = vec![7];
+        let calls = Cell::new(0);
+        let p = poll_recv(&io, 7, || {
+            calls.set(calls.get() + 1);
+            Recv::Pending
+        });
+        assert!(matches!(p, Poll::Pending));
+        assert_eq!(calls.get(), 1); // read exactly once — no double recvfrom
+        assert!(io.borrow().fired.is_empty()); // fd consumed
+        assert_eq!(io.borrow().waits.iter().map(|w| w.fd).collect::<Vec<_>>(), vec![7]); // re-registered
+    }
+
+    #[test]
+    fn poll_recv_dead() {
+        let io = mailbox();
+        io.borrow_mut().fired = vec![7];
+        let p = poll_recv(&io, 7, || Recv::Dead);
+        assert!(matches!(p, Poll::Ready(RecvReady::Dead)));
+    }
+
+    #[test]
+    fn poll_deadline_future_mins_and_pends() {
+        let io = mailbox();
+        let far = Instant::now() + Duration::from_secs(60);
+        assert!(matches!(poll_deadline(&io, far), Poll::Pending));
+        assert_eq!(io.borrow().deadline, Some(far));
+        // A nearer deadline mins in.
+        let near = Instant::now() + Duration::from_secs(1);
+        assert!(matches!(poll_deadline(&io, near), Poll::Pending));
+        assert_eq!(io.borrow().deadline, Some(near));
+    }
+
+    #[test]
+    fn poll_deadline_past_ready() {
+        let io = mailbox();
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(matches!(poll_deadline(&io, past), Poll::Ready(())));
+    }
 }
