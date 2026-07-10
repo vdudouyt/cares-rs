@@ -100,7 +100,7 @@ impl AsyncClient {
         // Inlined single-query driver (WET, see the module note): pick server →
         // socket → send → recv → QID-match → TC/failover/timeout verdicts. The raw
         // path: UDP-start (`use_tcp = false`), no probe, no USEVC. The connection
-        // is a `Conn` with `send`/`read`/`register`/`clear_slot` methods.
+        // is a `Conn` with async `send`/`recv`; its shared-TCP slot is RAII.
         let (result, timeouts) = 'drive: {
             let io = self.io.clone();
             let res = self.res.clone();
@@ -117,13 +117,16 @@ impl AsyncClient {
                     let mut s = server;
                     for _ in 0..res.opts.attempts.max(1) {
                         let Some(ep) = res.endpoints.get(s) else { break };
-                        let wire = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Wire::Shared(c, qid))
+                        let conn = if use_tcp {
+                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
-                            res.factory.create_udp(ep.bind).ok().map(|sk| Wire::Owned(OwnedSock { sock: sk, is_tcp: false, rbuf: Vec::new() }))
+                            res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                let _ = sk.connect(ep.udp_addr);
+                                Conn::owned(io.clone(), sk, false)
+                            })
                         };
-                        if let Some(wire) = wire {
-                            break 'connect (Conn { io: io.clone(), wire }, s);
+                        if let Some(conn) = conn {
+                            break 'connect (conn, s);
                         }
                         if res.health.borrow().len() > 1 {
                             res.health.borrow_mut().record_failure(s);
@@ -133,13 +136,10 @@ impl AsyncClient {
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                 };
                 server = si;
-                let ep = res.endpoints[server].clone();
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                 let deadline = Instant::now() + res.opts.timeout;
-                conn.register();
-                if !conn.send(&ep, wire, deadline).await {
-                    conn.clear_slot();
+                if !conn.send(wire, deadline).await {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -170,9 +170,7 @@ impl AsyncClient {
                             );
                             notify(&io, actions);
                             match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                    conn.clear_slot();
-                                    server = next;
+                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                    server = next;
                                     failover_tries = ft;
                                     continue 'attempt;
                                 }
@@ -180,15 +178,11 @@ impl AsyncClient {
                                     use_tcp = true;
                                     continue 'attempt;
                                 }
-                                TaskVerdict::Deliver => {
-                                    conn.clear_slot();
-                                    break 'drive (Ok(buf), timeouts);
+                                TaskVerdict::Deliver => {                                    break 'drive (Ok(buf), timeouts);
                                 }
                             }
                         }
-                        RecvOutcome::Timeout => {
-                            conn.clear_slot();
-                            if io.borrow().app.cancelled {
+                        RecvOutcome::Timeout => {                            if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -203,9 +197,7 @@ impl AsyncClient {
                                 TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
                             }
                         }
-                        RecvOutcome::Dead => {
-                            conn.clear_slot();
-                            if use_tcp {
+                        RecvOutcome::Dead => {                            if use_tcp {
                                 res.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
@@ -354,19 +346,19 @@ impl AsyncClient {
                     let primary_server = res.health.borrow().pick_next();
                     let pserver = res.health.borrow().pick_probe(res.opts.failover_delay, primary_server)?;
                     let ep = res.endpoints.get(pserver)?;
-                    let psock = if use_tcp {
+                    let sk = if use_tcp {
                         let sk = res.factory.create_tcp(ep.bind).ok()?;
                         let _ = sk.connect(ep.tcp_addr);
-                        OwnedSock { sock: sk, is_tcp: true, rbuf: Vec::new() }
+                        sk
                     } else {
                         let sk = res.factory.create_udp(ep.bind).ok()?;
                         let _ = sk.connect(ep.udp_addr);
-                        OwnedSock { sock: sk, is_tcp: false, rbuf: Vec::new() }
+                        sk
                     };
                     let framed = if use_tcp { frame_tcp(&pp) } else { pp.clone() };
-                    let _ = psock.sock.send(&framed);
+                    let _ = sk.send(&framed);
                     Some(Probe {
-                        conn: Conn { io: io.clone(), wire: Wire::Owned(psock) },
+                        conn: Conn::owned(io.clone(), sk, use_tcp),
                         server: pserver,
                         deadline: Instant::now() + res.opts.timeout,
                         payload: framed,
@@ -378,13 +370,16 @@ impl AsyncClient {
                         let mut s = server;
                         for _ in 0..res.opts.attempts.max(1) {
                             let Some(ep) = res.endpoints.get(s) else { break };
-                            let wire = if use_tcp {
-                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Wire::Shared(c, qid))
+                            let conn = if use_tcp {
+                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
                             } else {
-                                res.factory.create_udp(ep.bind).ok().map(|sk| Wire::Owned(OwnedSock { sock: sk, is_tcp: false, rbuf: Vec::new() }))
+                                res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                    let _ = sk.connect(ep.udp_addr);
+                                    Conn::owned(io.clone(), sk, false)
+                                })
                             };
-                            if let Some(wire) = wire {
-                                break 'connect (Conn { io: io.clone(), wire }, s);
+                            if let Some(conn) = conn {
+                                break 'connect (conn, s);
                             }
                             if res.health.borrow().len() > 1 {
                                 res.health.borrow_mut().record_failure(s);
@@ -394,13 +389,10 @@ impl AsyncClient {
                         break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                     };
                     server = si;
-                    let ep = res.endpoints[server].clone();
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                     let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                     let deadline = Instant::now() + res.opts.timeout;
-                    conn.register();
-                    if !conn.send(&ep, wire, deadline).await {
-                        conn.clear_slot();
+                    if !conn.send(wire, deadline).await {
                         if use_tcp {
                             res.tcp_pool.borrow_mut().remove(server);
                         }
@@ -453,9 +445,7 @@ impl AsyncClient {
                                         settle_probe(&io, &res, &p_taken, None);
                                     }
                                 }
-                                if now >= deadline {
-                                    conn.clear_slot();
-                                    if io.borrow().app.cancelled {
+                                if now >= deadline {                                    if io.borrow().app.cancelled {
                                         break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -475,9 +465,7 @@ impl AsyncClient {
                             ReplyEvent::Primary(r) => {
                                 let buf = match r {
                                     RecvReady::Msg(buf) => buf,
-                                    RecvReady::Dead => {
-                                        conn.clear_slot();
-                                        if use_tcp {
+                                    RecvReady::Dead => {                                        if use_tcp {
                                             res.tcp_pool.borrow_mut().remove(server);
                                         }
                                         if io.borrow().app.cancelled {
@@ -510,9 +498,7 @@ impl AsyncClient {
                                 );
                                 notify(&io, actions);
                                 match verdict {
-                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                        conn.clear_slot();
-                                        server = next;
+                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                        server = next;
                                         failover_tries = ft;
                                         continue 'attempt;
                                     }
@@ -520,9 +506,7 @@ impl AsyncClient {
                                         use_tcp = true;
                                         continue 'attempt;
                                     }
-                                    TaskVerdict::Deliver => {
-                                        conn.clear_slot();
-                                        break 'drive (Ok(buf), timeouts);
+                                    TaskVerdict::Deliver => {                                        break 'drive (Ok(buf), timeouts);
                                     }
                                 }
                             }
@@ -624,13 +608,16 @@ impl AsyncClient {
                     let mut s = server;
                     for _ in 0..res.opts.attempts.max(1) {
                         let Some(ep) = res.endpoints.get(s) else { break };
-                        let wire = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Wire::Shared(c, qid))
+                        let conn = if use_tcp {
+                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
-                            res.factory.create_udp(ep.bind).ok().map(|sk| Wire::Owned(OwnedSock { sock: sk, is_tcp: false, rbuf: Vec::new() }))
+                            res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                let _ = sk.connect(ep.udp_addr);
+                                Conn::owned(io.clone(), sk, false)
+                            })
                         };
-                        if let Some(wire) = wire {
-                            break 'connect (Conn { io: io.clone(), wire }, s);
+                        if let Some(conn) = conn {
+                            break 'connect (conn, s);
                         }
                         if res.health.borrow().len() > 1 {
                             res.health.borrow_mut().record_failure(s);
@@ -640,13 +627,10 @@ impl AsyncClient {
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                 };
                 server = si;
-                let ep = res.endpoints[server].clone();
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                 let deadline = Instant::now() + res.opts.timeout;
-                conn.register();
-                if !conn.send(&ep, wire, deadline).await {
-                    conn.clear_slot();
+                if !conn.send(wire, deadline).await {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -677,9 +661,7 @@ impl AsyncClient {
                             );
                             notify(&io, actions);
                             match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                    conn.clear_slot();
-                                    server = next;
+                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                    server = next;
                                     failover_tries = ft;
                                     continue 'attempt;
                                 }
@@ -687,15 +669,11 @@ impl AsyncClient {
                                     use_tcp = true;
                                     continue 'attempt;
                                 }
-                                TaskVerdict::Deliver => {
-                                    conn.clear_slot();
-                                    break 'drive (Ok(buf), timeouts);
+                                TaskVerdict::Deliver => {                                    break 'drive (Ok(buf), timeouts);
                                 }
                             }
                         }
-                        RecvOutcome::Timeout => {
-                            conn.clear_slot();
-                            if io.borrow().app.cancelled {
+                        RecvOutcome::Timeout => {                            if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -710,9 +688,7 @@ impl AsyncClient {
                                 TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
                             }
                         }
-                        RecvOutcome::Dead => {
-                            conn.clear_slot();
-                            if use_tcp {
+                        RecvOutcome::Dead => {                            if use_tcp {
                                 res.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
@@ -807,13 +783,16 @@ impl AsyncClient {
                     let mut s = server;
                     for _ in 0..res.opts.attempts.max(1) {
                         let Some(ep) = res.endpoints.get(s) else { break };
-                        let wire = if use_tcp {
-                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Wire::Shared(c, qid))
+                        let conn = if use_tcp {
+                            res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
                         } else {
-                            res.factory.create_udp(ep.bind).ok().map(|sk| Wire::Owned(OwnedSock { sock: sk, is_tcp: false, rbuf: Vec::new() }))
+                            res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                let _ = sk.connect(ep.udp_addr);
+                                Conn::owned(io.clone(), sk, false)
+                            })
                         };
-                        if let Some(wire) = wire {
-                            break 'connect (Conn { io: io.clone(), wire }, s);
+                        if let Some(conn) = conn {
+                            break 'connect (conn, s);
                         }
                         if res.health.borrow().len() > 1 {
                             res.health.borrow_mut().record_failure(s);
@@ -823,13 +802,10 @@ impl AsyncClient {
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                 };
                 server = si;
-                let ep = res.endpoints[server].clone();
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                 let deadline = Instant::now() + res.opts.timeout;
-                conn.register();
-                if !conn.send(&ep, wire, deadline).await {
-                    conn.clear_slot();
+                if !conn.send(wire, deadline).await {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -860,9 +836,7 @@ impl AsyncClient {
                             );
                             notify(&io, actions);
                             match verdict {
-                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                    conn.clear_slot();
-                                    server = next;
+                                TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                    server = next;
                                     failover_tries = ft;
                                     continue 'attempt;
                                 }
@@ -870,15 +844,11 @@ impl AsyncClient {
                                     use_tcp = true;
                                     continue 'attempt;
                                 }
-                                TaskVerdict::Deliver => {
-                                    conn.clear_slot();
-                                    break 'drive (Ok(buf), timeouts);
+                                TaskVerdict::Deliver => {                                    break 'drive (Ok(buf), timeouts);
                                 }
                             }
                         }
-                        RecvOutcome::Timeout => {
-                            conn.clear_slot();
-                            if io.borrow().app.cancelled {
+                        RecvOutcome::Timeout => {                            if io.borrow().app.cancelled {
                                 break 'drive (Err(ARES_ETIMEOUT), timeouts);
                             }
                             notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -893,9 +863,7 @@ impl AsyncClient {
                                 TimeoutVerdict::Expire => break 'drive (Err(ARES_ETIMEOUT), timeouts),
                             }
                         }
-                        RecvOutcome::Dead => {
-                            conn.clear_slot();
-                            if use_tcp {
+                        RecvOutcome::Dead => {                            if use_tcp {
                                 res.tcp_pool.borrow_mut().remove(server);
                             }
                             if io.borrow().app.cancelled {
@@ -971,19 +939,19 @@ impl AsyncClient {
                     let primary_server = res.health.borrow().pick_next();
                     let pserver = res.health.borrow().pick_probe(res.opts.failover_delay, primary_server)?;
                     let ep = res.endpoints.get(pserver)?;
-                    let psock = if use_tcp {
+                    let sk = if use_tcp {
                         let sk = res.factory.create_tcp(ep.bind).ok()?;
                         let _ = sk.connect(ep.tcp_addr);
-                        OwnedSock { sock: sk, is_tcp: true, rbuf: Vec::new() }
+                        sk
                     } else {
                         let sk = res.factory.create_udp(ep.bind).ok()?;
                         let _ = sk.connect(ep.udp_addr);
-                        OwnedSock { sock: sk, is_tcp: false, rbuf: Vec::new() }
+                        sk
                     };
                     let framed = if use_tcp { frame_tcp(&pp) } else { pp.clone() };
-                    let _ = psock.sock.send(&framed);
+                    let _ = sk.send(&framed);
                     Some(Probe {
-                        conn: Conn { io: io.clone(), wire: Wire::Owned(psock) },
+                        conn: Conn::owned(io.clone(), sk, use_tcp),
                         server: pserver,
                         deadline: Instant::now() + res.opts.timeout,
                         payload: framed,
@@ -995,13 +963,16 @@ impl AsyncClient {
                         let mut s = server;
                         for _ in 0..res.opts.attempts.max(1) {
                             let Some(ep) = res.endpoints.get(s) else { break };
-                            let wire = if use_tcp {
-                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Wire::Shared(c, qid))
+                            let conn = if use_tcp {
+                                res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
                             } else {
-                                res.factory.create_udp(ep.bind).ok().map(|sk| Wire::Owned(OwnedSock { sock: sk, is_tcp: false, rbuf: Vec::new() }))
+                                res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                    let _ = sk.connect(ep.udp_addr);
+                                    Conn::owned(io.clone(), sk, false)
+                                })
                             };
-                            if let Some(wire) = wire {
-                                break 'connect (Conn { io: io.clone(), wire }, s);
+                            if let Some(conn) = conn {
+                                break 'connect (conn, s);
                             }
                             if res.health.borrow().len() > 1 {
                                 res.health.borrow_mut().record_failure(s);
@@ -1011,13 +982,10 @@ impl AsyncClient {
                         break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                     };
                     server = si;
-                    let ep = res.endpoints[server].clone();
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                     let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                     let deadline = Instant::now() + res.opts.timeout;
-                    conn.register();
-                    if !conn.send(&ep, wire, deadline).await {
-                        conn.clear_slot();
+                    if !conn.send(wire, deadline).await {
                         if use_tcp {
                             res.tcp_pool.borrow_mut().remove(server);
                         }
@@ -1070,9 +1038,7 @@ impl AsyncClient {
                                         settle_probe(&io, &res, &p_taken, None);
                                     }
                                 }
-                                if now >= deadline {
-                                    conn.clear_slot();
-                                    if io.borrow().app.cancelled {
+                                if now >= deadline {                                    if io.borrow().app.cancelled {
                                         break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -1092,9 +1058,7 @@ impl AsyncClient {
                             ReplyEvent::Primary(r) => {
                                 let buf = match r {
                                     RecvReady::Msg(buf) => buf,
-                                    RecvReady::Dead => {
-                                        conn.clear_slot();
-                                        if use_tcp {
+                                    RecvReady::Dead => {                                        if use_tcp {
                                             res.tcp_pool.borrow_mut().remove(server);
                                         }
                                         if io.borrow().app.cancelled {
@@ -1127,9 +1091,7 @@ impl AsyncClient {
                                 );
                                 notify(&io, actions);
                                 match verdict {
-                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                        conn.clear_slot();
-                                        server = next;
+                                    TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                        server = next;
                                         failover_tries = ft;
                                         continue 'attempt;
                                     }
@@ -1137,9 +1099,7 @@ impl AsyncClient {
                                         use_tcp = true;
                                         continue 'attempt;
                                     }
-                                    TaskVerdict::Deliver => {
-                                        conn.clear_slot();
-                                        break 'drive (Ok(buf), timeouts);
+                                    TaskVerdict::Deliver => {                                        break 'drive (Ok(buf), timeouts);
                                     }
                                 }
                             }
@@ -1570,7 +1530,7 @@ fn qid_of(payload: &[u8]) -> u16 {
 
 /// A query's connection — the socket object the handler drives, tokio-style.
 /// It **owns its mailbox** (`io`), so `send`/`recv` take no reactor handle:
-/// `conn.send(&ep, bytes, deadline).await` / `conn.recv(deadline).await`, just
+/// `conn.send(bytes, deadline).await` / `conn.recv(deadline).await`, just
 /// like `socket.recv(..).await`. `wire` is the transport: an owned socket (UDP
 /// primary, or a one-shot probe) or a shared TCP connection multiplexed by `qid`;
 /// the datagram-vs-QID-demuxed-stream asymmetry is hidden behind the methods.
@@ -1585,6 +1545,19 @@ enum Wire {
 }
 
 impl Conn {
+    /// An owned socket (UDP primary, or a one-shot probe), already connected.
+    fn owned(io: Rc<RefCell<DnsMailbox>>, sock: Rc<dyn Socket>, is_tcp: bool) -> Self {
+        Conn { io, wire: Wire::Owned(OwnedSock { sock, is_tcp, rbuf: Vec::new() }) }
+    }
+
+    /// A query's handle on a shared TCP conn. Reserves `qid`'s inbox slot so a
+    /// sibling future's read routes this query's reply here; the slot is
+    /// released when the handle drops.
+    fn shared(io: Rc<RefCell<DnsMailbox>>, conn: Rc<RefCell<TcpConn>>, qid: u16) -> Self {
+        conn.borrow_mut().inbox.insert(qid, None);
+        Conn { io, wire: Wire::Shared(conn, qid) }
+    }
+
     fn fd(&self) -> i32 {
         match &self.wire {
             Wire::Owned(s) => s.fd(),
@@ -1599,31 +1572,12 @@ impl Conn {
         }
     }
 
-    /// Register this query's qid on a shared TCP conn before sending, so a
-    /// sibling future's read routes our reply into our slot. No-op for owned.
-    fn register(&self) {
-        if let Wire::Shared(c, qid) = &self.wire {
-            c.borrow_mut().inbox.insert(*qid, None);
-        }
-    }
-
-    /// Drop this query's slot on a shared TCP conn (on retry/deliver) so its
-    /// inbox doesn't accumulate stale entries. No-op for owned. (was `clear_tcp_slot`.)
-    fn clear_slot(&self) {
-        if let Wire::Shared(c, qid) = &self.wire {
-            c.borrow_mut().inbox.remove(qid);
-        }
-    }
-
     /// Await writability, then send `framed` once (WouldBlock re-awaits, matching
-    /// the classic `Writing`→`Reading` flow). UDP connects lazily here; TCP was
-    /// connected at create. `false` on a hard failure or timeout. (was `send_primary`.)
-    async fn send(&self, ep: &ServerEndpoint, framed: &[u8], deadline: Instant) -> bool {
+    /// the classic `Writing`→`Reading` flow). The socket was connected at
+    /// creation. `false` on a hard failure or timeout. (was `send_primary`.)
+    async fn send(&self, framed: &[u8], deadline: Instant) -> bool {
         let sock: Rc<dyn Socket> = match &self.wire {
-            Wire::Owned(s) => {
-                let _ = s.sock.connect(ep.udp_addr);
-                s.sock.clone()
-            }
+            Wire::Owned(s) => s.sock.clone(),
             Wire::Shared(c, _) => c.borrow().sock.clone(),
         };
         send_when_writable(&self.io, &*sock, framed, deadline).await
@@ -1664,6 +1618,16 @@ impl Conn {
             Which2::A(()) => RecvOutcome::Timeout,
             Which2::B(RecvReady::Msg(b)) => RecvOutcome::Reply(b),
             Which2::B(RecvReady::Dead) => RecvOutcome::Dead,
+        }
+    }
+}
+
+/// Dropping a query's conn releases its shared-TCP inbox slot (RAII — no manual
+/// register/clear), so retries, delivery, and abandonment can't leak slots.
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if let Wire::Shared(c, qid) = &self.wire {
+            c.borrow_mut().inbox.remove(qid);
         }
     }
 }
@@ -1762,13 +1726,16 @@ impl ParallelQueries {
                             let mut s = server;
                             for _ in 0..res.opts.attempts.max(1) {
                                 let Some(ep) = res.endpoints.get(s) else { break };
-                                let wire = if use_tcp {
-                                    res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Wire::Shared(c, qid))
+                                let conn = if use_tcp {
+                                    res.tcp_pool.borrow_mut().get_or_create(s, &res.factory, ep).ok().map(|c| Conn::shared(io.clone(), c, qid))
                                 } else {
-                                    res.factory.create_udp(ep.bind).ok().map(|sk| Wire::Owned(OwnedSock { sock: sk, is_tcp: false, rbuf: Vec::new() }))
+                                    res.factory.create_udp(ep.bind).ok().map(|sk| {
+                                        let _ = sk.connect(ep.udp_addr);
+                                        Conn::owned(io.clone(), sk, false)
+                                    })
                                 };
-                                if let Some(wire) = wire {
-                                    break 'connect (Conn { io: io.clone(), wire }, s);
+                                if let Some(conn) = conn {
+                                    break 'connect (conn, s);
                                 }
                                 if res.health.borrow().len() > 1 {
                                     res.health.borrow_mut().record_failure(s);
@@ -1778,22 +1745,17 @@ impl ParallelQueries {
                             return (Err(ARES_ECONNREFUSED), timeouts);
                         };
                         server = si;
-                        let ep = res.endpoints[server].clone();
                         // The wire buffer for this attempt's transport: TCP needs the framed
                         // copy, UDP sends the payload as-is (borrowed — no clone).
                         let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                         let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
                         let deadline = Instant::now() + res.opts.timeout;
 
-                        // Register this qid on the shared TCP conn before sending, so a sibling
-                        // future's read routes our reply into our slot.
-                        conn.register();
-                        if !conn.send(&ep, wire, deadline).await {
+                        if !conn.send(wire, deadline).await {
                             // Send failed (a hard socket error): recreate the socket and retry,
                             // bounded by the attempt budget — mirrors the classic write_impl's
                             // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
                             // retry succeeds.)
-                            conn.clear_slot();
                             if use_tcp {
                                 res.tcp_pool.borrow_mut().remove(server);
                             }
@@ -1826,9 +1788,7 @@ impl ParallelQueries {
                                     );
                                     notify(&io, actions);
                                     match verdict {
-                                        TaskVerdict::RetryNextServer { server: next, tries: ft } => {
-                                            conn.clear_slot();
-                                            server = next;
+                                        TaskVerdict::RetryNextServer { server: next, tries: ft } => {                                            server = next;
                                             failover_tries = ft;
                                             continue 'attempt;
                                         }
@@ -1836,15 +1796,11 @@ impl ParallelQueries {
                                             use_tcp = true;
                                             continue 'attempt;
                                         }
-                                        TaskVerdict::Deliver => {
-                                            conn.clear_slot();
-                                            return (Ok(buf), timeouts);
+                                        TaskVerdict::Deliver => {                                            return (Ok(buf), timeouts);
                                         }
                                     }
                                 }
-                                RecvOutcome::Timeout => {
-                                    conn.clear_slot();
-                                    if io.borrow().app.cancelled {
+                                RecvOutcome::Timeout => {                                    if io.borrow().app.cancelled {
                                         return (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -1859,9 +1815,7 @@ impl ParallelQueries {
                                         TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
                                     }
                                 }
-                                RecvOutcome::Dead => {
-                                    conn.clear_slot();
-                                    if use_tcp {
+                                RecvOutcome::Dead => {                                    if use_tcp {
                                         res.tcp_pool.borrow_mut().remove(server);
                                     }
                                     if io.borrow().app.cancelled {
