@@ -1,6 +1,6 @@
 //! The reactor driver entry shims (ares_process / ares_process_fd): they
 //! marshal the C `fd_set`s and drive every in-flight async future whose socket
-//! is ready (or whose deadline passed) via `ChannelData::process_channel`.
+//! is ready (or whose timeout passed) via `ChannelData::process_channel`.
 
 use super::*;
 

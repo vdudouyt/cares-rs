@@ -1,11 +1,11 @@
 //! The pure-IO reactor: a mailbox + await primitive + socket byte-pumps.
 //!
-//! This module knows **only** IO — file descriptors, readiness, deadlines, and
+//! This module knows **only** IO — file descriptors, readiness, timeouts, and
 //! opaque bytes on a [`Socket`]. It has zero knowledge of what the bytes mean:
 //! no DNS, no QID, no framing, no server health. A future publishes the fds it
-//! is blocked on (+ an earliest deadline) into its [`QueryIo`] mailbox; the ffi
+//! is blocked on (+ an earliest timeout) into its [`QueryIo`] mailbox; the ffi
 //! executor (driven by `ares_process`) sets which fds fired (or that the
-//! deadline passed) and re-polls the one future. The waker is a no-op —
+//! timeout passed) and re-polls the one future. The waker is a no-op —
 //! readiness is driven, not scheduled.
 //!
 //! The mailbox is generic over an opaque application-state type `A`
@@ -33,7 +33,7 @@ pub(crate) struct Wait {
 }
 
 /// The mailbox shared (via `Rc<RefCell<_>>`) between one lifecycle future and
-/// the ffi executor. The future publishes `waits`/`deadline` when it suspends;
+/// the ffi executor. The future publishes `waits`/`timeout` when it suspends;
 /// the executor sets `fired`/`expired` before re-polling. Nothing here names
 /// the channel, so polling the future borrows nothing of `ChannelData`. The
 /// `app` field holds the application state the reactor treats as opaque.
@@ -41,11 +41,11 @@ pub(crate) struct Wait {
 pub(crate) struct QueryIo<A> {
     /// fds the future is currently blocked on (published on suspension).
     pub waits: Vec<Wait>,
-    /// Earliest deadline the future wants to wake at.
-    pub deadline: Option<Instant>,
+    /// Earliest timeout the future wants to wake at.
+    pub timeout: Option<Instant>,
     /// Which published-wait fds are ready now (set by the executor).
     pub fired: Vec<i32>,
-    /// Whether the deadline passed (set by the executor).
+    /// Whether the timeout passed (set by the executor).
     pub expired: bool,
     /// Application signals the reactor doesn't interpret (opaque to it).
     pub app: A,
@@ -75,15 +75,15 @@ impl<A> Future for Ready1<A> {
     }
 }
 
-/// Publish the `waits` (+ `deadline`) into the mailbox — reusing its `waits`
+/// Publish the `waits` (+ `timeout`) into the mailbox — reusing its `waits`
 /// allocation, so a per-await stack slice avoids a heap allocation — then await
 /// readiness. Clears the published waits on return so a later await starts clean.
-pub(crate) async fn wait_io<A>(io: &Rc<RefCell<QueryIo<A>>>, waits: &[Wait], deadline: Instant) -> Woke {
+pub(crate) async fn wait_io<A>(io: &Rc<RefCell<QueryIo<A>>>, waits: &[Wait], timeout: Instant) -> Woke {
     {
         let mut m = io.borrow_mut();
         m.waits.clear();
         m.waits.extend_from_slice(waits);
-        m.deadline = Some(deadline);
+        m.timeout = Some(timeout);
         m.fired.clear();
         m.expired = false;
     }
@@ -116,11 +116,11 @@ pub(crate) async fn send_when_writable<A>(
     io: &Rc<RefCell<QueryIo<A>>>,
     sock: &dyn Socket,
     bytes: &[u8],
-    deadline: Instant,
+    timeout: Instant,
 ) -> bool {
     let fd = sock.as_raw_fd();
     loop {
-        let woke = wait_io(io, &[Wait { fd, writable: true }], deadline).await;
+        let woke = wait_io(io, &[Wait { fd, writable: true }], timeout).await;
         if woke.expired && !woke.fds.contains(&fd) {
             return false; // timed out before writable
         }
@@ -208,15 +208,15 @@ pub(crate) fn poll_recv<A>(
     }
 }
 
-/// A deadline arm: resolves once wall-clock passes `deadline`; otherwise mins
-/// `deadline` into the mailbox and suspends. Reads `Instant::now()` directly
-/// (ignores `io.expired`) so several deadline arms self-demux.
-pub(crate) fn poll_deadline<A>(io: &Rc<RefCell<QueryIo<A>>>, deadline: Instant) -> Poll<()> {
-    if Instant::now() >= deadline {
+/// A timeout arm: resolves once wall-clock passes `timeout`; otherwise mins
+/// `timeout` into the mailbox and suspends. Reads `Instant::now()` directly
+/// (ignores `io.expired`) so several timeout arms self-demux.
+pub(crate) fn poll_timeout<A>(io: &Rc<RefCell<QueryIo<A>>>, timeout: Instant) -> Poll<()> {
+    if Instant::now() >= timeout {
         return Poll::Ready(());
     }
     let mut m = io.borrow_mut();
-    m.deadline = Some(m.deadline.map_or(deadline, |d| d.min(deadline)));
+    m.timeout = Some(m.timeout.map_or(timeout, |d| d.min(timeout)));
     Poll::Pending
 }
 
@@ -233,7 +233,7 @@ pub(crate) enum Which3<A, B, C> {
 }
 
 /// Race two arms over the single mailbox, **biased** to `a`. Clears the mailbox's
-/// `waits`/`deadline` once at the top of each poll cycle; each pending arm
+/// `waits`/`timeout` once at the top of each poll cycle; each pending arm
 /// re-registers. The first arm to return `Ready` wins (the others aren't polled
 /// further this cycle). Pending propagates up so the ffi re-polls on readiness.
 pub(crate) async fn select2<St, RA, RB>(
@@ -245,7 +245,7 @@ pub(crate) async fn select2<St, RA, RB>(
         {
             let mut m = io.borrow_mut();
             m.waits.clear();
-            m.deadline = None;
+            m.timeout = None;
         }
         if let Poll::Ready(v) = a(io) {
             return Poll::Ready(Which2::A(v));
@@ -269,7 +269,7 @@ pub(crate) async fn select3<St, RA, RB, RC>(
         {
             let mut m = io.borrow_mut();
             m.waits.clear();
-            m.deadline = None;
+            m.timeout = None;
         }
         if let Poll::Ready(v) = a(io) {
             return Poll::Ready(Which3::A(v));
@@ -366,21 +366,21 @@ mod tests {
     }
 
     #[test]
-    fn poll_deadline_future_mins_and_pends() {
+    fn poll_timeout_future_mins_and_pends() {
         let io = mailbox();
         let far = Instant::now() + Duration::from_secs(60);
-        assert!(matches!(poll_deadline(&io, far), Poll::Pending));
-        assert_eq!(io.borrow().deadline, Some(far));
-        // A nearer deadline mins in.
+        assert!(matches!(poll_timeout(&io, far), Poll::Pending));
+        assert_eq!(io.borrow().timeout, Some(far));
+        // A nearer timeout mins in.
         let near = Instant::now() + Duration::from_secs(1);
-        assert!(matches!(poll_deadline(&io, near), Poll::Pending));
-        assert_eq!(io.borrow().deadline, Some(near));
+        assert!(matches!(poll_timeout(&io, near), Poll::Pending));
+        assert_eq!(io.borrow().timeout, Some(near));
     }
 
     #[test]
-    fn poll_deadline_past_ready() {
+    fn poll_timeout_past_ready() {
         let io = mailbox();
         let past = Instant::now() - Duration::from_secs(1);
-        assert!(matches!(poll_deadline(&io, past), Poll::Ready(())));
+        assert!(matches!(poll_timeout(&io, past), Poll::Ready(())));
     }
 }

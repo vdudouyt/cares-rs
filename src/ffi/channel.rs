@@ -270,7 +270,7 @@ impl ChannelData {
         }
     }
 
-    /// Drive every async future whose published fd is ready (or whose deadline
+    /// Drive every async future whose published fd is ready (or whose timeout
     /// passed) this `ares_process` cycle: set its mailbox readiness and poll it.
     fn drive_fd_futures(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
         let now = Instant::now();
@@ -287,7 +287,7 @@ impl ChannelData {
                             fired.push(w.fd);
                         }
                     }
-                    let expired = m.deadline.is_some_and(|d| now >= d);
+                    let expired = m.timeout.is_some_and(|d| now >= d);
                     if fired.is_empty() && !expired {
                         false
                     } else {
@@ -350,11 +350,11 @@ impl ChannelData {
 
     /// The earliest timeout (ms) across in-flight async futures, or `None` when
     /// nothing is in flight.
-    fn next_deadline_ms(&self) -> Option<u128> {
+    fn next_timeout_ms(&self) -> Option<u128> {
         let now = Instant::now();
         let mut best: Option<u128> = None;
         for aq in self.async_queries.iter().flatten() {
-            if let Some(d) = aq.io.borrow().deadline {
+            if let Some(d) = aq.io.borrow().timeout {
                 let ms = d.saturating_duration_since(now).as_millis();
                 best = Some(best.map_or(ms, |b| b.min(ms)));
             }
@@ -363,7 +363,7 @@ impl ChannelData {
     }
 
     /// One `ares_process` cycle: drive every in-flight async future whose
-    /// published socket is ready (or whose deadline passed) this cycle. Each
+    /// published socket is ready (or whose timeout passed) this cycle. Each
     /// future owns its socket(s) and applies its own verdicts; the only unsafe
     /// here is the `FD_ISSET` readiness check and the C-callback invokers.
     pub(crate) fn process_channel(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
@@ -447,7 +447,7 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return std::ptr::null_mut(); };
     let maxtv_ms = (!maxtv.is_null())
         .then(|| unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 });
-    match crate::core::api::clamp_timeout(channeldata.next_deadline_ms(), maxtv_ms) {
+    match crate::core::api::clamp_timeout(channeldata.next_timeout_ms(), maxtv_ms) {
         crate::core::api::TimeoutChoice::NoTasks => {
             if maxtv.is_null() { return std::ptr::null_mut(); }
             maxtv

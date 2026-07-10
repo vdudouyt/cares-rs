@@ -25,7 +25,7 @@ use crate::core::api;
 use crate::core::cache::QueryCache;
 use crate::core::conn::{Conn, RecvOutcome, TcpPool};
 use crate::core::executor::{
-    noop_waker, poll_deadline, select3, wait_io, QueryIo, RecvReady, Wait, Which3,
+    noop_waker, poll_timeout, select3, wait_io, QueryIo, RecvReady, Wait, Which3,
 };
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, Hosts};
@@ -137,8 +137,8 @@ impl AsyncClient {
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let deadline = Instant::now() + res.opts.timeout;
-                if !conn.send(wire, deadline).await {
+                let timeout = Instant::now() + res.opts.timeout;
+                if !conn.send(wire, timeout).await {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -153,7 +153,7 @@ impl AsyncClient {
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                 }
                 loop {
-                    match conn.recv(deadline).await {
+                    match conn.recv(timeout).await {
                         RecvOutcome::Msg(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
@@ -359,7 +359,7 @@ impl AsyncClient {
                     Some(Probe {
                         conn: Conn::owned(io.clone(), sk, use_tcp),
                         server: pserver,
-                        deadline: Instant::now() + res.opts.timeout,
+                        timeout: Instant::now() + res.opts.timeout,
                         payload: framed,
                     })
                 });
@@ -390,8 +390,8 @@ impl AsyncClient {
                     server = si;
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                     let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                    let deadline = Instant::now() + res.opts.timeout;
-                    if !conn.send(wire, deadline).await {
+                    let timeout = Instant::now() + res.opts.timeout;
+                    if !conn.send(wire, timeout).await {
                         if use_tcp {
                             res.tcp_pool.borrow_mut().remove(server);
                         }
@@ -406,20 +406,20 @@ impl AsyncClient {
                         break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                     }
                     loop {
-                        // Race the live probe, the deadline, and the primary reply.
-                        // Biased probe -> deadline -> primary (expiry preempts a
+                        // Race the live probe, the timeout, and the primary reply.
+                        // Biased probe -> timeout -> primary (expiry preempts a
                         // same-cycle primary read, as before). No probe => 2-arm recv.
                         let event = if let Some(p) = probe.as_mut() {
-                            let wake_deadline = deadline.min(p.deadline);
-                            match select3(&io, |_| p.conn.recv_arm(), |io| poll_deadline(io, wake_deadline), |_| conn.recv_arm()).await {
+                            let wake_timeout = timeout.min(p.timeout);
+                            match select3(&io, |_| p.conn.recv_arm(), |io| poll_timeout(io, wake_timeout), |_| conn.recv_arm()).await {
                                 Which3::A(r) => ReplyEvent::Probe(r),
-                                Which3::B(()) => ReplyEvent::Deadline,
+                                Which3::B(()) => ReplyEvent::Timeout,
                                 Which3::C(r) => ReplyEvent::Primary(r),
                             }
                         } else {
-                            match conn.recv(deadline).await {
+                            match conn.recv(timeout).await {
                                 RecvOutcome::Msg(b) => ReplyEvent::Primary(RecvReady::Msg(b)),
-                                RecvOutcome::Timeout => ReplyEvent::Deadline,
+                                RecvOutcome::Timeout => ReplyEvent::Timeout,
                                 RecvOutcome::Dead => ReplyEvent::Primary(RecvReady::Dead),
                             }
                         };
@@ -436,15 +436,15 @@ impl AsyncClient {
                                 }
                                 continue;
                             }
-                            ReplyEvent::Deadline => {
+                            ReplyEvent::Timeout => {
                                 let now = Instant::now();
                                 if let Some(p) = &probe {
-                                    if now >= p.deadline {
+                                    if now >= p.timeout {
                                         let p_taken = probe.take().unwrap();
                                         settle_probe(&io, &res, &p_taken, None);
                                     }
                                 }
-                                if now >= deadline {                                    if io.borrow().app.cancelled {
+                                if now >= timeout {                                    if io.borrow().app.cancelled {
                                         break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -628,8 +628,8 @@ impl AsyncClient {
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let deadline = Instant::now() + res.opts.timeout;
-                if !conn.send(wire, deadline).await {
+                let timeout = Instant::now() + res.opts.timeout;
+                if !conn.send(wire, timeout).await {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -644,7 +644,7 @@ impl AsyncClient {
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                 }
                 loop {
-                    match conn.recv(deadline).await {
+                    match conn.recv(timeout).await {
                         RecvOutcome::Msg(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
@@ -803,8 +803,8 @@ impl AsyncClient {
                 server = si;
                 let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                 let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                let deadline = Instant::now() + res.opts.timeout;
-                if !conn.send(wire, deadline).await {
+                let timeout = Instant::now() + res.opts.timeout;
+                if !conn.send(wire, timeout).await {
                     if use_tcp {
                         res.tcp_pool.borrow_mut().remove(server);
                     }
@@ -819,7 +819,7 @@ impl AsyncClient {
                     break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                 }
                 loop {
-                    match conn.recv(deadline).await {
+                    match conn.recv(timeout).await {
                         RecvOutcome::Msg(buf) => {
                             if !qid_matches(&buf, wire, use_tcp) {
                                 continue; // stray datagram — await the next reply
@@ -952,7 +952,7 @@ impl AsyncClient {
                     Some(Probe {
                         conn: Conn::owned(io.clone(), sk, use_tcp),
                         server: pserver,
-                        deadline: Instant::now() + res.opts.timeout,
+                        timeout: Instant::now() + res.opts.timeout,
                         payload: framed,
                     })
                 });
@@ -983,8 +983,8 @@ impl AsyncClient {
                     server = si;
                     let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                     let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                    let deadline = Instant::now() + res.opts.timeout;
-                    if !conn.send(wire, deadline).await {
+                    let timeout = Instant::now() + res.opts.timeout;
+                    if !conn.send(wire, timeout).await {
                         if use_tcp {
                             res.tcp_pool.borrow_mut().remove(server);
                         }
@@ -999,20 +999,20 @@ impl AsyncClient {
                         break 'drive (Err(ARES_ECONNREFUSED), timeouts);
                     }
                     loop {
-                        // Race the live probe, the deadline, and the primary reply.
-                        // Biased probe -> deadline -> primary (expiry preempts a
+                        // Race the live probe, the timeout, and the primary reply.
+                        // Biased probe -> timeout -> primary (expiry preempts a
                         // same-cycle primary read, as before). No probe => 2-arm recv.
                         let event = if let Some(p) = probe.as_mut() {
-                            let wake_deadline = deadline.min(p.deadline);
-                            match select3(&io, |_| p.conn.recv_arm(), |io| poll_deadline(io, wake_deadline), |_| conn.recv_arm()).await {
+                            let wake_timeout = timeout.min(p.timeout);
+                            match select3(&io, |_| p.conn.recv_arm(), |io| poll_timeout(io, wake_timeout), |_| conn.recv_arm()).await {
                                 Which3::A(r) => ReplyEvent::Probe(r),
-                                Which3::B(()) => ReplyEvent::Deadline,
+                                Which3::B(()) => ReplyEvent::Timeout,
                                 Which3::C(r) => ReplyEvent::Primary(r),
                             }
                         } else {
-                            match conn.recv(deadline).await {
+                            match conn.recv(timeout).await {
                                 RecvOutcome::Msg(b) => ReplyEvent::Primary(RecvReady::Msg(b)),
-                                RecvOutcome::Timeout => ReplyEvent::Deadline,
+                                RecvOutcome::Timeout => ReplyEvent::Timeout,
                                 RecvOutcome::Dead => ReplyEvent::Primary(RecvReady::Dead),
                             }
                         };
@@ -1029,15 +1029,15 @@ impl AsyncClient {
                                 }
                                 continue;
                             }
-                            ReplyEvent::Deadline => {
+                            ReplyEvent::Timeout => {
                                 let now = Instant::now();
                                 if let Some(p) = &probe {
-                                    if now >= p.deadline {
+                                    if now >= p.timeout {
                                         let p_taken = probe.take().unwrap();
                                         settle_probe(&io, &res, &p_taken, None);
                                     }
                                 }
-                                if now >= deadline {                                    if io.borrow().app.cancelled {
+                                if now >= timeout {                                    if io.borrow().app.cancelled {
                                         break 'drive (Err(ARES_ETIMEOUT), timeouts);
                                     }
                                     notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
@@ -1348,7 +1348,7 @@ pub(crate) enum Effect {
 }
 
 /// The application-owned half of the mailbox: everything the *reactor* need not
-/// understand. The reactor drives readiness (`waits`/`deadline`/`fired`/`expired`)
+/// understand. The reactor drives readiness (`waits`/`timeout`/`fired`/`expired`)
 /// and never touches these fields; the DNS lifecycle + the ffi do.
 #[derive(Default)]
 pub(crate) struct DnsSignals {
@@ -1440,11 +1440,11 @@ fn qid_of(payload: &[u8]) -> u16 {
 }
 
 /// One `select` result in the probe ops (`gethostbyname`/`search`): which of the
-/// raced arms — the concurrent failover probe, the deadline, or the primary
+/// raced arms — the concurrent failover probe, the timeout, or the primary
 /// reply — fired. Unifies the 3-arm (probe live) and 2-arm (no probe) branches.
 enum ReplyEvent {
     Probe(RecvReady),
-    Deadline,
+    Timeout,
     Primary(RecvReady),
 }
 
@@ -1452,7 +1452,7 @@ enum ReplyEvent {
 struct Probe {
     conn: Conn<DnsSignals>,
     server: usize,
-    deadline: Instant,
+    timeout: Instant,
     payload: BytesMut, // framed form actually sent (for qid_matches)
 }
 
@@ -1495,7 +1495,7 @@ struct ParSub {
 ///
 /// Each sub-query is a full [`resolve_query`] on its own sub-mailbox; `step`
 /// merges their published waits/effects into the outer mailbox the ffi drives,
-/// awaits it, and routes readiness back by fd + each sub's own deadline.
+/// awaits it, and routes readiness back by fd + each sub's own timeout.
 pub(crate) struct ParallelQueries {
     io: Rc<RefCell<DnsMailbox>>,
     subs: Vec<ParSub>,
@@ -1549,9 +1549,9 @@ impl ParallelQueries {
                         // copy, UDP sends the payload as-is (borrowed — no clone).
                         let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
                         let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-                        let deadline = Instant::now() + res.opts.timeout;
+                        let timeout = Instant::now() + res.opts.timeout;
 
-                        if !conn.send(wire, deadline).await {
+                        if !conn.send(wire, timeout).await {
                             // Send failed (a hard socket error): recreate the socket and retry,
                             // bounded by the attempt budget — mirrors the classic write_impl's
                             // recreate-and-resend. (SetReplyAndFailSend fails one send, then the
@@ -1572,7 +1572,7 @@ impl ParallelQueries {
 
                         // Await the primary reply, servicing the probe socket concurrently.
                         loop {
-                            match conn.recv(deadline).await {
+                            match conn.recv(timeout).await {
                                 RecvOutcome::Msg(buf) => {
                                     if !qid_matches(&buf, wire, use_tcp) {
                                         continue; // stray datagram — await the next reply
@@ -1678,10 +1678,10 @@ impl ParallelQueries {
             return;
         }
 
-        // Merge every live sub's waits + earliest deadline into the outer mailbox,
+        // Merge every live sub's waits + earliest timeout into the outer mailbox,
         // and lift its effects up so the ffi applies them.
         let mut merged: Vec<Wait> = Vec::new();
-        let mut deadline: Option<Instant> = None;
+        let mut timeout: Option<Instant> = None;
         for s in &self.subs {
             if s.fut.is_none() {
                 continue;
@@ -1689,21 +1689,21 @@ impl ParallelQueries {
             let drained: Vec<Effect> = {
                 let mut sub = s.io.borrow_mut();
                 merged.extend(sub.waits.iter().copied());
-                if let Some(d) = sub.deadline {
-                    deadline = Some(deadline.map_or(d, |m: Instant| m.min(d)));
+                if let Some(d) = sub.timeout {
+                    timeout = Some(timeout.map_or(d, |m: Instant| m.min(d)));
                 }
                 std::mem::take(&mut sub.app.effects)
             };
             self.io.borrow_mut().app.effects.extend(drained);
         }
-        let deadline = match deadline {
+        let timeout = match timeout {
             Some(d) => d,
             None => return, // nothing published a wait — avoid an unbounded await
         };
 
         // Await the outer mailbox (the ffi sets fired/expired against `merged`),
         // then route readiness back to each live sub.
-        let woke = wait_io(&self.io, &merged, deadline).await;
+        let woke = wait_io(&self.io, &merged, timeout).await;
         let now = Instant::now();
         for s in &self.subs {
             if s.fut.is_none() {
@@ -1712,7 +1712,7 @@ impl ParallelQueries {
             let mut sub = s.io.borrow_mut();
             let wants: Vec<i32> = sub.waits.iter().map(|w| w.fd).collect();
             sub.fired = woke.fds.iter().copied().filter(|fd| wants.contains(fd)).collect();
-            sub.expired = sub.deadline.is_some_and(|d| now >= d);
+            sub.expired = sub.timeout.is_some_and(|d| now >= d);
         }
     }
 }

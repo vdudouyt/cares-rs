@@ -5,8 +5,8 @@
 //! nothing in here names a protocol.
 //!
 //! - [`Conn`] — a query's connection. It owns its mailbox handle, so IO reads
-//!   tokio-style: `conn.send(bytes, deadline).await` /
-//!   `conn.recv(deadline).await`. The wire behind it is either an exclusively
+//!   tokio-style: `conn.send(bytes, timeout).await` /
+//!   `conn.recv(timeout).await`. The wire behind it is either an exclusively
 //!   owned socket (a datagram socket, or a one-shot stream) or a checkout of a
 //!   shared stream connection; the datagram-vs-demuxed-stream asymmetry is
 //!   hidden behind the methods.
@@ -25,7 +25,7 @@ use std::task::Poll;
 use std::time::Instant;
 
 use crate::core::executor::{
-    poll_deadline, poll_recv, recv_datagram, recv_stream, select2, send_when_writable, QueryIo,
+    poll_timeout, poll_recv, recv_datagram, recv_stream, select2, send_when_writable, QueryIo,
     Recv, RecvReady, Which2,
 };
 use crate::core::socket::{Socket, SocketFactory};
@@ -137,7 +137,7 @@ impl TcpPool {
 
 /// A query's connection — the socket object the handler drives, tokio-style.
 /// It **owns its mailbox** (`io`), so `send`/`recv` take no reactor handle:
-/// `conn.send(bytes, deadline).await` / `conn.recv(deadline).await`, just
+/// `conn.send(bytes, timeout).await` / `conn.recv(timeout).await`, just
 /// like `socket.recv(..).await`.
 pub struct Conn<A> {
     io: Rc<RefCell<QueryIo<A>>>,
@@ -181,12 +181,12 @@ impl<A> Conn<A> {
 
     /// Await writability, then send `bytes` once (WouldBlock re-awaits). The
     /// socket was connected at creation. `false` on a hard failure or timeout.
-    pub async fn send(&self, bytes: &[u8], deadline: Instant) -> bool {
+    pub async fn send(&self, bytes: &[u8], timeout: Instant) -> bool {
         let sock: Rc<dyn Socket> = match &self.wire {
             Wire::Owned { sock, .. } => sock.clone(),
             Wire::Shared(c, _) => c.borrow().sock.clone(),
         };
-        send_when_writable(&self.io, &*sock, bytes, deadline).await
+        send_when_writable(&self.io, &*sock, bytes, timeout).await
     }
 
     /// One non-blocking read of this conn's next message: a datagram / one-shot
@@ -228,12 +228,12 @@ impl<A> Conn<A> {
         poll_recv(&io, fd, || self.read())
     }
 
-    /// tokio-style `conn.recv(deadline).await`: await this conn's next message,
-    /// bounded by `deadline` (a 2-arm select over the conn's own mailbox,
-    /// deadline-biased to match the classic expiry-preempts-read order).
-    pub async fn recv(&mut self, deadline: Instant) -> RecvOutcome {
+    /// tokio-style `conn.recv(timeout).await`: await this conn's next message,
+    /// bounded by `timeout` (a 2-arm select over the conn's own mailbox,
+    /// timeout-biased to match the classic expiry-preempts-read order).
+    pub async fn recv(&mut self, timeout: Instant) -> RecvOutcome {
         let io = self.io.clone();
-        match select2(&io, |io| poll_deadline(io, deadline), |_| self.recv_arm()).await {
+        match select2(&io, |io| poll_timeout(io, timeout), |_| self.recv_arm()).await {
             Which2::A(()) => RecvOutcome::Timeout,
             Which2::B(RecvReady::Msg(b)) => RecvOutcome::Msg(b),
             Which2::B(RecvReady::Dead) => RecvOutcome::Dead,
@@ -251,7 +251,7 @@ impl<A> Drop for Conn<A> {
     }
 }
 
-/// The outcome of [`Conn::recv`]: a message's bytes, a deadline, or a dead socket.
+/// The outcome of [`Conn::recv`]: a message's bytes, a timeout, or a dead socket.
 pub enum RecvOutcome {
     Msg(Vec<u8>),
     Timeout,
