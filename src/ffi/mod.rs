@@ -4,6 +4,7 @@ pub mod ares_options;
 pub mod ares_socket;
 mod cnullterminated;
 mod clinkedlist;
+mod cstr;
 pub mod dns_record;
 pub mod error;
 mod offset_of;
@@ -22,6 +23,7 @@ use crate::ffi::ares_data::*;
 pub use crate::ffi::ares_data::AresAddrUnion;
 use crate::ffi::clinkedlist::*;
 use crate::ffi::error::*;
+use crate::cstr;
 pub use crate::ffi::ares_socket::{CSocketFactory, AresSocketFunctions};
 use crate::core::sortlist::*;
 use std::io::Cursor;
@@ -184,7 +186,7 @@ pub unsafe extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
     let (major, minor, patch) = (1, 34, 6);
     let v = (major << 16) | (minor << 8) | patch;
     if !version.is_null() { unsafe { *version = v } }
-    c"1.34.6".as_ptr()
+    cstr!("1.34.6")
 }
 
 pub const ARES_GETSOCK_MAXNUM: usize = 16; // per c-ares headers
