@@ -33,7 +33,7 @@ use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
     is_localhost, is_onion_domain, on_datagram, on_timeout, qid_matches,
     summarize, ReactorAction, SearchPlan, ServerHealth, TaskVerdict, TimeoutVerdict, AF_INET,
-    AF_INET6, AF_UNSPEC, RTYPE_A, RTYPE_AAAA,
+    AF_INET6, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::packets::AddrRecord;
 use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedRRs, ParsedResponse, ReplyRequire};
@@ -339,12 +339,7 @@ impl AsyncClient {
         if is_onion_domain(&hostname) {
             return Err(ARES_ENOTFOUND.into());
         }
-        let filter = match family {
-            AF_INET => AddressFamily::Ipv4,
-            AF_INET6 => AddressFamily::Ipv6,
-            AF_UNSPEC => AddressFamily::Any,
-            _ => return Err(ARES_ENOTIMP.into()),
-        };
+        let filter = AddressFamily::from_af(family).ok_or(ARES_ENOTIMP)?;
 
         // IP literal (a family mismatch falls through, not fails).
         if let Ok(ip) = hostname.parse::<IpAddr>() {
@@ -780,11 +775,7 @@ impl AsyncClient {
         }
 
         // Hosts file.
-        let family_filter = match ai_family {
-            libc::AF_INET => AddressFamily::Ipv4,
-            libc::AF_INET6 => AddressFamily::Ipv6,
-            _ => AddressFamily::Any,
-        };
+        let family_filter = AddressFamily::from_af(ai_family).unwrap_or(AddressFamily::Any);
         if let Some(lookup) = self.hostsfile().lookup(hostname, family_filter) {
             if !lookup.addrs.is_empty() {
                 return AddrInfoOut {
@@ -1742,13 +1733,7 @@ impl AsyncClient {
 
 /// The pure body of ares_gethostbyname_file: hosts-file-only lookup.
 fn hosts_file_lookup(st: &mut AsyncClient, name: &str, family: i32) -> Result<HostLookup, AresError> {
-    // Convert C family constant to our Family enum
-    let family_filter = match family {
-        libc::AF_INET => AddressFamily::Ipv4,
-        libc::AF_INET6 => AddressFamily::Ipv6,
-        libc::AF_UNSPEC => AddressFamily::Any,
-        _ => return Err(ARES_ENOTFOUND.into()),
-    };
+    let family_filter = AddressFamily::from_af(family).ok_or(ARES_ENOTFOUND)?;
 
     // Lookup in the hosts file cache
     let lookup = st.hosts().lookup(name, family_filter).ok_or(ARES_ENOTFOUND)?;

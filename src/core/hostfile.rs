@@ -14,6 +14,21 @@ pub enum AddressFamily {
     Any,
 }
 
+impl AddressFamily {
+    /// The lookup filter for a POSIX `AF_*` constant, or `None` if it isn't one
+    /// we recognize. Callers map `None` to their own status: `ares_gethostbyname`
+    /// (DNS) → `ENOTIMP`, `ares_gethostbyname_file` (hosts) → `ENOTFOUND`; while
+    /// `ares_getaddrinfo` treats an unknown family leniently (`unwrap_or(Any)`).
+    pub fn from_af(af: libc::c_int) -> Option<Self> {
+        match af {
+            libc::AF_INET => Some(Self::Ipv4),
+            libc::AF_INET6 => Some(Self::Ipv6),
+            libc::AF_UNSPEC => Some(Self::Any),
+            _ => None,
+        }
+    }
+}
+
 /// A single entry from the hosts file (one line)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEntry {

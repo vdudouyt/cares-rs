@@ -144,7 +144,7 @@ impl SearchPlan {
     }
 }
 
-pub use libc::{AF_INET, AF_INET6, AF_UNSPEC};
+pub use libc::{AF_INET, AF_INET6};
 
 /// A / AAAA DNS record types (the query rtypes the async lifecycles build).
 pub(crate) const RTYPE_A: u16 = 0x01;
