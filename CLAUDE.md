@@ -9,6 +9,7 @@ A Rust rewrite of the [c-ares](https://c-ares.org/) asynchronous DNS resolver, s
 * Use non-blocking I/O following the reactor pattern. Never use blocking I/O requests.
 * All functions and structures exported in C must be `pub`.
 * **No thread-local (or global mutable) state.** Working state lives in structures owned — directly or transitively — by the channel (`ChannelData`); e.g. the receive scratch buffer is a `Mailbox` field, not a `thread_local!`.
+* **No panic paths in production code** — a panic in a C-ABI library aborts the host process. No `panic!`/`todo!`/`unimplemented!`/`unreachable!`/`.unwrap()`/`.expect()` outside `cfg(test)`; degrade gracefully (error status, fallback value, or skip) even for invariants that "can't" fail. Enforced by the deny wall in `src/lib.rs` (fires under clippy, which CI runs with `-D warnings`). For C-string constants use native `c"..."` literals.
 * Commit with **zero** build/clippy warnings.
 * **Porting tests:** copy `.c`/`.cc` files from the original c-ares tree at `/root/c-ares-1.34.6/` with as few changes as possible, for logical consistency and easy updates. Copy them verbatim; the only tests you may comment out or skip are EDNS and malloc/alloc-failure ones.
 
@@ -41,6 +42,7 @@ CI additionally runs the gtest suite under **Valgrind** (`--leak-check=full`), a
 - **ABI header** — `include/cares.h` (cbindgen-generated on every build from `src/`) must match `ci-data/cares.h.baseline`.
 - **Exports** — the `.so`'s `ares_*` symbol set must match `ci-data/exports.baseline`.
 - **Unsafe ratchet** — `python3 tools/unsafe_lines.py --check tools/unsafe_baseline.json`. The count of lines inside `unsafe` contexts may never grow past the baseline. If you legitimately move logic and the count drops, run `--update` to lower the ratchet; it must never rise.
+- **Clippy `-D warnings`** — `cargo clippy --all-targets -- -D warnings`; this is also what makes the panic-safety deny wall in `src/lib.rs` binding.
 
 When you change the FFI surface, regenerate and re-baseline: `cargo build`, then update `ci-data/cares.h.baseline` / `ci-data/exports.baseline` as part of the same change.
 
