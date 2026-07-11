@@ -5,46 +5,11 @@ use super::*;
 use crate::core::async_client::search_precheck;
 use crate::core::hostent::Hostent;
 use crate::core::async_client::{service_to_port, ServicePort};
-
-
-/// The Copy delivery tail of an ares_gethostbyname / ares_gethostbyaddr lookup.
-/// Bare fn pointer + opaque arg are Copy; only *calling* them is unsafe.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HostTail {
-    pub(crate) callback: AresHostCallback,
-    pub(crate) arg: *mut c_void,
-}
-
-/// The Copy delivery tail of an ares_getnameinfo lookup.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct NameinfoTail {
-    pub(crate) callback: AresNameinfoCallback,
-    pub(crate) arg: *mut c_void,
-}
-
-/// The Copy delivery tail of an ares_getaddrinfo lookup (the service port
-/// travels with it into the node list built at delivery).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct AddrInfoTail {
-    pub(crate) callback: AresAddrInfoCallback,
-    pub(crate) arg: *mut c_void,
-    pub(crate) port: u16,
-}
-
-/// How a finished search lookup reports back to C: the raw-buffer callback of
-/// ares_search, or the parsed-record callback of ares_search_dnsrec. Bare fn
-/// pointers and the opaque arg are Copy; only *calling* them is unsafe.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SearchDelivery {
-    Raw { callback: AresCallback, arg: *mut c_void },
-    DnsRec { callback: AresCallbackDnsRec, arg: *mut c_void },
-}
-
-/// The Copy delivery tail of an ares_search / ares_search_dnsrec lookup.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SearchTail {
-    pub(crate) delivery: SearchDelivery,
-}
+use crate::core::async_client::{AddrInfoOut, Delivery, DnsMailbox, NameinfoReply};
+use crate::core::cache::QueryCache;
+use crate::core::AresError;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
@@ -60,8 +25,9 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     // synchronous preflight hit fires re-entrantly on this first `advance`.
     let client = channeldata.state.derive();
     let io = client.io.clone();
-    let fut = Box::pin(client.gethostbyname(hostname.to_string(), family));
-    channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
+    let io_cb = io.clone();
+    let fut = client.gethostbyname(hostname.to_string(), family);
+    channeldata.spawn(io, fut, move |r| on_hostent_reply(callback, arg, &io_cb, r));
 }
 
 /// # Safety
@@ -105,8 +71,9 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *mut c_void,
     // Build the resource bundle and spawn the self-contained async future.
     let client = channeldata.state.derive();
     let io = client.io.clone();
-    let fut = Box::pin(client.gethostbyaddr(ip, family));
-    channeldata.spawn(io, AsyncKind::Host { fut, tail: HostTail { callback, arg } });
+    let io_cb = io.clone();
+    let fut = client.gethostbyaddr(ip, family);
+    channeldata.spawn(io, fut, move |r| on_hostent_reply(callback, arg, &io_cb, r));
 }
 
 /// # Safety
@@ -124,10 +91,9 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let _ = dnsclass;
     let client = channeldata.state.derive();
-    let tail = SearchTail { delivery: SearchDelivery::Raw { callback, arg } };
     let io = client.io.clone();
-    let fut = Box::pin(client.search(name_str.to_string(), dnstype as u16, false));
-    channeldata.spawn(io, AsyncKind::Search { fut, tail });
+    let fut = client.search(name_str.to_string(), dnstype as u16, false);
+    channeldata.spawn(io, fut, move |r| on_raw_reply(callback, arg, r));
 }
 
 /// # Safety
@@ -143,10 +109,10 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
         Ok(payload) => {
             let client = channeldata.state.derive();
             let io = client.io.clone();
-            let fut = Box::pin(client.query_raw(payload));
-            channeldata.spawn(io, AsyncKind::Raw { fut, callback, arg });
+            let fut = client.query_raw(payload);
+            channeldata.spawn(io, fut, move |r| on_raw_reply(callback, arg, r));
         }
-        Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
+        Err(status) => on_raw_reply(callback, arg, Err(status.code())),
     }
 }
 
@@ -180,9 +146,10 @@ pub unsafe extern "C" fn ares_query_dnsrec(
         Err(e) => { unsafe { callback(arg, e.code(), 0, std::ptr::null_mut()) }; return; }
     };
     let client = channeldata.state.derive();
+    let cache = client.cache.clone();
     let io = client.io.clone();
-    let fut = Box::pin(client.query_raw(payload));
-    channeldata.spawn(io, AsyncKind::DnsRec { fut, callback, arg });
+    let fut = client.query_raw(payload);
+    channeldata.spawn(io, fut, move |r| on_dnsrec_reply(callback, arg, &cache, r));
 }
 
 /// # Safety
@@ -213,10 +180,10 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let client = channeldata.state.derive();
-    let tail = SearchTail { delivery: SearchDelivery::DnsRec { callback, arg } };
+    let cache = client.cache.clone();
     let io = client.io.clone();
-    let fut = Box::pin(client.search(name_str.to_string(), qtype as u16, true));
-    channeldata.spawn(io, AsyncKind::Search { fut, tail });
+    let fut = client.search(name_str.to_string(), qtype as u16, true);
+    channeldata.spawn(io, fut, move |r| on_dnsrec_reply(callback, arg, &cache, r));
 }
 
 /// Looks up the node name and service name for a socket address.
@@ -251,27 +218,96 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
     // fire re-entrantly on the first advance.
     let client = channeldata.state.derive();
     let io = client.io.clone();
-    let fut = Box::pin(client.getnameinfo(addr_info, flags));
-    channeldata.spawn(io, AsyncKind::Nameinfo { fut, tail: NameinfoTail { callback, arg } });
+    let fut = client.getnameinfo(addr_info, flags);
+    channeldata.spawn(io, fut, move |r| on_nameinfo_reply(callback, arg, r));
 }
 
 
-/// The single raw `ares_callback` invocation for the query/send path — the one
-/// place the raw C callback is fired (from the async executor's completion).
-pub(crate) fn fire_ares_callback(callback: AresCallback, arg: *mut c_void, res: Result<&[u8], c_int>, timeouts: c_int) {
+// ===== delivery handlers: a completed query's result (`Ok`) or a cancel status
+// (`Err`) → the C callback. One per callback signature; the shim closures forward
+// their `Result<T, c_int>` here. The only sites that call a C callback.
+
+/// ares_query / ares_send / ares_search → `ares_callback`: reply bytes on success,
+/// else the error/cancel status with a null buffer.
+pub(crate) fn on_raw_reply(callback: AresCallback, arg: *mut c_void, r: Result<Delivery, c_int>) {
+    let (res, timeouts): (Result<&[u8], c_int>, c_int) = match &r {
+        Ok(Delivery::Raw { result, timeouts }) => (result.as_deref().map_err(|&e| e), *timeouts),
+        Err(status) => (Err(*status), 0),
+    };
     match res {
         Ok(buf) => unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) },
         Err(err) => unsafe { callback(arg, err, timeouts, std::ptr::null_mut(), 0) },
     }
 }
 
-/// Build a C hostent from a core one, fire the host callback with it, and free
-/// it — the single success-firing site shared by the `ares_gethostbyname` shim
-/// (synchronous hit) and the async executor's `finalize`.
-pub(crate) fn fire_host_success(tail: HostTail, hostent: Hostent, timeouts: c_int) {
-    let c_hostent = unsafe { build_hostent(hostent) };
-    unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, timeouts, c_hostent) };
-    unsafe { ares_free_hostent(c_hostent) };
+/// ares_query_dnsrec / ares_search_dnsrec → `ares_callback_dnsrec`: cache-store +
+/// parse the reply into an `ares_dns_record_t` on success, else the status.
+pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, r: Result<Delivery, c_int>) {
+    let (result, timeouts) = match r {
+        Ok(Delivery::Raw { result, timeouts }) => (result, timeouts),
+        Err(status) => (Err(status), 0),
+    };
+    match result {
+        Ok(buf) => {
+            cache.borrow_mut().store_reply(&buf, Instant::now());
+            match crate::core::dns_record::parse_record(&buf) {
+                Ok(rec) => {
+                    let dnsrec = Box::into_raw(Box::new(rec));
+                    unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };
+                    unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
+                }
+                Err(e) => unsafe { callback(arg, e.code(), timeouts as usize, std::ptr::null_mut()) },
+            }
+        }
+        Err(status) => unsafe { callback(arg, status, timeouts as usize, std::ptr::null_mut()) },
+    }
+}
+
+/// ares_gethostbyname / ares_gethostbyaddr → `ares_host_callback`: build + fire +
+/// free a C hostent on success, else the status. The timeout count (no room in the
+/// `Result<Hostent, _>` output) is read from the mailbox on completion.
+pub(crate) fn on_hostent_reply(callback: AresHostCallback, arg: *mut c_void, io: &Rc<RefCell<DnsMailbox>>, r: Result<Result<Hostent, AresError>, c_int>) {
+    match r {
+        Ok(inner) => {
+            let timeouts = io.borrow().app.timeouts;
+            match inner {
+                Ok(hostent) => {
+                    let c_hostent = unsafe { build_hostent(hostent) };
+                    unsafe { callback(arg, ARES_SUCCESS, timeouts, c_hostent) };
+                    unsafe { ares_free_hostent(c_hostent) };
+                }
+                Err(e) => unsafe { callback(arg, e.code(), timeouts, std::ptr::null_mut()) },
+            }
+        }
+        Err(status) => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
+    }
+}
+
+/// ares_getnameinfo → `ares_nameinfo_callback`: the node / service strings on
+/// success, else the status with null strings.
+pub(crate) fn on_nameinfo_reply(callback: AresNameinfoCallback, arg: *mut c_void, r: Result<NameinfoReply, c_int>) {
+    match r {
+        Ok(reply) => {
+            let node_ptr = reply.node.as_ref().map(|s| s.as_ptr() as *mut c_char).unwrap_or(std::ptr::null_mut());
+            let service_ptr = reply.service.as_ref().map(|s| s.as_ptr() as *mut c_char).unwrap_or(std::ptr::null_mut());
+            unsafe { callback(arg, reply.status.code(), reply.timeouts, node_ptr, service_ptr) };
+        }
+        Err(status) => unsafe { callback(arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) },
+    }
+}
+
+/// ares_getaddrinfo → `ares_addrinfo_callback`: build the `ares_addrinfo` (nodes at
+/// `port`) on success, else the status with a null result.
+pub(crate) fn on_addrinfo_reply(callback: AresAddrInfoCallback, arg: *mut c_void, port: u16, r: Result<AddrInfoOut, c_int>) {
+    match r {
+        Ok(out) if out.status.code() == ARES_SUCCESS => {
+            let nodes = crate::ffi::addrinfo::nodes_from_addr_records(&out.records, port);
+            let ai = crate::ffi::addrinfo::build_ares_addrinfo(&out.name, nodes);
+            unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
+        }
+        Ok(out) => unsafe { callback(arg, out.status.code(), 0, std::ptr::null_mut()) },
+        Err(status) => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
+    }
 }
 
 #[no_mangle]
@@ -313,8 +349,8 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     let hostname_raw = unsafe { cstr_lossy(name) };
     let client = channeldata.state.derive();
     let io = client.io.clone();
-    let fut = Box::pin(client.getaddrinfo(hostname_raw.to_string(), ai_family));
-    channeldata.spawn(io, AsyncKind::AddrInfo { fut, tail: AddrInfoTail { callback, arg, port } });
+    let fut = client.getaddrinfo(hostname_raw.to_string(), ai_family);
+    channeldata.spawn(io, fut, move |r| on_addrinfo_reply(callback, arg, port, r));
 }
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
@@ -331,10 +367,10 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
         Ok(payload) => {
             let client = channeldata.state.derive();
             let io = client.io.clone();
-            let fut = Box::pin(client.query_raw(payload));
-            channeldata.spawn(io, AsyncKind::Raw { fut, callback, arg });
+            let fut = client.query_raw(payload);
+            channeldata.spawn(io, fut, move |r| on_raw_reply(callback, arg, r));
         }
-        Err(status) => unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) },
+        Err(status) => on_raw_reply(callback, arg, Err(status.code())),
     }
 }
 

@@ -3,12 +3,8 @@
 
 use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
-use crate::core::async_client::{Delivery, DnsMailbox, Effect};
+use crate::core::async_client::{DnsMailbox, Effect};
 use crate::async_runtime::executor::noop_waker;
-use crate::core::hostent::Hostent;
-use crate::core::AresError;
-use crate::core::async_client::NameinfoReply;
-use super::lookups::{fire_host_success, AddrInfoTail, HostTail, NameinfoTail, SearchDelivery, SearchTail};
 
 
 /// The C-visible channel: the pure core state plus the channel-level C
@@ -28,64 +24,51 @@ pub struct ChannelData {
     async_queries: Vec<Option<AsyncQuery>>,
 }
 
-/// One in-flight async lifecycle: its mailbox plus the boxed future and its C
-/// delivery target — both differ by kind (raw reply bytes vs a hostent).
+/// One in-flight async lifecycle: its mailbox plus the type-erased query (its
+/// future + the one closure that delivers the result to C).
 struct AsyncQuery {
     io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>,
-    kind: AsyncKind,
+    query: Box<dyn PendingQuery>,
 }
 
-/// The two async lifecycle kinds: the future's `Output` and where its result
-/// goes in C. The future owns its socket(s), so nothing is enqueued as a `Task`.
-pub(crate) enum AsyncKind {
-    /// ares_query / ares_send: raw reply bytes (+ timeout count) to the ares_callback.
-    Raw {
-        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
-        callback: AresCallback,
-        arg: *mut libc::c_void,
-    },
-    /// ares_gethostbyname / ares_gethostbyaddr: a hostent (or status) to
-    /// the ares_host_callback; the timeout count is read from the mailbox
-    /// (`io.timeouts`).
-    Host {
-        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hostent, AresError>>>>,
-        tail: HostTail,
-    },
-    /// ares_getnameinfo: a node / service pair (or status) to the
-    /// ares_nameinfo_callback; the timeout count rides in `NameinfoReply.timeouts`.
-    Nameinfo {
-        fut: std::pin::Pin<Box<dyn std::future::Future<Output = NameinfoReply>>>,
-        tail: NameinfoTail,
-    },
-    /// ares_query_dnsrec: raw reply bytes parsed into an ares_dns_record_t
-    /// (or status) to the ares_callback_dnsrec; reuses `Completed::Raw`.
-    DnsRec {
-        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
-        callback: AresCallbackDnsRec,
-        arg: *mut libc::c_void,
-    },
-    /// ares_search / ares_search_dnsrec: raw reply bytes (or status) from
-    /// the name-iteration loop; the tail distinguishes Raw vs DnsRec delivery.
-    Search {
-        fut: std::pin::Pin<Box<dyn std::future::Future<Output = Delivery>>>,
-        tail: SearchTail,
-    },
-    /// ares_getaddrinfo: the merged A+AAAA records (or status) built into an
-    /// ares_addrinfo for the ares_addrinfo_callback; the service port rides on
-    /// the tail.
-    AddrInfo {
-        fut: std::pin::Pin<Box<dyn std::future::Future<Output = crate::core::async_client::AddrInfoOut>>>,
-        tail: AddrInfoTail,
-    },
+/// A boxed in-flight query with its per-op `Output` type erased: poll it to
+/// completion, then hand the result — or a cancel status — to its C delivery
+/// closure. The future owns its socket(s), so nothing is enqueued as a `Task`.
+trait PendingQuery {
+    /// Poll the future once; on `Ready`, stash the output and return `true`.
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> bool;
+    /// Deliver to C: the stashed output (`cancel = None`) or a terminal
+    /// `ares_cancel`/`ares_destroy` status (`cancel = Some(status)`); consumes
+    /// the query (dropping the future — unpolled on the cancel path).
+    fn deliver(self: Box<Self>, cancel: Option<c_int>);
 }
 
-/// A polled-to-completion future's output, held across the mailbox-borrow drop
-/// so its C callback fires after effects are applied (mirrors [`AsyncKind`]).
-enum Completed {
-    Raw(Delivery),
-    Host(Result<Hostent, AresError>),
-    Nameinfo(NameinfoReply),
-    AddrInfo(crate::core::async_client::AddrInfoOut),
+/// The concrete query: a lifecycle future plus the single delivery closure that
+/// forwards its result (`Ok` on completion, `Err(status)` on cancel) to an
+/// `on_*_reply` handler in `lookups.rs`.
+struct Query<T> {
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = T>>>,
+    out: Option<T>,
+    on: Box<dyn FnOnce(Result<T, c_int>)>,
+}
+
+impl<T> PendingQuery for Query<T> {
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        match self.fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(v) => {
+                self.out = Some(v);
+                true
+            }
+            std::task::Poll::Pending => false,
+        }
+    }
+    fn deliver(self: Box<Self>, cancel: Option<c_int>) {
+        let result = match cancel {
+            None => Ok(self.out.expect("delivered before ready")),
+            Some(status) => Err(status),
+        };
+        (self.on)(result);
+    }
 }
 
 impl ChannelData {
@@ -125,13 +108,18 @@ impl ChannelData {
         self.socket_factory = factory;
     }
 
-    /// The single spawn path: register a lifecycle future + its mailbox + its
-    /// delivery sink (`AsyncKind`) in a free slot and drive it once (issuing the
-    /// initial send). Every ares_* entry shim builds `(io, kind)` and calls here.
-    /// The C callback fires when the reactor later settles the task (or in place
-    /// if the launch fails immediately).
-    pub(crate) fn spawn(&mut self, io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>, kind: AsyncKind) {
-        let slot = AsyncQuery { io, kind };
+    /// The single spawn path: register a lifecycle `fut` + its mailbox + its C
+    /// delivery closure `on` in a free slot and drive it once (issuing the initial
+    /// send). Every ares_* entry shim calls here. `on` fires when the reactor later
+    /// settles the query (or in place if it completes on this first poll).
+    pub(crate) fn spawn<T: 'static>(
+        &mut self,
+        io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>,
+        fut: impl std::future::Future<Output = T> + 'static,
+        on: impl FnOnce(Result<T, c_int>) + 'static,
+    ) {
+        let query: Box<dyn PendingQuery> = Box::new(Query { fut: Box::pin(fut), out: None, on: Box::new(on) });
+        let slot = AsyncQuery { io, query };
         let id = match self.async_queries.iter().position(|s| s.is_none()) {
             Some(i) => {
                 self.async_queries[i] = Some(slot);
@@ -164,36 +152,11 @@ impl ChannelData {
             m.waits.clear();
             m.timeout = None;
         }
-        // Poll the kind's future, capturing its output (if it completed) to fire
-        // after the mailbox borrow is released.
-        let done: Option<Completed> = {
+        // Poll the query's future; it stashes its output and returns true on
+        // completion, so it fires after the mailbox borrow drops + effects apply.
+        let done = {
             let mut cx = std::task::Context::from_waker(&waker);
-            match &mut self.async_queries[id].as_mut().unwrap().kind {
-                AsyncKind::Raw { fut, .. } => match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(d) => Some(Completed::Raw(d)),
-                    std::task::Poll::Pending => None,
-                },
-                AsyncKind::Host { fut, .. } => match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(r) => Some(Completed::Host(r)),
-                    std::task::Poll::Pending => None,
-                },
-                AsyncKind::Nameinfo { fut, .. } => match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(r) => Some(Completed::Nameinfo(r)),
-                    std::task::Poll::Pending => None,
-                },
-                AsyncKind::DnsRec { fut, .. } => match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(d) => Some(Completed::Raw(d)),
-                    std::task::Poll::Pending => None,
-                },
-                AsyncKind::Search { fut, .. } => match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(d) => Some(Completed::Raw(d)),
-                    std::task::Poll::Pending => None,
-                },
-                AsyncKind::AddrInfo { fut, .. } => match fut.as_mut().poll(&mut cx) {
-                    std::task::Poll::Ready(r) => Some(Completed::AddrInfo(r)),
-                    std::task::Poll::Pending => None,
-                },
-            }
+            self.async_queries[id].as_mut().unwrap().query.poll(&mut cx)
         };
         let effects = {
             let aq = self.async_queries[id].as_ref().unwrap();
@@ -206,77 +169,10 @@ impl ChannelData {
                 }
             }
         }
-        // On completion, reap the slot and fire the C callback.
-        if let Some(done) = done {
+        // On completion, reap the slot and fire its C delivery closure.
+        if done {
             let slot = self.async_queries[id].take().unwrap();
-            match (done, slot.kind) {
-                (Completed::Raw(Delivery::Raw { result, timeouts }), AsyncKind::Raw { callback, arg, .. }) => {
-                    fire_ares_callback(callback, arg, result.as_deref().map_err(|&e| e), timeouts);
-                }
-                (Completed::Raw(Delivery::Raw { result, timeouts }), AsyncKind::DnsRec { callback, arg, .. }) => {
-                    match result {
-                        Ok(ref buf) => {
-                            self.state.cache.borrow_mut().store_reply(buf, Instant::now());
-                            match crate::core::dns_record::parse_record(buf) {
-                                Ok(rec) => {
-                                    let dnsrec = Box::into_raw(Box::new(rec));
-                                    unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };
-                                    unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
-                                }
-                                Err(e) => unsafe { callback(arg, e.code(), timeouts as usize, std::ptr::null_mut()) },
-                            }
-                        }
-                        Err(status) => unsafe { callback(arg, status, timeouts as usize, std::ptr::null_mut()) },
-                    }
-                }
-                (Completed::Raw(Delivery::Raw { result, timeouts }), AsyncKind::Search { tail, .. }) => {
-                    match (result, tail.delivery) {
-                        (Ok(buf), SearchDelivery::Raw { callback, arg }) => {
-                            unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) };
-                        }
-                        (Ok(buf), SearchDelivery::DnsRec { callback, arg }) => {
-                            // Cache the raw reply for dnsrec search (same as classic `wants_dnsrec_cache`).
-                            self.state.cache.borrow_mut().store_reply(&buf, Instant::now());
-                            match crate::core::dns_record::parse_record(&buf) {
-                                Ok(rec) => {
-                                    let dnsrec = Box::into_raw(Box::new(rec));
-                                    unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };
-                                    unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
-                                }
-                                Err(e) => unsafe { callback(arg, e.code(), timeouts as usize, std::ptr::null_mut()) },
-                            }
-                        }
-                        (Err(status), SearchDelivery::Raw { callback, arg }) => {
-                            unsafe { callback(arg, status, timeouts, std::ptr::null_mut(), 0) };
-                        }
-                        (Err(status), SearchDelivery::DnsRec { callback, arg }) => {
-                            unsafe { callback(arg, status, timeouts as usize, std::ptr::null_mut()) };
-                        }
-                    }
-                }
-                (Completed::Host(result), AsyncKind::Host { tail, .. }) => {
-                    let timeouts = slot.io.borrow().app.timeouts;
-                    match result {
-                        Ok(hostent) => fire_host_success(tail, hostent, timeouts),
-                        Err(e) => unsafe { (tail.callback)(tail.arg, e.code(), timeouts, std::ptr::null_mut()) },
-                    }
-                }
-                (Completed::Nameinfo(reply), AsyncKind::Nameinfo { tail, .. }) => {
-                    let node_ptr = reply.node.as_ref().map(|s| s.as_ptr() as *mut c_char).unwrap_or(std::ptr::null_mut());
-                    let service_ptr = reply.service.as_ref().map(|s| s.as_ptr() as *mut c_char).unwrap_or(std::ptr::null_mut());
-                    unsafe { (tail.callback)(tail.arg, reply.status.code(), reply.timeouts, node_ptr, service_ptr) };
-                }
-                (Completed::AddrInfo(out), AsyncKind::AddrInfo { tail, .. }) => {
-                    if out.status.code() == ARES_SUCCESS {
-                        let nodes = crate::ffi::addrinfo::nodes_from_addr_records(&out.records, tail.port);
-                        let ai = crate::ffi::addrinfo::build_ares_addrinfo(&out.name, nodes);
-                        unsafe { (tail.callback)(tail.arg, ARES_SUCCESS, 0, ai) };
-                    } else {
-                        unsafe { (tail.callback)(tail.arg, out.status.code(), 0, std::ptr::null_mut()) };
-                    }
-                }
-                _ => unreachable!("async completion / slot kind mismatch"),
-            }
+            slot.query.deliver(None);
         }
     }
 
@@ -335,17 +231,7 @@ impl ChannelData {
         let Some(slot) = self.async_queries.get_mut(id).and_then(|s| s.take()) else {
             return; // already reaped
         };
-        match slot.kind {
-            AsyncKind::Raw { callback, arg, .. } => fire_ares_callback(callback, arg, Err(status), 0),
-            AsyncKind::Host { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) },
-            AsyncKind::Nameinfo { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut(), std::ptr::null_mut()) },
-            AsyncKind::DnsRec { callback, arg, .. } => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
-            AsyncKind::Search { tail, .. } => match tail.delivery {
-                SearchDelivery::Raw { callback, arg } => unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) },
-                SearchDelivery::DnsRec { callback, arg } => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
-            },
-            AsyncKind::AddrInfo { tail, .. } => unsafe { (tail.callback)(tail.arg, status, 0, std::ptr::null_mut()) },
-        }
+        slot.query.deliver(Some(status));
     }
 
     /// Every (fd, wants_write) the caller should select on: each in-flight

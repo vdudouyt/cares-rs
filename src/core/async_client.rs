@@ -7,7 +7,7 @@
 //! instance (config, options, server list, shared pools), and every entry
 //! shim mints a per-lookup copy via [`AsyncClient::derive`] (fresh mailbox,
 //! shared `Rc`s). Lifecycle methods take `self: Rc<Self>` so the spawned
-//! futures are `'static` (they are `Box::pin`'d into the ffi `AsyncKind`)
+//! futures are `'static` (they are `Box::pin`'d into the ffi query slot)
 //! while still allowing cheap sharing and nested calls
 //! (`self.clone().other(…)`). Also here: the entry preflights and the DNS
 //! wire builders; see the section markers.
