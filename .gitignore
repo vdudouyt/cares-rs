@@ -22,3 +22,4 @@ tests/cares-tests/cmake_install.cmake
 tests/cares-tests/arestest
 tests/cares-tests/aresfuzz
 tests/cares-tests/aresfuzzname
+*.swp
