@@ -175,12 +175,31 @@ impl Conn {
         Conn { io, wire: Wire::Stream { sock, rbuf: Vec::new() } }
     }
 
-    /// A query's handle on a shared stream conn. Reserves `tag`'s inbox slot
-    /// so a sibling future's read routes this query's reply here; the slot is
-    /// released when the handle drops.
-    pub fn shared(io: Rc<RefCell<DnsMailbox>>, conn: Rc<RefCell<TcpConn>>, tag: u16) -> Self {
-        conn.borrow_mut().inbox.insert(tag, None);
-        Conn { io, wire: Wire::Shared(conn, tag) }
+    /// A query's handle on a shared stream conn. Reserves an inbox slot so a
+    /// sibling future's read routes this query's reply here; the slot is
+    /// released when the handle drops. `qid` is the query's current
+    /// transaction id — if an in-flight sibling already owns that tag on this
+    /// conn, fresh ids are drawn from `reroll` until one is free (≈ upstream
+    /// `generate_unique_qid` in `ares_send.c`; without this the two queries
+    /// would clobber one inbox slot and a reply would be lost). Returns the
+    /// handle plus the tag actually reserved — on a re-roll the caller must
+    /// re-stamp its payload with it.
+    pub fn shared(
+        io: Rc<RefCell<DnsMailbox>>,
+        conn: Rc<RefCell<TcpConn>>,
+        qid: u16,
+        mut reroll: impl FnMut() -> u16,
+    ) -> (Self, u16) {
+        let tag = {
+            let mut c = conn.borrow_mut();
+            let mut tag = qid;
+            while c.inbox.contains_key(&tag) {
+                tag = reroll();
+            }
+            c.inbox.insert(tag, None);
+            tag
+        };
+        (Conn { io, wire: Wire::Shared(conn, tag) }, tag)
     }
 
     fn fd(&self) -> i32 {
@@ -335,6 +354,39 @@ mod tests {
         fn send(&self, data: &[u8]) -> io::Result<usize> {
             Ok(data.len())
         }
+    }
+
+    /// A colliding transaction id on a shared conn must be re-rolled until
+    /// free (≈ upstream `generate_unique_qid`) — never clobber a sibling's
+    /// inbox slot — and each handle's Drop must release only its own slot.
+    #[test]
+    fn shared_checkout_rerolls_colliding_qid() {
+        let tc = Rc::new(RefCell::new(TcpConn {
+            sock: Rc::new(AlwaysReadable { fd: 5 }),
+            fd: 5,
+            rbuf: Vec::new(),
+            inbox: HashMap::new(),
+        }));
+        let io: Rc<RefCell<DnsMailbox>> = Rc::new(RefCell::new(DnsMailbox::default()));
+
+        // First checkout: qid 7 is free — kept as-is, reroll never consulted.
+        let (a, tag_a) = Conn::shared(io.clone(), tc.clone(), 7, || panic!("free qid must not reroll"));
+        assert_eq!(tag_a, 7);
+
+        // Second checkout collides on 7; the reroll may collide again (7)
+        // before drawing a free id (9) — the loop must keep drawing.
+        let rolls = RefCell::new(vec![9u16, 7u16]); // popped back-to-front: 7, then 9
+        let (b, tag_b) = Conn::shared(io.clone(), tc.clone(), 7, || rolls.borrow_mut().pop().unwrap());
+        assert_eq!(tag_b, 9);
+        assert!(rolls.borrow().is_empty()); // both rolls consumed
+        assert!(tc.borrow().inbox.contains_key(&7) && tc.borrow().inbox.contains_key(&9));
+
+        // RAII: each handle releases exactly its own slot.
+        drop(a);
+        assert!(!tc.borrow().inbox.contains_key(&7));
+        assert!(tc.borrow().inbox.contains_key(&9));
+        drop(b);
+        assert!(tc.borrow().inbox.is_empty());
     }
 
     /// `Conn::recv` must be **timeout-biased**: when a reply and the timeout are

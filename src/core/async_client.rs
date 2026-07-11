@@ -150,16 +150,15 @@ impl AsyncClient {
     /// when the shared lookup mailbox's `cancelled` flag is set (only `getaddrinfo`
     /// sets it, once its A answer lands) a give-up branch returns instead of
     /// resending — an already in-flight reply still delivers.
-    async fn request(self: Rc<Self>, payload: BytesMut, mut use_tcp: bool) -> QueryOutcome {
+    async fn request(self: Rc<Self>, mut payload: BytesMut, mut use_tcp: bool) -> QueryOutcome {
         let io = self.io.clone();
         let opts = self.opts();
         let mut timeouts: c_int = 0;
         let mut tries: u32 = 0;
         let mut failover_tries: u32 = 0;
-        let qid = qid_of(&payload);
         let mut server = self.health.borrow().pick_next();
         'attempt: loop {
-            let (mut conn, si) = match self.connect_failover(server, use_tcp, qid) {
+            let (mut conn, si) = match self.connect_failover(&mut payload, server, use_tcp) {
                 Ok(v) => v,
                 Err(()) => return (Err(ARES_ECONNREFUSED), timeouts),
             };
@@ -1677,13 +1676,24 @@ impl AsyncClient {
     /// across servers on a creation failure (matches upstream `ares_conn.c`).
     /// Returns the live `Conn` + the server index it landed on, or `Err(())` when
     /// the attempt budget is spent (callers map that to `ARES_ECONNREFUSED`).
-    fn connect_failover(&self, start: usize, use_tcp: bool, qid: u16) -> Result<(Conn, usize), ()> {
+    /// On a shared-TCP checkout the query's transaction id is re-rolled if an
+    /// in-flight sibling on that conn already holds it (≈ upstream
+    /// `generate_unique_qid`), and `payload` is re-stamped with the reserved id
+    /// so framing and `qid_matches` see the wire truth.
+    fn connect_failover(&self, payload: &mut BytesMut, start: usize, use_tcp: bool) -> Result<(Conn, usize), ()> {
         let opts = self.opts();
         let mut s = start;
         for _ in 0..opts.attempts.max(1) {
             let Some(ep) = self.endpoints.get(s) else { break };
             let conn = if use_tcp {
-                self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| Conn::shared(self.io.clone(), c, qid))
+                self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| {
+                    let (conn, tag) =
+                        Conn::shared(self.io.clone(), c, qid_of(payload), || rand::thread_rng().r#gen());
+                    if payload.len() >= 2 {
+                        payload[0..2].copy_from_slice(&tag.to_be_bytes());
+                    }
+                    conn
+                })
             } else {
                 self.factory.create_udp(ep.bind).ok().map(|sk| {
                     let _ = sk.connect(ep.udp_addr);
