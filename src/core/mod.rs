@@ -17,5 +17,6 @@ pub mod sysconfig;
 pub mod servers_csv;
 pub mod hostfile;
 pub mod services;
+pub mod tcp_pool;
 
 pub(crate) use error::AresError;

@@ -25,7 +25,8 @@ use futures_util::{select_biased, FutureExt};
 use rand::Rng;
 
 use crate::core::cache::QueryCache;
-use crate::core::conn::{Conn, TcpPool};
+use crate::core::conn::Conn;
+use crate::core::tcp_pool::TcpPool;
 use crate::async_runtime::executor::{sleep_until, Mailbox};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
@@ -951,7 +952,7 @@ pub(crate) struct QueryOpts {
 }
 
 /// Wrap a DNS payload in the 2-byte big-endian length prefix used for TCP
-/// framing (RFC 1035 §4.2.2; the decode side is `core::conn::dns_frame`).
+/// framing (RFC 1035 §4.2.2; the decode side is `core::tcp_pool::dns_frame`).
 fn frame_tcp(payload: &[u8]) -> BytesMut {
     let mut framed = BytesMut::with_capacity(2 + payload.len());
     framed.put_u16(payload.len() as u16);
