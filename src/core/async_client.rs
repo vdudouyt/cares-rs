@@ -26,7 +26,7 @@ use rand::Rng;
 
 use crate::core::cache::QueryCache;
 use crate::async_runtime::conn::{Conn, TcpPool};
-use crate::async_runtime::executor::{sleep_until, QueryIo};
+use crate::async_runtime::executor::{sleep_until, Mailbox};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
@@ -64,8 +64,8 @@ use crate::ffi::{
 /// values in and out) *and* the resolver client the async lifecycles run on.
 /// One instance is owned by the channel; every lookup runs on a per-lookup
 /// copy minted by [`derive`](Self::derive) — same shared `Rc`s, a fresh
-/// [`QueryIo`] mailbox — so concurrent lookups on a channel never share a
-/// `QueryIo`. The channel-owned instance's `io` is an inert placeholder. The
+/// [`Mailbox`] — so concurrent lookups on a channel never share a
+/// `Mailbox`. The channel-owned instance's `io` is an inert placeholder. The
 /// ffi grabs the derived copy's `self.io.clone()` to drive that mailbox;
 /// nested inline sub-calls (`self.clone().other(…)`) share it.
 pub(crate) struct AsyncClient {
@@ -105,7 +105,7 @@ impl AsyncClient {
     /// Mint the per-lookup copy every entry shim runs on: clone the config +
     /// shared `Rc`s, load the hosts table, snapshot the per-server endpoints
     /// from the current config, and mint a **fresh** mailbox so each
-    /// concurrent lookup owns its own `QueryIo`. Cloning `self.io` here
+    /// concurrent lookup owns its own `Mailbox`. Cloning `self.io` here
     /// instead would make every lookup on the channel share one mailbox — the
     /// bug this avoids.
     pub(crate) fn derive(&mut self) -> Rc<Self> {
@@ -909,7 +909,7 @@ pub(crate) struct DnsSignals {
 /// The DNS-application instantiation of the reactor mailbox — the only one the
 /// crate builds. The reactor primitives stay generic over `A`; everything DNS
 /// speaks `DnsMailbox`.
-pub(crate) type DnsMailbox = QueryIo<DnsSignals>;
+pub(crate) type DnsMailbox = Mailbox<DnsSignals>;
 
 fn push_effect(io: &Rc<RefCell<DnsMailbox>>, e: Effect) {
     io.borrow_mut().app.effects.push(e);

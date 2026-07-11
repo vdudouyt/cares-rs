@@ -4,7 +4,7 @@
 use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
 use crate::core::async_client::{DnsMailbox, DnsSignals, Effect};
-use crate::async_runtime::tasks::Tasks;
+use crate::async_runtime::executor::Executor;
 
 
 /// The C-visible channel: the pure core state plus the channel-level C
@@ -19,9 +19,9 @@ pub struct ChannelData {
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
-    /// The in-flight resolver ops — the reactor's task set (each future owns its
-    /// socket(s)).
-    tasks: Tasks<DnsSignals>,
+    /// The in-flight resolver ops — the executor's task set (each future owns
+    /// its socket(s)).
+    executor: Executor<DnsSignals>,
 }
 
 impl ChannelData {
@@ -32,7 +32,7 @@ impl ChannelData {
             socket_factory,
             server_state_callback: None,
             server_state_callback_arg: std::ptr::null_mut(),
-            tasks: Tasks::default(),
+            executor: Executor::default(),
         }
     }
 
@@ -43,7 +43,7 @@ impl ChannelData {
             socket_factory: self.socket_factory.clone(),
             server_state_callback: self.server_state_callback,
             server_state_callback_arg: self.server_state_callback_arg,
-            tasks: Tasks::default(),
+            executor: Executor::default(),
         }
     }
 
@@ -71,7 +71,7 @@ impl ChannelData {
         fut: impl std::future::Future<Output = T> + 'static,
         on: impl FnOnce(Result<T, c_int>) + 'static,
     ) {
-        let id = self.tasks.spawn(io, fut, on);
+        let id = self.executor.spawn(io, fut, on);
         self.advance(id);
     }
 
@@ -79,11 +79,11 @@ impl ChannelData {
     /// (server-state notify), and on completion deliver its result. On `Pending` the
     /// future has published the fds it is now blocked on into its mailbox.
     fn advance(&mut self, id: usize) {
-        let done = self.tasks.poll(id);
+        let done = self.executor.poll(id);
         // Drain + apply the future's app-specific effects between poll and delivery
-        // (server-state callbacks fire before the result). Scoped so the `tasks`
+        // (server-state callbacks fire before the result). Scoped so the `executor`
         // borrow releases before the callbacks fire.
-        let effects = match self.tasks.io(id) {
+        let effects = match self.executor.io(id) {
             Some(io) => std::mem::take(&mut io.borrow_mut().app.effects),
             None => Vec::new(),
         };
@@ -95,7 +95,7 @@ impl ChannelData {
             }
         }
         if done {
-            self.tasks.deliver(id, None);
+            self.executor.deliver(id, None);
         }
     }
 
@@ -106,7 +106,7 @@ impl ChannelData {
         let now = Instant::now();
         let rf: &libc::fd_set = &*read_fds;
         let wf: &libc::fd_set = &*write_fds;
-        let ready = self.tasks.drive_ready(now, |fd, writable| {
+        let ready = self.executor.drive_ready(now, |fd, writable| {
             let set = if writable { wf } else { rf };
             unsafe { libc::FD_ISSET(fd, set as *const libc::fd_set as *mut libc::fd_set) }
         });
@@ -119,8 +119,8 @@ impl ChannelData {
     /// future, which drops its owned sockets). The shared safe teardown for
     /// `ares_cancel` (ECANCELLED) / `ares_destroy` (EDESTRUCTION).
     pub(crate) fn abort_all(&mut self, status: c_int) {
-        for id in self.tasks.ids() {
-            self.tasks.deliver(id, Some(status));
+        for id in self.executor.ids() {
+            self.executor.deliver(id, Some(status));
         }
         // Drop any shared TCP connections the aborted futures held.
         self.state.tcp_pool.borrow_mut().clear();
@@ -128,12 +128,12 @@ impl ChannelData {
 
     /// Every (fd, wants_write) the caller should select on.
     fn all_poll_fds(&self) -> Vec<(i32, bool)> {
-        self.tasks.poll_fds()
+        self.executor.poll_fds()
     }
 
     /// The earliest timeout (ms) across in-flight tasks, or `None`.
     fn next_timeout_ms(&self) -> Option<u128> {
-        self.tasks.next_timeout_ms(Instant::now())
+        self.executor.next_timeout_ms(Instant::now())
     }
 
     /// One `ares_process` cycle: drive every in-flight async future whose
@@ -475,7 +475,7 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 #[no_mangle]
 pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
     let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
-    channeldata.tasks.active_count() as c_int
+    channeldata.executor.active_count() as c_int
 }
 
 #[no_mangle]

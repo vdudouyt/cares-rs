@@ -1,8 +1,8 @@
 //! The async socket layer the resolver ops drive — tokio-style connections
-//! over the pure-IO reactor (`async_runtime::executor`). This module knows sockets,
-//! framed streams, and mux tags; it knows **zero** about its application:
-//! like the executor it is generic over the mailbox's app-state `A`, and
-//! nothing in here names a protocol or a wire format.
+//! over the executor's mailbox. This module knows sockets, framed streams,
+//! and mux tags; it knows **zero** about its application: like the executor
+//! it is generic over the mailbox's app-state `A`, and nothing in here names
+//! a protocol or a wire format.
 //!
 //! - [`Conn`] — a query's connection. It owns its mailbox handle, so IO reads
 //!   tokio-style: `conn.send(bytes, timeout).await` /
@@ -17,6 +17,10 @@
 //!   reassembly buffer, and the [`TagOf`] extractor that routes each message
 //!   to a per-tag inbox slot. [`Conn::shared`] reserves a tag's slot and
 //!   dropping the `Conn` releases it (RAII — no manual register/clear).
+//!
+//! The readiness-driven IO arms at the bottom are the plumbing between a
+//! [`Socket`] and the mailbox: private here, they speak std vocabulary —
+//! one non-blocking read/send attempt is a `Poll<io::Result<…>>`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,9 +34,7 @@ use std::time::Instant;
 
 use futures_util::{select_biased, FutureExt};
 
-use crate::async_runtime::executor::{
-    poll_recv, recv_datagram, recv_stream, send_when_writable, sleep_until, QueryIo, Recv,
-};
+use crate::async_runtime::executor::{sleep_until, Mailbox, Wait};
 use crate::async_runtime::socket::{Socket, SocketFactory};
 
 /// How a shared stream picks the inbox slot for an incoming frame: the frame's
@@ -140,7 +142,7 @@ impl TcpPool {
 /// `conn.send(bytes, timeout).await` / `conn.recv(timeout).await`, just
 /// like `socket.recv(..).await`.
 pub struct Conn<A> {
-    io: Rc<RefCell<QueryIo<A>>>,
+    io: Rc<RefCell<Mailbox<A>>>,
     wire: Wire,
 }
 
@@ -155,20 +157,20 @@ enum Wire {
 
 impl<A> Conn<A> {
     /// An owned datagram socket, already connected. One recv = one message.
-    pub fn datagram(io: Rc<RefCell<QueryIo<A>>>, sock: Rc<dyn Socket>) -> Self {
+    pub fn datagram(io: Rc<RefCell<Mailbox<A>>>, sock: Rc<dyn Socket>) -> Self {
         Conn { io, wire: Wire::Datagram { sock } }
     }
 
     /// An owned one-shot stream socket, already connected; `frame_of` cuts its
     /// bytes into messages.
-    pub fn stream(io: Rc<RefCell<QueryIo<A>>>, sock: Rc<dyn Socket>, frame_of: FrameOf) -> Self {
+    pub fn stream(io: Rc<RefCell<Mailbox<A>>>, sock: Rc<dyn Socket>, frame_of: FrameOf) -> Self {
         Conn { io, wire: Wire::Stream { sock, rbuf: Vec::new(), frame_of } }
     }
 
     /// A query's handle on a shared stream conn. Reserves `tag`'s inbox slot
     /// so a sibling future's read routes this query's reply here; the slot is
     /// released when the handle drops.
-    pub fn shared(io: Rc<RefCell<QueryIo<A>>>, conn: Rc<RefCell<TcpConn>>, tag: u16) -> Self {
+    pub fn shared(io: Rc<RefCell<Mailbox<A>>>, conn: Rc<RefCell<TcpConn>>, tag: u16) -> Self {
         conn.borrow_mut().inbox.insert(tag, None);
         Conn { io, wire: Wire::Shared(conn, tag) }
     }
@@ -210,28 +212,28 @@ impl<A> Conn<A> {
 
     /// One non-blocking read of this conn's next message: a datagram, a framed
     /// one-shot stream message, or this tag's routed message off the shared
-    /// conn. `Recv::Pending` = nothing yet (WouldBlock / incomplete).
-    fn read(&mut self) -> Recv {
+    /// conn. `Poll::Pending` = nothing yet (WouldBlock / incomplete).
+    fn read(&mut self) -> Poll<io::Result<Vec<u8>>> {
         match &mut self.wire {
             Wire::Datagram { sock } => recv_datagram(&**sock),
             Wire::Stream { sock, rbuf, frame_of } => {
                 // One-shot stream: drain bytes, then try to pop one frame. A
                 // buffered frame delivers even on a dead socket; else a dead
-                // socket is `Dead`, a live-but-incomplete is `Pending`.
+                // socket errors, a live-but-incomplete is `Pending`.
                 let alive = recv_stream(&**sock, rbuf);
                 match frame_of(rbuf) {
-                    Some(frame) => Recv::Msg(frame),
-                    None if !alive => Recv::Dead,
-                    None => Recv::Pending,
+                    Some(frame) => Poll::Ready(Ok(frame)),
+                    None if !alive => Poll::Ready(Err(dead())),
+                    None => Poll::Pending,
                 }
             }
             Wire::Shared(c, tag) => {
                 let mut conn = c.borrow_mut();
                 let alive = conn.recv_and_route();
                 match conn.inbox.get_mut(tag).and_then(|slot| slot.take()) {
-                    Some(msg) => Recv::Msg(msg),
-                    None if !alive => Recv::Dead,
-                    None => Recv::Pending,
+                    Some(msg) => Poll::Ready(Ok(msg)),
+                    None if !alive => Poll::Ready(Err(dead())),
+                    None => Poll::Pending,
                 }
             }
         }
@@ -281,13 +283,219 @@ impl<A> Drop for Conn<A> {
     }
 }
 
+// ===== Readiness-driven IO arms: the Socket ↔ mailbox plumbing =====
+
+thread_local! {
+    /// One reused 64 KB receive scratch buffer (a fresh `[0u8; 65535]` per recv
+    /// would zero 64 KB every call). Single-threaded engine, borrowed only for
+    /// the synchronous span of one recv.
+    static RECV_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; 65_535]);
+}
+
+/// The uniform dead-socket error (EOF / hard recv failure).
+fn dead() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")
+}
+
+/// Await writability on `sock`, then send `bytes` once. Re-awaits on `WouldBlock`;
+/// `Err(TimedOut)` on timeout before writable, the socket's own error on a hard
+/// send failure. The writable arm is polled first — a fd that fired in the same
+/// cycle the timeout passed still sends (writable preempts expiry).
+async fn send_when_writable<A>(
+    io: &Rc<RefCell<Mailbox<A>>>,
+    sock: &dyn Socket,
+    bytes: &[u8],
+    timeout: Instant,
+) -> io::Result<()> {
+    let fd = sock.as_raw_fd();
+    loop {
+        {
+            let mut writable = pin!(poll_fn(|_| poll_writable(io, fd)).fuse());
+            let mut t = pin!(sleep_until(io, timeout).fuse());
+            select_biased! {
+                _ = writable => {}
+                _ = t => return Err(io::ErrorKind::TimedOut.into()), // timed out before writable
+            }
+        }
+        match sock.send(bytes) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // re-await writable
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// One non-blocking receive of a self-delimiting datagram (UDP): `Ready(Ok)`
+/// on any read (incl. a zero-length datagram), `Pending` on `WouldBlock`,
+/// `Ready(Err)` on a hard error.
+fn recv_datagram(sock: &dyn Socket) -> Poll<io::Result<Vec<u8>>> {
+    RECV_BUF.with(|scratch| {
+        let mut tmp = scratch.borrow_mut();
+        match sock.recv(&mut tmp) {
+            Ok((n, _)) => Poll::Ready(Ok(tmp[..n].to_vec())),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+            Err(_) => Poll::Ready(Err(dead())),
+        }
+    })
+}
+
+/// Drain a stream socket (TCP) once, appending whatever bytes are available to
+/// `buf`. Returns `false` if the connection died (EOF / hard error). Does **not**
+/// de-frame — the caller owns framing.
+fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>) -> bool {
+    RECV_BUF.with(|scratch| {
+        let mut tmp = scratch.borrow_mut();
+        match sock.recv(&mut tmp) {
+            Ok((0, _)) => false, // peer closed
+            Ok((n, _)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
+        }
+    })
+}
+
+/// The poll body of a recv arm (`conn.recv_msg()`, raced with `select_biased!`).
+/// If `fd`'s **read** readiness fired this cycle, consume that entry
+/// (`swap_remove`) and run `read` once; a `WouldBlock` (`Poll::Pending` from
+/// `read`) re-registers read-interest and suspends (so a sibling arm can still
+/// progress). Otherwise registers read-interest and suspends. Matches only
+/// read-readiness, so a sibling send-arm's write-readiness on the same fd is
+/// left alone. Resolves tokio-style: `Ok(bytes)` for a message,
+/// `Err(UnexpectedEof)` for a dead socket. `read` yields opaque bytes — the
+/// runtime names nothing of the app.
+fn poll_recv<A>(
+    io: &Rc<RefCell<Mailbox<A>>>,
+    fd: i32,
+    mut read: impl FnMut() -> Poll<io::Result<Vec<u8>>>,
+) -> Poll<io::Result<Vec<u8>>> {
+    let fired = {
+        let mut m = io.borrow_mut();
+        match m.fired.iter().position(|w| w.fd == fd && !w.writable) {
+            Some(pos) => {
+                m.fired.swap_remove(pos);
+                true
+            }
+            None => {
+                m.waits.push(Wait { fd, writable: false });
+                false
+            }
+        }
+    };
+    if !fired {
+        return Poll::Pending;
+    }
+    match read() {
+        Poll::Pending => {
+            io.borrow_mut().waits.push(Wait { fd, writable: false });
+            Poll::Pending
+        }
+        ready => ready,
+    }
+}
+
+/// A writability arm: if `fd` fired this cycle, consume **that fd's**
+/// readiness; otherwise register write-interest and suspend.
+fn poll_writable<A>(io: &Rc<RefCell<Mailbox<A>>>, fd: i32) -> Poll<()> {
+    let mut m = io.borrow_mut();
+    match m.fired.iter().position(|w| w.fd == fd && w.writable) {
+        Some(pos) => {
+            m.fired.swap_remove(pos);
+            Poll::Ready(())
+        }
+        None => {
+            m.waits.push(Wait { fd, writable: true });
+            Poll::Pending
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_runtime::executor::{noop_waker, Wait};
+    use std::cell::Cell;
     use std::future::Future;
-    use std::task::{Context, Poll};
+    use std::task::{Context, Waker};
     use std::time::Duration;
+
+    fn mailbox() -> Rc<RefCell<Mailbox<()>>> {
+        Rc::new(RefCell::new(Mailbox::default()))
+    }
+
+    fn rd(fd: i32) -> Wait {
+        Wait { fd, writable: false }
+    }
+
+    #[test]
+    fn poll_recv_not_fired_registers_wait() {
+        let io = mailbox();
+        let calls = Cell::new(0);
+        let p = poll_recv(&io, 7, || {
+            calls.set(calls.get() + 1);
+            Poll::Ready(Ok(vec![1]))
+        });
+        assert!(matches!(p, Poll::Pending));
+        assert_eq!(calls.get(), 0); // read not attempted before readiness
+        assert_eq!(io.borrow().waits.iter().map(|w| w.fd).collect::<Vec<_>>(), vec![7]);
+    }
+
+    #[test]
+    fn poll_recv_fired_msg_consumes_only_its_fd() {
+        let io = mailbox();
+        io.borrow_mut().fired = vec![rd(3), rd(7), rd(9)];
+        let calls = Cell::new(0);
+        let p = poll_recv(&io, 7, || {
+            calls.set(calls.get() + 1);
+            Poll::Ready(Ok(vec![42]))
+        });
+        assert!(matches!(p, Poll::Ready(Ok(ref b)) if b == &[42]));
+        assert_eq!(calls.get(), 1);
+        // Only fd 7 consumed; siblings 3 and 9 remain for their own arms.
+        let fds: Vec<i32> = io.borrow().fired.iter().map(|w| w.fd).collect();
+        assert!(!fds.contains(&7) && fds.contains(&3) && fds.contains(&9));
+    }
+
+    #[test]
+    fn poll_recv_ignores_a_write_readiness_on_its_fd() {
+        // A read-arm must not consume a *write* readiness on the same fd (that
+        // belongs to a sibling send-arm sharing the socket).
+        let io = mailbox();
+        io.borrow_mut().fired = vec![Wait { fd: 7, writable: true }];
+        let calls = Cell::new(0);
+        let p = poll_recv(&io, 7, || {
+            calls.set(calls.get() + 1);
+            Poll::Ready(Ok(vec![1]))
+        });
+        assert!(matches!(p, Poll::Pending));
+        assert_eq!(calls.get(), 0); // did not read
+        // The write readiness is left intact for the send-arm.
+        assert!(io.borrow().fired.iter().any(|w| w.fd == 7 && w.writable));
+    }
+
+    #[test]
+    fn poll_recv_wouldblock_reregisters_single_read() {
+        let io = mailbox();
+        io.borrow_mut().fired = vec![rd(7)];
+        let calls = Cell::new(0);
+        let p = poll_recv(&io, 7, || {
+            calls.set(calls.get() + 1);
+            Poll::Pending
+        });
+        assert!(matches!(p, Poll::Pending));
+        assert_eq!(calls.get(), 1); // read exactly once — no double recvfrom
+        assert!(io.borrow().fired.is_empty()); // fd consumed
+        assert_eq!(io.borrow().waits.iter().map(|w| w.fd).collect::<Vec<_>>(), vec![7]); // re-registered
+    }
+
+    #[test]
+    fn poll_recv_dead() {
+        let io = mailbox();
+        io.borrow_mut().fired = vec![rd(7)];
+        let p = poll_recv(&io, 7, || Poll::Ready(Err(dead())));
+        assert!(matches!(p, Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof));
+    }
 
     /// A socket that always has a datagram waiting — so a recv arm that is
     /// polled goes `Ready(Ok(..))` immediately.
@@ -320,18 +528,17 @@ mod tests {
     /// trial. The scenario is constructed, not timing-raced, so this is stable.
     #[test]
     fn recv_is_timeout_biased_under_simultaneous_readiness() {
-        let waker = noop_waker();
         for trial in 0..100 {
-            let io = Rc::new(RefCell::new(QueryIo::<()>::default()));
+            let io = mailbox();
             // Both arms ready on the first poll: the read fd is fired (a datagram
             // is waiting) AND the deadline is already in the past.
-            io.borrow_mut().fired = vec![Wait { fd: 42, writable: false }];
+            io.borrow_mut().fired = vec![rd(42)];
             let sock: Rc<dyn Socket> = Rc::new(AlwaysReadable { fd: 42 });
             let mut conn = Conn::datagram(io.clone(), sock);
             let past = Instant::now() - Duration::from_secs(1);
 
             let mut fut = pin!(conn.recv(past));
-            let mut cx = Context::from_waker(&waker);
+            let mut cx = Context::from_waker(Waker::noop());
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(r) => assert!(
                     r.is_err_and(|e| e.kind() == io::ErrorKind::TimedOut),
