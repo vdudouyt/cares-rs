@@ -132,8 +132,12 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
     // Cache probe: if a fresh cached reply parses, deliver synchronously.
-    let name_clean = name.strip_suffix('.').unwrap_or(name.as_ref());
-    if let Some(cached_buf) = channeldata.state.cache.borrow_mut().get(name_clean, dnstype as u16, Instant::now()) {
+    // Hoisted out of the `if let` scrutinee so the cache RefMut drops at the
+    // `;` — a scrutinee guard would be held across the C callback below, and
+    // a callback re-entering any cache path would then panic (regression
+    // test: tests/reentrant_callback.rs).
+    let cached = channeldata.state.cache.borrow_mut().get(name.strip_suffix('.').unwrap_or(name.as_ref()), dnstype as u16, Instant::now());
+    if let Some(cached_buf) = cached {
         if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf) {
             let dnsrec = Box::into_raw(Box::new(rec));
             unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };

@@ -26,7 +26,7 @@ use rand::Rng;
 
 use crate::core::cache::QueryCache;
 use crate::core::conn::Conn;
-use crate::core::tcp_pool::TcpPool;
+use crate::core::tcp_pool::{TcpConn, TcpPool};
 use crate::async_runtime::executor::{sleep_until, Mailbox};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
@@ -385,7 +385,10 @@ impl AsyncClient {
         // through.
         let cache_rtype = if matches!(filter, AddressFamily::Ipv4) { RTYPE_A } else { RTYPE_AAAA };
         let cache_family = if matches!(filter, AddressFamily::Ipv4) { AF_INET } else { AF_INET6 };
-        if let Some(cached) = self.cache.borrow_mut().get(&resolved, cache_rtype, Instant::now()) {
+        // Hoisted out of the `if let` scrutinee: edition 2021 would keep the
+        // cache RefMut alive for the whole body otherwise (fragile).
+        let cached = self.cache.borrow_mut().get(&resolved, cache_rtype, Instant::now());
+        if let Some(cached) = cached {
             if let Ok(mut rrs) = addr_reply(&cached, cache_rtype, ReplyRequire::Items) {
                 if !self.sortlist.is_empty() {
                     apply_sortlist(&self.sortlist, &mut rrs.items);
@@ -1688,7 +1691,18 @@ impl AsyncClient {
         for _ in 0..opts.attempts.max(1) {
             let Some(ep) = self.endpoints.get(s) else { break };
             let conn = if use_tcp {
-                self.tcp_pool.borrow_mut().get_or_create(s, &self.factory, ep.bind, ep.tcp_addr).ok().map(|c| {
+                // Checkout-then-release: no pool guard is live while the C
+                // socket callbacks (asocket/create-cb/config-cb/aconnect) fire
+                // during creation, nor while `Conn::shared` borrows the TcpConn.
+                let pooled = self.tcp_pool.borrow().get(s);
+                let checked_out = pooled.or_else(|| {
+                    let sock = self.factory.create_tcp(ep.bind).ok()?;
+                    let _ = sock.connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
+                    let c = TcpConn::new(sock);
+                    self.tcp_pool.borrow_mut().insert(s, c.clone());
+                    Some(c)
+                });
+                checked_out.map(|c| {
                     let (conn, tag) =
                         Conn::shared(self.io.clone(), c, qid_of(payload), || rand::thread_rng().r#gen());
                     if payload.len() >= 2 {

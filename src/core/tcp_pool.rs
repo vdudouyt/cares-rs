@@ -20,12 +20,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
 use std::rc::Rc;
 use std::task::Poll;
 
 use crate::async_runtime::io::{dead, recv_stream};
-use crate::async_runtime::socket::{Socket, SocketFactory};
+use crate::async_runtime::socket::Socket;
 
 /// The mux tag of a DNS frame — its transaction ID (header bytes 0..2), the
 /// demux key shared-TCP replies are routed by. `None` for a frame too short to
@@ -67,6 +66,15 @@ pub(crate) struct TcpConn {
 }
 
 impl TcpConn {
+    /// A fresh shared connection over `sock` — already created **and**
+    /// connected by the caller, outside any pool borrow, so the C socket
+    /// callbacks (asocket / create-cb / config-cb / aconnect) fire with no
+    /// cell held.
+    pub(crate) fn new(sock: Rc<dyn Socket>) -> Rc<RefCell<Self>> {
+        let fd = sock.as_raw_fd();
+        Rc::new(RefCell::new(TcpConn { sock, fd, rbuf: Vec::new(), inbox: HashMap::new() }))
+    }
+
     /// Reserve a free inbox tag for a query. Starts from the query's current
     /// transaction id `qid`; if an in-flight sibling on this conn already owns
     /// it, fresh ids are drawn from `reroll` until one is free (≈ upstream
@@ -161,41 +169,23 @@ impl TcpPool {
         self.conns.remove(&key);
     }
 
-    /// Reuse the live connection to `key`, else open one bound to `bind` and
-    /// connect it to `to`.
-    pub fn get_or_create(
-        &mut self,
-        key: usize,
-        factory: &Rc<dyn SocketFactory>,
-        bind: SocketAddr,
-        to: SocketAddr,
-    ) -> Result<Rc<RefCell<TcpConn>>, ()> {
-        if let Some(c) = self.conns.get(&key) {
-            return Ok(c.clone());
-        }
-        let sock = factory.create_tcp(bind).map_err(|_| ())?;
-        let _ = sock.connect(to); // optimistic (EINPROGRESS → Ok)
-        let fd = sock.as_raw_fd();
-        let conn = Rc::new(RefCell::new(TcpConn {
-            sock,
-            fd,
-            rbuf: Vec::new(),
-            inbox: HashMap::new(),
-        }));
-        self.conns.insert(key, conn.clone());
-        Ok(conn)
+    /// The live connection to `key`, if any. (Take-and-release: callers clone
+    /// the `Rc` so no pool borrow outlives this call — socket creation on a
+    /// miss must happen with the pool **unborrowed**, see [`TcpConn::new`].)
+    pub fn get(&self, key: usize) -> Option<Rc<RefCell<TcpConn>>> {
+        self.conns.get(&key).cloned()
+    }
+
+    /// Register `conn` as the shared connection to `key`.
+    pub fn insert(&mut self, key: usize, conn: Rc<RefCell<TcpConn>>) {
+        self.conns.insert(key, conn);
     }
 }
 
 #[cfg(test)]
 impl TcpConn {
-    /// A `TcpConn` around `sock` with an empty inbox — for `core::conn`'s
-    /// checkout/RAII tests (its fields are private to this module).
-    pub(crate) fn stub(sock: Rc<dyn Socket>) -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(TcpConn { sock, fd: 5, rbuf: Vec::new(), inbox: HashMap::new() }))
-    }
-
-    /// Whether `tag` currently has a reserved inbox slot.
+    /// Whether `tag` currently has a reserved inbox slot (for the checkout/
+    /// RAII tests here and in `core::conn`; fields are private to this module).
     pub(crate) fn has_waiter(&self, tag: u16) -> bool {
         self.inbox.contains_key(&tag)
     }
@@ -204,6 +194,7 @@ impl TcpConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     /// A socket with no bytes waiting — enough to stand up a `TcpConn` for the
     /// tag-reservation tests (which never read it).

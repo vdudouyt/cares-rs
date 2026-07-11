@@ -108,18 +108,18 @@ impl Conn {
     /// One non-blocking read of this conn's next message: a datagram, a framed
     /// one-shot stream message, or this tag's routed message off the shared
     /// conn. `Poll::Pending` = nothing yet (WouldBlock / incomplete). The recv
-    /// goes through this lookup's mailbox `scratch` (borrowed only for the
-    /// synchronous span of the read).
+    /// goes through this lookup's mailbox `scratch`, taken OUT of the mailbox
+    /// for the read's span (each `borrow_mut` ends at its `;`) so the C recv
+    /// callback under `Socket::recv` fires with no mailbox borrow live.
     fn read(&mut self) -> Poll<io::Result<Vec<u8>>> {
-        let mut m = self.io.borrow_mut();
-        let scratch = &mut m.scratch;
-        match &mut self.wire {
-            Wire::Datagram { sock } => recv_datagram(&**sock, scratch),
+        let mut scratch = std::mem::take(&mut self.io.borrow_mut().scratch);
+        let r = match &mut self.wire {
+            Wire::Datagram { sock } => recv_datagram(&**sock, &mut scratch),
             Wire::Stream { sock, rbuf } => {
                 // One-shot stream: drain bytes, then try to pop one frame. A
                 // buffered frame delivers even on a dead socket; else a dead
                 // socket errors, a live-but-incomplete is `Pending`.
-                let alive = recv_stream(&**sock, rbuf, scratch);
+                let alive = recv_stream(&**sock, rbuf, &mut scratch);
                 match dns_frame(rbuf) {
                     Some(frame) => Poll::Ready(Ok(frame)),
                     None if !alive => Poll::Ready(Err(dead())),
@@ -127,8 +127,10 @@ impl Conn {
                 }
             }
             // The shared conn owns the drain+route+demux (per-tag inbox).
-            Wire::Shared(c, tag) => c.borrow_mut().poll_read(*tag, scratch),
-        }
+            Wire::Shared(c, tag) => c.borrow_mut().poll_read(*tag, &mut scratch),
+        };
+        self.io.borrow_mut().scratch = scratch; // put back (grown on first use)
+        r
     }
 
     /// Await this conn's next message with no timeout bound — usable directly
@@ -210,7 +212,7 @@ mod tests {
     /// covered in `tcp_pool`; here we check the `Conn` wiring around it.
     #[test]
     fn shared_conn_releases_slot_on_drop() {
-        let tc = TcpConn::stub(Rc::new(AlwaysReadable { fd: 5 }));
+        let tc = TcpConn::new(Rc::new(AlwaysReadable { fd: 5 }));
         let io: Rc<RefCell<DnsMailbox>> = Rc::new(RefCell::new(DnsMailbox::default()));
 
         let (a, ta) = Conn::shared(io.clone(), tc.clone(), 7, || panic!("free qid must not reroll"));
