@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
-use crate::core::async_client::{DnsMailbox, Effect};
-use crate::async_runtime::executor::noop_waker;
+use crate::core::async_client::{DnsMailbox, DnsSignals, Effect};
+use crate::async_runtime::tasks::Tasks;
 
 
 /// The C-visible channel: the pure core state plus the channel-level C
@@ -19,56 +19,9 @@ pub struct ChannelData {
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
-    /// In-flight async lifecycle futures (`None` = a reaped slot). Every
-    /// resolver op is one of these; the future owns its socket(s).
-    async_queries: Vec<Option<AsyncQuery>>,
-}
-
-/// One in-flight async lifecycle: its mailbox plus the type-erased query (its
-/// future + the one closure that delivers the result to C).
-struct AsyncQuery {
-    io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>,
-    query: Box<dyn PendingQuery>,
-}
-
-/// A boxed in-flight query with its per-op `Output` type erased: poll it to
-/// completion, then hand the result — or a cancel status — to its C delivery
-/// closure. The future owns its socket(s), so nothing is enqueued as a `Task`.
-trait PendingQuery {
-    /// Poll the future once; on `Ready`, stash the output and return `true`.
-    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> bool;
-    /// Deliver to C: the stashed output (`cancel = None`) or a terminal
-    /// `ares_cancel`/`ares_destroy` status (`cancel = Some(status)`); consumes
-    /// the query (dropping the future — unpolled on the cancel path).
-    fn deliver(self: Box<Self>, cancel: Option<c_int>);
-}
-
-/// The concrete query: a lifecycle future plus the single delivery closure that
-/// forwards its result (`Ok` on completion, `Err(status)` on cancel) to an
-/// `on_*_reply` handler in `lookups.rs`.
-struct Query<T> {
-    fut: std::pin::Pin<Box<dyn std::future::Future<Output = T>>>,
-    out: Option<T>,
-    on: Box<dyn FnOnce(Result<T, c_int>)>,
-}
-
-impl<T> PendingQuery for Query<T> {
-    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> bool {
-        match self.fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(v) => {
-                self.out = Some(v);
-                true
-            }
-            std::task::Poll::Pending => false,
-        }
-    }
-    fn deliver(self: Box<Self>, cancel: Option<c_int>) {
-        let result = match cancel {
-            None => Ok(self.out.expect("delivered before ready")),
-            Some(status) => Err(status),
-        };
-        (self.on)(result);
-    }
+    /// The in-flight resolver ops — the reactor's task set (each future owns its
+    /// socket(s)).
+    tasks: Tasks<DnsSignals>,
 }
 
 impl ChannelData {
@@ -79,7 +32,7 @@ impl ChannelData {
             socket_factory,
             server_state_callback: None,
             server_state_callback_arg: std::ptr::null_mut(),
-            async_queries: Vec::new(),
+            tasks: Tasks::default(),
         }
     }
 
@@ -90,7 +43,7 @@ impl ChannelData {
             socket_factory: self.socket_factory.clone(),
             server_state_callback: self.server_state_callback,
             server_state_callback_arg: self.server_state_callback_arg,
-            async_queries: Vec::new(),
+            tasks: Tasks::default(),
         }
     }
 
@@ -118,49 +71,21 @@ impl ChannelData {
         fut: impl std::future::Future<Output = T> + 'static,
         on: impl FnOnce(Result<T, c_int>) + 'static,
     ) {
-        let query: Box<dyn PendingQuery> = Box::new(Query { fut: Box::pin(fut), out: None, on: Box::new(on) });
-        let slot = AsyncQuery { io, query };
-        let id = match self.async_queries.iter().position(|s| s.is_none()) {
-            Some(i) => {
-                self.async_queries[i] = Some(slot);
-                i
-            }
-            None => {
-                self.async_queries.push(Some(slot));
-                self.async_queries.len() - 1
-            }
-        };
+        let id = self.tasks.spawn(io, fut, on);
         self.advance(id);
     }
 
-    /// Advance one async future one step: poll it, apply the effects it emitted
-    /// (server-state notify / success cache), and on completion fire its C
-    /// callback and reap the slot. On `Pending` the future has published the
-    /// fds it is now blocked on into its mailbox.
+    /// Advance one task one step: poll it, apply the DNS effects it emitted
+    /// (server-state notify), and on completion deliver its result. On `Pending` the
+    /// future has published the fds it is now blocked on into its mailbox.
     fn advance(&mut self, id: usize) {
-        if self.async_queries.get(id).and_then(|s| s.as_ref()).is_none() {
-            return;
-        }
-        let waker = noop_waker();
-        // The mailbox contract: published waits/timeout are valid until the next
-        // poll; every pending arm re-registers during the poll. Clear here (after
-        // drive_fd_futures computed `fired` from them) so registrations start
-        // fresh — generic combinators (`select_biased!`) can't clear for us.
-        {
-            let io = &self.async_queries[id].as_ref().unwrap().io;
-            let mut m = io.borrow_mut();
-            m.waits.clear();
-            m.timeout = None;
-        }
-        // Poll the query's future; it stashes its output and returns true on
-        // completion, so it fires after the mailbox borrow drops + effects apply.
-        let done = {
-            let mut cx = std::task::Context::from_waker(&waker);
-            self.async_queries[id].as_mut().unwrap().query.poll(&mut cx)
-        };
-        let effects = {
-            let aq = self.async_queries[id].as_ref().unwrap();
-            std::mem::take(&mut aq.io.borrow_mut().app.effects)
+        let done = self.tasks.poll(id);
+        // Drain + apply the future's app-specific effects between poll and delivery
+        // (server-state callbacks fire before the result). Scoped so the `tasks`
+        // borrow releases before the callbacks fire.
+        let effects = match self.tasks.io(id) {
+            Some(io) => std::mem::take(&mut io.borrow_mut().app.effects),
+            None => Vec::new(),
         };
         for effect in effects {
             match effect {
@@ -169,95 +94,46 @@ impl ChannelData {
                 }
             }
         }
-        // On completion, reap the slot and fire its C delivery closure.
         if done {
-            let slot = self.async_queries[id].take().unwrap();
-            slot.query.deliver(None);
+            self.tasks.deliver(id, None);
         }
     }
 
-    /// Drive every async future whose published fd is ready (or whose timeout
-    /// passed) this `ares_process` cycle: set its mailbox readiness and poll it.
+    /// Drive every task whose published fd is ready (or whose timeout passed) this
+    /// `ares_process` cycle: set its mailbox readiness via the `FD_ISSET` oracle
+    /// (the sole unsafe here) and re-poll it.
     fn drive_fd_futures(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
         let now = Instant::now();
-        for id in 0..self.async_queries.len() {
-            // Compute readiness under the mailbox borrow (no waits clone), then
-            // release it before `advance` (which needs `&mut self`).
-            let ready = match self.async_queries.get(id).and_then(|s| s.as_ref()) {
-                Some(aq) => {
-                    let mut m = aq.io.borrow_mut();
-                    let mut fired = Vec::new();
-                    for w in &m.waits {
-                        let set = if w.writable { &mut *write_fds } else { &mut *read_fds };
-                        if unsafe { libc::FD_ISSET(w.fd, set) } {
-                            fired.push(*w);
-                        }
-                    }
-                    // Expiry gates the re-poll (a future blocked only on a
-                    // timeout still needs waking); it isn't stored — the timeout
-                    // arms read the clock directly.
-                    let expired = m.timeout.is_some_and(|d| now >= d);
-                    if fired.is_empty() && !expired {
-                        false
-                    } else {
-                        m.fired = fired;
-                        true
-                    }
-                }
-                None => continue,
-            };
-            if ready {
-                self.advance(id);
-            }
+        let rf: &libc::fd_set = &*read_fds;
+        let wf: &libc::fd_set = &*write_fds;
+        let ready = self.tasks.drive_ready(now, |fd, writable| {
+            let set = if writable { wf } else { rf };
+            unsafe { libc::FD_ISSET(fd, set as *const libc::fd_set as *mut libc::fd_set) }
+        });
+        for id in ready {
+            self.advance(id);
         }
     }
 
-    /// Fire `status` to everything in flight — classic tasks via their C
-    /// callback, async futures aborted (fire the terminal status + drop the
+    /// Fire `status` to every in-flight task (fire the terminal status + drop the
     /// future, which drops its owned sockets). The shared safe teardown for
     /// `ares_cancel` (ECANCELLED) / `ares_destroy` (EDESTRUCTION).
     pub(crate) fn abort_all(&mut self, status: c_int) {
-        for id in 0..self.async_queries.len() {
-            self.terminate_async(id, status);
+        for id in self.tasks.ids() {
+            self.tasks.deliver(id, Some(status));
         }
         // Drop any shared TCP connections the aborted futures held.
         self.state.tcp_pool.borrow_mut().clear();
     }
 
-    /// Abort one async lifecycle: fire its terminal status (ECANCELLED /
-    /// EDESTRUCTION) and drop the future without polling it (so a multi-step
-    /// lifecycle won't re-send into a channel being torn down).
-    fn terminate_async(&mut self, id: usize, status: c_int) {
-        let Some(slot) = self.async_queries.get_mut(id).and_then(|s| s.take()) else {
-            return; // already reaped
-        };
-        slot.query.deliver(Some(status));
-    }
-
-    /// Every (fd, wants_write) the caller should select on: each in-flight
-    /// async future's published waits.
+    /// Every (fd, wants_write) the caller should select on.
     fn all_poll_fds(&self) -> Vec<(i32, bool)> {
-        let mut fds = Vec::new();
-        for aq in self.async_queries.iter().flatten() {
-            for w in &aq.io.borrow().waits {
-                fds.push((w.fd, w.writable));
-            }
-        }
-        fds
+        self.tasks.poll_fds()
     }
 
-    /// The earliest timeout (ms) across in-flight async futures, or `None` when
-    /// nothing is in flight.
+    /// The earliest timeout (ms) across in-flight tasks, or `None`.
     fn next_timeout_ms(&self) -> Option<u128> {
-        let now = Instant::now();
-        let mut best: Option<u128> = None;
-        for aq in self.async_queries.iter().flatten() {
-            if let Some(d) = aq.io.borrow().timeout {
-                let ms = d.saturating_duration_since(now).as_millis();
-                best = Some(best.map_or(ms, |b| b.min(ms)));
-            }
-        }
-        best
+        self.tasks.next_timeout_ms(Instant::now())
     }
 
     /// One `ares_process` cycle: drive every in-flight async future whose
@@ -599,7 +475,7 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 #[no_mangle]
 pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
     let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
-    channeldata.async_queries.iter().filter(|s| s.is_some()).count() as c_int
+    channeldata.tasks.active_count() as c_int
 }
 
 #[no_mangle]
