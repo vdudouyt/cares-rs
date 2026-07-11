@@ -44,7 +44,8 @@ impl FromStr for SysConfig {
             if line.is_empty() { continue; }
 
             let mut parts = line.split_whitespace();
-            let keyword = parts.next().unwrap();
+            // A non-empty trimmed line always has a first token.
+            let Some(keyword) = parts.next() else { continue };
             let rest = parts.collect::<Vec<_>>();
             let [arg1, ..] = rest[..] else { return Err(ParseError::MissingValue { keyword: keyword.into() })  };
 

@@ -1173,7 +1173,8 @@ impl ares_dns_record_t {
     ) -> Result<&mut ares_dns_rr_t, AresError> {
         let vec = section_vec_mut(self, sect).ok_or(AresError::from(ARES_EBADRESP))?;
         vec.push(new_rr(name, rtype, rclass, ttl));
-        Ok(vec.last_mut().unwrap())
+        // Just pushed, so never empty; the error arm is unreachable by construction.
+        vec.last_mut().ok_or(AresError::from(ARES_EBADRESP))
     }
 
     pub(crate) fn rr_cnt(&self, sect: u32) -> usize {

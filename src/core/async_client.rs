@@ -420,9 +420,12 @@ impl AsyncClient {
         if lookup.replies.is_empty() {
             return Err(lookup.status);
         }
-        // Pick one family for the Hostent — IPv6 (AAAA) if present, else the first.
+        // Pick one family for the Hostent — IPv6 (AAAA) if present, else the first
+        // (the emptiness check above makes the else-branch unreachable).
         let pick = lookup.replies.iter().position(|f| f.rtype == RTYPE_AAAA).unwrap_or(0);
-        let reply = lookup.replies.into_iter().nth(pick).unwrap();
+        let Some(reply) = lookup.replies.into_iter().nth(pick) else {
+            return Err(ARES_ENODATA.into());
+        };
         let hfamily = if reply.rtype == RTYPE_AAAA { AF_INET6 } else { AF_INET };
 
         // Cache the chosen family's raw reply under the winning name (+ the bare name
@@ -503,7 +506,8 @@ impl AsyncClient {
             if (flags & ARES_NI_NAMEREQD) != 0 {
                 return NameinfoReply { status: ARES_EBADFLAGS.into(), node: None, service: None, timeouts: 0 };
             }
-            let node = CString::new(format_ip_with_scope(&addr.ip, addr.scope_id, flags)).unwrap();
+            // IP strings never contain NUL; degrade to an empty node if ever violated.
+            let node = CString::new(format_ip_with_scope(&addr.ip, addr.scope_id, flags)).unwrap_or_default();
             let service = if want_service {
                 get_service_string(&Services::default(), addr.port, flags)
             } else {
@@ -1223,21 +1227,23 @@ pub(crate) fn get_service_string(services: &Services, port: u16, flags: i32) -> 
         return None;
     }
 
+    // A numeric port string never contains NUL, so this is always `Some`.
+    let numeric = || CString::new(port.to_string()).ok();
+
     if flags & ARES_NI_NUMERICSERV != 0 {
         // Return numeric port
-        return Some(CString::new(port.to_string()).unwrap());
+        return numeric();
     }
 
     // Determine protocol preference based on flags
     let prefer_udp = (flags & ARES_NI_DGRAM) != 0;
 
-    // Try to look up the service name
-    if let Some(name) = services.lookup_any(port, prefer_udp) {
-        Some(CString::new(name).unwrap())
-    } else {
-        // Fall back to numeric port
-        Some(CString::new(port.to_string()).unwrap())
-    }
+    // Try to look up the service name; fall back to the numeric port (also the
+    // fallback for a service name with an embedded NUL — degrade, don't panic).
+    services
+        .lookup_any(port, prefer_udp)
+        .and_then(|name| CString::new(name).ok())
+        .or_else(numeric)
 }
 
 /// How a getaddrinfo service string resolves to a port.
@@ -1306,8 +1312,12 @@ pub(crate) fn on_host_reply(res: Result<&[u8], AresError>, rtype: u16, family: i
     let is_ptr = rtype == RECORD_TYPE_PTR;
     let require = if is_ptr { ReplyRequire::ItemsOrAliases } else { ReplyRequire::Items };
     let mut rrs = addr_reply(buf, rtype, require)?;
+    // PTR flows always carry the queried ip; if that invariant ever broke we
+    // would deliver without the synthetic PTR record rather than panic.
     if is_ptr {
-        push_synthetic_ptr(&mut rrs, ip.expect("PTR flows carry the queried ip"));
+        if let Some(ip) = ip {
+            push_synthetic_ptr(&mut rrs, ip);
+        }
     }
     Ok(Hostent::from_parsed(rrs, family))
 }

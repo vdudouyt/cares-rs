@@ -383,7 +383,8 @@ pub unsafe extern "C" fn ares_inet_ntop(af: c_int, src: *const c_void, dst: *mut
             let addr = unsafe { *(src as *const [u8; 4]) };
             let s = format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
             if s.len() + 1 > size as usize { return std::ptr::null(); }
-            let cs = CString::new(s).unwrap();
+            // Dotted-quad strings never contain NUL; null on the impossible.
+            let Ok(cs) = CString::new(s) else { return std::ptr::null() };
             let bytes = cs.as_bytes_with_nul();
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
             dst
@@ -393,7 +394,8 @@ pub unsafe extern "C" fn ares_inet_ntop(af: c_int, src: *const c_void, dst: *mut
             let ip6 = std::net::Ipv6Addr::from(addr);
             let s = ip6.to_string();
             if s.len() + 1 > size as usize { return std::ptr::null(); }
-            let cs = CString::new(s).unwrap();
+            // IPv6 display strings never contain NUL; null on the impossible.
+            let Ok(cs) = CString::new(s) else { return std::ptr::null() };
             let bytes = cs.as_bytes_with_nul();
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
             dst

@@ -39,6 +39,12 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      # Lint gate: zero warnings, and the panic-safety wall in src/lib.rs
+      # (deny unwrap/expect/panic!/todo!/unimplemented!/unreachable! outside
+      # cfg(test)) only binds under clippy — so clippy must run in CI.
+      - name: Clippy (zero warnings + panic-safety wall)
+        run: cargo clippy --all-targets -- -D warnings
+
       # ABI + unsafe-surface gates:
       #  - the cbindgen-generated header must match the committed baseline
       #  - the .so's ares_* export set must match the committed baseline

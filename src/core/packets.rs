@@ -568,11 +568,13 @@ impl RRParser<'_> for AddrRecord {
 }
 
 pub fn buf_to_ip(buf: &[u8]) -> Result<IpAddr, &'static str> {
-    match buf.len() {
-        4 => Ok(IpAddr::from(<[u8; 4]>::try_from(buf).unwrap())),
-        16 => Ok(IpAddr::from(<[u8; 16]>::try_from(buf).unwrap())),
-        _ => Err("invalid IP byte length"),
+    if let Ok(v4) = <[u8; 4]>::try_from(buf) {
+        return Ok(IpAddr::from(v4));
     }
+    if let Ok(v6) = <[u8; 16]>::try_from(buf) {
+        return Ok(IpAddr::from(v6));
+    }
+    Err("invalid IP byte length")
 }
 
 #[cfg(test)]

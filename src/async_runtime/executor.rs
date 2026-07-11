@@ -141,11 +141,17 @@ impl<A, T> AbstractTask<A> for Task<A, T> {
         }
     }
     fn deliver(self: Box<Self>, cancel: Option<i32>) {
-        let result = match cancel {
-            None => Ok(self.out.expect("delivered before ready")),
-            Some(status) => Err(status),
+        let this = *self;
+        let result = match (cancel, this.out) {
+            (Some(status), _) => Err(status),
+            (None, Some(out)) => Ok(out),
+            // Completion-delivery of a task that never stashed an output — the
+            // host only calls `deliver(None)` after `poll` returned `true`, so
+            // this arm is unreachable by construction; degrade to a dropped
+            // delivery rather than panic.
+            (None, None) => return,
         };
-        (self.on)(result);
+        (this.on)(result);
     }
 }
 
