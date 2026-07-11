@@ -8,6 +8,7 @@ A Rust rewrite of the [c-ares](https://c-ares.org/) asynchronous DNS resolver, s
 
 * Use non-blocking I/O following the reactor pattern. Never use blocking I/O requests.
 * All functions and structures exported in C must be `pub`.
+* **No thread-local (or global mutable) state.** Working state lives in structures owned — directly or transitively — by the channel (`ChannelData`); e.g. the receive scratch buffer is a `Mailbox` field, not a `thread_local!`.
 * Commit with **zero** build/clippy warnings.
 * **Porting tests:** copy `.c`/`.cc` files from the original c-ares tree at `/root/c-ares-1.34.6/` with as few changes as possible, for logical consistency and easy updates. Copy them verbatim; the only tests you may comment out or skip are EDNS and malloc/alloc-failure ones.
 

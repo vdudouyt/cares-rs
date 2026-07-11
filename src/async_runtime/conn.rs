@@ -64,12 +64,13 @@ pub struct TcpConn {
 }
 
 impl TcpConn {
-    /// Drain the socket, reassemble frames, and route each by its tag into
-    /// `inbox` (frames with no registered waiter are dropped). Returns `false`
-    /// if the connection died (EOF / hard error). Idempotent: a sibling future
-    /// calling this after the socket is drained just no-ops.
-    fn recv_and_route(&mut self) -> bool {
-        let alive = recv_stream(&*self.sock, &mut self.rbuf);
+    /// Drain the socket (via the reading lookup's `scratch`), reassemble
+    /// frames, and route each by its tag into `inbox` (frames with no
+    /// registered waiter are dropped). Returns `false` if the connection died
+    /// (EOF / hard error). Idempotent: a sibling future calling this after the
+    /// socket is drained just no-ops.
+    fn recv_and_route(&mut self, scratch: &mut Vec<u8>) -> bool {
+        let alive = recv_stream(&*self.sock, &mut self.rbuf, scratch);
         while let Some(frame) = (self.frame_of)(&mut self.rbuf) {
             if let Some(tag) = (self.tag_of)(&frame) {
                 if let Some(slot) = self.inbox.get_mut(&tag) {
@@ -212,15 +213,19 @@ impl<A> Conn<A> {
 
     /// One non-blocking read of this conn's next message: a datagram, a framed
     /// one-shot stream message, or this tag's routed message off the shared
-    /// conn. `Poll::Pending` = nothing yet (WouldBlock / incomplete).
+    /// conn. `Poll::Pending` = nothing yet (WouldBlock / incomplete). The recv
+    /// goes through this lookup's mailbox `scratch` (borrowed only for the
+    /// synchronous span of the read).
     fn read(&mut self) -> Poll<io::Result<Vec<u8>>> {
+        let mut m = self.io.borrow_mut();
+        let scratch = &mut m.scratch;
         match &mut self.wire {
-            Wire::Datagram { sock } => recv_datagram(&**sock),
+            Wire::Datagram { sock } => recv_datagram(&**sock, scratch),
             Wire::Stream { sock, rbuf, frame_of } => {
                 // One-shot stream: drain bytes, then try to pop one frame. A
                 // buffered frame delivers even on a dead socket; else a dead
                 // socket errors, a live-but-incomplete is `Pending`.
-                let alive = recv_stream(&**sock, rbuf);
+                let alive = recv_stream(&**sock, rbuf, scratch);
                 match frame_of(rbuf) {
                     Some(frame) => Poll::Ready(Ok(frame)),
                     None if !alive => Poll::Ready(Err(dead())),
@@ -229,7 +234,7 @@ impl<A> Conn<A> {
             }
             Wire::Shared(c, tag) => {
                 let mut conn = c.borrow_mut();
-                let alive = conn.recv_and_route();
+                let alive = conn.recv_and_route(scratch);
                 match conn.inbox.get_mut(tag).and_then(|slot| slot.take()) {
                     Some(msg) => Poll::Ready(Ok(msg)),
                     None if !alive => Poll::Ready(Err(dead())),
@@ -285,16 +290,17 @@ impl<A> Drop for Conn<A> {
 
 // ===== Readiness-driven IO arms: the Socket ↔ mailbox plumbing =====
 
-thread_local! {
-    /// One reused 64 KB receive scratch buffer (a fresh `[0u8; 65535]` per recv
-    /// would zero 64 KB every call). Single-threaded engine, borrowed only for
-    /// the synchronous span of one recv.
-    static RECV_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; 65_535]);
-}
-
 /// The uniform dead-socket error (EOF / hard recv failure).
 fn dead() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")
+}
+
+/// Grow the mailbox's receive scratch to its 64 KB working size on first use
+/// (kept allocated for the lookup's lifetime; see `Mailbox::scratch`).
+fn ensure_scratch(scratch: &mut Vec<u8>) {
+    if scratch.is_empty() {
+        scratch.resize(65_535, 0);
+    }
 }
 
 /// Await writability on `sock`, then send `bytes` once. Re-awaits on `WouldBlock`;
@@ -325,36 +331,32 @@ async fn send_when_writable<A>(
     }
 }
 
-/// One non-blocking receive of a self-delimiting datagram (UDP): `Ready(Ok)`
-/// on any read (incl. a zero-length datagram), `Pending` on `WouldBlock`,
-/// `Ready(Err)` on a hard error.
-fn recv_datagram(sock: &dyn Socket) -> Poll<io::Result<Vec<u8>>> {
-    RECV_BUF.with(|scratch| {
-        let mut tmp = scratch.borrow_mut();
-        match sock.recv(&mut tmp) {
-            Ok((n, _)) => Poll::Ready(Ok(tmp[..n].to_vec())),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-            Err(_) => Poll::Ready(Err(dead())),
-        }
-    })
+/// One non-blocking receive of a self-delimiting datagram (UDP) into the
+/// lookup's `scratch`: `Ready(Ok)` on any read (incl. a zero-length datagram),
+/// `Pending` on `WouldBlock`, `Ready(Err)` on a hard error.
+fn recv_datagram(sock: &dyn Socket, scratch: &mut Vec<u8>) -> Poll<io::Result<Vec<u8>>> {
+    ensure_scratch(scratch);
+    match sock.recv(scratch) {
+        Ok((n, _)) => Poll::Ready(Ok(scratch[..n].to_vec())),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+        Err(_) => Poll::Ready(Err(dead())),
+    }
 }
 
-/// Drain a stream socket (TCP) once, appending whatever bytes are available to
-/// `buf`. Returns `false` if the connection died (EOF / hard error). Does **not**
-/// de-frame — the caller owns framing.
-fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>) -> bool {
-    RECV_BUF.with(|scratch| {
-        let mut tmp = scratch.borrow_mut();
-        match sock.recv(&mut tmp) {
-            Ok((0, _)) => false, // peer closed
-            Ok((n, _)) => {
-                buf.extend_from_slice(&tmp[..n]);
-                true
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
-            Err(_) => false,
+/// Drain a stream socket (TCP) once via the lookup's `scratch`, appending
+/// whatever bytes are available to `buf`. Returns `false` if the connection
+/// died (EOF / hard error). Does **not** de-frame — the caller owns framing.
+fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>, scratch: &mut Vec<u8>) -> bool {
+    ensure_scratch(scratch);
+    match sock.recv(scratch) {
+        Ok((0, _)) => false, // peer closed
+        Ok((n, _)) => {
+            buf.extend_from_slice(&scratch[..n]);
+            true
         }
-    })
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
 }
 
 /// The poll body of a recv arm (`conn.recv_msg()`, raced with `select_biased!`).

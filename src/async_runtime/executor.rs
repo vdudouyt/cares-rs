@@ -65,6 +65,12 @@ pub(crate) struct Mailbox<A> {
     /// one fd with opposite interests a write-readiness isn't consumed by a
     /// read-arm (or vice versa).
     pub fired: Vec<Wait>,
+    /// This lookup's reusable receive scratch (grown to 64 KB by `conn` on
+    /// first use — a fresh `[0u8; 65535]` per recv would zero 64 KB every
+    /// call). Borrowed only for the synchronous span of one recv; empty for
+    /// lookups that never touch a socket. No global/thread-local state: the
+    /// buffer lives in the lookup's own mailbox, owned via the channel.
+    pub scratch: Vec<u8>,
     /// Application signals the reactor doesn't interpret (opaque to it).
     pub app: A,
 }
