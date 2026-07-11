@@ -26,7 +26,7 @@
 //!
 //! Protocol-agnostic end to end: the mailbox is generic over an opaque
 //! application-state type `A` the reactor never inspects, and each task's
-//! output type is erased behind [`ErasedTask`], so one [`Executor`] drives
+//! output type is erased behind [`AbstractTask`], so one [`Executor`] drives
 //! futures of many output types side by side. The host owns the `Executor`
 //! and orchestrates it: drives readiness in, polls, drains its own
 //! app-specific signals from each mailbox between poll and delivery, and
@@ -97,9 +97,9 @@ pub(crate) fn sleep_until<A>(
 /// One in-flight task with its future's `Output` type erased: its mailbox
 /// (opaque generic `A`), the future, and the delivery closure. Poll it to
 /// completion, then hand the result — or a cancel status — to that closure.
-/// The executor holds these as `Box<dyn ErasedTask<A>>`, so one [`Executor`]
+/// The executor holds these as `Box<dyn AbstractTask<A>>`, so one [`Executor`]
 /// drives futures of many different output types side by side.
-trait ErasedTask<A> {
+trait AbstractTask<A> {
     /// This task's mailbox (fds/timeout/fired + the host's app signals).
     fn io(&self) -> &Rc<RefCell<Mailbox<A>>>;
     /// Poll the future once; on `Ready`, stash the output and return `true`.
@@ -121,7 +121,7 @@ struct Task<A, T> {
     on: Box<dyn FnOnce(Result<T, i32>)>,
 }
 
-impl<A, T> ErasedTask<A> for Task<A, T> {
+impl<A, T> AbstractTask<A> for Task<A, T> {
     fn io(&self) -> &Rc<RefCell<Mailbox<A>>> {
         &self.io
     }
@@ -146,7 +146,7 @@ impl<A, T> ErasedTask<A> for Task<A, T> {
 /// The set of in-flight tasks, kept in a reused-slot free list (`None` =
 /// reaped). Generic over the mailbox app-state `A` — never inspected here.
 pub(crate) struct Executor<A> {
-    slots: Vec<Option<Box<dyn ErasedTask<A>>>>,
+    slots: Vec<Option<Box<dyn AbstractTask<A>>>>,
 }
 
 impl<A> Default for Executor<A> {
@@ -167,7 +167,7 @@ impl<A> Executor<A> {
     where
         A: 'static,
     {
-        let task: Box<dyn ErasedTask<A>> =
+        let task: Box<dyn AbstractTask<A>> =
             Box::new(Task { io, fut: Box::pin(fut), out: None, on: Box::new(on) });
         match self.slots.iter().position(|s| s.is_none()) {
             Some(i) => {
