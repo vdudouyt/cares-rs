@@ -25,7 +25,7 @@ use futures_util::{select_biased, FutureExt};
 use rand::Rng;
 
 use crate::core::cache::QueryCache;
-use crate::async_runtime::conn::{Conn, TcpPool};
+use crate::core::conn::{Conn, TcpPool};
 use crate::async_runtime::executor::{sleep_until, Mailbox};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
@@ -294,7 +294,7 @@ impl AsyncClient {
         let framed = if use_tcp { frame_tcp(&probe_payload) } else { probe_payload.clone() };
         let _ = sk.send(&framed);
         let mut conn = if use_tcp {
-            Conn::stream(io.clone(), sk, dns_frame)
+            Conn::stream(io.clone(), sk)
         } else {
             Conn::datagram(io.clone(), sk)
         };
@@ -876,8 +876,8 @@ fn resolve_hostaliases(hostname: &str) -> Result<String, c_int> {
 // ===================================================================
 // DNS resolver lifecycle (the "application" over the pure-IO reactor).
 // Moved out of executor.rs so the reactor names nothing DNS. Speaks the
-// conn layer's async sockets (async_runtime::conn — Conn::send/recv over the reactor)
-// + the neutral lookup.rs decision tables.
+// conn layer's async sockets (core::conn — Conn::send/recv, framed/muxed
+// TCP over the runtime's byte arms) + the neutral lookup.rs decision tables.
 // ===================================================================
 
 /// A fire-and-forget side effect the ffi applies after a poll — the one thing a
@@ -951,34 +951,8 @@ pub(crate) struct QueryOpts {
     pub failover_delay: u64,
 }
 
-/// The mux tag of a DNS frame — its transaction ID (header bytes 0..2), the
-/// demux key the conn layer routes shared-TCP replies by. `None` for a frame
-/// too short to carry one: the conn layer then hands it to any awaiting
-/// waiter, which rejects it in parsing (EBADRESP) — matching `qid_matches`'s
-/// acceptance of short buffers.
-pub(crate) fn dns_tag(frame: &[u8]) -> Option<u16> {
-    frame.get(0..2).map(|b| u16::from_be_bytes([b[0], b[1]]))
-}
-
-/// DNS-over-TCP message framing (RFC 1035 §4.2.2): each message is preceded
-/// by a u16-BE length. Pop one complete message off a stream's reassembly
-/// buffer, or `None` until it has accumulated. Supplied to the runtime's
-/// stream conns — the wire format is DNS's, not the runtime's. (`frame_tcp`
-/// below is the encode side.)
-pub(crate) fn dns_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    if rbuf.len() < 2 {
-        return None;
-    }
-    let payload_len = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
-    if rbuf.len() < 2 + payload_len {
-        return None;
-    }
-    let msg = rbuf[2..2 + payload_len].to_vec();
-    rbuf.drain(..2 + payload_len);
-    Some(msg)
-}
-
-/// Wrap a DNS payload in the 2-byte big-endian length prefix used for TCP framing.
+/// Wrap a DNS payload in the 2-byte big-endian length prefix used for TCP
+/// framing (RFC 1035 §4.2.2; the decode side is `core::conn::dns_frame`).
 fn frame_tcp(payload: &[u8]) -> BytesMut {
     let mut framed = BytesMut::with_capacity(2 + payload.len());
     framed.put_u16(payload.len() as u16);
@@ -1395,7 +1369,7 @@ impl AsyncClient {
             resolvconf_path: String::new(),
             hosts_path: String::new(),
             cache: Rc::new(RefCell::new(QueryCache::default())),
-            tcp_pool: Rc::new(RefCell::new(TcpPool::new(dns_frame, dns_tag))),
+            tcp_pool: Rc::new(RefCell::new(TcpPool::new())),
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
@@ -1703,7 +1677,7 @@ impl AsyncClient {
     /// across servers on a creation failure (matches upstream `ares_conn.c`).
     /// Returns the live `Conn` + the server index it landed on, or `Err(())` when
     /// the attempt budget is spent (callers map that to `ARES_ECONNREFUSED`).
-    fn connect_failover(&self, start: usize, use_tcp: bool, qid: u16) -> Result<(Conn<DnsSignals>, usize), ()> {
+    fn connect_failover(&self, start: usize, use_tcp: bool, qid: u16) -> Result<(Conn, usize), ()> {
         let opts = self.opts();
         let mut s = start;
         for _ in 0..opts.attempts.max(1) {
@@ -1897,20 +1871,3 @@ fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, health: &RefCell<ServerHealth>, se
 
 /// One query's `(reply-or-status, timeout-count)` outcome.
 type QueryOutcome = (Result<Vec<u8>, c_int>, c_int);
-#[cfg(test)]
-mod tests {
-    use super::dns_frame;
-
-    #[test]
-    fn dns_frame_extraction() {
-        let mut rbuf = vec![0x00, 0x03, 1, 2, 3, 0x00];
-        assert_eq!(dns_frame(&mut rbuf), Some(vec![1, 2, 3]));
-        assert_eq!(rbuf, vec![0x00]); // partial next frame stays buffered
-        assert_eq!(dns_frame(&mut rbuf), None);
-        rbuf.push(0x02);
-        assert_eq!(dns_frame(&mut rbuf), None); // length known, payload missing
-        rbuf.extend_from_slice(&[9, 8]);
-        assert_eq!(dns_frame(&mut rbuf), Some(vec![9, 8]));
-        assert!(rbuf.is_empty());
-    }
-}
