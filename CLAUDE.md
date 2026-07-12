@@ -44,7 +44,7 @@ CI additionally runs the gtest suite under **Valgrind** (`--leak-check=full`), a
 - **Unsafe ratchet** — `python3 tools/unsafe_lines.py --check tools/unsafe_baseline.json`. The count of lines inside `unsafe` contexts may never grow past the baseline. If you legitimately move logic and the count drops, run `--update` to lower the ratchet; it must never rise.
 - **Clippy `-D warnings`** — `cargo clippy --all-targets -- -D warnings`; this is also what makes the panic-safety deny wall in `src/lib.rs` binding.
 
-When you change the FFI surface, regenerate and re-baseline: `cargo build`, then update `ci-data/cares.h.baseline` / `ci-data/exports.baseline` as part of the same change.
+When you change the FFI surface, regenerate and re-baseline: `cargo build`, then update `ci-data/cares.h.baseline` / `ci-data/exports.baseline` as part of the same change. The exports baseline is committed in **`LC_ALL=C` sort order** (and CI pins `LC_ALL=C` when comparing) — locale-dependent collation must never decide the gate.
 
 ## Architecture
 
