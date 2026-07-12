@@ -19,8 +19,13 @@ pub fn parse_from_reader<R: Read>(mut r: R) -> Option<Vec<(IpAddr, Option<u16>)>
 pub fn parse_servers_str(s: &str) -> Option<Vec<(IpAddr, Option<u16>)>> {
     let mut out = Vec::new();
 
-    for item in s.split([',', '\n']).filter(|t| !t.is_empty()) {
-        out.push(parse_ns_addr(item.trim())?);
+    // Also split on spaces (c-ares accepts space-separated)
+    for item in s.split([',', '\n', ' ']).map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        // Skip entries with % (link-local interface specifier)
+        if item.contains('%') {
+            continue;
+        }
+        out.push(parse_ns_addr(item)?);
     }
 
     Some(out)

@@ -2,13 +2,13 @@ pub trait CLinkedList {
     fn next(&mut self) -> &mut *mut Self;
 }
 
-pub fn chain_nodes<T>(mut elts: Vec<T>) -> T where T: CLinkedList {
-    let mut tail = elts.pop().unwrap();
+pub fn chain_nodes<T>(mut elts: Vec<T>) -> Option<T> where T: CLinkedList {
+    let mut tail = elts.pop()?;
     while let Some(mut x) = elts.pop() /* O(1) */ {
         *(x.next()) = Box::into_raw(Box::new(tail));
         tail = x
     }
-    tail
+    Some(tail)
 }
 
 #[cfg(test)]
@@ -34,13 +34,17 @@ mod tests {
     fn test_chain_leaves() {
         let vec = vec![DummyNode::new(1), DummyNode::new(2), DummyNode::new(3)];
         unsafe {
-            let head = chain_nodes(vec);
+            let head = chain_nodes(vec).unwrap();
             assert_eq!(head.num, 1);
-            let head = &*(head.next);
-            assert_eq!(head.num, 2);
-            let head = &*(head.next);
-            assert_eq!(head.num, 3);
-            assert_eq!(head.next, std::ptr::null_mut());
+            let n2 = head.next; // chain_nodes Box::into_raw'd every node after the head
+            assert_eq!((*n2).num, 2);
+            let n3 = (*n2).next;
+            assert_eq!((*n3).num, 3);
+            assert_eq!((*n3).next, std::ptr::null_mut());
+            // Reclaim the heap nodes so the test is leak-clean (Miri checks this;
+            // in production the chain is freed via ares_free_data).
+            drop(Box::from_raw(n2));
+            drop(Box::from_raw(n3));
         }
     }
 }

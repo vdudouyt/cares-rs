@@ -1,25 +1,43 @@
-mod ares_data;
+pub mod ares_data;
 mod ares_hostent;
-mod ares_options;
+pub mod ares_options;
+pub mod ares_socket;
 mod cnullterminated;
-mod cstr;
 mod clinkedlist;
-mod error;
+pub mod dns_record;
+pub mod error;
 mod offset_of;
 
-use std::ffi::{ c_int, c_void, c_char };
-use std::os::fd::{ AsRawFd };
+use std::ffi::{ c_int, c_uint, c_void, c_char };
 use std::ffi::{ CString, CStr };
-use std::io::Cursor;
 use std::net::IpAddr;
 use std::cmp::min;
+use std::time::Instant;
 use crate::core::packets::*;
-use crate::core::ares::{ Ares, Status, Family };
 use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::*;
+// Re-export the address union (a field type of the public ares_addr_node /
+// ares_addr_port_node structs) so Rust consumers can construct those.
+pub use crate::ffi::ares_data::AresAddrUnion;
 use crate::ffi::clinkedlist::*;
-use crate::cstr;
+use crate::ffi::error::*;
+pub use crate::ffi::ares_socket::{CSocketFactory, AresSocketFunctions};
+use crate::core::sortlist::*;
+use std::io::Cursor;
+
+mod addrinfo;
+mod convert;
+mod channel;
+mod lookups;
+mod parsers;
+mod process;
+pub use addrinfo::*;
+pub(crate) use convert::*;
+pub use channel::*;
+pub use lookups::*;
+pub use parsers::*;
+pub use process::*;
 
 pub const ARES_SUCCESS: i32 = 0;
 pub const ARES_ENODATA: i32 = 1;
@@ -32,6 +50,24 @@ pub const ARES_LIB_INIT_ALL: i32 = 1;
 #[allow(non_camel_case_types)]
 pub type ares_socket_t = c_int;
 
+// Upstream c-ares spells many parameters/returns with named enum/typedef types.
+// We keep `int`-based signatures (C phase) but define the type NAMES so that C
+// consumer source that declares e.g. `ares_status_t s = ares_parse_a_reply(...)`
+// compiles against our header. (Phase 2 promotes these to real `#[repr(C)] enum`s
+// for strict C++ compatibility.) These are force-emitted via cbindgen's
+// `[export] include`.
+#[allow(non_camel_case_types)] pub type ares_status_t = c_int;
+#[allow(non_camel_case_types)] pub type ares_bool_t = c_int;
+#[allow(non_camel_case_types)] pub type ares_socklen_t = libc::socklen_t;
+#[allow(non_camel_case_types)] pub type ares_dns_rec_type_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_class_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_section_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_opcode_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_rcode_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_flags_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_datatype_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_rr_key_t = c_uint;
+
 #[no_mangle]
 pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
     ARES_SUCCESS
@@ -41,326 +77,127 @@ pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
 pub extern "C" fn ares_library_cleanup() {
 }
 
+/// We do not provide the built-in event thread, so the library is not
+/// thread-safe. Report ARES_FALSE (0), matching c-ares on non-threaded builds.
+#[no_mangle]
+pub extern "C" fn ares_threadsafety() -> i32 {
+    0
+}
+
 pub type Channel = *mut ChannelData;
 
-pub struct ChannelData {
-    ares: Ares<FFIData>,
-    sock_create_callback: Option<AresSockCreateCallback>,
-    sock_create_callback_arg: *mut libc::c_void,
+// Custom 16-byte IPv6 address type matching upstream c-ares
+// (`struct ares_in6_addr { union { unsigned char _S6_u8[16]; } _S6_un; }`), so
+// consumer source using `addr._S6_un._S6_u8` and the `struct ares_in6_addr` type
+// name compiles. A single-member inner struct is layout- and field-path-identical
+// to upstream's single-member union, without Rust union ergonomics.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types, non_snake_case)]
+pub struct ares_in6_addr_un {
+    pub _S6_u8: [u8; 16],
 }
-
-#[derive(Debug)]
-enum Callback {
-    AresHostCallback(AresHostCallback),
-    AresCallback(AresCallback),
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types, non_snake_case)]
+pub struct ares_in6_addr {
+    pub _S6_un: ares_in6_addr_un,
 }
-
-impl Callback {
-    fn run(&self, buf: Vec<u8>, result: DnsFrame, ffidata: &FFIData) {
-        match self {
-            Self::AresHostCallback(callback) => run_ares_host_callback(buf, result, *callback, ffidata.arg),
-            Self::AresCallback(callback) => run_ares_callback(buf, result, *callback, ffidata.arg),
-        }
-    }
-    fn run_error(&self, status: i32, arg: *mut c_void) {
-        match self {
-            Self::AresHostCallback(callback) => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
-            Self::AresCallback(callback) => unsafe { callback(arg, status, 0, std::ptr::null_mut(), 0) },
-        }
+impl ares_in6_addr {
+    pub fn from_octets(octets: [u8; 16]) -> Self {
+        ares_in6_addr { _S6_un: ares_in6_addr_un { _S6_u8: octets } }
     }
 }
 
-#[derive(Debug)]
-struct FFIData {
-    callback: Callback,
-    arg: *mut c_void,
-}
-
+// Dual-role: caller-allocatable input to `ares_set_servers`, and cares-rs-allocated
+// output of `ares_get_servers`. Intentionally NO `Drop` — a chain-walking Drop would
+// free caller-owned stack instances. See the ownership taxonomy in `ffi/ares_data.rs`.
 #[repr(C)]
 pub struct ares_addr_node {
     pub next: *mut ares_addr_node,
     pub family: c_int,
-    pub data: [u8; 16], // enough to hold IPv6
+    pub addr: AresAddrUnion, // union { struct in_addr addr4; struct ares_in6_addr addr6; }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
-    let ares = Ares::from_sysconfig();
-    let channeldata = ChannelData { ares, sock_create_callback: None, sock_create_callback_arg: std::ptr::null_mut() };
-    let channel = Box::into_raw(Box::new(channeldata));
-    unsafe { *out_channel = channel };
-    ARES_SUCCESS
-}
+pub const RECORD_TYPE_A: u16 = 0x01;
+pub const RECORD_TYPE_NS: u16 = 0x02;
+pub const RECORD_TYPE_CNAME: u16 = 0x05;
+pub const RECORD_TYPE_SOA: u16 = 0x06;
+pub const RECORD_TYPE_PTR: u16 = 0x0c;
+pub const RECORD_TYPE_AAAA: u16 = 0x1c;
+pub const RECORD_TYPE_MX: u16 = 0x0f;
+pub const RECORD_TYPE_TXT: u16 = 0x10;
+pub const RECORD_TYPE_CAA: u16 = 0x101;
+pub const RECORD_TYPE_SRV: u16 = 0x21;
+pub const RECORD_TYPE_NAPTR: u16 = 0x23;
+pub const RECORD_TYPE_URI: u16 = 0x100;
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_destroy(channel: Channel) {
-    unsafe { drop(Box::from_raw(channel)); }
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c_char, family: c_int, callback: AresHostCallback, arg: *mut c_void) {
-    let channeldata = unsafe { &mut *channel };
-    let family = match family {
-        libc::AF_INET => Family::Ipv4,
-        libc::AF_INET6 => Family::Ipv6,
-        _ => panic!("unexpected family value: {}", family),
-    };
-    let hostname = unsafe { CStr::from_ptr(hostname).to_string_lossy() };
-    let ffidata = FFIData { callback: Callback::AresHostCallback(callback), arg };
-    let newtask = channeldata.ares.gethostbyname(&hostname, family, ffidata);
-    if let Some(cb) = channeldata.sock_create_callback {
-        cb(newtask.sock.as_raw_fd(), libc::SOCK_DGRAM, channeldata.sock_create_callback_arg);
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: AresCallback, arg: *mut c_void) {
-    let channeldata = unsafe { &mut *channel };
-    let name = unsafe { CStr::from_ptr(name).to_string_lossy() };
-    let ffidata = FFIData { callback: Callback::AresCallback(callback), arg };
-    channeldata.ares.query(&name, dnsclass as u16, dnstype as u16, ffidata);
-}
-
-pub unsafe extern "C" fn ares_parse_data<T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2) -> c_int
-where T1: Parser + IntoAresData<T2>, T2: CLinkedList + DataType
-{
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let frame = DnsFrame::parse(&mut Cursor::new(buf)).unwrap();
-    let replies: Vec<T1> = frame.answers.into_iter().map(|x| T1::parse(&mut Cursor::new(&x.data)).unwrap()).collect();
-    let aresreplies: Vec<_> = replies.into_iter().map(|x| x.into_ares_data(&buf)).collect();
-    let reply = clinkedlist::chain_nodes(aresreplies);
-    let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut (*aresdata).data };
-    ARES_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
-    unsafe { ares_parse_data::<MxReply, AresMxReply>(abuf, alen, out) }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
-    unsafe { ares_parse_data::<TxtReply, AresTxtReply>(abuf, alen, out) }
-}
-
-impl DnsLabel {
-    pub fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
-        Some(CString::new(self.build_string(main_buf)?).ok()?)
-    }
-}
-
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Aliases).unwrap() };
-    let hostent = Box::into_raw(Box::new(hostent));
-    unsafe { *out = hostent };
-    ARES_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_a_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs4).unwrap() };
-    let hostent = Box::into_raw(Box::new(hostent));
-    unsafe { *out = hostent };
-    ARES_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_parse_aaaa_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let hostent = unsafe { parse_hostent(abuf, alen, HostentParseMode::Addrs6).unwrap() };
-    let hostent = Box::into_raw(Box::new(hostent));
-    unsafe { *out = hostent };
-    ARES_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
-    unsafe { free_hostent(hostent) };
-}
-
+// Internal bare-fn callback aliases (used by the Callback enum, state structs and
+// run_* dispatchers). Excluded from the generated header — see the C-ABI nullable
+// typedefs below, which is what public signatures and cbindgen use.
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 pub type AresCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int);
-pub type AresSockCreateCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void);
+pub type AresCallbackDnsRec = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: usize, dnsrec: *mut dns_record::ares_dns_record_t);
+pub type AresSockCreateCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int;
+pub type AresNameinfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, node: *mut c_char, service: *mut c_char);
+pub type AresAddrInfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, res: *mut ares_addrinfo);
 
+// C-ABI nullable callback typedefs used in the public FFI signatures. These wrap
+// an INLINE `extern "C" fn` in `Option<...>` so cbindgen collapses them to proper
+// nullable C function pointers with the upstream c-ares names (it cannot do this
+// for `Option<TypeAlias>`). Signatures must mirror the bare aliases above.
+#[allow(non_camel_case_types)] pub type ares_host_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent)>;
+#[allow(non_camel_case_types)] pub type ares_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int)>;
+#[allow(non_camel_case_types)] pub type ares_callback_dnsrec = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: libc::size_t, dnsrec: *mut dns_record::ares_dns_record_t)>;
+#[allow(non_camel_case_types)] pub type ares_sock_create_callback = Option<unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int>;
+#[allow(non_camel_case_types)] pub type ares_nameinfo_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, node: *mut c_char, service: *mut c_char)>;
+#[allow(non_camel_case_types)] pub type ares_addrinfo_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, res: *mut ares_addrinfo)>;
+
+pub const ARES_AI_CANONNAME: c_int = 1 << 0;
+pub const ARES_AI_NUMERICHOST: c_int = 1 << 1;
+pub const ARES_AI_PASSIVE: c_int = 1 << 2;
+pub const ARES_AI_NUMERICSERV: c_int = 1 << 3;
+pub const ARES_AI_V4MAPPED: c_int = 1 << 4;
+pub const ARES_AI_ALL: c_int = 1 << 5;
+pub const ARES_AI_ADDRCONFIG: c_int = 1 << 6;
+pub const ARES_AI_NOSORT: c_int = 1 << 7;
+pub const ARES_AI_ENVHOSTS: c_int = 1 << 8;
+
+// ares_getnameinfo flags
+pub const ARES_NI_NOFQDN: c_int = 1 << 0;
+pub const ARES_NI_NUMERICHOST: c_int = 1 << 1;
+pub const ARES_NI_NAMEREQD: c_int = 1 << 2;
+pub const ARES_NI_NUMERICSERV: c_int = 1 << 3;
+pub const ARES_NI_DGRAM: c_int = 1 << 4;
+pub const ARES_NI_TCP: c_int = 0;
+pub const ARES_NI_UDP: c_int = ARES_NI_DGRAM;
+pub const ARES_NI_SCTP: c_int = 1 << 5;
+pub const ARES_NI_DCCP: c_int = 1 << 6;
+pub const ARES_NI_NUMERICSCOPE: c_int = 1 << 7;
+pub const ARES_NI_LOOKUPHOST: c_int = 1 << 8;
+pub const ARES_NI_LOOKUPSERVICE: c_int = 1 << 9;
+
+/// # Safety
+/// `version` must be null or a valid, writable pointer to a `c_int`.
 #[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
-    let channeldata = unsafe { &mut *channel };
-    unsafe { libc::FD_ZERO(write_fds) };
-    unsafe { libc::FD_ZERO(read_fds) };
-
-    let mut nfds = 0;
-    for task in &channeldata.ares.tasks {
-        let fd = task.sock.as_raw_fd();
-        match task.status {
-            Status::Writing => unsafe { libc::FD_SET(fd, write_fds) },
-            Status::Reading => unsafe { libc::FD_SET(fd, read_fds) },
-            Status::Completed => continue,
-        };
-        if nfds < fd { nfds = fd + 1 }
-    }
-    nfds
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_timeout(channel: Channel, _maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
-    let channeldata = unsafe { &mut *channel };
-    let max_wait_time = channeldata.ares.max_wait_time().as_millis();
-    unsafe {
-        (*tv).tv_sec = (max_wait_time / 1000) as i64;
-        (*tv).tv_usec = 1000 * (max_wait_time % 1000) as i64;
-    };
-    tv
-}
-
-fn run_ares_host_callback(buf: Vec<u8>, result: DnsFrame, callback: AresHostCallback, arg: *mut c_void) {
-    let reply_code = result.flags & 0x0f;
-    if reply_code > 0 {
-        let status = match reply_code {
-            3 => ARES_ENOTFOUND,
-            _ => ARES_ESERVFAIL,
-        };
-        return unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
-    }
-
-    let hostent = unsafe { parse_hostent(buf.as_ptr(), buf.len() as i32, HostentParseMode::Addrs).unwrap() };
-    let hostent = Box::into_raw(Box::new(hostent));
-    unsafe { callback(arg, ARES_SUCCESS, 0, &mut *hostent) };
-    unsafe { ares_free_hostent(hostent) };
-}
-
-fn run_ares_callback(buf: Vec<u8>, _result: DnsFrame, callback: AresCallback, arg: *mut c_void) {
-    unsafe { callback(arg, ARES_SUCCESS, 0, buf.as_ptr() as *mut u8, buf.len() as i32) };
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
-    let channeldata = unsafe { &mut *channel };
-    for task in &mut channeldata.ares.tasks {
-        if task.is_expired() {
-            let ffidata = &task.userdata;
-            (ffidata.callback).run_error(ARES_ETIMEOUT, ffidata.arg);
-            task.status = Status::Completed;
-        }
-    }
-    channeldata.ares.remove_completed();
-
-    let mut tasks = std::mem::take(&mut channeldata.ares.tasks);
-    for task in &mut tasks {
-        if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), write_fds) } {
-            channeldata.ares.write_impl(task);
-        }
-        if unsafe { libc::FD_ISSET(task.sock.as_raw_fd(), read_fds) } {
-            if let Some((buf, frame)) = channeldata.ares.read_impl(task) {
-                (task.userdata.callback).run(buf, frame, &task.userdata);
-            }
-        }
-    }
-    channeldata.ares.tasks = tasks;
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) {
-    let channeldata = unsafe { &mut *channel };
-    channeldata.ares.config.nameservers.clear();
-    while !head.is_null() {
-        if unsafe { (*head).family } == libc::AF_INET {
-            let node = unsafe { &(*head) };
-            let oct4: [u8; 4] = node.data[0..4].try_into().unwrap();
-            channeldata.ares.config.nameservers.push((IpAddr::from(oct4), None));
-        }
-        head = unsafe { (*head).next };
-    }
-}
-
-fn ipv4_to_in_addr(ip: IpAddr) -> Option<AresAddrUnion> {
-    match ip {
-        IpAddr::V4(v4) => {
-            let addr = u32::from_ne_bytes(v4.octets());
-            Some(AresAddrUnion { addr4: libc::in_addr { s_addr: addr } })
-        }
-        IpAddr::V6(_) => None,
-    }
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut AresAddrPortNode) -> c_int {
-    let channeldata = unsafe { &mut *channel };
-    let mut data: Vec<AresAddrPortNode> = vec![];
-    for srv in &channeldata.ares.config.nameservers {
-        data.push(AresAddrPortNode {
-            next: std::ptr::null_mut(),
-            family: libc::AF_INET,
-            addr: ipv4_to_in_addr(srv.0).unwrap(),
-            udp_port: srv.1.unwrap_or(channeldata.ares.default_udp_port) as c_int,
-            tcp_port: srv.1.unwrap_or(channeldata.ares.default_tcp_port) as c_int,
-        });
-    }
-    let data = clinkedlist::chain_nodes(data);
-    let aresdata: AresData<AresAddrPortNode> = AresData { data_type: AresAddrPortNode::datatype(), data };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut (*aresdata).data };
-    ARES_SUCCESS
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
-    let channeldata = unsafe { &mut *channel };
-    let mut cursor = Cursor::new(CStr::from_ptr(servers).to_str().unwrap());
-    channeldata.ares.config.nameservers = servers_csv::parse_from_reader(&mut cursor).unwrap();
-    ARES_SUCCESS
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
-    let (major, minor, patch) = (1, 17, 1);
+pub unsafe extern "C" fn ares_version(version: *mut c_int) -> *const c_char {
+    let (major, minor, patch) = (1, 34, 6);
     let v = (major << 16) | (minor << 8) | patch;
     if !version.is_null() { unsafe { *version = v } }
-    cstr!("1.17.1-rs")
+    c"1.34.6".as_ptr()
 }
 
 pub const ARES_GETSOCK_MAXNUM: usize = 16; // per c-ares headers
 pub const ARES_SOCKET_BAD: ares_socket_t = -1;
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
-    let channeldata = unsafe { &mut *channel };
-    let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
+pub type AresSockConfigureCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int;
+pub type AresServerStateCallback = unsafe extern "C" fn(server_string: *const c_char, success: c_int, flags: c_int, arg: *mut libc::c_void);
+// C-ABI nullable forms (see note by the other ares_*_callback typedefs).
+#[allow(non_camel_case_types)] pub type ares_sock_config_callback = Option<unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int>;
+#[allow(non_camel_case_types)] pub type ares_server_state_callback = Option<unsafe extern "C" fn(server_string: *const c_char, success: c_int, flags: c_int, arg: *mut libc::c_void)>;
 
-    let mut mask: c_int = 0;
-    for i in 0..n {
-        let maybe_task = channeldata.ares.tasks.get(i);
-        std::ptr::write(socks.add(i), maybe_task.map(|x| x.sock.as_raw_fd()).unwrap_or(ARES_SOCKET_BAD));
-
-        if maybe_task.is_some() {
-            mask |= 1 << i; // No need to wait ARES_GETSOCK_WRITABLE for UDP sockets
-        }
-    }
-
-    mask
-}
 
 #[no_mangle]
-pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
-    drop(CString::from_raw(s as *mut c_char));
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: Option<AresSockCreateCallback>, arg: *mut c_void) {
-    let channeldata = unsafe { &mut *channel };
-    channeldata.sock_create_callback = callback;
-    channeldata.sock_create_callback_arg = arg;
+pub extern "C" fn ares_library_initialized() -> c_int {
+    ARES_SUCCESS
 }

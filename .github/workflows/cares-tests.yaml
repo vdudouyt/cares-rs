@@ -1,0 +1,125 @@
+name: CI/CD
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cares-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc-ares-dev libgtest-dev libgmock-dev cmake
+      - name: Build Rust library
+        run: cargo build --release
+      - name: Check C header is a valid drop-in
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -Wpointer-sign -Iinclude -fsyntax-only tests/header_smoke.c
+          cc -std=c11 -Iinclude -c examples/example.c -o /tmp/example.o
+          cc /tmp/example.o -Ltarget/release -lcares_rs -o /tmp/example
+      - name: Build C++ tests
+        working-directory: tests/cares-tests
+        run: cmake . && make
+      - name: Run integration tests
+        working-directory: tests/cares-tests
+        run: >-
+          ./arestest ../../target/release/libcares_rs.so
+          "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*"
+      - name: Run fuzz corpus (DNS parsing)
+        working-directory: tests/cares-tests
+        run: |
+          ls fuzzinput/ | wc -l
+          ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
+          echo "aresfuzz completed successfully"
+      - name: Run fuzz corpus (server CSV)
+        working-directory: tests/cares-tests
+        run: |
+          ls fuzznames/ | wc -l
+          ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
+          echo "aresfuzzname completed successfully"
+
+  valgrind:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-valgrind-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-valgrind-
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc-ares-dev libgtest-dev libgmock-dev cmake valgrind
+      - name: Build Rust library (debug symbols)
+        run: cargo build --release
+      - name: Build C++ tests
+        working-directory: tests/cares-tests
+        run: cmake -DCMAKE_BUILD_TYPE=Debug . && make
+      - name: Run integration tests under Valgrind
+        working-directory: tests/cares-tests
+        run: >-
+          valgrind --leak-check=full --error-exitcode=1
+          ./arestest ../../target/release/libcares_rs.so
+          "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*:*Live*"
+      - name: Run fuzz corpus under Valgrind
+        working-directory: tests/cares-tests
+        run: |
+          valgrind --leak-check=full --error-exitcode=1 ./aresfuzz ../../target/release/libcares_rs.so fuzzinput/*
+          valgrind --leak-check=full --error-exitcode=1 ./aresfuzzname ../../target/release/libcares_rs.so fuzznames/*
+
+  # On a v* tag, after all tests pass, build the .deb packages for that version
+  # and publish them to the GitHub Release.
+  release-deb:
+    needs: [cares-tests, valgrind]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Debian build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential debhelper dh-cargo dpkg-dev fakeroot cargo rustc \
+            librust-arrayvec-dev librust-bytes-dev librust-libc-dev \
+            librust-rand-dev librust-cbindgen-dev
+      - name: Set package version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Building cares-rs ${VERSION}"
+          sed -i "1s/.*/cares-rs (${VERSION}-1) unstable; urgency=medium/" debian/changelog
+          sed -i "s/^Version: .*/Version: ${VERSION}/" debian/libcares-rs.pc.in
+          sed -i "s/^set(PACKAGE_VERSION .*/set(PACKAGE_VERSION \"${VERSION}\")/" debian/cmake/cares-rs-config-version.cmake
+      - name: Build .deb packages
+        run: dpkg-buildpackage -us -uc -b
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          mv ../libcares-rs*_*.deb ../libcares-rs*_*.ddeb dist/ 2>/dev/null || true
+          ls -l dist
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.ddeb

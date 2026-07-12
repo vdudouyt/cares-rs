@@ -38,3 +38,24 @@ jobs:
       # Run tests
       - name: Run tests
         run: cargo test
+
+      # Lint gate: zero warnings, and the panic-safety wall in src/lib.rs
+      # (deny unwrap/expect/panic!/todo!/unimplemented!/unreachable! outside
+      # cfg(test)) only binds under clippy — so clippy must run in CI.
+      - name: Clippy (zero warnings + panic-safety wall)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # ABI + unsafe-surface gates:
+      #  - the cbindgen-generated header must match the committed baseline
+      #  - the .so's ares_* export set must match the committed baseline
+      #  - unsafe-context lines must not grow past the ratchet baseline
+      #    (logic belongs in forbid(unsafe_code) kernels; see tools/unsafe_lines.py)
+      - name: ABI + unsafe-ratchet gates
+        run: |
+          diff ci-data/cares.h.baseline include/cares.h
+          # LC_ALL=C on both sides: sort order must not depend on the runner's
+          # locale (the baseline is committed in C collation).
+          nm -D --defined-only target/debug/libcares_rs.so \
+            | awk '$2=="T" && $3 ~ /^ares_/ {print $3}' | LC_ALL=C sort \
+            | diff <(LC_ALL=C sort ci-data/exports.baseline) -
+          python3 tools/unsafe_lines.py --check tools/unsafe_baseline.json

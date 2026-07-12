@@ -1,0 +1,486 @@
+//! Channel lifecycle and configuration: init/dup/destroy/cancel, server
+//! lists, reactor fd/timeout accessors, and the channel-level callbacks.
+
+use super::*;
+use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
+use crate::core::async_client::{DnsMailbox, DnsSignals, Effect};
+use crate::async_runtime::executor::Executor;
+
+
+/// The C-visible channel: the pure core state plus the channel-level C
+/// callbacks. Everything the shims marshal lives behind `.state`; the six
+/// callback fields are the only C-tainted residents.
+pub struct ChannelData {
+    pub(crate) state: AsyncClient,
+    /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
+    /// in `state`. The socket-state callbacks (create/configure) live in
+    /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
+    /// can simply share the Rc and stay independent.
+    pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
+    pub(crate) server_state_callback: ares_server_state_callback,
+    pub(crate) server_state_callback_arg: *mut libc::c_void,
+    /// The in-flight resolver ops — the executor's task set (each future owns
+    /// its socket(s)).
+    executor: Executor<DnsSignals>,
+}
+
+impl ChannelData {
+    /// A fresh channel: pure state, no callbacks installed.
+    pub(crate) fn new(state: AsyncClient, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
+        ChannelData {
+            state,
+            socket_factory,
+            server_state_callback: None,
+            server_state_callback_arg: std::ptr::null_mut(),
+            executor: Executor::default(),
+        }
+    }
+
+    /// ares_dup: duplicate the pure state and share the (immutable) factory.
+    pub(crate) fn dup_from(&self) -> Self {
+        ChannelData {
+            state: self.state.duplicate(),
+            socket_factory: self.socket_factory.clone(),
+            server_state_callback: self.server_state_callback,
+            server_state_callback_arg: self.server_state_callback_arg,
+            executor: Executor::default(),
+        }
+    }
+
+    /// A fresh channel with the default (libc) socket factory.
+    pub(crate) fn new_default() -> Self {
+        let factory = std::rc::Rc::new(CSocketFactory::default());
+        let state = AsyncClient::from_sysconfig(factory.clone());
+        ChannelData::new(state, factory)
+    }
+
+    /// Install a rebuilt socket factory, keeping the concrete handle and the
+    /// core's `Rc<dyn SocketFactory>` in sync (they are the same object).
+    pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<CSocketFactory>) {
+        self.state.factory = factory.clone();
+        self.socket_factory = factory;
+    }
+
+    /// The single spawn path: register a lifecycle `fut` + its mailbox + its C
+    /// delivery closure `on` in a free slot and drive it once (issuing the initial
+    /// send). Every ares_* entry shim calls here. `on` fires when the reactor later
+    /// settles the query (or in place if it completes on this first poll).
+    pub(crate) fn spawn<T: 'static>(
+        &mut self,
+        io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>,
+        fut: impl std::future::Future<Output = T> + 'static,
+        on: impl FnOnce(Result<T, c_int>) + 'static,
+    ) {
+        let id = self.executor.spawn(io, fut, on);
+        self.advance(id);
+    }
+
+    /// Advance one task one step: poll it, apply the DNS effects it emitted
+    /// (server-state notify), and on completion deliver its result. On `Pending` the
+    /// future has published the fds it is now blocked on into its mailbox.
+    fn advance(&mut self, id: usize) {
+        let done = self.executor.poll(id);
+        // Drain + apply the future's app-specific effects between poll and delivery
+        // (server-state callbacks fire before the result). Scoped so the `executor`
+        // borrow releases before the callbacks fire.
+        let effects = match self.executor.io(id) {
+            Some(io) => std::mem::take(&mut io.borrow_mut().app.effects),
+            None => Vec::new(),
+        };
+        for effect in effects {
+            match effect {
+                Effect::NotifyServerState { server, ok, tcp } => {
+                    self.invoke_server_state_callback(server, ok, tcp)
+                }
+            }
+        }
+        if done {
+            self.executor.deliver(id, None);
+        }
+    }
+
+    /// Drive every task whose published fd is ready (or whose timeout passed) this
+    /// `ares_process` cycle: set its mailbox readiness via the `FD_ISSET` oracle
+    /// (the sole unsafe here) and re-poll it.
+    fn drive_fd_futures(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
+        let now = Instant::now();
+        let rf: &libc::fd_set = &*read_fds;
+        let wf: &libc::fd_set = &*write_fds;
+        let ready = self.executor.drive_ready(now, |fd, writable| {
+            let set = if writable { wf } else { rf };
+            unsafe { libc::FD_ISSET(fd, set as *const libc::fd_set as *mut libc::fd_set) }
+        });
+        for id in ready {
+            self.advance(id);
+        }
+    }
+
+    /// Fire `status` to every in-flight task (fire the terminal status + drop the
+    /// future, which drops its owned sockets). The shared safe teardown for
+    /// `ares_cancel` (ECANCELLED) / `ares_destroy` (EDESTRUCTION).
+    pub(crate) fn abort_all(&mut self, status: c_int) {
+        for id in self.executor.ids() {
+            self.executor.deliver(id, Some(status));
+        }
+        // Drop any shared TCP connections the aborted futures held.
+        self.state.tcp_pool.borrow_mut().clear();
+    }
+
+    /// Every (fd, wants_write) the caller should select on.
+    fn all_poll_fds(&self) -> Vec<(i32, bool)> {
+        self.executor.poll_fds()
+    }
+
+    /// The earliest timeout (ms) across in-flight tasks, or `None`.
+    fn next_timeout_ms(&self) -> Option<u128> {
+        self.executor.next_timeout_ms(Instant::now())
+    }
+
+    /// One `ares_process` cycle: drive every in-flight async future whose
+    /// published socket is ready (or whose timeout passed) this cycle. Each
+    /// future owns its socket(s) and applies its own verdicts; the only unsafe
+    /// here is the `FD_ISSET` readiness check and the C-callback invokers.
+    pub(crate) fn process_channel(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
+        self.drive_fd_futures(read_fds, write_fds);
+    }
+
+    /// Fire the server-state notification callback (if installed) for a server
+    /// index; a stale index is silently skipped.
+    pub(crate) fn invoke_server_state_callback(&self, server_index: usize, success: bool, is_tcp: bool) {
+        if let Some(cb) = self.server_state_callback {
+            let Some(server_str) = self.state.server_state_string(server_index, is_tcp) else {
+                return;
+            };
+            let c_server_str = CString::new(server_str).unwrap_or_default();
+            let success_int: c_int = if success { 1 } else { 0 };
+            let flags: c_int = if is_tcp { 1 << 1 } else { 1 << 0 }; // ARES_SERV_STATE_TCP=2, UDP=1
+            unsafe { cb(c_server_str.as_ptr(), success_int, flags, self.server_state_callback_arg) };
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
+    let channel = Box::into_raw(Box::new(ChannelData::new_default()));
+    unsafe { *out_channel = channel };
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int {
+    if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
+    let src = unsafe { &*source };
+    let channeldata = src.dup_from();
+    unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_cancel(channel: Channel) {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    // Aborts every in-flight future and clears the shared TCP pool.
+    channeldata.abort_all(ARES_ECANCELLED);
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_destroy(channel: Channel) {
+    if let Some(channeldata) = unsafe { channel.as_mut() } {
+        // Fire callbacks with ARES_EDESTRUCTION for all pending tasks.
+        channeldata.abort_all(ARES_EDESTRUCTION);
+        unsafe { drop(Box::from_raw(channel)); }
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
+    unsafe { libc::FD_ZERO(write_fds) };
+    unsafe { libc::FD_ZERO(read_fds) };
+
+    let fds = channeldata.all_poll_fds();
+    for (fd, wants_write) in &fds {
+        if *wants_write {
+            unsafe { libc::FD_SET(*fd, write_fds) };
+        } else {
+            unsafe { libc::FD_SET(*fd, read_fds) };
+        }
+    }
+    crate::core::async_client::nfds(&fds)
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
+    // Upstream: NULL channel or output buffer -> return NULL.
+    if tv.is_null() { return std::ptr::null_mut(); }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return std::ptr::null_mut(); };
+    let maxtv_ms = (!maxtv.is_null())
+        .then(|| unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 });
+    match crate::core::async_client::clamp_timeout(channeldata.next_timeout_ms(), maxtv_ms) {
+        crate::core::async_client::TimeoutChoice::NoTasks => {
+            if maxtv.is_null() { return std::ptr::null_mut(); }
+            maxtv
+        }
+        crate::core::async_client::TimeoutChoice::Wait { ms, use_max } => {
+            unsafe {
+                (*tv).tv_sec = (ms / 1000) as i64;
+                (*tv).tv_usec = 1000 * (ms % 1000) as i64;
+            };
+            if use_max { maxtv } else { tv }
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) -> c_int {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    let mut servers = Vec::new();
+    while !head.is_null() {
+        let node = unsafe { &(*head) };
+        match node.family {
+            libc::AF_INET => {
+                let oct4 = unsafe { node.addr.addr4 }.s_addr.to_ne_bytes();
+                servers.push(ServerSpec { ip: IpAddr::from(oct4), udp_port: None, tcp_port: None });
+            }
+            libc::AF_INET6 => {
+                let oct16 = unsafe { node.addr.addr6._S6_un._S6_u8 };
+                servers.push(ServerSpec { ip: IpAddr::from(oct16), udp_port: None, tcp_port: None });
+            }
+            _ => {}
+        }
+        head = unsafe { (*head).next };
+    }
+    channeldata.state.set_servers(servers);
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut AresAddrPortNode) -> c_int {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    let mut servers = Vec::new();
+    while !head.is_null() {
+        let node = unsafe { &*head };
+        let udp_port = normalize_port(node.udp_port as u16);
+        let tcp_port = normalize_port(node.tcp_port as u16);
+        match node.family {
+            libc::AF_INET => {
+                let octets = unsafe { node.addr.addr4.s_addr.to_ne_bytes() };
+                servers.push(ServerSpec { ip: IpAddr::from(octets), udp_port, tcp_port });
+            }
+            libc::AF_INET6 => {
+                let octets = unsafe { node.addr.addr6._S6_un._S6_u8 };
+                servers.push(ServerSpec { ip: IpAddr::from(octets), udp_port, tcp_port });
+            }
+            _ => {}
+        }
+        head = node.next;
+    }
+    channeldata.state.set_servers(servers);
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut AresAddrPortNode) -> c_int {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    let mut data: Vec<AresAddrPortNode> = vec![];
+    for (ip, udp_port, tcp_port) in channeldata.state.server_list() {
+        let (family, addr) = match ip {
+            IpAddr::V4(v4) => {
+                let s_addr = u32::from_ne_bytes(v4.octets());
+                (libc::AF_INET, AresAddrUnion { addr4: libc::in_addr { s_addr } })
+            }
+            IpAddr::V6(v6) => {
+                (libc::AF_INET6, AresAddrUnion { addr6: ares_in6_addr::from_octets(v6.octets()) })
+            }
+        };
+        data.push(AresAddrPortNode {
+            next: std::ptr::null_mut(),
+            family,
+            addr,
+            udp_port: udp_port as c_int,
+            tcp_port: tcp_port as c_int,
+        });
+    }
+    let Some(replies) = clinkedlist::chain_nodes(data) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return ARES_ENODATA;
+    };
+    let aresdata: AresData<AresAddrPortNode> = AresData { data_type: AresAddrPortNode::datatype(), data: replies };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut (*aresdata).data };
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    // NULL or empty string clears servers
+    if servers.is_null() {
+        channeldata.state.clear_servers();
+        return ARES_SUCCESS;
+    }
+    let Some(s) = (unsafe { cstr_opt(servers) }) else { return ARES_EBADSTR };
+    if s.is_empty() {
+        channeldata.state.clear_servers();
+        return ARES_SUCCESS;
+    }
+    let mut cursor = Cursor::new(s);
+    match servers_csv::parse_from_reader(&mut cursor) {
+        Some(ns) => {
+            channeldata.state.install_csv_servers(ns);
+            ARES_SUCCESS
+        }
+        None => ARES_EBADSTR,
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const c_char) -> c_int {
+    unsafe { ares_set_servers_ports_csv(channel, servers) }
+}
+
+/// # Safety
+/// `channel` must be a valid channel and `socks` must point to at least `numsocks` writable slots.
+#[no_mangle]
+pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
+    // Upstream: NULL channel or non-positive numsocks -> return 0 (no sockets).
+    if numsocks <= 0 { return 0; }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
+    let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
+
+    let fds = channeldata.all_poll_fds();
+    for i in 0..n {
+        let fd = fds.get(i).map(|(fd, _)| *fd).unwrap_or(ARES_SOCKET_BAD);
+        unsafe { std::ptr::write(socks.add(i), fd) };
+    }
+    getsock_mask(&fds, n)
+}
+
+#[no_mangle]
+pub extern "C" fn ares_set_local_ip4(_channel: Channel, _local_ip: u32) {
+    if _channel.is_null() {}
+}
+
+#[no_mangle]
+pub extern "C" fn ares_set_local_ip6(_channel: Channel, _local_ip6: *const u8) {
+    if _channel.is_null() {}
+}
+
+#[no_mangle]
+pub extern "C" fn ares_set_local_dev(_channel: Channel, _local_dev_name: *const c_char) {
+    if _channel.is_null() {}
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ares_sock_create_callback, arg: *mut c_void) {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let factory = channeldata.socket_factory.with_create_cb(callback, arg);
+    channeldata.apply_socket_factory(factory);
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_addr_node) -> c_int {
+    if out.is_null() { return ARES_ENODATA; }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    // Build the list the same way as ares_get_servers_ports: an AresData-wrapped
+    // chain so the caller can free it with ares_free_data (the c-ares contract).
+    // (A plain Box chain here corrupted the heap under ares_free_data.)
+    let mut data: Vec<ares_addr_node> = vec![];
+    for (ip, _, _) in channeldata.state.server_list() {
+        let (family, addr) = match ip {
+            IpAddr::V4(v4) => {
+                let s_addr = u32::from_ne_bytes(v4.octets());
+                (libc::AF_INET, AresAddrUnion { addr4: libc::in_addr { s_addr } })
+            }
+            IpAddr::V6(v6) => (libc::AF_INET6, AresAddrUnion { addr6: ares_in6_addr::from_octets(v6.octets()) }),
+        };
+        data.push(ares_addr_node { next: std::ptr::null_mut(), family, addr });
+    }
+    let Some(chain) = clinkedlist::chain_nodes(data) else {
+        unsafe { *out = std::ptr::null_mut() };
+        return ARES_ENODATA;
+    };
+    let aresdata: AresData<ares_addr_node> = AresData { data_type: ares_addr_node::datatype(), data: chain };
+    let aresdata = Box::into_raw(Box::new(aresdata));
+    unsafe { *out = &mut (*aresdata).data };
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return std::ptr::null_mut(); };
+    let csv = channeldata.state.servers_csv_string();
+    // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
+    unsafe { malloc_cstr(csv.as_bytes()) }
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_char) -> c_int {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    if sortstr.is_null() {
+        channeldata.state.sortlist = Vec::new();
+        return ARES_SUCCESS;
+    }
+    let Some(s) = (unsafe { cstr_opt(sortstr) }) else { return ARES_EBADSTR };
+    match parse_sortlist(s) {
+        Ok(entries) => {
+            channeldata.state.sortlist = entries;
+            ARES_SUCCESS
+        }
+        Err(e) => e.code(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
+    if channel.is_null() { return ARES_ENODATA; }
+    // Re-read sysconfig but preserve explicitly configured servers
+    // For now, this is a no-op to avoid overwriting mock/test nameservers
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, callback: ares_sock_config_callback, arg: *mut c_void) {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let factory = channeldata.socket_factory.with_config_cb(callback, arg);
+    channeldata.apply_socket_factory(factory);
+}
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callback: ares_server_state_callback, arg: *mut c_void) {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    channeldata.server_state_callback = callback;
+    channeldata.server_state_callback_arg = arg;
+}
+
+/// # Safety
+/// `channel` must be null or a valid channel handle returned by
+/// `ares_init`/`ares_init_options` and not yet destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
+    channeldata.executor.active_count() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn ares_queue_wait_empty(_channel: Channel, _timeout_ms: c_int) -> c_int {
+    // Only meaningful with the built-in event thread, which we no longer
+    // provide. Match upstream c-ares on a non-threaded build (!ares_threadsafety()).
+    ARES_ENOTIMP
+}

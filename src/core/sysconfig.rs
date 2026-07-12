@@ -3,7 +3,8 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SysConfig {
-    pub nameservers: Vec<(IpAddr, Option<u16>)>,
+    pub nameservers: Vec<(IpAddr, Option<u16>)>, // (ip, udp_port_override)
+    pub tcp_ports: Vec<Option<u16>>, // per-server TCP port overrides
     pub domain: Option<String>,
     pub search: Vec<String>,
     pub options: SysConfigOptions,
@@ -13,7 +14,7 @@ pub struct SysConfig {
 pub struct SysConfigOptions {
     pub ndots: u32,
     pub attempts: u32,
-    pub timeout_secs: u32,
+    pub timeout_ms: u32,
     pub use_vc: bool,
     pub rotate: bool,
     pub inet6: bool,
@@ -22,7 +23,7 @@ pub struct SysConfigOptions {
 
 impl Default for SysConfigOptions {
     fn default() -> Self {
-        SysConfigOptions { ndots: 0, attempts: 4, timeout_secs: 5, use_vc: false, rotate: false, inet6: false, edns0: false }
+        SysConfigOptions { ndots: 1, attempts: 4, timeout_ms: 5000, use_vc: false, rotate: false, inet6: false, edns0: false }
     }
 }
 
@@ -43,14 +44,20 @@ impl FromStr for SysConfig {
             if line.is_empty() { continue; }
 
             let mut parts = line.split_whitespace();
-            let keyword = parts.next().unwrap();
+            // A non-empty trimmed line always has a first token.
+            let Some(keyword) = parts.next() else { continue };
             let rest = parts.collect::<Vec<_>>();
             let [arg1, ..] = rest[..] else { return Err(ParseError::MissingValue { keyword: keyword.into() })  };
 
             match keyword {
                 "nameserver" => {
                     for tok in rest {
-                        conf.nameservers.push(parse_ns_addr(tok).unwrap());
+                        // Skip invalid nameserver tokens instead of panicking on a
+                        // malformed resolv.conf (matches upstream c-ares).
+                        if let Some(ns) = parse_ns_addr(tok) {
+                            conf.nameservers.push(ns);
+                            conf.tcp_ports.push(None); // keep the parallel vecs in sync
+                        }
                     }
                 }
                 "domain" => conf.domain = Some(arg1.to_string()),
@@ -76,7 +83,7 @@ fn parse_options_into(opts: &mut SysConfigOptions, src: &str) -> Result<(), Pars
         match key {
             "ndots" => opts.ndots = take_num_arg(key, val)?,
             "attempts" => opts.attempts = take_num_arg(key, val)?,
-            "timeout" | "retrans" => opts.timeout_secs = take_num_arg(key, val)?,
+            "timeout" | "retrans" => opts.timeout_ms = take_num_arg::<u32>(key, val)? * 1000,
             "use-vc" | "usevc" => opts.use_vc = true,
             "rotate" => opts.rotate = true,
             "inet6" => opts.inet6 = true,
@@ -95,6 +102,28 @@ fn take_num_arg<T: FromStr>(keyword: &str, val: &str) -> Result<T, ParseError> {
     
 }
 
+/// Apply `RES_OPTIONS` environment variable overrides to a SysConfig.
+pub fn apply_env_overrides(config: &mut SysConfig) {
+    // LOCALDOMAIN overrides search/domain
+    if let Ok(val) = std::env::var("LOCALDOMAIN") {
+        let val = val.trim();
+        if !val.is_empty() {
+            config.search = val.split_whitespace().map(|s| s.to_string()).collect();
+            config.domain = config.search.first().cloned();
+        }
+    }
+
+    // RES_OPTIONS overrides options
+    if let Ok(val) = std::env::var("RES_OPTIONS") {
+        let val = val.trim();
+        if !val.is_empty() {
+            // Strip leading "options" keyword if present
+            let opts_str = val.strip_prefix("options").map(|s| s.trim_start()).unwrap_or(val);
+            let _ = parse_options_into(&mut config.options, opts_str);
+        }
+    }
+}
+
 pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
     if let Ok(sa) = SocketAddr::from_str(s) {
         return Some((sa.ip(), Some(sa.port())));
@@ -102,6 +131,14 @@ pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
 
     if let Ok(ip) = IpAddr::from_str(s) {
         return Some((ip, None))
+    }
+
+    // Handle bracketed IPv6 without port, e.g. "[::1]"
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len()-1];
+        if let Ok(ip) = IpAddr::from_str(inner) {
+            return Some((ip, None));
+        }
     }
 
     None
@@ -112,13 +149,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn skips_malformed_nameserver() {
+        // A malformed nameserver token must be skipped, not panic on init/reinit.
+        let input = "nameserver 8.8.8.8\nnameserver not-an-ip\nnameserver 1.1.1.1\n";
+        let conf: SysConfig = input.parse().unwrap();
+        assert_eq!(conf.nameservers.len(), 2, "the invalid token is skipped");
+        assert_eq!(conf.nameservers.len(), conf.tcp_ports.len(), "parallel vecs stay in sync");
+    }
+
+    #[test]
     fn parse_minimal() {
         let input = "nameserver 1.1.1.1\n";
         let conf: SysConfig = input.parse().unwrap();
         assert_eq!(conf.nameservers.len(), 1);
         assert_eq!(conf.domain, None);
         assert!(conf.search.is_empty());
-        assert_eq!(conf.options.timeout_secs, 5);
+        assert_eq!(conf.options.timeout_ms, 5000);
         assert_eq!(conf.options.attempts, 4);
     }
 
@@ -137,7 +183,7 @@ mod tests {
         assert_eq!(conf.search, vec!["corp.local", "example.org"]);
         assert_eq!(conf.options.ndots, 2);
         assert_eq!(conf.options.attempts, 4);
-        assert_eq!(conf.options.timeout_secs, 3);
+        assert_eq!(conf.options.timeout_ms, 3000);
         assert!(conf.options.rotate);
         assert!(conf.options.use_vc);
     }
@@ -146,7 +192,7 @@ mod tests {
     fn parse_options_variants() {
         let input = "options retrans=7 edns0 foo=bar baz:9 qux";
         let conf: SysConfig = input.parse().unwrap();
-        assert_eq!(conf.options.timeout_secs, 7);
+        assert_eq!(conf.options.timeout_ms, 7000);
         assert!(conf.options.edns0);
     }
 
