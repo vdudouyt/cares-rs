@@ -407,7 +407,10 @@ fn dns_record_accessors_roundtrip() {
         assert_eq!(ares_dns_rr_set_bin(rr_txt, ARES_RR_TXT_DATA, txt.as_ptr(), txt.len()), ARES_SUCCESS);
 
         let mut rr_opt = ptr::null_mut();
-        assert_eq!(ares_dns_record_rr_add(&mut rr_opt, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_OPT as u32, 1232, 0), ARES_SUCCESS);
+        // OPT's public class is IN; the UDP payload size is a separate field
+        // (the wire class is overloaded with ARES_RR_OPT_UDP_SIZE).
+        assert_eq!(ares_dns_record_rr_add(&mut rr_opt, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_OPT as u32, ARES_CLASS_IN as u32, 0), ARES_SUCCESS);
+        assert_eq!(ares_dns_rr_set_u16(rr_opt, ARES_RR_OPT_UDP_SIZE, 1232), ARES_SUCCESS);
         let optval = b"optdata";
         assert_eq!(ares_dns_rr_set_opt(rr_opt, ARES_RR_OPT_OPTIONS, 5, optval.as_ptr(), optval.len()), ARES_SUCCESS);
 
