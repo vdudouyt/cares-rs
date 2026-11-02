@@ -148,7 +148,14 @@ pub(crate) fn has_opt(buf: &[u8]) -> bool {
 /// last additional record. Returns false when the message is malformed, already
 /// has an OPT, or the ARCOUNT cannot be incremented.
 pub(crate) fn append_opt(buf: &mut Vec<u8>, udp_size: u16) -> bool {
-    if buf.len() < 12 || buf.len() > u16::MAX as usize || find_opt(buf).is_some() {
+    // Header + root name + TYPE/CLASS/TTL/RDLENGTH = 11 bytes. Reserve the
+    // whole record first so a near-limit packet is rejected cleanly instead of
+    // being truncated/corrupted (DNS messages are bound by the 16-bit length).
+    const OPT_WIRE_LEN: usize = 11;
+    if buf.len() < 12
+        || buf.len().saturating_add(OPT_WIRE_LEN) > u16::MAX as usize
+        || find_opt(buf).is_some()
+    {
         return false;
     }
     let Some(arcount) = header_u16(buf, 10) else { return false };
@@ -250,32 +257,57 @@ pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) {
     buf.splice(opt.rdata_offset..opt.rdata_offset + opt.rdata_len, new_rdata);
 }
 
+/// Locate question 0's label byte ranges `(start, end)` in the wire message.
+/// Shared by the case-preserving reader and the DNS 0x20 randomizer so both
+/// accept exactly the same names. Returns `None` for a missing/malformed
+/// question or a compressed name (queries sent by this crate never compress
+/// the question).
+fn question_label_ranges(buf: &[u8]) -> Option<Vec<(usize, usize)>> {
+    if buf.len() < 12 || header_u16(buf, 4)? == 0 {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut ranges = Vec::new();
+    loop {
+        let len = *buf.get(pos)?;
+        pos += 1;
+        if len == 0 {
+            return Some(ranges);
+        }
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        let end = pos.checked_add(len as usize)?;
+        if end > buf.len() {
+            return None;
+        }
+        ranges.push((pos, end));
+        pos = end;
+    }
+}
+
+/// Join label ranges with '.' into a presentation-form name.
+fn join_question_name(buf: &[u8], ranges: &[(usize, usize)]) -> Option<Vec<u8>> {
+    let mut name = Vec::new();
+    for (i, &(start, end)) in ranges.iter().enumerate() {
+        if i > 0 {
+            name.push(b'.');
+        }
+        name.extend_from_slice(buf.get(start..end)?);
+    }
+    Some(name)
+}
+
 /// Randomize the case of every ASCII letter in question 0's name, writing the
 /// mixed-case name back into the wire buffer (draft-vixie-dnsext-dns0x20). One
 /// random bit per letter, exactly like upstream `ares_apply_dns0x20`. Returns
 /// the presentation-form randomized name (labels joined by '.') for response
 /// validation, or `None` when the message has no parseable question name.
 pub(crate) fn randomize_question_name(buf: &mut [u8]) -> Option<Vec<u8>> {
-    if buf.len() < 12 || header_u16(buf, 4)? == 0 {
-        return None;
-    }
-    let mut pos = 12usize;
-    let mut name = Vec::new();
+    let ranges = question_label_ranges(buf)?;
     let mut rng = rand::thread_rng();
-    loop {
-        let len = *buf.get(pos)?;
-        pos += 1;
-        if len == 0 {
-            break;
-        }
-        if len & 0xc0 != 0 {
-            return None; // compressed/invalid name in a query question
-        }
-        let label = buf.get_mut(pos..pos + len as usize)?;
-        if !name.is_empty() {
-            name.push(b'.');
-        }
-        for byte in label.iter_mut() {
+    for &(start, end) in &ranges {
+        for byte in buf.get_mut(start..end)? {
             if byte.is_ascii_alphabetic() {
                 if rng.r#gen::<bool>() {
                     *byte |= 0x20;
@@ -283,39 +315,16 @@ pub(crate) fn randomize_question_name(buf: &mut [u8]) -> Option<Vec<u8>> {
                     *byte &= !0x20;
                 }
             }
-            name.push(*byte);
         }
-        pos += len as usize;
     }
-    Some(name)
+    join_question_name(buf, &ranges)
 }
 
 /// Extract question 0's presentation-form name from a wire message, preserving
-/// its case. Returns `None` for a missing/malformed question or a compressed
-/// name (queries sent by this crate never compress the question).
+/// its case.
 pub(crate) fn question_name(buf: &[u8]) -> Option<Vec<u8>> {
-    if buf.len() < 12 || header_u16(buf, 4)? == 0 {
-        return None;
-    }
-    let mut pos = 12usize;
-    let mut name = Vec::new();
-    loop {
-        let len = *buf.get(pos)?;
-        pos += 1;
-        if len == 0 {
-            break;
-        }
-        if len & 0xc0 != 0 {
-            return None;
-        }
-        let label = buf.get(pos..pos + len as usize)?;
-        if !name.is_empty() {
-            name.push(b'.');
-        }
-        name.extend_from_slice(label);
-        pos += len as usize;
-    }
-    Some(name)
+    let ranges = question_label_ranges(buf)?;
+    join_question_name(buf, &ranges)
 }
 
 /// DNS 0x20 response validation: the response question 0 must carry the exact
@@ -404,9 +413,11 @@ impl ServerCookie {
     ) -> CookieVerdict {
         let resp_cookie = cookie_option(resp);
 
-        // A malformed COOKIE length is always dropped as a likely spoof.
+        // A malformed COOKIE length is always dropped as a likely spoof. An
+        // 8-byte echo is just the client cookie (server does not support
+        // cookies yet); 9..40 carries a server cookie.
         if let Some(cookie) = resp_cookie {
-            if !(16..=40).contains(&cookie.len()) {
+            if !(8..=40).contains(&cookie.len()) {
                 return CookieVerdict::Drop;
             }
         }
@@ -422,7 +433,13 @@ impl ServerCookie {
                 Some(prefix) if prefix == sent => {}
                 _ => return CookieVerdict::Drop,
             }
-            self.store_server(cookie);
+            // Only a real server cookie (more than the 8-byte client echo)
+            // confirms support and is remembered. An 8-byte echo leaves the
+            // state untouched so the GENERATED handling below can mark the
+            // server unsupported and accept the reply.
+            if cookie.len() > 8 {
+                self.store_server(cookie);
+            }
         }
 
         const RCODE_BADCOOKIE: u16 = 23;
@@ -478,6 +495,23 @@ mod tests {
         assert!(!has_opt(&q));
         assert_eq!(header_u16(&q, 10), Some(0));
         assert_eq!(q.len(), 29);
+    }
+
+    #[test]
+    fn append_opt_rejects_messages_without_room_for_the_whole_rr() {
+        // Header + 65519 zero bytes = 65531 bytes; the 11-byte OPT would
+        // overflow the 16-bit DNS message length, so it must be rejected
+        // without mutating the buffer.
+        let mut buf = vec![0u8; 65531];
+        assert!(!append_opt(&mut buf, 1280));
+        assert_eq!(buf.len(), 65531);
+        assert_eq!(header_u16(&buf, 10), Some(0));
+
+        // Exactly 65535 bytes is still representable.
+        let mut fits = vec![0u8; 65524];
+        assert!(append_opt(&mut fits, 1280));
+        assert_eq!(fits.len(), 65535);
+        assert_eq!(header_u16(&fits, 10), Some(1));
     }
 
     #[test]
@@ -569,5 +603,42 @@ mod tests {
             CookieVerdict::Accept
         );
         assert_eq!(c.state, CookieState::Unsupported);
+    }
+
+    fn response_with_cookie(cookie: &[u8]) -> Vec<u8> {
+        let mut resp = vec![0, 1, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(append_opt(&mut resp, 1280));
+        set_cookie_option(&mut resp, Some(cookie));
+        resp
+    }
+
+    #[test]
+    fn eight_byte_cookie_is_accepted_as_client_only() {
+        // An 8-byte echoed client cookie is valid: no server cookie is stored,
+        // the server is marked UNSUPPORTED, and the reply is accepted.
+        let mut c = ServerCookie::default();
+        let client = c.cookie_for_query().unwrap();
+        let sent: [u8; 8] = client[..8].try_into().unwrap();
+        assert_eq!(
+            c.validate_response(&response_with_cookie(&client), Some(&sent), 0),
+            CookieVerdict::Accept
+        );
+        assert_eq!(c.state, CookieState::Unsupported);
+
+        // A real server cookie (16 bytes) instead confirms SUPPORTED.
+        let mut c = ServerCookie::default();
+        let mut client = c.cookie_for_query().unwrap();
+        let sent: [u8; 8] = client[..8].try_into().unwrap();
+        client.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            c.validate_response(&response_with_cookie(&client), Some(&sent), 0),
+            CookieVerdict::Accept
+        );
+        assert_eq!(c.state, CookieState::Supported);
+        // Once SUPPORTED, a client-only echo (8 bytes) is a regression: drop.
+        assert_eq!(
+            c.validate_response(&response_with_cookie(&client[..8]), Some(&sent), 0),
+            CookieVerdict::Drop
+        );
     }
 }
