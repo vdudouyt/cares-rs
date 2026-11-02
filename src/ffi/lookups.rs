@@ -81,9 +81,13 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *const c_voi
 #[no_mangle]
 pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
+    // Upstream ares_search returns silently on a NULL channel/name — no
+    // callback may fire before the EFORMERR/void error return.
+    if channel.is_null() || name.is_null() {
+        return;
+    }
     let name_str = unsafe { cstr_lossy(name) };
-    // Name sanity precedes the channel deref: a bad name reports even on a
-    // NULL channel (upstream ordering).
+    // Name sanity precedes the channel deref.
     if let Some(status) = search_precheck(name_str) {
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
         return;
@@ -401,12 +405,71 @@ pub(crate) fn on_nameinfo_reply(callback: AresNameinfoCallback, arg: *mut c_void
 pub(crate) fn on_addrinfo_reply(callback: AresAddrInfoCallback, arg: *mut c_void, port: u16, r: Result<AddrInfoOut, c_int>) {
     match r {
         Ok(out) if out.status.code() == ARES_SUCCESS => {
-            let nodes = crate::ffi::addrinfo::nodes_from_addr_records(&out.records, port);
-            let ai = crate::ffi::addrinfo::build_ares_addrinfo(&out.name, nodes);
+            let nodes = crate::ffi::addrinfo::nodes_from_addr_records(
+                &out.records,
+                port,
+                out.socktype,
+                out.protocol,
+            );
+            let cnames = crate::ffi::addrinfo::cnames_from_entries(&out.cnames);
+            let ai = crate::ffi::addrinfo::build_ares_addrinfo(&out.name, nodes, cnames);
             unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
         }
         Ok(out) => unsafe { callback(arg, out.status.code(), 0, std::ptr::null_mut()) },
         Err(status) => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
+    }
+}
+
+/// Resolve a getaddrinfo service string. `numeric_only` implements
+/// ARES_AI_NUMERICSERV. Unknown services return ARES_ESERVICE; the
+/// libc::getservbyname fallback is inherently a C call.
+fn resolve_service_port(service: *const c_char, numeric_only: bool) -> Result<u16, c_int> {
+    let svc = unsafe { cstr_lossy(service) };
+    if numeric_only {
+        return svc.parse::<u16>().map_err(|_| ARES_ESERVICE);
+    }
+    match service_to_port(svc) {
+        ServicePort::Port(p) => Ok(p),
+        ServicePort::NeedSystemLookup => {
+            let c_svc = unsafe { CStr::from_ptr(service) };
+            let result = unsafe { libc::getservbyname(c_svc.as_ptr(), std::ptr::null()) };
+            if result.is_null() {
+                Err(ARES_ESERVICE)
+            } else {
+                Ok(unsafe { u16::from_be((*result).s_port as u16) })
+            }
+        }
+    }
+}
+
+/// Decode the caller's hints, defaulting to AF_UNSPEC with zeroed
+/// socktype/protocol when the pointer is NULL.
+fn decode_addrinfo_hints(hints: *const ares_addrinfo_hints) -> (c_int, c_int, c_int, c_int) {
+    if hints.is_null() {
+        return (libc::AF_UNSPEC, 0, 0, 0);
+    }
+    let hints = unsafe { &*hints };
+    (hints.ai_family, hints.ai_flags, hints.ai_socktype, hints.ai_protocol)
+}
+
+/// Resolve the service port, firing the callback with ARES_ESERVICE on an
+/// unknown/non-numeric service. `None` means the callback already fired.
+fn service_port_or_callback(
+    service: *const c_char,
+    ai_flags: c_int,
+    callback: AresAddrInfoCallback,
+    arg: *mut c_void,
+) -> Option<u16> {
+    if service.is_null() {
+        return Some(0);
+    }
+    let numeric_only = ai_flags & crate::ffi::ARES_AI_NUMERICSERV != 0;
+    match resolve_service_port(service, numeric_only) {
+        Ok(port) => Some(port),
+        Err(status) => {
+            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+            None
+        }
     }
 }
 
@@ -423,29 +486,13 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     let Some(callback) = callback else { return; };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
 
-    let (ai_family, ai_flags) = if hints.is_null() {
-        (libc::AF_UNSPEC, 0)
-    } else {
-        unsafe { ((*hints).ai_family, (*hints).ai_flags) }
-    };
+    let (ai_family, ai_flags, ai_socktype, ai_protocol) = decode_addrinfo_hints(hints);
 
-    // Resolve the service name to a port (order decided in core; the
-    // libc::getservbyname fallback is inherently a C call, so it runs here).
-    let port: u16 = if !service.is_null() {
-        match service_to_port(unsafe { cstr_lossy(service) }) {
-            ServicePort::Port(p) => p,
-            ServicePort::NeedSystemLookup => {
-                let c_svc = unsafe { CStr::from_ptr(service) };
-                let result = unsafe { libc::getservbyname(c_svc.as_ptr(), std::ptr::null()) };
-                if !result.is_null() {
-                    unsafe { u16::from_be((*result).s_port as u16) }
-                } else {
-                    0
-                }
-            }
-        }
-    } else {
-        0
+    // Resolve the service name to a port. ARES_AI_NUMERICSERV rejects
+    // non-numeric services synchronously, before any DNS work; an unknown text
+    // service is ARES_ESERVICE either way.
+    let Some(port) = service_port_or_callback(service, ai_flags, callback, arg) else {
+        return;
     };
 
     // Build the resource bundle and spawn the self-contained async future. A
@@ -453,7 +500,13 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     let hostname_raw = unsafe { cstr_lossy(name) };
     let client = channeldata.state.derive();
     let io = client.io.clone();
-    let fut = client.getaddrinfo(hostname_raw.to_string(), ai_family, ai_flags);
+    let fut = client.getaddrinfo(
+        hostname_raw.to_string(),
+        ai_family,
+        ai_flags,
+        ai_socktype,
+        ai_protocol,
+    );
     channeldata.spawn(io, fut, move |r| on_addrinfo_reply(callback, arg, port, r));
 }
 #[no_mangle]

@@ -55,11 +55,23 @@ pub struct ParsedResponse<'a> {
     pub answers: Vec<DnsAnswer<'a>>,
 }
 
+/// One entry of the CNAME chain in a reply, in answer order. `alias` is the
+/// owner name and `name` the target; both are absent only for synthetic
+/// (hosts-file) canonical-name entries.
+#[derive(Debug, Clone)]
+pub struct CnameEntry {
+    pub ttl: u32,
+    pub alias: Option<CString>,
+    pub name: Option<CString>,
+}
+
 #[derive(Debug)]
 pub struct ParsedRRs<T> {
     pub items: Vec<T>,
     pub name: CString,
     pub aliases: Vec<CString>,
+    /// Every IN-class CNAME answer, in reply order (owner/target/TTL).
+    pub cnames: Vec<CnameEntry>,
     pub _limit_ttl: Option<u32>,
     pub success: usize,
 }
@@ -126,6 +138,7 @@ impl<'a> ParsedResponse<'a> {
         let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
         let mut success = 0;
         let mut aliases: Vec<CString> = vec![];
+        let mut cnames: Vec<CnameEntry> = vec![];
         // Upstream clamps every A/AAAA TTL to the smallest CNAME TTL anywhere in
         // the answer section, regardless of record order.
         let min_cname_ttl = self
@@ -148,6 +161,14 @@ impl<'a> ParsedResponse<'a> {
                 let mut cname_buf = SliceBuf::new(answer.data);
                 let alias_of = DnsLabel::parse(&mut cname_buf).ok_or(AresError::from(ARES_EBADRESP))?;
                 let alias_of = alias_of.build_cstring(buf).ok_or(AresError::from(ARES_EBADRESP))?;
+                // `answer.name` is the CNAME owner (the previous name in the
+                // chain); `alias_of` is the target. Keep the raw RR TTL.
+                let owner = answer.name.build_cstring(buf).ok_or(AresError::from(ARES_EBADRESP))?;
+                cnames.push(CnameEntry {
+                    ttl: answer.ttl,
+                    alias: Some(owner),
+                    name: Some(alias_of.clone()),
+                });
                 if expected_record_type != RECORD_TYPE_PTR {
                     aliases.push(name);
                     if first_cname.is_none() {
@@ -191,7 +212,7 @@ impl<'a> ParsedResponse<'a> {
                 name = first;
             }
         }
-        Ok(ParsedRRs { items, name, aliases, _limit_ttl: min_cname_ttl, success })
+        Ok(ParsedRRs { items, name, aliases, cnames, _limit_ttl: min_cname_ttl, success })
     }
 }
 
@@ -278,6 +299,65 @@ mod tests {
         let buf = a_reply(2);
         let err = ParsedResponse::from_buf(&buf).unwrap_err();
         assert_eq!(err.code(), ARES_EFORMERR);
+    }
+
+    fn push_name(buf: &mut Vec<u8>, name: &str) {
+        for label in name.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+    }
+
+    /// A CNAME chain (two hops) followed by an A record. The hostent name is
+    /// the first target, while the addrinfo chain retains both hops in order.
+    #[test]
+    fn cname_chain_records_owner_target_and_ttl() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0, 1]); // id
+        buf.extend_from_slice(&[0x80, 0]); // response
+        buf.extend_from_slice(&[0, 1]); // qdcount
+        buf.extend_from_slice(&[0, 3]); // ancount
+        buf.extend_from_slice(&[0, 0, 0, 0]); // nscount, arcount
+        push_name(&mut buf, "query.example");
+        buf.extend_from_slice(&[0, 1, 0, 1]); // A IN
+
+        // query.example CNAME first.example (TTL 120)
+        buf.extend_from_slice(&[0xc0, 0x0c]);
+        buf.extend_from_slice(&[0, 5, 0, 1]);
+        buf.extend_from_slice(&120u32.to_be_bytes());
+        let mut rdata = Vec::new();
+        push_name(&mut rdata, "first.example");
+        buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&rdata);
+
+        // first.example CNAME second.example (TTL 60)
+        push_name(&mut buf, "first.example");
+        buf.extend_from_slice(&[0, 5, 0, 1]);
+        buf.extend_from_slice(&60u32.to_be_bytes());
+        let mut rdata = Vec::new();
+        push_name(&mut rdata, "second.example");
+        buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&rdata);
+
+        // second.example A 1.2.3.4
+        push_name(&mut buf, "second.example");
+        buf.extend_from_slice(&[0, 1, 0, 1]);
+        buf.extend_from_slice(&300u32.to_be_bytes());
+        buf.extend_from_slice(&[0, 4, 1, 2, 3, 4]);
+
+        let rrs = addr_reply(&buf, RECORD_TYPE_A, ReplyRequire::Items).expect("parse");
+        assert_eq!(rrs.cnames.len(), 2);
+        assert_eq!(rrs.cnames[0].ttl, 120);
+        assert_eq!(rrs.cnames[0].alias.as_ref().map(|s| s.to_str().unwrap()), Some("query.example"));
+        assert_eq!(rrs.cnames[0].name.as_ref().map(|s| s.to_str().unwrap()), Some("first.example"));
+        assert_eq!(rrs.cnames[1].ttl, 60);
+        assert_eq!(rrs.cnames[1].alias.as_ref().map(|s| s.to_str().unwrap()), Some("first.example"));
+        assert_eq!(rrs.cnames[1].name.as_ref().map(|s| s.to_str().unwrap()), Some("second.example"));
+        // Legacy hostent semantics use the first CNAME target.
+        assert_eq!(rrs.name.to_str().unwrap(), "first.example");
+        // The A TTL is clamped to the smallest CNAME TTL.
+        assert_eq!(rrs.items[0].ttl, 60);
     }
 }
 

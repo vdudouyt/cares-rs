@@ -3,16 +3,20 @@
 
 use libc::{in_addr};
 use crate::ffi::Channel;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
 use crate::core::async_client::DecodedOptions;
 use crate::ffi::channel::ChannelData;
 use crate::ares_socket_t;
 
+/// Upstream's private sortlist pattern: an address + prefix length. The public
+/// header only forward-declares it, but `ares_options.sortlist` / `nsort` make
+/// the layout observable through `ares_save_options`, so mirror it exactly.
 #[repr(C)]
 pub struct apattern {
-    _private: [u8; 0],
+    pub addr: crate::ffi::ares_addr,
+    pub mask: libc::c_uchar,
 }
 
 pub type ares_evsys_t = c_int;
@@ -91,6 +95,30 @@ impl Default for ares_options {
     }
 }
 
+/// Decode `ARES_OPT_SORTLIST` patterns. Invalid families/masks are rejected
+/// like `ares_set_sortlist`.
+fn decode_sortlist(patterns: &[apattern]) -> Result<Vec<(IpAddr, u8)>, c_int> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        let (ip, max) = match pattern.addr.family {
+            libc::AF_INET => {
+                let raw = unsafe { pattern.addr.addr.addr4.s_addr };
+                (IpAddr::V4(Ipv4Addr::from(u32::from_be(raw))), 32)
+            }
+            libc::AF_INET6 => {
+                let octets = unsafe { pattern.addr.addr.addr6._S6_un._S6_u8 };
+                (IpAddr::V6(Ipv6Addr::from(octets)), 128)
+            }
+            _ => return Err(ARES_EBADSTR),
+        };
+        if pattern.mask > max {
+            return Err(ARES_EBADSTR);
+        }
+        out.push((ip, pattern.mask));
+    }
+    Ok(out)
+}
+
 pub const ARES_OPT_FLAGS          : c_int = 1 << 0;
 pub const ARES_OPT_TIMEOUT        : c_int = 1 << 1;
 pub const ARES_OPT_TRIES          : c_int = 1 << 2;
@@ -154,6 +182,13 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     };
 
     // Marshal every C field into an owned mirror before any logic runs.
+    let decoded_sortlist = match (optmask & ARES_OPT_SORTLIST != 0)
+        .then(|| decode_sortlist_options(options))
+    {
+        Some(Err(status)) => return status,
+        Some(Ok(list)) => list,
+        None => None,
+    };
     let decoded = DecodedOptions {
         flags: options.flags,
         timeout: options.timeout,
@@ -182,6 +217,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         },
         lookups: (!options.lookups.is_null())
             .then(|| unsafe { CStr::from_ptr(options.lookups) }.to_string_lossy().into_owned()),
+        sortlist: decoded_sortlist,
         resolvconf_path: (!options.resolvconf_path.is_null())
             .then(|| unsafe { CStr::from_ptr(options.resolvconf_path) }.to_string_lossy().into_owned()),
         hosts_path: (!options.hosts_path.is_null())
@@ -202,6 +238,53 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
+}
+
+/// Decode `ARES_OPT_SORTLIST` from the caller's option struct. `Some(empty)`
+/// means an explicit `nsort == 0` (clears the list).
+fn decode_sortlist_options(options: &ares_options) -> Result<Option<Vec<(IpAddr, u8)>>, c_int> {
+    if options.nsort <= 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if options.sortlist.is_null() {
+        return Err(ARES_EBADSTR);
+    }
+    let patterns = unsafe {
+        std::slice::from_raw_parts(options.sortlist as *const apattern, options.nsort as usize)
+    };
+    decode_sortlist(patterns).map(Some)
+}
+
+/// Copy the safe sortlist entries into a caller-owned libc array.
+fn save_sortlist(entries: &[crate::core::sortlist::SortlistEntry]) -> Option<(*mut apattern, c_int)> {
+    let count = entries.len();
+    let arr = unsafe { libc::malloc(count * std::mem::size_of::<apattern>()) as *mut apattern };
+    if arr.is_null() {
+        return None;
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        let (family, addr) = match entry.addr() {
+            IpAddr::V4(v4) => (
+                libc::AF_INET,
+                crate::ffi::AresAddrUnion {
+                    addr4: libc::in_addr { s_addr: u32::from(v4).to_be() },
+                },
+            ),
+            IpAddr::V6(v6) => (
+                libc::AF_INET6,
+                crate::ffi::AresAddrUnion {
+                    addr6: crate::ffi::ares_in6_addr::from_octets(v6.octets()),
+                },
+            ),
+        };
+        unsafe {
+            *arr.add(i) = apattern {
+                addr: crate::ffi::ares_addr { family, addr },
+                mask: entry.mask_bits(),
+            };
+        }
+    }
+    Some((arr, count as c_int))
 }
 
 #[no_mangle]
@@ -248,6 +331,7 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
             mask |= ARES_OPT_DOMAINS;
         }
     }
+    mask |= save_sortlist_into(out, &saved.sortlist);
 
     if let Some(maxtimeout) = saved.maxtimeout {
         out.maxtimeout = maxtimeout;
@@ -264,6 +348,38 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
 
     unsafe { *optmask = mask };
     ARES_SUCCESS
+}
+
+fn free_sortlist(ptr: *mut apattern) {
+    if !ptr.is_null() {
+        unsafe { libc::free(ptr as *mut c_void) };
+    }
+}
+
+/// Fill `out.sortlist`/`out.nsort`; returns the optmask contribution.
+fn save_sortlist_into(
+    out: &mut ares_options,
+    entries: &[crate::core::sortlist::SortlistEntry],
+) -> c_int {
+    if entries.is_empty() {
+        return 0;
+    }
+    let Some((arr, count)) = save_sortlist(entries) else {
+        return 0;
+    };
+    out.sortlist = arr;
+    out.nsort = count;
+    ARES_OPT_SORTLIST
+}
+
+/// Free and clear a saved sortlist on an options struct.
+fn take_sortlist(opts: &mut ares_options) {
+    if opts.sortlist.is_null() {
+        return;
+    }
+    free_sortlist(opts.sortlist);
+    opts.sortlist = std::ptr::null_mut();
+    opts.nsort = 0;
 }
 
 #[no_mangle]
@@ -292,6 +408,9 @@ pub unsafe extern "C" fn ares_destroy_options(options: *mut ares_options) {
         unsafe { libc::free(opts.domains as *mut c_void) };
         opts.domains = std::ptr::null_mut();
     }
+
+    // Free sortlist array
+    take_sortlist(opts);
 
     // Free lookups string
     if !opts.lookups.is_null() {

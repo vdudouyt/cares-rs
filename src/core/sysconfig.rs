@@ -235,4 +235,17 @@ mod tests {
             _ => panic!("unexpected error: {:?}", err),
         }
     }
+
+    #[test]
+    fn parses_lookup_and_hostresorder_order() {
+        let conf: SysConfig = "lookup bind files\n".parse().unwrap();
+        assert_eq!(conf.lookups.as_deref(), Some("bf"));
+
+        let conf: SysConfig = "hostresorder files bind\n".parse().unwrap();
+        assert_eq!(conf.lookups.as_deref(), Some("fb"));
+
+        // Unknown tokens are skipped; duplicates keep first position.
+        let conf: SysConfig = "lookup garbage bind local bind\n".parse().unwrap();
+        assert_eq!(conf.lookups.as_deref(), Some("bf"));
+    }
 }

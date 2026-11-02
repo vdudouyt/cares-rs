@@ -670,8 +670,27 @@ typedef int ares_socket_t;
 
 typedef void (*ares_sock_state_cb)(void *data, ares_socket_t socket_fd, int readable, int writable);
 
+typedef struct ares_in6_addr_un {
+  uint8_t _S6_u8[16];
+} ares_in6_addr_un;
+
+typedef struct ares_in6_addr {
+  struct ares_in6_addr_un _S6_un;
+} ares_in6_addr;
+
+typedef union ares_addr_union {
+  struct in_addr addr4;
+  struct ares_in6_addr addr6;
+} ares_addr_union;
+
+typedef struct ares_addr {
+  int family;
+  union ares_addr_union addr;
+} ares_addr;
+
 typedef struct apattern {
-  uint8_t _private[0];
+  struct ares_addr addr;
+  unsigned char mask;
 } apattern;
 
 typedef int ares_evsys_t;
@@ -756,25 +775,7 @@ typedef unsigned int ares_dns_rcode_t;
 
 typedef int ares_bool_t;
 
-typedef struct ares_in6_addr_un {
-  uint8_t _S6_u8[16];
-} ares_in6_addr_un;
-
-typedef struct ares_in6_addr {
-  struct ares_in6_addr_un _S6_un;
-} ares_in6_addr;
-
 typedef unsigned int ares_dns_class_t;
-
-typedef union ares_addr_union {
-  struct in_addr addr4;
-  struct ares_in6_addr addr6;
-} ares_addr_union;
-
-typedef struct ares_addr {
-  int family;
-  union ares_addr_union addr;
-} ares_addr;
 
 typedef unsigned int ares_dns_opt_datatype_t;
 

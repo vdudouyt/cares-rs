@@ -37,7 +37,7 @@ use crate::core::lookup::{
 };
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
 use crate::core::packets::AddrRecord;
-use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedRRs, ParsedResponse, ReplyRequire};
+use crate::core::response::{addr_reply, push_synthetic_ptr, CnameEntry, ParsedRRs, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
 use crate::async_runtime::socket::SocketFactory;
 use crate::core::sortlist::{apply_sortlist, parse_sortlist, SortlistEntry};
@@ -145,6 +145,28 @@ impl AsyncClient {
     /// empty only on the channel-owned instance before first use).
     fn hostsfile(&self) -> Rc<Hosts> {
         self.hosts.clone().unwrap_or_default()
+    }
+
+    /// Hosts lookup honouring ARES_AI_ENVHOSTS. Upstream's `use_env` flag
+    /// selects the environment-provided hosts file (`CARES_HOSTS`); newer
+    /// c-ares documentation also mentions `HOSTALIASES` for the same flag, so
+    /// accept either while preferring CARES_HOSTS. When no environment path is
+    /// set, the channel's configured hosts path (or `/etc/hosts`) applies.
+    fn hosts_lookup(
+        &self,
+        name: &str,
+        family: AddressFamily,
+        use_env: bool,
+    ) -> Option<HostLookup> {
+        if use_env {
+            if let Some(path) = std::env::var("CARES_HOSTS")
+                .ok()
+                .or_else(|| std::env::var("HOSTALIASES").ok())
+            {
+                return Hosts::from_path(path).ok().and_then(|h| h.lookup(name, family));
+            }
+        }
+        self.hostsfile().lookup(name, family)
     }
 
     /// ares_query / ares_send: one query delivered raw. Keeps the historical
@@ -381,121 +403,142 @@ impl AsyncClient {
             }
         }
 
-        // Hosts file.
-        if let Some(lookup) = self.hostsfile().lookup(&hostname, filter) {
-            if !lookup.addrs.is_empty() {
-                return Ok(Hostent::from_lookup(lookup));
-            }
-        }
+        // Apply the configured resolver order (`lookup`/`hostresorder` from
+        // resolv.conf, default "fb"): 'f' is the hosts file, 'b' the DNS.
+        // Unknown characters are ignored, matching upstream next_lookup().
+        let order: Vec<char> = self.lookups.chars().collect();
+        let mut last_error: AresError = ARES_ECONNREFUSED.into();
+        for ch in order {
+            match ch {
+                'f' => {
+                    if let Some(lookup) = self.hostsfile().lookup(&hostname, filter) {
+                        if !lookup.addrs.is_empty() {
+                            return Ok(Hostent::from_lookup(lookup));
+                        }
+                    }
 
-        // RFC 6761: localhost / *.localhost → loopback.
-        if is_localhost(&hostname) {
-            let addrs = match filter {
-                AddressFamily::Ipv4 => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-                AddressFamily::Ipv6 => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
-                AddressFamily::Any => vec![IpAddr::V6(Ipv6Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            };
-            return Ok(Hostent::new(hostname, addrs));
-        }
-
-        // HOSTALIASES (single-label names): resolve via env-pointed file.
-        // ARES_FLAG_NOALIASES disables the lookup entirely.
-        let (resolved, alias_found) = match hostaliases_lookup(
-            &hostname,
-            self.flags & ARES_FLAG_NOALIASES != 0,
-        ) {
-            Ok(Some(alias)) => (alias, true),
-            Ok(None) => (hostname.clone(), false),
-            Err(status) => return Err(status.into()),
-        };
-
-        if self.endpoints.is_empty() {
-            return Err(ARES_ENOSERVER.into());
-        }
-
-        // Query-cache probe: a fresh cached reply that parses to a non-empty
-        // answer delivers now; an expired entry is evicted; a parse error falls
-        // through.
-        let cache_rtype = if matches!(filter, AddressFamily::Ipv4) { RTYPE_A } else { RTYPE_AAAA };
-        let cache_family = if matches!(filter, AddressFamily::Ipv4) { AF_INET } else { AF_INET6 };
-        // Hoisted out of the `if let` scrutinee: edition 2021 would keep the
-        // cache RefMut alive for the whole body otherwise (fragile).
-        let cache_key = CacheKey::new(
-            &resolved,
-            cache_rtype,
-            ARES_CLASS_IN,
-            0,
-            self.recursion_desired(),
-            false,
-        );
-        let cached = self.cache.borrow_mut().get(&cache_key, Instant::now());
-        if let Some(cached) = cached {
-            if let Ok(mut rrs) = addr_reply(&cached, cache_rtype, ReplyRequire::Items) {
-                if !self.sortlist.is_empty() {
-                    apply_sortlist(&self.sortlist, &mut rrs.items);
+                    // RFC 6761: localhost / *.localhost → loopback (upstream
+                    // performs this fallback as part of the file lookup).
+                    if is_localhost(&hostname) {
+                        let addrs = match filter {
+                            AddressFamily::Ipv4 => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                            AddressFamily::Ipv6 => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
+                            AddressFamily::Any => vec![IpAddr::V6(Ipv6Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                        };
+                        return Ok(Hostent::new(hostname, addrs));
+                    }
                 }
-                return Ok(Hostent::from_parsed(rrs, cache_family));
+                'b' => {
+                    // RFC 6761: localhost names never go to the configured
+                    // nameservers; the file lookup (if any) answered above.
+                    if is_localhost(&hostname) {
+                        continue;
+                    }
+
+                    // HOSTALIASES (single-label names): resolve via the
+                    // env-pointed file. ARES_FLAG_NOALIASES disables it.
+                    let (resolved, alias_found) = match hostaliases_lookup(
+                        &hostname,
+                        self.flags & ARES_FLAG_NOALIASES != 0,
+                    ) {
+                        Ok(Some(alias)) => (alias, true),
+                        Ok(None) => (hostname.clone(), false),
+                        Err(status) => return Err(status.into()),
+                    };
+
+                    if self.endpoints.is_empty() {
+                        last_error = ARES_ENOSERVER.into();
+                        continue;
+                    }
+
+                    // Query-cache probe: a fresh cached reply that parses to a
+                    // non-empty answer delivers now.
+                    let cache_rtype = if matches!(filter, AddressFamily::Ipv4) { RTYPE_A } else { RTYPE_AAAA };
+                    let cache_family = if matches!(filter, AddressFamily::Ipv4) { AF_INET } else { AF_INET6 };
+                    let cache_key = CacheKey::new(
+                        &resolved,
+                        cache_rtype,
+                        ARES_CLASS_IN,
+                        0,
+                        self.recursion_desired(),
+                        false,
+                    );
+                    let cached = self.cache.borrow_mut().get(&cache_key, Instant::now());
+                    if let Some(cached) = cached {
+                        if let Ok(mut rrs) = addr_reply(&cached, cache_rtype, ReplyRequire::Items) {
+                            if !self.sortlist.is_empty() {
+                                apply_sortlist(&self.sortlist, &mut rrs.items);
+                            }
+                            return Ok(Hostent::from_parsed(rrs, cache_family));
+                        }
+                    }
+
+                    // ===== DNS phase =====
+                    // Candidate names, in order (trailing dots kept verbatim,
+                    // unlike ares_search, so the query / cache-store /
+                    // cache-probe keys all match).
+                    let dots = resolved.chars().filter(|&c| c == '.').count() as u32;
+                    let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
+                    let names: Vec<String> = if !no_search && dots < self.config.options.ndots && !self.config.search.is_empty() {
+                        let mut v: Vec<String> = self.config.search.iter().map(|d| format!("{resolved}.{d}")).collect();
+                        v.push(resolved.clone());
+                        v
+                    } else {
+                        vec![resolved.clone()]
+                    };
+                    // AF_UNSPEC resolves A+AAAA in parallel via the shared core
+                    // (like getaddrinfo, matching upstream where gethostbyname is
+                    // a shell over getaddrinfo). The Hostent holds a single
+                    // family — preferring IPv6 when it has records.
+                    let rtypes: Vec<u16> = match family {
+                        AF_INET => vec![RTYPE_A],
+                        AF_INET6 => vec![RTYPE_AAAA],
+                        _ => vec![RTYPE_A, RTYPE_AAAA],
+                    };
+                    let lookup = self.clone().resolve_addrinfo(&names, &rtypes, true).await;
+                    self.io.borrow_mut().app.timeouts = lookup.timeouts;
+                    if lookup.replies.is_empty() {
+                        last_error = lookup.status;
+                        continue;
+                    }
+                    // Pick one family for the Hostent — IPv6 (AAAA) if present,
+                    // else the first.
+                    let pick = lookup.replies.iter().position(|f| f.rtype == RTYPE_AAAA).unwrap_or(0);
+                    let Some(reply) = lookup.replies.into_iter().nth(pick) else {
+                        last_error = ARES_ENODATA.into();
+                        continue;
+                    };
+                    let hfamily = if reply.rtype == RTYPE_AAAA { AF_INET6 } else { AF_INET };
+
+                    // Cache the chosen family's raw reply under the winning name
+                    // (+ the bare name when a search domain was appended), then
+                    // sortlist + build the Hostent.
+                    if self.cache.borrow().enabled() {
+                        let mut store = vec![lookup.name.clone()];
+                        if resolved != lookup.name {
+                            store.push(resolved.clone());
+                        }
+                        let ttl = reply.rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
+                        let template = CacheKey::new(
+                            &lookup.name,
+                            reply.rtype,
+                            ARES_CLASS_IN,
+                            0,
+                            self.recursion_desired(),
+                            false,
+                        );
+                        self.cache.borrow_mut().store_names(store, &template, ttl, &reply.buf, Instant::now());
+                    }
+                    let mut rrs = reply.rrs;
+                    if !self.sortlist.is_empty() {
+                        apply_sortlist(&self.sortlist, &mut rrs.items);
+                    }
+                    return Ok(Hostent::from_parsed(rrs, hfamily));
+                }
+                _ => {}
             }
         }
-
-        // ===== DNS phase =====
-        // Candidate names, in order (trailing dots kept verbatim, unlike ares_search,
-        // so the query / cache-store / cache-probe keys all match): below ndots with a
-        // search list, each `name.domain` then the bare name; otherwise just the name.
-        let dots = resolved.chars().filter(|&c| c == '.').count() as u32;
-        let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
-        let names: Vec<String> = if !no_search && dots < self.config.options.ndots && !self.config.search.is_empty() {
-            let mut v: Vec<String> = self.config.search.iter().map(|d| format!("{resolved}.{d}")).collect();
-            v.push(resolved.clone());
-            v
-        } else {
-            vec![resolved.clone()]
-        };
-        // AF_UNSPEC resolves A+AAAA in parallel via the shared core (like getaddrinfo,
-        // matching upstream where gethostbyname is a shell over getaddrinfo). The
-        // Hostent holds a single family — preferring IPv6 when it has records. The
-        // first-query failover probe is spawned by the core (`probe = true`).
-        let rtypes: Vec<u16> = match family {
-            AF_INET => vec![RTYPE_A],
-            AF_INET6 => vec![RTYPE_AAAA],
-            _ => vec![RTYPE_A, RTYPE_AAAA],
-        };
-        let lookup = self.clone().resolve_addrinfo(&names, &rtypes, true).await;
-        self.io.borrow_mut().app.timeouts = lookup.timeouts;
-        if lookup.replies.is_empty() {
-            return Err(lookup.status);
-        }
-        // Pick one family for the Hostent — IPv6 (AAAA) if present, else the first
-        // (the emptiness check above makes the else-branch unreachable).
-        let pick = lookup.replies.iter().position(|f| f.rtype == RTYPE_AAAA).unwrap_or(0);
-        let Some(reply) = lookup.replies.into_iter().nth(pick) else {
-            return Err(ARES_ENODATA.into());
-        };
-        let hfamily = if reply.rtype == RTYPE_AAAA { AF_INET6 } else { AF_INET };
-
-        // Cache the chosen family's raw reply under the winning name (+ the bare name
-        // when a search domain was appended), then sortlist + build the Hostent.
-        if self.cache.borrow().enabled() {
-            let mut store = vec![lookup.name.clone()];
-            if resolved != lookup.name {
-                store.push(resolved.clone());
-            }
-            let ttl = reply.rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-            let template = CacheKey::new(
-                &lookup.name,
-                reply.rtype,
-                ARES_CLASS_IN,
-                0,
-                self.recursion_desired(),
-                false,
-            );
-            self.cache.borrow_mut().store_names(store, &template, ttl, &reply.buf, Instant::now());
-        }
-        let mut rrs = reply.rrs;
-        if !self.sortlist.is_empty() {
-            apply_sortlist(&self.sortlist, &mut rrs.items);
-        }
-        Ok(Hostent::from_parsed(rrs, hfamily))
+        Err(last_error)
     }
 
     /// ares_gethostbyaddr: hosts-file reverse lookup, then a single PTR query.
@@ -892,23 +935,33 @@ impl AsyncClient {
         AddrLookup { name, replies: Vec::new(), status: status.into(), timeouts }
     }
 
-    /// ares_getaddrinfo: preflight (empty/onion/IP-literal/hosts/no-servers), then
-    /// the shared [`resolve_addrinfo`](Self::resolve_addrinfo) DNS phase (parallel
-    /// A+AAAA per search name, no probe), merging every family's records.
+    /// ares_getaddrinfo: preflight (family/empty/onion/IP-literal), then the
+    /// configured lookup order (hosts file `f` / DNS `b`, default "fb"),
+    /// merging every family's records, applying the sortlist unless
+    /// ARES_AI_NOSORT, and carrying the CNAME chain + final canonical name.
     pub(crate) async fn getaddrinfo(
         self: Rc<Self>,
         hostname_raw: String,
         ai_family: c_int,
         ai_flags: c_int,
+        socktype: c_int,
+        protocol: c_int,
     ) -> AddrInfoOut {
         // ===== preflight (synchronous) — order is behavior =====
         // The raw name keeps its trailing dot for the SearchPlan; the checks and
         // the delivered canonical name use the stripped form.
         let hostname = hostname_raw.strip_suffix('.').unwrap_or(&hostname_raw);
 
+        if !matches!(ai_family, libc::AF_INET | libc::AF_INET6 | libc::AF_UNSPEC) {
+            return fail(ARES_ENOTIMP);
+        }
         if hostname.is_empty() || is_onion_domain(hostname) {
             return fail(ARES_ENOTFOUND);
         }
+
+        let can_name = ai_flags & crate::ffi::ARES_AI_CANONNAME != 0;
+        let env_hosts = ai_flags & crate::ffi::ARES_AI_ENVHOSTS != 0;
+        let no_sort = ai_flags & crate::ffi::ARES_AI_NOSORT != 0;
 
         // IP literal (a family mismatch fails — no fall-through).
         if let Ok(ip) = hostname.parse::<IpAddr>() {
@@ -919,62 +972,142 @@ impl AsyncClient {
                 _ => false,
             };
             if matches {
-                return AddrInfoOut {
-                    name: hostname.to_string(),
-                    records: vec![AddrRecord { ip, ttl: u32::MAX }],
-                    status: ARES_SUCCESS.into(),
+                let cnames = if can_name {
+                    vec![CnameEntry {
+                        ttl: 0,
+                        alias: None,
+                        name: CString::new(hostname).ok(),
+                    }]
+                } else {
+                    Vec::new()
                 };
+                return AddrInfoOut::success(
+                    hostname.to_string(),
+                    vec![AddrRecord { ip, ttl: 0 }],
+                    cnames,
+                    socktype,
+                    protocol,
+                );
             }
             return fail(ARES_ENOTFOUND);
         }
 
-        // Hosts file.
         let family_filter = AddressFamily::from_af(ai_family).unwrap_or(AddressFamily::Any);
-        if let Some(lookup) = self.hostsfile().lookup(hostname, family_filter) {
-            if !lookup.addrs.is_empty() {
-                return AddrInfoOut {
-                    name: hostname.to_string(),
-                    records: lookup.addrs.iter().map(|&ip| AddrRecord { ip, ttl: u32::MAX }).collect(),
-                    status: ARES_SUCCESS.into(),
-                };
+        let order: Vec<char> = self.lookups.chars().collect();
+        let mut last_error: AresError = ARES_ECONNREFUSED.into();
+
+        for ch in order {
+            match ch {
+                'f' => {
+                    // Hosts file, honouring ARES_AI_ENVHOSTS (CARES_HOSTS /
+                    // HOSTALIASES) when requested.
+                    if let Some(lookup) = self.hosts_lookup(hostname, family_filter, env_hosts) {
+                        if !lookup.addrs.is_empty() {
+                            let mut records: Vec<AddrRecord> = lookup
+                                .addrs
+                                .iter()
+                                .map(|&ip| AddrRecord { ip, ttl: 0 })
+                                .collect();
+                            // Upstream file_lookup merges the loopback
+                            // fallback for localhost even when the hosts entry
+                            // only covered one family.
+                            if is_localhost(hostname) {
+                                merge_loopback(&mut records, family_filter);
+                            }
+                            if !no_sort {
+                                apply_sortlist(&self.sortlist, &mut records);
+                            }
+                            let cnames = if can_name {
+                                hosts_cnames(&lookup)
+                            } else {
+                                Vec::new()
+                            };
+                            return AddrInfoOut::success(
+                                hostname.to_string(),
+                                records,
+                                cnames,
+                                socktype,
+                                protocol,
+                            );
+                        }
+                    }
+
+                    // RFC 6761 loopback fallback (also the whole answer when
+                    // no hosts entry exists).
+                    if is_localhost(hostname) {
+                        let mut records: Vec<AddrRecord> = Vec::new();
+                        merge_loopback(&mut records, family_filter);
+                        if !no_sort {
+                            apply_sortlist(&self.sortlist, &mut records);
+                        }
+                        return AddrInfoOut::success(
+                            hostname.to_string(),
+                            records,
+                            Vec::new(),
+                            socktype,
+                            protocol,
+                        );
+                    }
+                }
+                'b' => {
+                    if is_localhost(hostname) {
+                        continue;
+                    }
+                    if self.endpoints.is_empty() {
+                        last_error = ARES_ENOSERVER.into();
+                        continue;
+                    }
+
+                    // ===== DNS phase: shared resolver, parallel A+AAAA =====
+                    let rtypes: Vec<u16> = match ai_family {
+                        libc::AF_INET => vec![RTYPE_A],
+                        libc::AF_INET6 => vec![RTYPE_AAAA],
+                        _ => vec![RTYPE_A, RTYPE_AAAA],
+                    };
+                    let no_aliases = self.flags & ARES_FLAG_NOALIASES != 0;
+                    let (search_name, alias_found) = match hostaliases_lookup(&hostname_raw, no_aliases) {
+                        Ok(Some(alias)) => (alias, true),
+                        Ok(None) => (hostname_raw.clone(), false),
+                        Err(status) => return fail(status),
+                    };
+                    let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
+                    let names = SearchPlan::for_search(
+                        &search_name,
+                        self.config.options.ndots,
+                        &self.config.search,
+                        no_search,
+                    )
+                    .into_names();
+                    let lookup = self.clone().resolve_addrinfo(&names, &rtypes, false).await;
+                    self.io.borrow_mut().app.timeouts = lookup.timeouts;
+                    if lookup.replies.is_empty() {
+                        last_error = lookup.status;
+                        continue;
+                    }
+                    // Merge every family's records (rtypes order) and their
+                    // CNAME chains (reply order). The canonical name is the
+                    // last CNAME target, or the winning query name.
+                    let mut cnames: Vec<CnameEntry> = Vec::new();
+                    let mut records: Vec<AddrRecord> = Vec::new();
+                    for reply in lookup.replies {
+                        records.extend(reply.rrs.items);
+                        cnames.extend(reply.rrs.cnames);
+                    }
+                    let name = cnames
+                        .iter()
+                        .rev()
+                        .find_map(|c| c.name.clone())
+                        .map(|c| c.to_string_lossy().into_owned())
+                        .unwrap_or(lookup.name);
+                    if !no_sort {
+                        apply_sortlist(&self.sortlist, &mut records);
+                    }
+                    return AddrInfoOut::success(name, records, cnames, socktype, protocol);
+                }
+                _ => {}
             }
         }
-
-        if self.endpoints.is_empty() {
-            return fail(ARES_ENOSERVER);
-        }
-
-        // ===== DNS phase: the shared resolver, parallel A+AAAA, no probe =====
-        // ARES_AI_ENVHOSTS is accepted here so Phase 3B can wire the hosts-file
-        // environment lookup without another signature change.
-        let _env_hosts = ai_flags & crate::ffi::ARES_AI_ENVHOSTS != 0;
-        let rtypes: Vec<u16> = match ai_family {
-            libc::AF_INET => vec![RTYPE_A],
-            libc::AF_INET6 => vec![RTYPE_AAAA],
-            _ => vec![RTYPE_A, RTYPE_AAAA],
-        };
-        let no_aliases = self.flags & ARES_FLAG_NOALIASES != 0;
-        let (search_name, alias_found) = match hostaliases_lookup(&hostname_raw, no_aliases) {
-            Ok(Some(alias)) => (alias, true),
-            Ok(None) => (hostname_raw.clone(), false),
-            Err(status) => return fail(status),
-        };
-        let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
-        let names = SearchPlan::for_search(
-            &search_name,
-            self.config.options.ndots,
-            &self.config.search,
-            no_search,
-        )
-        .into_names();
-        let lookup = self.clone().resolve_addrinfo(&names, &rtypes, false).await;
-        self.io.borrow_mut().app.timeouts = lookup.timeouts;
-        if lookup.replies.is_empty() {
-            return fail(lookup.status.code());
-        }
-        // Merge every family's records (rtypes order).
-        let records = lookup.replies.into_iter().flat_map(|f| f.rrs.items).collect();
-        AddrInfoOut { name: lookup.name, records, status: ARES_SUCCESS.into() }
+        fail(last_error.code())
     }
 }
 
@@ -998,15 +1131,78 @@ struct AddrLookup {
 }
 
 /// The safe result the FFI turns into an `ares_addrinfo`: the canonical name,
-/// the merged address records (arrival order), and the status.
+/// the merged address records (arrival order), the CNAME chain, the hint's
+/// socket type/protocol, and the status.
 pub(crate) struct AddrInfoOut {
     pub name: String,
     pub records: Vec<AddrRecord>,
+    pub cnames: Vec<CnameEntry>,
+    pub socktype: c_int,
+    pub protocol: c_int,
     pub status: AresError,
 }
 
+impl AddrInfoOut {
+    fn success(
+        name: String,
+        records: Vec<AddrRecord>,
+        cnames: Vec<CnameEntry>,
+        socktype: c_int,
+        protocol: c_int,
+    ) -> Self {
+        AddrInfoOut {
+            name,
+            records,
+            cnames,
+            socktype,
+            protocol,
+            status: ARES_SUCCESS.into(),
+        }
+    }
+}
+
 fn fail(status: c_int) -> AddrInfoOut {
-    AddrInfoOut { name: String::new(), records: Vec::new(), status: status.into() }
+    AddrInfoOut {
+        name: String::new(),
+        records: Vec::new(),
+        cnames: Vec::new(),
+        socktype: 0,
+        protocol: 0,
+        status: status.into(),
+    }
+}
+
+/// Add the RFC 6761 loopback addresses for any requested family the hosts
+/// entry did not already provide. IPv6 is considered before IPv4, matching
+/// upstream `ares_default_loopback_addrs`.
+fn merge_loopback(records: &mut Vec<AddrRecord>, filter: AddressFamily) {
+    let has_v4 = records.iter().any(|r| r.ip.is_ipv4());
+    let has_v6 = records.iter().any(|r| r.ip.is_ipv6());
+    if matches!(filter, AddressFamily::Any | AddressFamily::Ipv6) && !has_v6 {
+        records.push(AddrRecord { ip: IpAddr::V6(Ipv6Addr::LOCALHOST), ttl: 0 });
+    }
+    if matches!(filter, AddressFamily::Any | AddressFamily::Ipv4) && !has_v4 {
+        records.push(AddrRecord { ip: IpAddr::V4(Ipv4Addr::LOCALHOST), ttl: 0 });
+    }
+}
+
+/// Hosts-file CNAME chain (upstream `ares_hosts_ai_append_cnames`): each alias
+/// points at the entry's primary host. With no aliases, a single
+/// alias-less entry names the primary host.
+fn hosts_cnames(lookup: &HostLookup) -> Vec<CnameEntry> {
+    let primary = CString::new(lookup.canonical.as_str()).ok();
+    if lookup.aliases.is_empty() {
+        return vec![CnameEntry { ttl: 0, alias: None, name: primary }];
+    }
+    lookup
+        .aliases
+        .iter()
+        .map(|alias| CnameEntry {
+            ttl: 0,
+            alias: CString::new(alias.as_str()).ok(),
+            name: primary.clone(),
+        })
+        .collect()
 }
 
 /// HOSTALIASES for single-label names: read the env-pointed file. `Ok(Some)`
@@ -1574,6 +1770,8 @@ impl AsyncClient {
         let mut client = AsyncClient::build(build_sysconfig(path), factory, 53, 53);
         let n = client.config.nameservers.len();
         client.health.borrow_mut().reset(n);
+        // Upstream init_by_defaults: hosts file first, then DNS.
+        client.lookups = "fb".to_string();
         if let Some(lookups) = client.config.lookups.clone() {
             client.lookups = lookups;
         }
@@ -1682,10 +1880,18 @@ impl AsyncClient {
         }
     }
 
-    /// The `/etc/hosts` table as a shared `Rc` (lazily loaded once); `derive`
-    /// hands a clone to every lookup copy.
+    /// The hosts table as a shared `Rc` (lazily loaded once); `derive`
+    /// hands a clone to every lookup copy. ARES_OPT_HOSTS_FILE selects the
+    /// path; an empty path means the system `/etc/hosts`.
     pub fn hosts(&mut self) -> Rc<Hosts> {
-        self.hosts.get_or_insert_with(|| Rc::new(Hosts::from_path("/etc/hosts").unwrap_or_default())).clone()
+        let path = if self.hosts_path.is_empty() {
+            "/etc/hosts".to_string()
+        } else {
+            self.hosts_path.clone()
+        };
+        self.hosts
+            .get_or_insert_with(|| Rc::new(Hosts::from_path(path).unwrap_or_default()))
+            .clone()
     }
 
     /// The pure body of ares_dup: clone configuration, start with a fresh
@@ -1782,6 +1988,16 @@ impl AsyncClient {
                 self.lookups = lookups;
             }
         }
+        if optmask & ARES_OPT_SORTLIST != 0 {
+            // An explicitly empty list (nsort == 0) clears the resolv.conf
+            // sortlist, matching upstream ContainerSortlistOptionInit.
+            self.sortlist = o
+                .sortlist
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(addr, bits)| SortlistEntry::from_parts(addr, bits))
+                .collect();
+        }
         if optmask & ARES_OPT_RESOLVCONF != 0 {
             if let Some(path) = o.resolvconf_path {
                 self.resolvconf_path = path;
@@ -1864,6 +2080,7 @@ impl AsyncClient {
             tcp_port: self.default_tcp_port,
             v4_servers,
             domains,
+            sortlist: self.sortlist.clone(),
             maxtimeout,
             lookups,
             resolvconf_path,
@@ -2159,6 +2376,9 @@ pub(crate) struct DecodedOptions {
     /// None when the C pointer was NULL: the bit is then ignored entirely.
     pub domains: Option<Vec<String>>,
     pub lookups: Option<String>,
+    /// Decoded `ARES_OPT_SORTLIST` patterns (address, prefix bits). `Some`
+    /// distinguishes an explicitly empty list (clear) from "not supplied".
+    pub sortlist: Option<Vec<(IpAddr, u8)>>,
     pub resolvconf_path: Option<String>,
     pub hosts_path: Option<String>,
     pub maxtimeout: i32,
@@ -2179,6 +2399,7 @@ pub(crate) struct SavedOptions {
     pub tcp_port: u16,
     pub v4_servers: Vec<Ipv4Addr>,
     pub domains: Vec<CString>,
+    pub sortlist: Vec<SortlistEntry>,
     pub maxtimeout: Option<i32>,
     pub lookups: Option<CString>,
     pub resolvconf_path: Option<CString>,

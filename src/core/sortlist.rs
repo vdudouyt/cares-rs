@@ -13,6 +13,24 @@ pub struct SortlistEntry {
 }
 
 impl SortlistEntry {
+    /// Validate and build one entry (the same family/mask rules
+    /// `ares_set_sortlist` applies to its textual form).
+    pub(crate) fn from_parts(addr: IpAddr, mask_bits: u8) -> Option<Self> {
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        if mask_bits > max {
+            return None;
+        }
+        Some(SortlistEntry { addr, mask_bits })
+    }
+
+    pub(crate) fn addr(&self) -> IpAddr {
+        self.addr
+    }
+
+    pub(crate) fn mask_bits(&self) -> u8 {
+        self.mask_bits
+    }
+
     fn matches(&self, ip: &IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(net), IpAddr::V4(candidate)) => {
@@ -65,4 +83,39 @@ pub(crate) fn parse_sortlist(s: &str) -> Result<Vec<SortlistEntry>, AresError> {
         }
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn rec(ip: IpAddr) -> AddrRecord {
+        AddrRecord { ip, ttl: 0 }
+    }
+
+    #[test]
+    fn rejects_out_of_range_prefixes_and_accepts_valid_families() {
+        assert!(SortlistEntry::from_parts(IpAddr::V4(Ipv4Addr::LOCALHOST), 32).is_some());
+        assert!(SortlistEntry::from_parts(IpAddr::V4(Ipv4Addr::LOCALHOST), 33).is_none());
+        assert!(SortlistEntry::from_parts(IpAddr::V6(Ipv6Addr::LOCALHOST), 128).is_some());
+        assert!(SortlistEntry::from_parts(IpAddr::V6(Ipv6Addr::LOCALHOST), 129).is_none());
+    }
+
+    #[test]
+    fn apply_prefers_earliest_matching_entry_and_is_stable() {
+        let list = vec![
+            SortlistEntry::from_parts(IpAddr::V4(Ipv4Addr::new(2, 0, 0, 0)), 8).unwrap(),
+            SortlistEntry::from_parts(IpAddr::V4(Ipv4Addr::new(3, 0, 0, 0)), 8).unwrap(),
+        ];
+        let mut items = vec![
+            rec(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))),
+            rec(IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3))),
+            rec(IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))),
+            rec(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        ];
+        apply_sortlist(&list, &mut items);
+        let got: Vec<_> = items.iter().map(|r| r.ip.to_string()).collect();
+        assert_eq!(got, ["2.2.2.2", "3.3.3.3", "9.9.9.9", "8.8.8.8"]);
+    }
 }

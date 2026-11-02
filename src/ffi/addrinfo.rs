@@ -40,7 +40,12 @@ pub struct ares_addrinfo {
 
 /// Build the C node list from accumulated (safe) AddrRecords at delivery
 /// time — arrival order preserved, ai_ttl carried from the answer records.
-pub(crate) fn nodes_from_addr_records(records: &[AddrRecord], port: u16) -> *mut ares_addrinfo_node {
+pub(crate) fn nodes_from_addr_records(
+    records: &[AddrRecord],
+    port: u16,
+    socktype: c_int,
+    protocol: c_int,
+) -> *mut ares_addrinfo_node {
     let mut head: *mut ares_addrinfo_node = std::ptr::null_mut();
     let mut tail: *mut ares_addrinfo_node = std::ptr::null_mut();
     for record in records {
@@ -71,8 +76,8 @@ pub(crate) fn nodes_from_addr_records(records: &[AddrRecord], port: u16) -> *mut
             ai_ttl: record.ttl as c_int,
             ai_flags: 0,
             ai_family,
-            ai_socktype: 0,
-            ai_protocol: 0,
+            ai_socktype: socktype,
+            ai_protocol: protocol,
             ai_addrlen,
             ai_addr,
             ai_next: std::ptr::null_mut(),
@@ -87,9 +92,45 @@ pub(crate) fn nodes_from_addr_records(records: &[AddrRecord], port: u16) -> *mut
     head
 }
 
-pub(crate) fn build_ares_addrinfo(name: &str, nodes: *mut ares_addrinfo_node) -> *mut ares_addrinfo {
+/// Build the CNAME chain (reply order) from the safe parsed entries. `alias`
+/// is the owner and `name` the target; absent strings stay NULL.
+pub(crate) fn cnames_from_entries(entries: &[crate::core::response::CnameEntry]) -> *mut ares_addrinfo_cname {
+    let mut head: *mut ares_addrinfo_cname = std::ptr::null_mut();
+    let mut tail: *mut ares_addrinfo_cname = std::ptr::null_mut();
+    for entry in entries {
+        let alias = entry
+            .alias
+            .as_ref()
+            .map(|s| s.clone().into_raw())
+            .unwrap_or(std::ptr::null_mut());
+        let name = entry
+            .name
+            .as_ref()
+            .map(|s| s.clone().into_raw())
+            .unwrap_or(std::ptr::null_mut());
+        let node = Box::into_raw(Box::new(ares_addrinfo_cname {
+            ttl: entry.ttl as c_int,
+            alias,
+            name,
+            next: std::ptr::null_mut(),
+        }));
+        if head.is_null() {
+            head = node;
+        } else {
+            unsafe { (*tail).next = node };
+        }
+        tail = node;
+    }
+    head
+}
+
+pub(crate) fn build_ares_addrinfo(
+    name: &str,
+    nodes: *mut ares_addrinfo_node,
+    cnames: *mut ares_addrinfo_cname,
+) -> *mut ares_addrinfo {
     Box::into_raw(Box::new(ares_addrinfo {
-        cnames: std::ptr::null_mut(),
+        cnames,
         nodes,
         name: CString::new(name).unwrap_or_default().into_raw(),
     }))

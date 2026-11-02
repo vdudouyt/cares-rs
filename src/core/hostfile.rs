@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
@@ -139,22 +138,17 @@ impl Hosts {
         // Use canonical name from the first matching entry
         let canonical = matching_entries[0].canonical.clone();
 
-        // Collect all unique aliases across all matching entries
-        let mut alias_set: HashSet<String> = HashSet::new();
+        // Collect all unique aliases across all matching entries, preserving
+        // file order (the getaddrinfo CNAME chain is reported in this order).
+        let mut aliases: Vec<String> = Vec::new();
+        let canonical_lower = canonical.to_lowercase();
         for entry in &matching_entries {
             for alias in &entry.aliases {
-                let alias_lower = alias.to_lowercase();
-                if alias_lower != canonical.to_lowercase() {
-                    alias_set.insert(alias.clone());
-                }
+                push_alias_unique(&mut aliases, alias, &canonical_lower);
             }
             // Also add canonical names from other entries as aliases
-            if entry.canonical.to_lowercase() != canonical.to_lowercase() {
-                alias_set.insert(entry.canonical.clone());
-            }
+            push_alias_unique(&mut aliases, &entry.canonical, &canonical_lower);
         }
-
-        let aliases: Vec<String> = alias_set.into_iter().collect();
 
         Some(HostLookup {
             canonical,
@@ -174,19 +168,14 @@ impl Hosts {
 
         let canonical = matching_entries[0].canonical.clone();
 
-        let mut alias_set: HashSet<String> = HashSet::new();
+        let mut aliases: Vec<String> = Vec::new();
+        let canonical_lower = canonical.to_lowercase();
         for entry in &matching_entries {
             for alias in &entry.aliases {
-                if alias.to_lowercase() != canonical.to_lowercase() {
-                    alias_set.insert(alias.clone());
-                }
+                push_alias_unique(&mut aliases, alias, &canonical_lower);
             }
-            if entry.canonical.to_lowercase() != canonical.to_lowercase() {
-                alias_set.insert(entry.canonical.clone());
-            }
+            push_alias_unique(&mut aliases, &entry.canonical, &canonical_lower);
         }
-
-        let aliases: Vec<String> = alias_set.into_iter().collect();
 
         Some(HostLookup {
             canonical,
@@ -194,6 +183,16 @@ impl Hosts {
             addrs: vec![ip],
         })
     }
+}
+
+/// Append `candidate` to `aliases` unless it is the canonical host or already
+/// present (case-insensitive).
+fn push_alias_unique(aliases: &mut Vec<String>, candidate: &str, canonical_lower: &str) {
+    let lower = candidate.to_lowercase();
+    if lower == canonical_lower || aliases.iter().any(|a| a.to_lowercase() == lower) {
+        return;
+    }
+    aliases.push(candidate.to_string());
 }
 
 #[cfg(test)]
