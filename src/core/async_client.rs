@@ -37,6 +37,7 @@ use crate::core::lookup::{
     TimeoutVerdict, AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
+use crate::core::edns::{self, CookieVerdict, EDNS_PACKETSZ, ServerCookie};
 use crate::core::packets::AddrRecord;
 use crate::core::response::{addr_reply, push_synthetic_ptr, CnameEntry, ParsedRRs, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
@@ -46,9 +47,9 @@ use crate::core::sysconfig::SysConfig;
 use crate::core::AresError;
 use crate::ffi::dns_record::ARES_CLASS_IN;
 use crate::ffi::ares_options::{
-    ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
+    ARES_FLAG_DNS0x20, ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
     ARES_FLAG_NOCHECKRESP, ARES_FLAG_NORECURSE, ARES_FLAG_NOSEARCH, ARES_FLAG_PRIMARY,
-    ARES_FLAG_STAYOPEN, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_FLAGS,
+    ARES_FLAG_STAYOPEN, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_EDNSPSZ, ARES_OPT_FLAGS,
     ARES_OPT_HOSTS_FILE, ARES_OPT_LOOKUPS, ARES_OPT_MAXTIMEOUTMS, ARES_OPT_NDOTS,
     ARES_OPT_NOROTATE, ARES_OPT_QUERY_CACHE, ARES_OPT_RESOLVCONF, ARES_OPT_ROTATE,
     ARES_OPT_SERVERS, ARES_OPT_SERVER_FAILOVER, ARES_OPT_SOCK_RCVBUF,
@@ -99,6 +100,12 @@ pub(crate) struct AsyncClient {
     pub health: Rc<RefCell<ServerHealth>>,
     pub sortlist: Vec<SortlistEntry>,
     pub flags: i32,
+    /// `ARES_OPT_EDNSPSZ`: UDP payload size advertised in the OPT RR (0 =
+    /// [`EDNS_PACKETSZ`]).
+    pub ednspsz: u16,
+    /// Per-server DNS cookie state (client/server cookie + support state),
+    /// shared by every lookup on the channel. Reset by `duplicate`.
+    pub cookies: Rc<RefCell<Vec<ServerCookie>>>,
     pub maxtimeout: i32,
     /// The option mask the channel was initialized with. `ares_reinit` uses it
     /// to preserve values the caller set explicitly (upstream `channel->optmask`).
@@ -150,6 +157,8 @@ impl AsyncClient {
             health: self.health.clone(),
             sortlist: self.sortlist.clone(),
             flags: self.flags,
+            ednspsz: self.ednspsz,
+            cookies: self.cookies.clone(),
             maxtimeout: self.maxtimeout,
             optmask: self.optmask,
             lookups: self.lookups.clone(),
@@ -210,9 +219,29 @@ impl AsyncClient {
     /// when the shared lookup mailbox's `cancelled` flag is set (only `getaddrinfo`
     /// sets it, once its A answer lands) a give-up branch returns instead of
     /// resending — an already in-flight reply still delivers.
-    async fn request(self: Rc<Self>, mut payload: BytesMut, mut use_tcp: bool) -> QueryOutcome {
+    async fn request(self: Rc<Self>, payload: BytesMut, mut use_tcp: bool) -> QueryOutcome {
         let io = self.io.clone();
         let opts = self.opts();
+        // Per-query EDNS / DNS 0x20 / cookie state lives in locals rather than
+        // the mailbox: the mailbox is shared by the concurrent A/AAAA sibling
+        // requests of one lookup, so mailbox fields would alias across queries.
+        // EDNS: ensure a normal resolver query carries an OPT pseudo-RR when
+        // ARES_FLAG_EDNS is set. A caller/template-supplied OPT is preserved
+        // verbatim (including its advertised size and option values).
+        let mut payload = payload.to_vec();
+        if !edns::has_opt(&payload) && self.flags & ARES_FLAG_EDNS != 0 {
+            let size = if self.ednspsz == 0 { EDNS_PACKETSZ } else { self.ednspsz };
+            edns::append_opt(&mut payload, size);
+        }
+        // DNS 0x20: randomize the case of question 0's name once per query on
+        // UDP; the exact-case name is retained for every retry and validated
+        // against the response question.
+        let dns0x20_expected = if self.flags & ARES_FLAG_DNS0x20 != 0 && !use_tcp {
+            edns::randomize_question_name(&mut payload)
+        } else {
+            None
+        };
+        let mut cookie_try_count: u32 = 0;
         let mut timeouts: c_int = 0;
         let mut tries: u32 = 0;
         let mut failover_tries: u32 = 0;
@@ -227,6 +256,11 @@ impl AsyncClient {
                 Err(()) => return (Err(ARES_ECONNREFUSED), timeouts),
             };
             server = si;
+            // Cookies ride on the OPT record: re-evaluate them for this server
+            // and transport immediately before every send (a BADCOOKIE retry
+            // must pick up the newly learned server cookie; a TCP upgrade must
+            // remove it).
+            let sent_cookie = self.apply_cookie(&mut payload, server, use_tcp);
             let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
             let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
             let timeout = Instant::now()
@@ -259,7 +293,39 @@ impl AsyncClient {
                         if !qid_matches(&buf, wire, use_tcp) {
                             continue; // stray datagram — await the next reply
                         }
+                        // DNS 0x20: an otherwise matching reply must echo the
+                        // exact randomized question case, else treat it as a
+                        // stray/spoofed datagram and keep waiting.
+                        if !use_tcp {
+                            if let Some(expected) = dns0x20_expected.as_deref() {
+                                if !edns::question_matches_case(&buf, expected) {
+                                    continue;
+                                }
+                            }
+                        }
                         let summary = summarize(&buf, 0);
+                        let full_rcode = edns::extended_rcode(&buf, summary.rcode);
+                        match self.validate_cookie(&buf, sent_cookie.as_ref(), server, full_rcode) {
+                            CookieVerdict::Drop => continue,
+                            CookieVerdict::BadCookie => {
+                                cookie_try_count += 1;
+                                if cookie_try_count >= 3 {
+                                    // Persistent BADCOOKIE (e.g. AnyCast cluster
+                                    // rotation): upgrade to TCP, where cookies
+                                    // are not used.
+                                    use_tcp = true;
+                                }
+                                continue 'attempt;
+                            }
+                            CookieVerdict::Accept => {}
+                        }
+                        // FORMERR fallback: a server that does not understand
+                        // EDNS answers our OPT-bearing query with FORMERR.
+                        // Strip the OPT (and its cookie) and retry the same
+                        // server without counting a failure or timeout.
+                        if summary.rcode == 1 && edns::has_opt(&payload) && edns::strip_opt(&mut payload) {
+                            continue 'attempt;
+                        }
                         let (actions, verdict) = on_datagram(
                             &summary,
                             server,
@@ -1876,11 +1942,20 @@ impl AsyncClient {
     /// loopback default unless ARES_FLAG_NO_DFLT_SVR asks for an empty list
     /// (lookups then report ARES_ENOSERVER).
     pub fn apply_defaults(&mut self) {
+        // Upstream init_by_defaults: EDNS is on unless the caller explicitly
+        // supplied ARES_OPT_FLAGS (in which case its flag word is authoritative).
+        if self.optmask & ARES_OPT_FLAGS == 0 {
+            self.flags |= ARES_FLAG_EDNS;
+        }
+        if self.ednspsz == 0 {
+            self.ednspsz = EDNS_PACKETSZ;
+        }
         if self.config.nameservers.is_empty() && self.flags & ARES_FLAG_NO_DFLT_SVR == 0 {
             self.config.nameservers.push((IpAddr::V4(Ipv4Addr::LOCALHOST), None));
             self.config.tcp_ports.push(None);
         }
         self.health.borrow_mut().reset(self.config.nameservers.len());
+        self.cookies.borrow_mut().clear();
     }
 
     /// ARES_FLAG_NORECURSE clears the RD bit in constructed queries.
@@ -1908,6 +1983,8 @@ impl AsyncClient {
             health: Rc::new(RefCell::new(ServerHealth::default())),
             sortlist: vec![],
             flags: 0,
+            ednspsz: EDNS_PACKETSZ,
+            cookies: Rc::new(RefCell::new(Vec::new())),
             maxtimeout: 0,
             optmask: 0,
             lookups: String::new(),
@@ -1957,6 +2034,7 @@ impl AsyncClient {
         }
         dup.sortlist = self.sortlist.clone();
         dup.flags = self.flags;
+        dup.ednspsz = self.ednspsz;
         dup.maxtimeout = self.maxtimeout;
         dup.udp_max_queries = self.udp_max_queries;
         dup.socket_send_buffer_size = self.socket_send_buffer_size;
@@ -2008,6 +2086,16 @@ impl AsyncClient {
         }
         if optmask & ARES_OPT_NDOTS != 0 {
             self.config.options.ndots = o.ndots as u32;
+        }
+        if optmask & ARES_OPT_EDNSPSZ != 0 {
+            if o.ednspsz <= 0 {
+                // Upstream drops the bit for a non-positive value; the default
+                // (EDNSPACKETSZ) is applied by init_by_defaults.
+                stored_mask &= !ARES_OPT_EDNSPSZ;
+                self.ednspsz = EDNS_PACKETSZ;
+            } else {
+                self.ednspsz = o.ednspsz as u16;
+            }
         }
         if optmask & ARES_OPT_FLAGS != 0 {
             self.flags = o.flags;
@@ -2154,9 +2242,13 @@ impl AsyncClient {
         if self.optmask & ARES_OPT_SOCK_RCVBUF != 0 && self.socket_receive_buffer_size > 0 {
             base_mask |= ARES_OPT_SOCK_RCVBUF;
         }
+        if self.optmask & ARES_OPT_EDNSPSZ != 0 && self.ednspsz > 0 {
+            base_mask |= ARES_OPT_EDNSPSZ;
+        }
 
         SavedOptions {
             flags: self.flags,
+            ednspsz: self.ednspsz as i32,
             timeout: opts.timeout_ms as i32,
             tries: opts.attempts as i32,
             ndots: opts.ndots as i32,
@@ -2186,6 +2278,7 @@ impl AsyncClient {
         }
         self.optmask |= ARES_OPT_SERVERS;
         self.health.borrow_mut().reset(self.config.nameservers.len());
+        self.cookies.borrow_mut().clear();
         let retired = self.udp_pool.borrow_mut().clear();
         drop(retired);
     }
@@ -2196,6 +2289,7 @@ impl AsyncClient {
         self.config.tcp_ports.clear();
         self.optmask |= ARES_OPT_SERVERS;
         self.health.borrow_mut().clear();
+        self.cookies.borrow_mut().clear();
         let retired = self.udp_pool.borrow_mut().clear();
         drop(retired);
     }
@@ -2208,6 +2302,7 @@ impl AsyncClient {
         self.health.borrow_mut().reset(ns.len());
         self.config.nameservers = ns;
         self.optmask |= ARES_OPT_SERVERS;
+        self.cookies.borrow_mut().clear();
         let retired = self.udp_pool.borrow_mut().clear();
         drop(retired);
     }
@@ -2313,6 +2408,60 @@ impl AsyncClient {
         drop(retired);
     }
 
+    /// Grow/resize the per-server cookie table to cover `server`, returning a
+    /// mutable handle for the duration of `f`.
+    fn with_cookie<R>(&self, server: usize, f: impl FnOnce(&mut ServerCookie) -> R) -> Option<R> {
+        let mut cookies = self.cookies.borrow_mut();
+        let needed = self.endpoints.len().max(server + 1);
+        if cookies.len() < needed {
+            cookies.resize_with(needed, ServerCookie::default);
+        }
+        cookies.get_mut(server).map(f)
+    }
+
+    /// Attach the COOKIE EDNS option for this send (UDP only; removed on TCP).
+    /// Returns the 8-byte client cookie actually placed on the wire, which is
+    /// what the response's echoed client cookie must match (per-query spoof
+    /// check, independent of later state changes).
+    fn apply_cookie(&self, payload: &mut Vec<u8>, server: usize, use_tcp: bool) -> Option<[u8; 8]> {
+        if !edns::has_opt(payload) {
+            return None;
+        }
+        if use_tcp {
+            // Cookies are deliberately not used over TCP; strip a stale one
+            // (e.g. after a BADCOOKIE-driven upgrade).
+            edns::set_cookie_option(payload, None);
+            return None;
+        }
+        let cookie = self.with_cookie(server, ServerCookie::cookie_for_query).flatten();
+        let Some(cookie) = cookie else {
+            // Server is known to be unsupported right now: no cookie.
+            edns::set_cookie_option(payload, None);
+            return None;
+        };
+        if cookie.len() < 8 {
+            return None;
+        }
+        let mut client = [0u8; 8];
+        client.copy_from_slice(&cookie[..8]);
+        edns::set_cookie_option(payload, Some(&cookie));
+        Some(client)
+    }
+
+    /// Validate a response's COOKIE option against this server's state.
+    fn validate_cookie(
+        &self,
+        resp: &[u8],
+        sent_client: Option<&[u8; 8]>,
+        server: usize,
+        rcode: u16,
+    ) -> CookieVerdict {
+        self.with_cookie(server, |cookie| {
+            cookie.validate_response(resp, sent_client, rcode)
+        })
+        .unwrap_or(CookieVerdict::Accept)
+    }
+
     /// Connect-with-failover: create + connect the socket for `start`, retrying
     /// across servers on a creation failure (matches upstream `ares_conn.c`).
     /// Returns the live `Conn` + the server index it landed on, or `Err(())` when
@@ -2321,7 +2470,7 @@ impl AsyncClient {
     /// id is re-rolled if an in-flight sibling on that conn already holds it
     /// (≈ upstream `generate_unique_qid`), and `payload` is re-stamped with the
     /// reserved id so framing and `qid_matches` see the wire truth.
-    fn connect_failover(&self, payload: &mut BytesMut, start: usize, use_tcp: bool) -> Result<(Conn, usize), ()> {
+    fn connect_failover(&self, payload: &mut [u8], start: usize, use_tcp: bool) -> Result<(Conn, usize), ()> {
         let opts = self.opts();
         let stayopen = self.flags & ARES_FLAG_STAYOPEN != 0;
         let mut s = start;
@@ -2518,6 +2667,7 @@ pub(crate) struct DecodedOptions {
     pub hosts_path: Option<String>,
     pub maxtimeout: i32,
     pub qcache_max_ttl: u32,
+    pub ednspsz: i32,
     pub udp_max_queries: i32,
     pub socket_send_buffer_size: i32,
     pub socket_receive_buffer_size: i32,
@@ -2530,6 +2680,7 @@ pub(crate) struct DecodedOptions {
 /// succeeding — the shim adds those two after the copies land.
 pub(crate) struct SavedOptions {
     pub flags: i32,
+    pub ednspsz: i32,
     pub timeout: i32,
     pub tries: i32,
     pub ndots: i32,

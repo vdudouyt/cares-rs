@@ -235,6 +235,7 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
             .then(|| unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned()),
         maxtimeout: options.maxtimeout,
         qcache_max_ttl: options.qcache_max_ttl,
+        ednspsz: options.ednspsz,
         udp_max_queries: options.udp_max_queries,
         socket_send_buffer_size: options.socket_send_buffer_size,
         socket_receive_buffer_size: options.socket_receive_buffer_size,
@@ -331,7 +332,7 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
     *out = ares_options::default();
     let mut mask = saved.base_mask;
 
-    out.flags = saved.flags;
+    save_flags_and_ednspsz(out, saved.flags, saved.ednspsz, mask);
     out.timeout = saved.timeout;
     out.tries = saved.tries;
     out.ndots = saved.ndots;
@@ -393,6 +394,15 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
 
     unsafe { *optmask = mask };
     ARES_SUCCESS
+}
+
+/// Copy the flags word and the (optional) EDNS payload size into a saved
+/// options struct. Safe helper so the `unsafe extern` shim stays thin.
+fn save_flags_and_ednspsz(out: &mut ares_options, flags: c_int, ednspsz: c_int, mask: c_int) {
+    out.flags = flags;
+    if mask & ARES_OPT_EDNSPSZ != 0 {
+        out.ednspsz = ednspsz;
+    }
 }
 
 fn free_sortlist(ptr: *mut apattern) {
