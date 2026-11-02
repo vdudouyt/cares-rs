@@ -5,6 +5,7 @@ use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
 use crate::core::async_client::{DnsMailbox, DnsSignals, Effect};
 use crate::async_runtime::executor::Executor;
+use crate::ffi::ares_options::ARES_OPT_SORTLIST;
 
 
 /// The C-visible channel: the pure core state plus the channel-level C
@@ -484,12 +485,16 @@ pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_c
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     if sortstr.is_null() {
         channeldata.state.sortlist = Vec::new();
+        // An explicit clear is still an explicit sortlist option, so reinit
+        // must not repopulate it from resolv.conf and save_options reports it.
+        channeldata.state.optmask |= ARES_OPT_SORTLIST;
         return ARES_SUCCESS;
     }
     let Some(s) = (unsafe { cstr_opt(sortstr) }) else { return ARES_EBADSTR };
     match parse_sortlist(s) {
         Ok(entries) => {
             channeldata.state.sortlist = entries;
+            channeldata.state.optmask |= ARES_OPT_SORTLIST;
             ARES_SUCCESS
         }
         Err(e) => e.code(),

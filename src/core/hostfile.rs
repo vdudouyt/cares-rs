@@ -28,33 +28,24 @@ impl AddressFamily {
     }
 }
 
-/// A single entry from the hosts file (one line)
+/// A merged entry from the hosts file: every IP and name that upstream's
+/// parser would fold together because they share an IP or any hostname.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEntry {
-    pub ip: IpAddr,
-    pub canonical: String,
-    pub aliases: Vec<String>,
+    pub ips: Vec<IpAddr>,
+    /// File order; the first name is the primary/canonical hostname.
+    pub names: Vec<String>,
 }
 
 impl HostEntry {
-    /// Returns all names (canonical + aliases)
-    pub fn all_names(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.canonical.as_str()).chain(self.aliases.iter().map(|s| s.as_str()))
+    /// The primary hostname (first name seen in the file).
+    fn canonical(&self) -> &str {
+        self.names.first().map(String::as_str).unwrap_or("")
     }
 
     /// Check if this entry contains the given name (case-insensitive)
     pub fn has_name(&self, name: &str) -> bool {
-        let name_lower = name.to_lowercase();
-        self.all_names().any(|n| n.to_lowercase() == name_lower)
-    }
-
-    /// Check if this entry matches the address family filter
-    pub fn matches_family(&self, family: AddressFamily) -> bool {
-        match family {
-            AddressFamily::Any => true,
-            AddressFamily::Ipv4 => self.ip.is_ipv4(),
-            AddressFamily::Ipv6 => self.ip.is_ipv6(),
-        }
+        self.names.iter().any(|n| n.eq_ignore_ascii_case(name))
     }
 }
 
@@ -66,6 +57,9 @@ pub struct HostLookup {
     pub addrs: Vec<IpAddr>,
 }
 
+/// Upstream caps the CNAME/alias list derived from one hosts entry at 100.
+const MAX_HOST_ALIASES: usize = 100;
+
 /// Parsed hosts file
 #[derive(Debug, Clone, Default)]
 pub struct Hosts {
@@ -73,17 +67,21 @@ pub struct Hosts {
 }
 
 impl Hosts {
-    /// Parse hosts file content from a string
+    /// Parse hosts file content from a string.
+    ///
+    /// Matching upstream `ares_hosts_file_add`: a new line merges into the
+    /// first existing entry that shares an IP (checked first) or any hostname;
+    /// merged IPs/names append in file order, and duplicate names are skipped.
     pub fn parse(content: &str) -> Self {
-        let mut entries = Vec::new();
+        let mut hosts = Self::default();
 
         for line in content.lines() {
             if let Some(entry) = Self::parse_line(line) {
-                entries.push(entry);
+                hosts.add_entry(entry);
             }
         }
 
-        Self { entries }
+        hosts
     }
 
     /// Load and parse hosts file from a path
@@ -92,7 +90,8 @@ impl Hosts {
         Ok(Self::parse(&content))
     }
 
-    /// Parse a single line, returning None for comments/empty/malformed lines
+    /// Parse a single line, returning None for comments/empty/malformed lines.
+    /// The returned entry is a single-line fragment to be merged by `add_entry`.
     fn parse_line(line: &str) -> Option<HostEntry> {
         // Strip comments (everything after #)
         let line = match line.find('#') {
@@ -107,92 +106,120 @@ impl Hosts {
         let ip_str = parts.next()?;
         let ip = IpAddr::from_str(ip_str).ok()?;
 
-        // Second part is the canonical hostname
-        let canonical = parts.next()?.to_string();
-
-        // Remaining parts are aliases
-        let aliases: Vec<String> = parts.map(|s| s.to_string()).collect();
-
-        Some(HostEntry {
-            ip,
-            canonical,
-            aliases,
-        })
-    }
-
-    /// Lookup a hostname, aggregating results across all matching entries
-    pub fn lookup(&self, name: &str, family: AddressFamily) -> Option<HostLookup> {
-        let matching_entries: Vec<&HostEntry> = self
-            .entries
-            .iter()
-            .filter(|e| e.has_name(name) && e.matches_family(family))
-            .collect();
-
-        if matching_entries.is_empty() {
+        // Second part is the primary hostname; the rest are aliases.
+        let mut names = Vec::new();
+        for name in parts {
+            if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(name)) {
+                names.push(name.to_string());
+            }
+        }
+        if names.is_empty() {
             return None;
         }
 
-        // Collect all addresses
-        let addrs: Vec<IpAddr> = matching_entries.iter().map(|e| e.ip).collect();
+        Some(HostEntry { ips: vec![ip], names })
+    }
 
-        // Use canonical name from the first matching entry
-        let canonical = matching_entries[0].canonical.clone();
+    /// Fold one parsed line into the matching entry, or start a new one.
+    fn add_entry(&mut self, entry: HostEntry) {
+        let Some(ip) = entry.ips.first().copied() else { return; };
+        let Some(match_idx) = self.find_merge_target(ip, &entry.names) else {
+            self.entries.push(entry);
+            return;
+        };
 
-        // Collect all unique aliases across all matching entries, preserving
-        // file order (the getaddrinfo CNAME chain is reported in this order).
-        let mut aliases: Vec<String> = Vec::new();
-        let canonical_lower = canonical.to_lowercase();
-        for entry in &matching_entries {
-            for alias in &entry.aliases {
-                push_alias_unique(&mut aliases, alias, &canonical_lower);
+        let mut new_names = Vec::new();
+        for name in entry.names {
+            if self.entries[match_idx].has_name(&name) {
+                continue;
             }
-            // Also add canonical names from other entries as aliases
-            push_alias_unique(&mut aliases, &entry.canonical, &canonical_lower);
+            // Upstream's host hash has first-wins semantics: a name already
+            // owned by a different group is not moved into this one.
+            if self
+                .entries
+                .iter()
+                .enumerate()
+                .any(|(i, e)| i != match_idx && e.has_name(&name))
+            {
+                continue;
+            }
+            new_names.push(name);
+        }
+
+        let target = &mut self.entries[match_idx];
+        if !target.ips.contains(&ip) {
+            target.ips.push(ip);
+        }
+        target.names.extend(new_names);
+    }
+
+    /// Upstream checks an IP match before any hostname match, then takes the
+    /// first hostname match in file order.
+    fn find_merge_target(&self, ip: IpAddr, names: &[String]) -> Option<usize> {
+        if let Some(idx) = self.entries.iter().position(|e| e.ips.contains(&ip)) {
+            return Some(idx);
+        }
+        for name in names {
+            if let Some(idx) = self.entries.iter().position(|e| e.has_name(name)) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Lookup a hostname, returning every address in its merged entry.
+    pub fn lookup(&self, name: &str, family: AddressFamily) -> Option<HostLookup> {
+        let entry = self.entries.iter().find(|e| e.has_name(name))?;
+
+        let addrs: Vec<IpAddr> = entry
+            .ips
+            .iter()
+            .copied()
+            .filter(|ip| match family {
+                AddressFamily::Any => true,
+                AddressFamily::Ipv4 => ip.is_ipv4(),
+                AddressFamily::Ipv6 => ip.is_ipv6(),
+            })
+            .collect();
+        if addrs.is_empty() {
+            return None;
         }
 
         Some(HostLookup {
-            canonical,
-            aliases,
+            canonical: entry.canonical().to_string(),
+            aliases: entry_alias_list(entry),
             addrs,
         })
     }
 
-    /// Lookup by IP address, returning all hostnames associated with it
+    /// Lookup by IP address, matching any IP in a merged entry.
     pub fn reverse_lookup(&self, ip: IpAddr) -> Option<HostLookup> {
-        let matching_entries: Vec<&HostEntry> =
-            self.entries.iter().filter(|e| e.ip == ip).collect();
-
-        if matching_entries.is_empty() {
-            return None;
-        }
-
-        let canonical = matching_entries[0].canonical.clone();
-
-        let mut aliases: Vec<String> = Vec::new();
-        let canonical_lower = canonical.to_lowercase();
-        for entry in &matching_entries {
-            for alias in &entry.aliases {
-                push_alias_unique(&mut aliases, alias, &canonical_lower);
-            }
-            push_alias_unique(&mut aliases, &entry.canonical, &canonical_lower);
-        }
+        let entry = self.entries.iter().find(|e| e.ips.contains(&ip))?;
+        let addrs: Vec<IpAddr> = entry
+            .ips
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.is_ipv4() == ip.is_ipv4())
+            .collect();
 
         Some(HostLookup {
-            canonical,
-            aliases,
-            addrs: vec![ip],
+            canonical: entry.canonical().to_string(),
+            aliases: entry_alias_list(entry),
+            addrs,
         })
     }
 }
 
-/// Append `candidate` to `aliases` unless it is the canonical host or already
-/// present (case-insensitive).
-fn push_alias_unique(aliases: &mut Vec<String>, candidate: &str, canonical_lower: &str) {
-    let lower = candidate.to_lowercase();
-    if lower == canonical_lower || aliases.iter().any(|a| a.to_lowercase() == lower) {
-        return;
-    }
-    aliases.push(candidate.to_string());
+/// All names after the primary, preserving file order and capping at the
+/// upstream 100-alias limit.
+fn entry_alias_list(entry: &HostEntry) -> Vec<String> {
+    entry
+        .names
+        .iter()
+        .skip(1)
+        .take(MAX_HOST_ALIASES)
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -216,7 +243,11 @@ fd00::10        myserver
     #[test]
     fn test_parse_basic() {
         let hosts = Hosts::parse(SAMPLE_HOSTS);
-        assert_eq!(hosts.entries.len(), 6);
+        // Lines merge by shared hostname: localhost (v4+v6), the three
+        // myserver lines, and gateway.
+        assert_eq!(hosts.entries.len(), 3);
+        assert_eq!(hosts.entries[0].ips.len(), 2);
+        assert_eq!(hosts.entries[1].ips.len(), 3);
     }
 
     #[test]
@@ -224,9 +255,9 @@ fd00::10        myserver
         let entry = Hosts::parse_line("127.0.0.1 localhost # this is a comment");
         assert!(entry.is_some());
         let entry = entry.unwrap();
-        assert_eq!(entry.ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-        assert_eq!(entry.canonical, "localhost");
-        assert!(entry.aliases.is_empty());
+        assert_eq!(entry.ips, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
+        assert_eq!(entry.names, vec!["localhost"]);
+        assert_eq!(entry.canonical(), "localhost");
     }
 
     #[test]
@@ -234,8 +265,8 @@ fd00::10        myserver
         let entry = Hosts::parse_line("127.0.0.1 localhost localhost.localdomain loopback");
         assert!(entry.is_some());
         let entry = entry.unwrap();
-        assert_eq!(entry.canonical, "localhost");
-        assert_eq!(entry.aliases, vec!["localhost.localdomain", "loopback"]);
+        assert_eq!(entry.names[0], "localhost");
+        assert_eq!(&entry.names[1..], &["localhost.localdomain", "loopback"]);
     }
 
     #[test]
@@ -243,7 +274,10 @@ fd00::10        myserver
         let entry = Hosts::parse_line("::1 localhost");
         assert!(entry.is_some());
         let entry = entry.unwrap();
-        assert_eq!(entry.ip, IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)));
+        assert_eq!(
+            entry.ips,
+            vec![IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))]
+        );
     }
 
     #[test]
@@ -267,6 +301,10 @@ fd00::10        myserver
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.addrs.len(), 2); // 127.0.0.1 and ::1
+        assert_eq!(
+            result.aliases,
+            vec!["localhost.localdomain", "loopback", "ip6-localhost"]
+        );
     }
 
     #[test]
@@ -299,6 +337,47 @@ fd00::10        myserver
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.addrs.len(), 3); // two IPv4, one IPv6
+        assert_eq!(result.canonical, "myserver");
+        assert_eq!(result.aliases, vec!["myserver.local"]);
+    }
+
+    #[test]
+    fn test_merge_by_alias_and_ip_across_lines() {
+        let hosts = Hosts::parse(
+            "1.2.3.4 primary.example alias1 alias2\n\
+             5.6.7.8 primary.example alias3\n",
+        );
+        assert_eq!(hosts.entries.len(), 1);
+
+        let result = hosts.lookup("alias1", AddressFamily::Any).unwrap();
+        assert_eq!(result.canonical, "primary.example");
+        assert_eq!(result.aliases, vec!["alias1", "alias2", "alias3"]);
+        assert_eq!(
+            result.addrs,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            ]
+        );
+
+        // A reverse lookup of the second line's address sees the whole group.
+        let rev = hosts
+            .reverse_lookup(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)))
+            .unwrap();
+        assert_eq!(rev.canonical, "primary.example");
+        assert_eq!(rev.aliases, vec!["alias1", "alias2", "alias3"]);
+        assert_eq!(rev.addrs.len(), 2);
+    }
+
+    #[test]
+    fn test_alias_output_is_capped_at_100() {
+        let mut line = String::from("1.2.3.4 primary");
+        for i in 0..150 {
+            line.push_str(&format!(" alias{i}"));
+        }
+        let hosts = Hosts::parse(&line);
+        let result = hosts.lookup("primary", AddressFamily::Any).unwrap();
+        assert_eq!(result.aliases.len(), MAX_HOST_ALIASES);
     }
 
     #[test]

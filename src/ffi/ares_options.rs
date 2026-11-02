@@ -331,7 +331,9 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
             mask |= ARES_OPT_DOMAINS;
         }
     }
-    mask |= save_sortlist_into(out, &saved.sortlist);
+    if mask & ARES_OPT_SORTLIST != 0 {
+        mask |= save_sortlist_into(out, &saved.sortlist);
+    }
 
     if let Some(maxtimeout) = saved.maxtimeout {
         out.maxtimeout = maxtimeout;

@@ -40,7 +40,7 @@ use crate::core::packets::AddrRecord;
 use crate::core::response::{addr_reply, push_synthetic_ptr, CnameEntry, ParsedRRs, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
 use crate::async_runtime::socket::SocketFactory;
-use crate::core::sortlist::{apply_sortlist, parse_sortlist, SortlistEntry};
+use crate::core::sortlist::{parse_sortlist, sort_addrinfo, SortlistEntry};
 use crate::core::sysconfig::SysConfig;
 use crate::core::AresError;
 use crate::ffi::dns_record::ARES_CLASS_IN;
@@ -147,11 +147,11 @@ impl AsyncClient {
         self.hosts.clone().unwrap_or_default()
     }
 
-    /// Hosts lookup honouring ARES_AI_ENVHOSTS. Upstream's `use_env` flag
-    /// selects the environment-provided hosts file (`CARES_HOSTS`); newer
-    /// c-ares documentation also mentions `HOSTALIASES` for the same flag, so
-    /// accept either while preferring CARES_HOSTS. When no environment path is
-    /// set, the channel's configured hosts path (or `/etc/hosts`) applies.
+    /// Hosts lookup honouring ARES_AI_ENVHOSTS. Upstream's 1.34.6 `use_env`
+    /// flag selects the environment-provided hosts file (`CARES_HOSTS`) only;
+    /// HOSTALIASES remains reserved for the legacy alias path. When no
+    /// environment path is set, the channel's configured hosts path (or
+    /// `/etc/hosts`) applies.
     fn hosts_lookup(
         &self,
         name: &str,
@@ -159,14 +159,18 @@ impl AsyncClient {
         use_env: bool,
     ) -> Option<HostLookup> {
         if use_env {
-            if let Some(path) = std::env::var("CARES_HOSTS")
-                .ok()
-                .or_else(|| std::env::var("HOSTALIASES").ok())
-            {
+            if let Ok(path) = std::env::var("CARES_HOSTS") {
                 return Hosts::from_path(path).ok().and_then(|h| h.lookup(name, family));
             }
         }
         self.hostsfile().lookup(name, family)
+    }
+
+    /// gethostbyname applies the channel sortlist to the final hostent, after
+    /// the hosts/DNS lookup order has selected the address set.
+    fn finalize_hostent(&self, mut hostent: Hostent) -> Hostent {
+        hostent.sort_addrs(&self.sortlist);
+        hostent
     }
 
     /// ares_query / ares_send: one query delivered raw. Keeps the historical
@@ -399,7 +403,7 @@ impl AsyncClient {
                 AddressFamily::Any => true,
             };
             if matches {
-                return Ok(Hostent::new(hostname, vec![ip]));
+                return Ok(self.finalize_hostent(Hostent::new(hostname, vec![ip])));
             }
         }
 
@@ -413,7 +417,7 @@ impl AsyncClient {
                 'f' => {
                     if let Some(lookup) = self.hostsfile().lookup(&hostname, filter) {
                         if !lookup.addrs.is_empty() {
-                            return Ok(Hostent::from_lookup(lookup));
+                            return Ok(self.finalize_hostent(Hostent::from_lookup(lookup)));
                         }
                     }
 
@@ -425,7 +429,7 @@ impl AsyncClient {
                             AddressFamily::Ipv6 => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
                             AddressFamily::Any => vec![IpAddr::V6(Ipv6Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::LOCALHOST)],
                         };
-                        return Ok(Hostent::new(hostname, addrs));
+                        return Ok(self.finalize_hostent(Hostent::new(hostname, addrs)));
                     }
                 }
                 'b' => {
@@ -465,11 +469,8 @@ impl AsyncClient {
                     );
                     let cached = self.cache.borrow_mut().get(&cache_key, Instant::now());
                     if let Some(cached) = cached {
-                        if let Ok(mut rrs) = addr_reply(&cached, cache_rtype, ReplyRequire::Items) {
-                            if !self.sortlist.is_empty() {
-                                apply_sortlist(&self.sortlist, &mut rrs.items);
-                            }
-                            return Ok(Hostent::from_parsed(rrs, cache_family));
+                        if let Ok(rrs) = addr_reply(&cached, cache_rtype, ReplyRequire::Items) {
+                            return Ok(self.finalize_hostent(Hostent::from_parsed(rrs, cache_family)));
                         }
                     }
 
@@ -529,11 +530,8 @@ impl AsyncClient {
                         );
                         self.cache.borrow_mut().store_names(store, &template, ttl, &reply.buf, Instant::now());
                     }
-                    let mut rrs = reply.rrs;
-                    if !self.sortlist.is_empty() {
-                        apply_sortlist(&self.sortlist, &mut rrs.items);
-                    }
-                    return Ok(Hostent::from_parsed(rrs, hfamily));
+                    let rrs = reply.rrs;
+                    return Ok(self.finalize_hostent(Hostent::from_parsed(rrs, hfamily)));
                 }
                 _ => {}
             }
@@ -937,7 +935,7 @@ impl AsyncClient {
 
     /// ares_getaddrinfo: preflight (family/empty/onion/IP-literal), then the
     /// configured lookup order (hosts file `f` / DNS `b`, default "fb"),
-    /// merging every family's records, applying the sortlist unless
+    /// merging every family's records, applying RFC 6724 ordering unless
     /// ARES_AI_NOSORT, and carrying the CNAME chain + final canonical name.
     pub(crate) async fn getaddrinfo(
         self: Rc<Self>,
@@ -1015,7 +1013,7 @@ impl AsyncClient {
                                 merge_loopback(&mut records, family_filter);
                             }
                             if !no_sort {
-                                apply_sortlist(&self.sortlist, &mut records);
+                                sort_addrinfo(&mut records);
                             }
                             let cnames = if can_name {
                                 hosts_cnames(&lookup)
@@ -1038,7 +1036,7 @@ impl AsyncClient {
                         let mut records: Vec<AddrRecord> = Vec::new();
                         merge_loopback(&mut records, family_filter);
                         if !no_sort {
-                            apply_sortlist(&self.sortlist, &mut records);
+                            sort_addrinfo(&mut records);
                         }
                         return AddrInfoOut::success(
                             hostname.to_string(),
@@ -1100,7 +1098,7 @@ impl AsyncClient {
                         .map(|c| c.to_string_lossy().into_owned())
                         .unwrap_or(lookup.name);
                     if !no_sort {
-                        apply_sortlist(&self.sortlist, &mut records);
+                        sort_addrinfo(&mut records);
                     }
                     return AddrInfoOut::success(name, records, cnames, socktype, protocol);
                 }
@@ -2031,7 +2029,9 @@ impl AsyncClient {
             | ARES_OPT_UDP_PORT
             | ARES_OPT_TCP_PORT;
         base_mask |= if opts.rotate { ARES_OPT_ROTATE } else { ARES_OPT_NOROTATE };
-        if !self.sortlist.is_empty() {
+        // Preserve explicit sortlist state (including an explicit empty list);
+        // a sortlist merely inherited from resolv.conf is not reported.
+        if self.optmask & ARES_OPT_SORTLIST != 0 {
             base_mask |= ARES_OPT_SORTLIST;
         }
 
