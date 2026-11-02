@@ -16,8 +16,8 @@ use cares_rs::dns_record::ares_dns_record_t;
 use cares_rs::*;
 
 const ARES_SUCCESS: c_int = 0;
-const T_A: c_int = 1;
-const C_IN: c_int = 1;
+const T_A: u32 = 1;
+const C_IN: u32 = 1;
 
 /// Answer one DNS request: echo QID + question, one A record, TTL 600
 /// (TTL > 0 so the reply is cacheable).

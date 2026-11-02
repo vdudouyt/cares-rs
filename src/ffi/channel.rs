@@ -163,6 +163,26 @@ impl ChannelData {
         self.drive_fd_futures(read_fds, write_fds, skip_timeouts);
     }
 
+    /// Drive one batch of explicit fd/event pairs without ever putting them in
+    /// an `fd_set` (upstream `ares_process_fds` semantics). This avoids the
+    /// `FD_SETSIZE` ceiling: a custom socket layer may legally return a high
+    /// fd, and `libc::FD_SET` would index out of bounds and abort the process.
+    pub(crate) fn process_events(
+        &mut self,
+        events: &[crate::ffi::ares_socket::ares_fd_events_t],
+        skip_timeouts: bool,
+    ) {
+        use crate::ffi::ares_socket::{ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
+        let now = Instant::now();
+        let ready = self.executor.drive_ready(now, skip_timeouts, |fd, writable| {
+            let bit = if writable { ARES_FD_EVENT_WRITE } else { ARES_FD_EVENT_READ };
+            events.iter().any(|ev| ev.fd == fd && ev.events & bit != 0)
+        });
+        for id in ready {
+            self.advance(id);
+        }
+    }
+
     /// Fire the server-state notification callback (if installed) for a server
     /// index; a stale index is silently skipped.
     pub(crate) fn invoke_server_state_callback(&self, server_index: usize, success: bool, is_tcp: bool) {
@@ -503,8 +523,8 @@ pub unsafe extern "C" fn ares_queue_active_queries(channel: *const ChannelData) 
 /// directly, so the callback is stored (and copied by ares_dup) but never
 /// fired yet; the API surface matches upstream.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_set_pending_write_cb(
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_set_pending_write_cb(
     channel: Channel,
     callback: ares_pending_write_cb,
     arg: *mut c_void,

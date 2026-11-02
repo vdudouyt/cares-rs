@@ -960,7 +960,11 @@ pub(crate) fn parse_rdata(
                 if end > rdata.len() {
                     break;
                 }
-                rr.opts.push((code, rdata[off..end].to_vec()));
+                // Keep the C getter contract: option values are NUL
+                // terminated, while the logical length excludes the NUL.
+                let mut opt_data = rdata[off..end].to_vec();
+                opt_data.push(0);
+                rr.opts.push((code, opt_data));
                 off = end;
             }
         }
@@ -1181,12 +1185,14 @@ pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) {
         }
         ARES_REC_TYPE_OPT => {
             for (code, data) in &rr.opts {
+                // The final byte is the internal C-string terminator, not wire data.
+                let logical = data.len().saturating_sub(1);
                 out.push((*code >> 8) as u8);
                 out.push(*code as u8);
-                let len = data.len() as u16;
+                let len = logical as u16;
                 out.push((len >> 8) as u8);
                 out.push(len as u8);
-                out.extend_from_slice(data);
+                out.extend_from_slice(&data[..logical]);
             }
         }
         ARES_REC_TYPE_TLSA => {
@@ -1498,7 +1504,10 @@ impl ares_dns_rr_t {
         self.data.insert(key, bin_nul(&combined));
     }
 
-    pub(crate) fn set_opt(&mut self, opt: u16, data: Vec<u8>) {
+    pub(crate) fn set_opt(&mut self, opt: u16, mut data: Vec<u8>) {
+        // The C getter returns a NUL-terminated value; keep that guarantee in
+        // the backing store while opt_at/opt_by_id expose the logical bytes.
+        data.push(0);
         // Remove existing opt with same code if present, then add
         self.opts.retain(|(code, _)| *code != opt);
         self.opts.push((opt, data));
@@ -1509,14 +1518,16 @@ impl ares_dns_rr_t {
     }
 
     pub(crate) fn opt_at(&self, idx: usize) -> Option<(u16, &[u8])> {
-        self.opts.get(idx).map(|(code, data)| (*code, data.as_slice()))
+        let (code, data) = self.opts.get(idx)?;
+        // Stored values always carry the trailing NUL; `len` is logical.
+        Some((*code, &data[..data.len().saturating_sub(1)]))
     }
 
     pub(crate) fn opt_by_id(&self, opt: u16) -> Option<&[u8]> {
         self.opts
             .iter()
             .find(|(code, _)| *code == opt)
-            .map(|(_, data)| data.as_slice())
+            .map(|(_, data)| &data[..data.len().saturating_sub(1)])
     }
 
     pub(crate) fn del_opt_by_id(&mut self, opt: u16) -> bool {

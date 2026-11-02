@@ -24,6 +24,7 @@ pub const ARES_PROCESS_FLAG_SKIP_NON_FD: c_uint = 1 << 0;
 
 /// One fd + event mask, used by ares_process_fds().
 #[repr(C)]
+#[derive(Clone, Copy)]
 #[allow(non_camel_case_types)]
 pub struct ares_fd_events_t {
     pub fd: ares_socket_t,
@@ -76,8 +77,7 @@ pub struct AresSocketFunctionsEx {
 /// # Safety
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *const AresSocketFunctionsEx, user_data: *mut c_void) -> crate::ffi::ares_status_t {
+pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *const AresSocketFunctionsEx, user_data: *mut c_void) -> crate::ffi::ares_status_t {
     if channel.is_null() || funcs.is_null() {
         return crate::ffi::error::ARES_EFORMERR;
     }

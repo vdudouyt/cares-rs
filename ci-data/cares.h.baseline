@@ -370,6 +370,20 @@
 
 #define ARES_DNS_FLAGS_RA (1 << 7)
 
+#define ARES_FLAG_QR (1 << 0)
+
+#define ARES_FLAG_AA (1 << 1)
+
+#define ARES_FLAG_TC (1 << 2)
+
+#define ARES_FLAG_RD (1 << 3)
+
+#define ARES_FLAG_RA (1 << 4)
+
+#define ARES_FLAG_AD (1 << 5)
+
+#define ARES_FLAG_CD (1 << 6)
+
 #define ARES_DATATYPE_INADDR 1
 
 #define ARES_DATATYPE_INADDR6 2
@@ -819,6 +833,8 @@ typedef void (*ares_host_callback)(void *arg, int status, int timeouts, struct h
 
 typedef void (*ares_callback)(void *arg, int status, int timeouts, uint8_t *abuf, int alen);
 
+typedef unsigned int ares_dns_rec_type_t;
+
 typedef void (*ares_callback_dnsrec)(void *arg,
                                      int status,
                                      size_t timeouts,
@@ -922,8 +938,6 @@ typedef struct ares_fd_events_t {
 } ares_fd_events_t;
 
 typedef socklen_t ares_socklen_t;
-
-typedef unsigned int ares_dns_rec_type_t;
 
 typedef unsigned int ares_dns_section_t;
 
@@ -1259,8 +1273,8 @@ void ares_query(ares_channel channel,
 
 ares_status_t ares_query_dnsrec(ares_channel channel,
                                 const char *name,
-                                int dnsclass,
-                                int dnstype,
+                                ares_dns_class_t dnsclass,
+                                ares_dns_rec_type_t dnstype,
                                 ares_callback_dnsrec callback,
                                 void *arg,
                                 unsigned short *qid);

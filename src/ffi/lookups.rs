@@ -119,12 +119,11 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsc
 /// # Safety
 /// `channel` must be a valid channel and `name` a valid NUL-terminated C string.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_query_dnsrec(
+pub unsafe extern "C" fn ares_query_dnsrec(
     channel: Channel,
     name: *const c_char,
-    dnsclass: c_int,
-    dnstype: c_int,
+    dnsclass: crate::ffi::ares_dns_class_t,
+    dnstype: crate::ffi::ares_dns_rec_type_t,
     callback: ares_callback_dnsrec,
     arg: *mut c_void,
     qid: *mut libc::c_ushort,
@@ -145,9 +144,6 @@ pub extern "C" fn ares_query_dnsrec(
     let cached = channeldata.state.cache.borrow_mut().get(name.strip_suffix('.').unwrap_or(name.as_ref()), dnstype as u16, Instant::now());
     if let Some(cached_buf) = cached {
         if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf) {
-            if !qid.is_null() {
-                unsafe { *qid = rec.id(); }
-            }
             let dnsrec = Box::into_raw(Box::new(rec));
             unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
             unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
@@ -177,8 +173,7 @@ pub extern "C" fn ares_query_dnsrec(
 /// # Safety
 /// `channel` must be a valid channel and `dnsrec` a valid `ares_dns_record_t` pointer.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_search_dnsrec(
+pub unsafe extern "C" fn ares_search_dnsrec(
     channel: Channel,
     dnsrec: *const dns_record::ares_dns_record_t,
     callback: ares_callback_dnsrec,
@@ -399,11 +394,11 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
 }
 
 /// Serialize an `ares_dns_record_t` and send it through the same async query
-/// lifecycle as `ares_send`. This is the basic Phase 1 form: the record's own
-/// id is used and cache/qid-generation/usevc semantics are refined later.
+/// lifecycle as `ares_send`. Phase 1 generates a fresh query id (the caller's
+/// record id is not trusted); cache/usevc semantics are refined in Phase 3.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_send_dnsrec(
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn ares_send_dnsrec(
     channel: Channel,
     dnsrec: *const dns_record::ares_dns_record_t,
     callback: ares_callback_dnsrec,
@@ -414,12 +409,21 @@ pub extern "C" fn ares_send_dnsrec(
     if channel.is_null() || dnsrec.is_null() { return ARES_EFORMERR; }
     // SAFETY: the caller guarantees a live, initialized record.
     let rec = unsafe { &*dnsrec };
-    let buf = crate::core::dns_record::write_record(rec);
+    let mut buf = crate::core::dns_record::write_record(rec);
     // DNS messages carry a 16-bit length; upstream rejects larger queries.
-    if buf.len() > u16::MAX as usize {
+    if buf.len() > u16::MAX as usize || buf.len() < 12 {
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut()) };
         return ARES_EBADQUERY;
     }
+    // Upstream generates a unique non-zero id; a zero id is reserved as
+    // "unset" by the public send_dnsrec contract. A full in-flight registry
+    // lands with the shared-connection work; a random non-zero id is enough
+    // here and keeps the returned qid equal to the wire truth.
+    let new_qid = {
+        let id = rand::random::<u16>();
+        if id == 0 { 1 } else { id }
+    };
+    buf[0..2].copy_from_slice(&new_qid.to_be_bytes());
     // SAFETY: the caller guarantees a live channel handle.
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_EFORMERR; };
     let payload = match channeldata.state.send_payload(&buf) {
@@ -431,7 +435,7 @@ pub extern "C" fn ares_send_dnsrec(
         }
     };
     if !qid.is_null() {
-        unsafe { *qid = rec.id(); }
+        unsafe { *qid = new_qid; }
     }
     let client = channeldata.state.derive();
     let cache = client.cache.clone();

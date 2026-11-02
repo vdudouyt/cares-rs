@@ -101,6 +101,17 @@ pub const ARES_DNS_FLAGS_TC: u16 = 1 << 9;
 pub const ARES_DNS_FLAGS_RD: u16 = 1 << 8;
 pub const ARES_DNS_FLAGS_RA: u16 = 1 << 7;
 
+// Upstream spells the DNS header flag bits `ARES_FLAG_*` in
+// ares_dns_record.h (same wire bits, but distinct names from the
+// channel-level ARES_FLAG_USEVC family). Keep both spellings source-compatible.
+pub const ARES_FLAG_QR: u16 = 1 << 0;
+pub const ARES_FLAG_AA: u16 = 1 << 1;
+pub const ARES_FLAG_TC: u16 = 1 << 2;
+pub const ARES_FLAG_RD: u16 = 1 << 3;
+pub const ARES_FLAG_RA: u16 = 1 << 4;
+pub const ARES_FLAG_AD: u16 = 1 << 5;
+pub const ARES_FLAG_CD: u16 = 1 << 6;
+
 // ---------------------------------------------------------------------------
 // ares_dns_datatype_t
 // ---------------------------------------------------------------------------
@@ -824,19 +835,17 @@ pub unsafe extern "C" fn ares_dns_rr_set_opt(
 }
 
 #[no_mangle]
-#[allow(unused_variables)] // `key`/`flags`: C API params this impl ignores; names frozen by the header
 pub unsafe extern "C" fn ares_dns_rr_get_opt_cnt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
 ) -> libc::size_t {
-    if rr.is_null() {
+    if rr.is_null() || crate::core::dns_record::rr_key_datatype_of(key) != ARES_DATATYPE_OPT as u32 {
         return 0;
     }
     unsafe { &*rr }.opt_cnt()
 }
 
 #[no_mangle]
-#[allow(unused_variables)] // `key`/`flags`: C API params this impl ignores; names frozen by the header
 pub unsafe extern "C" fn ares_dns_rr_get_opt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
@@ -846,7 +855,15 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt(
 ) -> c_ushort {
     // ABI-mandated sentinel: 65535 means "misuse / not found".
     const NO_OPT: c_ushort = u16::MAX;
-    if rr.is_null() {
+    // Upstream clears the optional outputs on every path, so a caller that
+    // reuses them never sees stale pointer/length data after a miss.
+    if !val.is_null() {
+        unsafe { *val = std::ptr::null(); }
+    }
+    if !val_len.is_null() {
+        unsafe { *val_len = 0; }
+    }
+    if rr.is_null() || crate::core::dns_record::rr_key_datatype_of(key) != ARES_DATATYPE_OPT as u32 {
         return NO_OPT;
     }
     let Some((code, data)) = (unsafe { &*rr }).opt_at(idx) else {
@@ -862,7 +879,6 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt(
 }
 
 #[no_mangle]
-#[allow(unused_variables)] // `key`/`flags`: C API params this impl ignores; names frozen by the header
 pub unsafe extern "C" fn ares_dns_rr_get_opt_byid(
     rr: *const ares_dns_rr_t,
     key: c_uint,
@@ -870,7 +886,13 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt_byid(
     val: *mut *const u8,
     val_len: *mut libc::size_t,
 ) -> c_int {
-    if rr.is_null() {
+    if !val.is_null() {
+        unsafe { *val = std::ptr::null(); }
+    }
+    if !val_len.is_null() {
+        unsafe { *val_len = 0; }
+    }
+    if rr.is_null() || crate::core::dns_record::rr_key_datatype_of(key) != ARES_DATATYPE_OPT as u32 {
         return ARES_FALSE;
     }
     let Some(data) = (unsafe { &*rr }).opt_by_id(opt as u16) else {
@@ -886,19 +908,18 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt_byid(
 }
 
 #[no_mangle]
-#[allow(unused_variables)] // `key`/`flags`: C API params this impl ignores; names frozen by the header
 pub unsafe extern "C" fn ares_dns_rr_del_opt_byid(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     opt: c_uint,
 ) -> c_int {
-    if rr.is_null() {
-        return ARES_EBADRESP;
+    if rr.is_null() || crate::core::dns_record::rr_key_datatype_of(key) != ARES_DATATYPE_OPT as u32 {
+        return ARES_EFORMERR;
     }
     if unsafe { &mut *rr }.del_opt_by_id(opt as u16) {
         ARES_SUCCESS
     } else {
-        ARES_EBADRESP
+        crate::ffi::error::ARES_ENOTFOUND
     }
 }
 
@@ -1011,8 +1032,7 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_dns_pton(
+pub unsafe extern "C" fn ares_dns_pton(
     ipaddr: *const c_char,
     addr: *mut crate::ffi::ares_addr,
     out_len: *mut libc::size_t,
@@ -1047,8 +1067,7 @@ pub extern "C" fn ares_dns_pton(
 }
 
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_dns_addr_to_ptr(
+pub unsafe extern "C" fn ares_dns_addr_to_ptr(
     addr: *const crate::ffi::ares_addr,
 ) -> *mut c_char {
     if addr.is_null() {
@@ -1177,8 +1196,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
 }
 
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_dns_rr_add_abin(
+pub unsafe extern "C" fn ares_dns_rr_add_abin(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     val: *const u8,
@@ -1202,8 +1220,7 @@ pub extern "C" fn ares_dns_rr_add_abin(
 }
 
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_dns_rr_del_abin(
+pub unsafe extern "C" fn ares_dns_rr_del_abin(
     rr: *mut ares_dns_rr_t,
     key: c_uint,
     idx: libc::size_t,
