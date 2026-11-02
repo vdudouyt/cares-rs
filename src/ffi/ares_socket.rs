@@ -293,6 +293,7 @@ fn default_setsockopt(fd: ares_socket_t, opt: c_uint, value: &[u8]) -> c_int {
 /// The channel's socket source: the (user-replaceable) C function table.
 /// Implements the core `SocketFactory` trait, so the engine never sees
 /// the table or the user_data pointer.
+#[derive(Clone)]
 pub struct CSocketFactory {
     funcs: AresSocketFunctions,
     user_data: *mut c_void,

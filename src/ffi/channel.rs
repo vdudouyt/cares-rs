@@ -3,9 +3,9 @@
 //!
 //! With `ARES_OPT_EVENT_THREAD` a background thread drives the reactor, so
 //! every shim serializes on the channel lock. Completion callbacks fire while
-//! that lock is held: an event-mode callback must not call back into the same
-//! channel. Non-event channels keep the historical single-thread model, where
-//! completion callbacks may re-enter.
+//! that lock is held. The lock is recursive, so a completion callback may
+//! re-enter the same channel on the same thread; a callback that calls
+//! `ares_destroy` is still unsupported (destroy joins the event thread).
 
 use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
@@ -14,8 +14,8 @@ use crate::async_runtime::executor::Executor;
 use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 /// How long the built-in event thread parks in `poll` when no task publishes
@@ -30,8 +30,9 @@ pub struct ChannelData {
     pub(crate) state: AsyncClient,
     /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
     /// in `state`. The socket-state callbacks (create/configure) live in
-    /// the factory; the setters below rebuild it (copy-on-write), so ares_dup
-    /// can simply share the Rc and stay independent.
+    /// the factory; setters rebuild it copy-on-write. ares_dup deep-clones it
+    /// so no `Rc` is ever shared between channels (each may have its own
+    /// event thread).
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
@@ -56,8 +57,10 @@ pub struct ChannelData {
     pub(crate) event_join: Option<JoinHandle<()>>,
     /// Per-channel serialization for every shim that touches channel state.
     /// The event thread also takes it around its process cycle; user callbacks
-    /// fire while it is held (see the module docs in `channel.rs`).
-    pub(crate) lock: Arc<Mutex<()>>,
+    /// fire while it is held. Recursive so a completion callback may re-enter
+    /// the same channel on the same thread (destroy from a callback remains
+    /// unsupported).
+    pub(crate) lock: Arc<ReentrantMutex>,
 }
 
 impl ChannelData {
@@ -76,15 +79,20 @@ impl ChannelData {
             event_mode: false,
             event_stop: Arc::new(AtomicBool::new(false)),
             event_join: None,
-            lock: Arc::new(Mutex::new(())),
+            lock: Arc::new(ReentrantMutex::new()),
         }
     }
 
-    /// ares_dup: duplicate the pure state and share the (immutable) factory.
+    /// ares_dup: duplicate the pure state. The socket factory is deep-cloned
+    /// rather than sharing its `Rc`: duplicated event channels each have their
+    /// own thread, and `Rc` refcounts are not atomic.
     pub(crate) fn dup_from(&self) -> Self {
+        let socket_factory = std::rc::Rc::new((*self.socket_factory).clone());
+        let mut state = self.state.duplicate();
+        state.factory = socket_factory.clone();
         ChannelData {
-            state: self.state.duplicate(),
-            socket_factory: self.socket_factory.clone(),
+            state,
+            socket_factory,
             server_state_callback: self.server_state_callback,
             server_state_callback_arg: self.server_state_callback_arg,
             pending_write_cb: self.pending_write_cb,
@@ -95,7 +103,7 @@ impl ChannelData {
             event_mode: self.event_mode,
             event_stop: Arc::new(AtomicBool::new(false)),
             event_join: None,
-            lock: Arc::new(Mutex::new(())),
+            lock: Arc::new(ReentrantMutex::new()),
         }
     }
 
@@ -269,10 +277,78 @@ impl ChannelData {
     }
 }
 
+/// A per-channel recursive lock. Completion callbacks fire while the lock is
+/// held, so the same thread must be able to re-enter a channel API (the
+/// historical single-thread behavior). A different thread waits on `available`
+/// until the owner fully unwinds.
+pub(crate) struct ReentrantMutex {
+    state: Mutex<LockState>,
+    available: Condvar,
+}
+
+struct LockState {
+    owner: Option<ThreadId>,
+    depth: usize,
+}
+
+impl ReentrantMutex {
+    fn new() -> Self {
+        ReentrantMutex {
+            state: Mutex::new(LockState { owner: None, depth: 0 }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> ReentrantGuard<'_> {
+        let me = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match state.owner {
+                None => {
+                    state.owner = Some(me);
+                    state.depth = 1;
+                    break;
+                }
+                Some(owner) if owner == me => {
+                    state.depth += 1;
+                    break;
+                }
+                Some(_) => {
+                    state = self.available.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+        drop(state);
+        ReentrantGuard { lock: self }
+    }
+}
+
+pub(crate) struct ReentrantGuard<'a> {
+    lock: &'a ReentrantMutex,
+}
+
+impl Drop for ReentrantGuard<'_> {
+    fn drop(&mut self) {
+        let me = std::thread::current().id();
+        let mut state = self.lock.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.owner != Some(me) {
+            return;
+        }
+        if state.depth > 1 {
+            state.depth -= 1;
+            return;
+        }
+        state.depth = 0;
+        state.owner = None;
+        drop(state);
+        self.lock.available.notify_one();
+    }
+}
+
 /// The built-in event thread: snapshot the fds/timeout under the channel lock,
 /// `poll` without holding it, then lock again and drive the futures whose fds
 /// became ready (or whose timeout expired).
-fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Mutex<()>) {
+fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static ReentrantMutex) {
     use crate::ffi::ares_socket::{ares_fd_events_t, ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
     loop {
         if stop.load(Ordering::Acquire) {
@@ -282,7 +358,7 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Mutex
         // Snapshot the reactor interests while serialized. The channel pointer
         // stays valid until `ares_destroy` joins this thread.
         let (waits, next_timeout) = {
-            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = lock.lock();
             if stop.load(Ordering::Acquire) {
                 break;
             }
@@ -329,7 +405,7 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Mutex
         }
 
         {
-            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = lock.lock();
             if stop.load(Ordering::Acquire) {
                 break;
             }
@@ -346,20 +422,20 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Mutex
     }
 }
 
-/// Lock a channel and hand back the guard (for event-mode channels) together
-/// with a mutable view of its state. `None` for a NULL handle. The guard is
-/// `'static` because the channel owns its lock for as long as it lives and
-/// `ares_destroy` joins the event thread before dropping the channel; the
-/// caller must not retain the returned reference past its own frame.
+/// Lock a channel (recursively on the same thread) and hand back the guard
+/// together with a mutable view of its state. `None` for a NULL handle. The
+/// guard is `'static` because the channel owns its lock for as long as it
+/// lives and `ares_destroy` joins the event thread before dropping the
+/// channel; the caller must not retain the returned reference past its frame.
 ///
 /// # Safety
 /// `channel` must be NULL or a live channel handle.
-pub(crate) unsafe fn channel_access<'a>(channel: *const ChannelData) -> Option<(Option<std::sync::MutexGuard<'static, ()>>, &'a mut ChannelData)> {
+pub(crate) unsafe fn channel_access<'a>(channel: *const ChannelData) -> Option<(ReentrantGuard<'static>, &'a mut ChannelData)> {
     if channel.is_null() { return None; }
-    // SAFETY: caller guarantees a live channel; event_mode and the lock handle are immutable once published.
-    let guard = unsafe { (*channel).event_mode.then(|| { let lock: &'static Mutex<()> = &*((*channel).lock.as_ref() as *const Mutex<()>); lock.lock().unwrap_or_else(|e| e.into_inner()) }) };
-    // SAFETY: as above.
-    Some((guard, unsafe { &mut *(channel as *mut ChannelData) }))
+    // SAFETY: caller guarantees a live channel; the lock Arc outlives this
+    // borrow (destroy waits for the lock before freeing the channel).
+    let lock: &'static ReentrantMutex = unsafe { &*((*channel).lock.as_ref() as *const ReentrantMutex) };
+    Some((lock.lock(), unsafe { &mut *(channel as *mut ChannelData) }))
 }
 
 /// Start the built-in event thread for `channel`. The thread only owns a raw
@@ -371,7 +447,7 @@ pub(crate) fn start_event_thread(channel: *mut ChannelData) -> bool {
     let (stop, lock) = unsafe {
         (
             (*channel).event_stop.clone(),
-            &*((*channel).lock.as_ref() as *const Mutex<()>),
+            &*((*channel).lock.as_ref() as *const ReentrantMutex),
         )
     };
     let raw = channel as usize;
@@ -406,8 +482,8 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: *const ChannelData
 /// duplicate's own event thread.
 fn dup_impl(dest: *mut Channel, source: *const ChannelData) -> c_int {
     if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
-    let event_lock = unsafe { (*source).event_mode.then(|| (*source).lock.clone()) };
-    let guard = event_lock.as_ref().map(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()));
+    let lock = unsafe { (*source).lock.clone() };
+    let guard = lock.lock();
     let channeldata = unsafe { &*source }.dup_from();
     drop(guard);
     let channel = Box::into_raw(Box::new(channeldata));
@@ -439,7 +515,9 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 }
 
 /// Safe body of ares_destroy: stop and join the event thread (without holding
-/// the lock across the join), abort every query, then free the channel.
+/// the lock across the join), abort every query, then free the channel. The
+/// stop flag is observed on the thread's next poll wakeup (at most
+/// `EVENT_POLL_MS`); there is no separate wake pipe.
 fn destroy_impl(channel: *mut ChannelData) {
     if channel.is_null() { return; }
     let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return; };
@@ -450,8 +528,10 @@ fn destroy_impl(channel: *mut ChannelData) {
         stop.store(true, Ordering::Release);
         let _ = handle.join();
     }
-    let Some((_guard, data)) = (unsafe { channel_access(channel) }) else { return; };
+    let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return; };
     data.abort_all(ARES_EDESTRUCTION);
+    // Release the recursive lock before freeing the channel (and the lock).
+    drop(guard);
     drop(unsafe { Box::from_raw(channel) });
 }
 
@@ -830,6 +910,7 @@ pub unsafe extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_i
 /// releasing the channel lock while sleeping so the event thread can run.
 fn wait_empty_impl(channel: *mut ChannelData, timeout_ms: c_int) -> c_int {
     let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
+    if data.executor.active_count() == 0 { return ARES_SUCCESS; }
     if !data.event_mode { return ARES_ENOTIMP; }
     drop(guard);
     let start = Instant::now();
