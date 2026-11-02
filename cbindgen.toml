@@ -26,6 +26,15 @@ after_includes = """
    time in consumer code, so definition order does not matter. */
 #define ARES_GETSOCK_READABLE(bits, num) ((bits) & (1 << (num)))
 #define ARES_GETSOCK_WRITABLE(bits, num) ((bits) & (1 << ((num) + ARES_GETSOCK_MAXNUM)))
+
+/* Addrinfo flag mask (upstream defines it as a function-like composition). */
+#define ARES_AI_MASK \\
+  (ARES_AI_CANONNAME | ARES_AI_NUMERICHOST | ARES_AI_PASSIVE | \\
+   ARES_AI_NUMERICSERV | ARES_AI_V4MAPPED | ARES_AI_ALL | ARES_AI_ADDRCONFIG)
+
+/* Library-init capability markers (upstream ares.h). */
+#define CARES_HAVE_ARES_LIBRARY_INIT 1
+#define CARES_HAVE_ARES_LIBRARY_CLEANUP 1
 """
 
 trailer = """
@@ -55,6 +64,12 @@ include = [
   "ares_dns_rec_type_t", "ares_dns_class_t", "ares_dns_section_t",
   "ares_dns_opcode_t", "ares_dns_rcode_t", "ares_dns_flags_t",
   "ares_dns_datatype_t", "ares_dns_rr_key_t", "ares_in6_addr",
+  "ares_dns_opt_datatype_t", "ares_dns_parse_flags_t",
+  "ares_tlsa_usage_t", "ares_tlsa_selector_t", "ares_tlsa_match_t",
+  "ares_svcb_param_t", "ares_opt_param_t", "ares_socket_opt_t",
+  "ares_socket_bind_flags_t", "ares_socket_connect_flags_t",
+  "ares_sockfunc_flags_t", "ares_fd_eventflag_t", "ares_process_flag_t",
+  "ares_pending_write_cb", "ares_addr", "ares_fd_events_t",
 ]
 
 [export.rename]

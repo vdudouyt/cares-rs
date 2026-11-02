@@ -33,6 +33,17 @@ use crate::ffi::dns_record::{
     ARES_RR_SVCB_TARGET, ARES_RR_TLSA_CERT_USAGE, ARES_RR_TLSA_DATA, ARES_RR_TLSA_MATCH,
     ARES_RR_TLSA_SELECTOR, ARES_RR_TXT_DATA, ARES_RR_URI_PRIORITY, ARES_RR_URI_TARGET,
     ARES_RR_URI_WEIGHT,
+    ARES_OPT_DATATYPE_BIN, ARES_OPT_DATATYPE_INADDR4_LIST, ARES_OPT_DATATYPE_INADDR6_LIST,
+    ARES_OPT_DATATYPE_NAME, ARES_OPT_DATATYPE_NONE, ARES_OPT_DATATYPE_STR_LIST,
+    ARES_OPT_DATATYPE_U16, ARES_OPT_DATATYPE_U16_LIST, ARES_OPT_DATATYPE_U32,
+    ARES_OPT_DATATYPE_U8_LIST, ARES_OPT_PARAM_CHAIN, ARES_OPT_PARAM_COOKIE,
+    ARES_OPT_PARAM_DAU, ARES_OPT_PARAM_DHU, ARES_OPT_PARAM_EDNS_CLIENT_SUBNET,
+    ARES_OPT_PARAM_EDNS_EXPIRE, ARES_OPT_PARAM_EDNS_KEY_TAG,
+    ARES_OPT_PARAM_EDNS_TCP_KEEPALIVE, ARES_OPT_PARAM_EXTENDED_DNS_ERROR,
+    ARES_OPT_PARAM_LLQ, ARES_OPT_PARAM_N3U, ARES_OPT_PARAM_NSID, ARES_OPT_PARAM_PADDING,
+    ARES_OPT_PARAM_UL, ARES_SVCB_PARAM_ALPN, ARES_SVCB_PARAM_ECH,
+    ARES_SVCB_PARAM_IPV4HINT, ARES_SVCB_PARAM_IPV6HINT, ARES_SVCB_PARAM_MANDATORY,
+    ARES_SVCB_PARAM_NO_DEFAULT_ALPN, ARES_SVCB_PARAM_PORT,
 };
 
 /// Read a DNS name from wire format, handling label compression.
@@ -455,6 +466,163 @@ pub(crate) fn section_name(section: u32) -> &'static CStr {
         2 => c"AUTHORITY",
         3 => c"ADDITIONAL",
         _ => c"UNKNOWN",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Address text helpers (pure bodies of ares_dns_pton / ares_dns_addr_to_ptr)
+// ---------------------------------------------------------------------------
+
+pub(crate) enum PtonAddr {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+impl PtonAddr {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            PtonAddr::V4(_) => 4,
+            PtonAddr::V6(_) => 16,
+        }
+    }
+}
+
+/// Parse an IP literal according to the caller-supplied family. Returns the
+/// (possibly updated) family plus the network-order octets. AF_UNSPEC tries
+/// IPv4 first, then IPv6, exactly like upstream ares_dns_pton().
+pub(crate) fn dns_pton(ipaddr: &str, family: libc::c_int) -> Option<(libc::c_int, PtonAddr)> {
+    if family == libc::AF_INET {
+        ipaddr
+            .parse::<Ipv4Addr>()
+            .ok()
+            .map(|ip| (libc::AF_INET, PtonAddr::V4(ip.octets())))
+    } else if family == libc::AF_INET6 {
+        ipaddr
+            .parse::<Ipv6Addr>()
+            .ok()
+            .map(|ip| (libc::AF_INET6, PtonAddr::V6(ip.octets())))
+    } else if family == libc::AF_UNSPEC {
+        if let Ok(ip) = ipaddr.parse::<Ipv4Addr>() {
+            Some((libc::AF_INET, PtonAddr::V4(ip.octets())))
+        } else {
+            ipaddr
+                .parse::<Ipv6Addr>()
+                .ok()
+                .map(|ip| (libc::AF_INET6, PtonAddr::V6(ip.octets())))
+        }
+    } else {
+        None
+    }
+}
+
+/// `d.c.b.a.in-addr.arpa` for the network-order IPv4 octets.
+pub(crate) fn addr_to_ptr_v4(octets: [u8; 4]) -> String {
+    let mut out = String::with_capacity(24);
+    for b in octets.iter().rev() {
+        out.push_str(&b.to_string());
+        out.push('.');
+    }
+    out.push_str("in-addr.arpa");
+    out
+}
+
+/// Reverse nibble form `....ip6.arpa` for the network-order IPv6 octets.
+pub(crate) fn addr_to_ptr_v6(octets: [u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(76);
+    for b in octets.iter().rev() {
+        out.push(HEX[(b & 0x0f) as usize] as char);
+        out.push('.');
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push('.');
+    }
+    out.push_str("ip6.arpa");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// OPT / SVCB option metadata (pure bodies of ares_dns_opt_get_*)
+// ---------------------------------------------------------------------------
+
+fn opt_datatype_opt(opt: u16) -> u32 {
+    match opt as u32 {
+        ARES_OPT_PARAM_LLQ => ARES_OPT_DATATYPE_BIN,
+        ARES_OPT_PARAM_UL => ARES_OPT_DATATYPE_U32,
+        ARES_OPT_PARAM_NSID => ARES_OPT_DATATYPE_BIN,
+        ARES_OPT_PARAM_DAU => ARES_OPT_DATATYPE_U8_LIST,
+        ARES_OPT_PARAM_DHU => ARES_OPT_DATATYPE_U8_LIST,
+        ARES_OPT_PARAM_N3U => ARES_OPT_DATATYPE_U8_LIST,
+        ARES_OPT_PARAM_EDNS_CLIENT_SUBNET => ARES_OPT_DATATYPE_BIN,
+        ARES_OPT_PARAM_EDNS_EXPIRE => ARES_OPT_DATATYPE_U32,
+        ARES_OPT_PARAM_COOKIE => ARES_OPT_DATATYPE_BIN,
+        ARES_OPT_PARAM_EDNS_TCP_KEEPALIVE => ARES_OPT_DATATYPE_U16,
+        ARES_OPT_PARAM_PADDING => ARES_OPT_DATATYPE_BIN,
+        ARES_OPT_PARAM_CHAIN => ARES_OPT_DATATYPE_NAME,
+        ARES_OPT_PARAM_EDNS_KEY_TAG => ARES_OPT_DATATYPE_U16_LIST,
+        ARES_OPT_PARAM_EXTENDED_DNS_ERROR => ARES_OPT_DATATYPE_BIN,
+        _ => ARES_OPT_DATATYPE_BIN,
+    }
+}
+
+fn opt_datatype_svcb(opt: u16) -> u32 {
+    match opt as u32 {
+        ARES_SVCB_PARAM_NO_DEFAULT_ALPN => ARES_OPT_DATATYPE_NONE,
+        ARES_SVCB_PARAM_ECH => ARES_OPT_DATATYPE_BIN,
+        ARES_SVCB_PARAM_MANDATORY => ARES_OPT_DATATYPE_U16_LIST,
+        ARES_SVCB_PARAM_ALPN => ARES_OPT_DATATYPE_STR_LIST,
+        ARES_SVCB_PARAM_PORT => ARES_OPT_DATATYPE_U16,
+        ARES_SVCB_PARAM_IPV4HINT => ARES_OPT_DATATYPE_INADDR4_LIST,
+        ARES_SVCB_PARAM_IPV6HINT => ARES_OPT_DATATYPE_INADDR6_LIST,
+        _ => ARES_OPT_DATATYPE_BIN,
+    }
+}
+
+pub(crate) fn opt_datatype(key: u32, opt: u16) -> u32 {
+    match key {
+        ARES_RR_OPT_OPTIONS => opt_datatype_opt(opt),
+        ARES_RR_SVCB_PARAMS | ARES_RR_HTTPS_PARAMS => opt_datatype_svcb(opt),
+        _ => ARES_OPT_DATATYPE_BIN,
+    }
+}
+
+fn opt_name_opt(opt: u16) -> Option<&'static CStr> {
+    Some(match opt as u32 {
+        ARES_OPT_PARAM_LLQ => c"LLQ",
+        ARES_OPT_PARAM_UL => c"UL",
+        ARES_OPT_PARAM_NSID => c"NSID",
+        ARES_OPT_PARAM_DAU => c"DAU",
+        ARES_OPT_PARAM_DHU => c"DHU",
+        ARES_OPT_PARAM_N3U => c"N3U",
+        ARES_OPT_PARAM_EDNS_CLIENT_SUBNET => c"edns-client-subnet",
+        ARES_OPT_PARAM_EDNS_EXPIRE => c"edns-expire",
+        ARES_OPT_PARAM_COOKIE => c"COOKIE",
+        ARES_OPT_PARAM_EDNS_TCP_KEEPALIVE => c"edns-tcp-keepalive",
+        ARES_OPT_PARAM_PADDING => c"Padding",
+        ARES_OPT_PARAM_CHAIN => c"CHAIN",
+        ARES_OPT_PARAM_EDNS_KEY_TAG => c"edns-key-tag",
+        ARES_OPT_PARAM_EXTENDED_DNS_ERROR => c"extended-dns-error",
+        _ => return None,
+    })
+}
+
+fn opt_name_svcb(opt: u16) -> Option<&'static CStr> {
+    Some(match opt as u32 {
+        ARES_SVCB_PARAM_NO_DEFAULT_ALPN => c"no-default-alpn",
+        ARES_SVCB_PARAM_ECH => c"ech",
+        ARES_SVCB_PARAM_MANDATORY => c"mandatory",
+        ARES_SVCB_PARAM_ALPN => c"alpn",
+        ARES_SVCB_PARAM_PORT => c"port",
+        ARES_SVCB_PARAM_IPV4HINT => c"ipv4hint",
+        ARES_SVCB_PARAM_IPV6HINT => c"ipv6hint",
+        _ => return None,
+    })
+}
+
+pub(crate) fn opt_name(key: u32, opt: u16) -> Option<&'static CStr> {
+    match key {
+        ARES_RR_OPT_OPTIONS => opt_name_opt(opt),
+        ARES_RR_SVCB_PARAMS | ARES_RR_HTTPS_PARAMS => opt_name_svcb(opt),
+        _ => None,
     }
 }
 
@@ -1313,6 +1481,21 @@ impl ares_dns_rr_t {
 
     pub(crate) fn set_bin(&mut self, key: u32, data: &[u8]) {
         self.data.insert(key, bin_nul(data));
+    }
+
+    /// Append one binary element to an ABINP value. The Phase 1 model keeps
+    /// ABINP data as a single NUL-terminated blob, so appending concatenates;
+    /// Phase 2 will split elements into the upstream per-string representation.
+    pub(crate) fn append_bin(&mut self, key: u32, data: &[u8]) {
+        let mut combined = match self.data.get(&key) {
+            Some(RRValue::Bin(v)) => {
+                let logical = if v.last() == Some(&0) { &v[..v.len() - 1] } else { &v[..] };
+                logical.to_vec()
+            }
+            _ => Vec::new(),
+        };
+        combined.extend_from_slice(data);
+        self.data.insert(key, bin_nul(&combined));
     }
 
     pub(crate) fn set_opt(&mut self, opt: u16, data: Vec<u8>) {

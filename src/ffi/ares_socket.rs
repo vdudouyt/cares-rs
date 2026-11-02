@@ -12,6 +12,39 @@ pub type ares_socket_t = c_int;
 #[allow(non_camel_case_types)]
 pub type ares_ssize_t = libc::ssize_t;
 
+// ---------------------------------------------------------------------------
+// ares_process_fds() event/flag constants
+// ---------------------------------------------------------------------------
+pub const ARES_FD_EVENT_NONE: c_uint = 0;
+pub const ARES_FD_EVENT_READ: c_uint = 1 << 0;
+pub const ARES_FD_EVENT_WRITE: c_uint = 1 << 1;
+
+pub const ARES_PROCESS_FLAG_NONE: c_uint = 0;
+pub const ARES_PROCESS_FLAG_SKIP_NON_FD: c_uint = 1 << 0;
+
+/// One fd + event mask, used by ares_process_fds().
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct ares_fd_events_t {
+    pub fd: ares_socket_t,
+    pub events: c_uint,
+}
+
+// ---------------------------------------------------------------------------
+// Socket-option / connect / bind / sockfunc flags
+// ---------------------------------------------------------------------------
+pub const ARES_SOCKET_OPT_SENDBUF_SIZE: c_uint = 0;
+pub const ARES_SOCKET_OPT_RECVBUF_SIZE: c_uint = 1;
+pub const ARES_SOCKET_OPT_BIND_DEVICE: c_uint = 2;
+pub const ARES_SOCKET_OPT_TCP_FASTOPEN: c_uint = 3;
+
+pub const ARES_SOCKET_CONN_TCP_FASTOPEN: c_uint = 1 << 0;
+
+pub const ARES_SOCKET_BIND_TCP: c_uint = 1 << 0;
+pub const ARES_SOCKET_BIND_CLIENT: c_uint = 1 << 1;
+
+pub const ARES_SOCKFUNC_FLAG_NONBLOCKING: c_uint = 1 << 0;
+
 /// # Safety
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
@@ -30,19 +63,38 @@ pub struct AresSocketFunctionsEx {
     pub flags: c_uint,
     pub asocket: Option<unsafe extern "C" fn(c_int, c_int, c_int, *mut c_void) -> ares_socket_t>,
     pub aclose: Option<unsafe extern "C" fn(ares_socket_t, *mut c_void) -> c_int>,
-    pub asetsockopt: Option<unsafe extern "C" fn(ares_socket_t, c_int, *const c_void, socklen_t, *mut c_void) -> c_int>,
+    pub asetsockopt: Option<unsafe extern "C" fn(ares_socket_t, crate::ffi::ares_socket_opt_t, *const c_void, socklen_t, *mut c_void) -> c_int>,
     pub aconnect: Option<unsafe extern "C" fn(ares_socket_t, *const sockaddr, socklen_t, c_uint, *mut c_void) -> c_int>,
     pub arecvfrom: Option<unsafe extern "C" fn(ares_socket_t, *mut c_void, libc::size_t, c_int, *mut sockaddr, *mut socklen_t, *mut c_void) -> ares_ssize_t>,
     pub asendto: Option<unsafe extern "C" fn(ares_socket_t, *const c_void, libc::size_t, c_int, *const sockaddr, socklen_t, *mut c_void) -> ares_ssize_t>,
-    // Additional optional fields omitted — we only use the above
+    pub agetsockname: Option<unsafe extern "C" fn(ares_socket_t, *mut sockaddr, *mut socklen_t, *mut c_void) -> c_int>,
+    pub abind: Option<unsafe extern "C" fn(ares_socket_t, c_uint, *const sockaddr, socklen_t, *mut c_void) -> c_int>,
+    pub aif_nametoindex: Option<unsafe extern "C" fn(*const libc::c_char, *mut c_void) -> c_uint>,
+    pub aif_indextoname: Option<unsafe extern "C" fn(c_uint, *mut libc::c_char, libc::size_t, *mut c_void) -> *const libc::c_char>,
 }
 
 /// # Safety
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
-pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *const AresSocketFunctionsEx, user_data: *mut c_void) -> c_int {
-    if funcs.is_null() { return 0; }
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *const AresSocketFunctionsEx, user_data: *mut c_void) -> crate::ffi::ares_status_t {
+    if channel.is_null() || funcs.is_null() {
+        return crate::ffi::error::ARES_EFORMERR;
+    }
+    // SAFETY: the caller guarantees a valid function table.
     let ex = unsafe { &*funcs };
+    // Version 1 is the only ABI we implement; every required callback must be
+    // present (optional ones are the getname/bind/ifname trio).
+    if ex.version != 1
+        || ex.asocket.is_none()
+        || ex.aclose.is_none()
+        || ex.asetsockopt.is_none()
+        || ex.aconnect.is_none()
+        || ex.arecvfrom.is_none()
+        || ex.asendto.is_none()
+    {
+        return crate::ffi::error::ARES_EFORMERR;
+    }
     let basic = AresSocketFunctions {
         asocket: ex.asocket,
         aclose: ex.aclose,
@@ -50,11 +102,13 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
         arecvfrom: ex.arecvfrom,
         asendv: None, // ex.asendto has different signature
     };
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else {
+        return crate::ffi::error::ARES_EFORMERR;
+    };
     let factory = CSocketFactory::with_funcs(basic, user_data, &channeldata.socket_factory);
     channeldata.socket_factory = factory.clone();
     channeldata.state.factory = factory;
-    0 // ARES_SUCCESS
+    crate::ffi::error::ARES_SUCCESS
 }
 
 #[repr(C)]

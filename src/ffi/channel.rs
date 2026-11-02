@@ -19,6 +19,11 @@ pub struct ChannelData {
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
+    /// Optional notification hook fired when a pending write drains. Our writes
+    /// are awaited directly, so nothing currently invokes it; the fields exist
+    /// for API parity and are copied by ares_dup.
+    pub(crate) pending_write_cb: ares_pending_write_cb,
+    pub(crate) pending_write_arg: *mut libc::c_void,
     /// The in-flight resolver ops — the executor's task set (each future owns
     /// its socket(s)).
     executor: Executor<DnsSignals>,
@@ -32,6 +37,8 @@ impl ChannelData {
             socket_factory,
             server_state_callback: None,
             server_state_callback_arg: std::ptr::null_mut(),
+            pending_write_cb: None,
+            pending_write_arg: std::ptr::null_mut(),
             executor: Executor::default(),
         }
     }
@@ -43,6 +50,8 @@ impl ChannelData {
             socket_factory: self.socket_factory.clone(),
             server_state_callback: self.server_state_callback,
             server_state_callback_arg: self.server_state_callback_arg,
+            pending_write_cb: self.pending_write_cb,
+            pending_write_arg: self.pending_write_arg,
             executor: Executor::default(),
         }
     }
@@ -102,11 +111,16 @@ impl ChannelData {
     /// Drive every task whose published fd is ready (or whose timeout passed) this
     /// `ares_process` cycle: set its mailbox readiness via the `FD_ISSET` oracle
     /// (the sole unsafe here) and re-poll it.
-    fn drive_fd_futures(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
+    fn drive_fd_futures(
+        &mut self,
+        read_fds: &mut libc::fd_set,
+        write_fds: &mut libc::fd_set,
+        skip_timeouts: bool,
+    ) {
         let now = Instant::now();
         let rf: &libc::fd_set = &*read_fds;
         let wf: &libc::fd_set = &*write_fds;
-        let ready = self.executor.drive_ready(now, |fd, writable| {
+        let ready = self.executor.drive_ready(now, skip_timeouts, |fd, writable| {
             let set = if writable { wf } else { rf };
             unsafe { libc::FD_ISSET(fd, set as *const libc::fd_set as *mut libc::fd_set) }
         });
@@ -140,8 +154,13 @@ impl ChannelData {
     /// published socket is ready (or whose timeout passed) this cycle. Each
     /// future owns its socket(s) and applies its own verdicts; the only unsafe
     /// here is the `FD_ISSET` readiness check and the C-callback invokers.
-    pub(crate) fn process_channel(&mut self, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
-        self.drive_fd_futures(read_fds, write_fds);
+    pub(crate) fn process_channel(
+        &mut self,
+        read_fds: &mut libc::fd_set,
+        write_fds: &mut libc::fd_set,
+        skip_timeouts: bool,
+    ) {
+        self.drive_fd_futures(read_fds, write_fds, skip_timeouts);
     }
 
     /// Fire the server-state notification callback (if installed) for a server
@@ -169,7 +188,7 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: Channel) -> c_int {
+pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: *const ChannelData) -> c_int {
     if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
     let src = unsafe { &*source };
     let channeldata = src.dup_from();
@@ -197,8 +216,8 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_fds(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
+pub unsafe extern "C" fn ares_fds(channel: *const ChannelData, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
     unsafe { libc::FD_ZERO(write_fds) };
     unsafe { libc::FD_ZERO(read_fds) };
 
@@ -238,7 +257,8 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_addr_node) -> c_int {
+pub unsafe extern "C" fn ares_set_servers(channel: Channel, head: *const ares_addr_node) -> c_int {
+    let mut head = head;
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     let mut servers = Vec::new();
     while !head.is_null() {
@@ -254,7 +274,7 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
             }
             _ => {}
         }
-        head = unsafe { (*head).next };
+        head = unsafe { (*head).next as *const ares_addr_node };
     }
     channeldata.state.set_servers(servers);
     ARES_SUCCESS
@@ -262,7 +282,8 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, mut head: *mut ares_
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut AresAddrPortNode) -> c_int {
+pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, head: *const AresAddrPortNode) -> c_int {
+    let mut head = head;
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
     let mut servers = Vec::new();
     while !head.is_null() {
@@ -280,7 +301,7 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut
             }
             _ => {}
         }
-        head = node.next;
+        head = node.next as *const AresAddrPortNode;
     }
     channeldata.state.set_servers(servers);
     ARES_SUCCESS
@@ -288,8 +309,8 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, mut head: *mut
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_get_servers_ports(channel: Channel, out: *mut *mut AresAddrPortNode) -> c_int {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+pub unsafe extern "C" fn ares_get_servers_ports(channel: *const ChannelData, out: *mut *mut AresAddrPortNode) -> c_int {
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return ARES_ENODATA; };
     let mut data: Vec<AresAddrPortNode> = vec![];
     for (ip, udp_port, tcp_port) in channeldata.state.server_list() {
         let (family, addr) = match ip {
@@ -352,10 +373,10 @@ pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const 
 /// # Safety
 /// `channel` must be a valid channel and `socks` must point to at least `numsocks` writable slots.
 #[no_mangle]
-pub unsafe extern "C" fn ares_getsock(channel: Channel, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
+pub unsafe extern "C" fn ares_getsock(channel: *const ChannelData, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
     // Upstream: NULL channel or non-positive numsocks -> return 0 (no sockets).
     if numsocks <= 0 { return 0; }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return 0; };
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
 
     let fds = channeldata.all_poll_fds();
@@ -391,9 +412,9 @@ pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ar
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_addr_node) -> c_int {
+pub unsafe extern "C" fn ares_get_servers(channel: *const ChannelData, out: *mut *mut ares_addr_node) -> c_int {
     if out.is_null() { return ARES_ENODATA; }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return ARES_ENODATA; };
     // Build the list the same way as ares_get_servers_ports: an AresData-wrapped
     // chain so the caller can free it with ares_free_data (the c-ares contract).
     // (A plain Box chain here corrupted the heap under ares_free_data.)
@@ -420,7 +441,7 @@ pub unsafe extern "C" fn ares_get_servers(channel: Channel, out: *mut *mut ares_
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_get_servers_csv(channel: Channel) -> *mut c_char {
+pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *mut c_char {
     let Some(channeldata) = (unsafe { channel.as_ref() }) else { return std::ptr::null_mut(); };
     let csv = channeldata.state.servers_csv_string();
     // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
@@ -473,9 +494,32 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 /// `channel` must be null or a valid channel handle returned by
 /// `ares_init`/`ares_init_options` and not yet destroyed.
 #[no_mangle]
-pub unsafe extern "C" fn ares_queue_active_queries(channel: Channel) -> c_int {
+pub unsafe extern "C" fn ares_queue_active_queries(channel: *const ChannelData) -> libc::size_t {
     let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
-    channeldata.executor.active_count() as c_int
+    channeldata.executor.active_count()
+}
+
+/// Install the pending-write notification callback. Our writes are awaited
+/// directly, so the callback is stored (and copied by ares_dup) but never
+/// fired yet; the API surface matches upstream.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_set_pending_write_cb(
+    channel: Channel,
+    callback: ares_pending_write_cb,
+    arg: *mut c_void,
+) {
+    // SAFETY: the caller guarantees a live channel handle.
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    channeldata.pending_write_cb = callback;
+    channeldata.pending_write_arg = arg;
+}
+
+/// Process queued writes. Everything we write is awaited inline, so there is
+/// nothing to drain; accepting NULL matches the upstream contract.
+#[no_mangle]
+pub extern "C" fn ares_process_pending_write(channel: Channel) {
+    if channel.is_null() {}
 }
 
 #[no_mangle]

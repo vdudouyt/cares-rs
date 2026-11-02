@@ -2,10 +2,14 @@ ares_cancel
 ares_create_query
 ares_destroy
 ares_destroy_options
+ares_dns_addr_to_ptr
 ares_dns_class_fromstr
 ares_dns_class_tostr
 ares_dns_opcode_tostr
+ares_dns_opt_get_datatype
+ares_dns_opt_get_name
 ares_dns_parse
+ares_dns_pton
 ares_dns_rcode_tostr
 ares_dns_rec_type_fromstr
 ares_dns_rec_type_tostr
@@ -27,6 +31,8 @@ ares_dns_record_rr_del
 ares_dns_record_rr_get
 ares_dns_record_rr_get_const
 ares_dns_record_set_id
+ares_dns_rr_add_abin
+ares_dns_rr_del_abin
 ares_dns_rr_del_opt_byid
 ares_dns_rr_get_abin
 ares_dns_rr_get_abin_cnt
@@ -82,6 +88,7 @@ ares_init
 ares_init_options
 ares_library_cleanup
 ares_library_init
+ares_library_init_mem
 ares_library_initialized
 ares_mkquery
 ares_parse_a_reply
@@ -98,6 +105,8 @@ ares_parse_txt_reply_ext
 ares_parse_uri_reply
 ares_process
 ares_process_fd
+ares_process_fds
+ares_process_pending_write
 ares_query
 ares_query_dnsrec
 ares_queue_active_queries
@@ -107,9 +116,11 @@ ares_save_options
 ares_search
 ares_search_dnsrec
 ares_send
+ares_send_dnsrec
 ares_set_local_dev
 ares_set_local_ip4
 ares_set_local_ip6
+ares_set_pending_write_cb
 ares_set_server_state_callback
 ares_set_servers
 ares_set_servers_csv

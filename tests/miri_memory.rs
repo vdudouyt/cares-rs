@@ -437,10 +437,9 @@ fn dns_record_accessors_roundtrip() {
             assert!(!ares_dns_rr_get_abin(rr_txt, ARES_RR_TXT_DATA, 0, &mut alen).is_null());
         }
         assert!(ares_dns_rr_get_opt_cnt(rr_opt, ARES_RR_OPT_OPTIONS) >= 1);
-        let mut optid: c_uint = 0;
         let mut oval: *const u8 = ptr::null();
         let mut olen: libc::size_t = 0;
-        let _ = ares_dns_rr_get_opt(rr_opt, ARES_RR_OPT_OPTIONS, 0, &mut optid, &mut oval, &mut olen);
+        let _ = ares_dns_rr_get_opt(rr_opt, ARES_RR_OPT_OPTIONS, 0, &mut oval, &mut olen);
         let _ = ares_dns_rr_get_opt_byid(rr_opt, ARES_RR_OPT_OPTIONS, 5, &mut oval, &mut olen);
         let _ = ares_dns_rr_del_opt_byid(rr_opt, ARES_RR_OPT_OPTIONS, 5);
 
@@ -494,7 +493,7 @@ fn dns_record_converters() {
         assert!(!ares_dns_class_tostr(1).is_null());
         let inc = CString::new("IN").unwrap();
         let mut cl: c_uint = 0;
-        assert_ne!(ares_dns_class_fromstr(inc.as_ptr(), &mut cl), 0); // ares_bool_t (true)
+        assert_ne!(ares_dns_class_fromstr(&mut cl, inc.as_ptr()), 0); // ares_bool_t (true)
 
         assert!(!ares_dns_opcode_tostr(0).is_null());
         assert!(!ares_dns_rcode_tostr(0).is_null());
@@ -557,21 +556,21 @@ fn channel_config_smoke() {
         assert_eq!(ares_set_servers_csv(ch, csv.as_ptr()), ARES_SUCCESS);
         assert_eq!(ares_set_servers_ports_csv(ch, csv.as_ptr()), ARES_SUCCESS);
 
-        let mut node = ares_addr_node {
+        let node = ares_addr_node {
             next: ptr::null_mut(),
             family: AF_INET,
             addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([8, 8, 4, 4]) } },
         };
-        assert_eq!(ares_set_servers(ch, &mut node), ARES_SUCCESS);
+        assert_eq!(ares_set_servers(ch, &node), ARES_SUCCESS);
 
-        let mut pnode = AresAddrPortNode {
+        let pnode = AresAddrPortNode {
             next: ptr::null_mut(),
             family: AF_INET,
             addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([1, 1, 1, 1]) } },
             udp_port: 53,
             tcp_port: 53,
         };
-        assert_eq!(ares_set_servers_ports(ch, &mut pnode), ARES_SUCCESS);
+        assert_eq!(ares_set_servers_ports(ch, &pnode), ARES_SUCCESS);
 
         // server getters (allocate -> free)
         let mut servers: *mut ares_addr_node = ptr::null_mut();
@@ -597,7 +596,8 @@ fn channel_config_smoke() {
         ares_set_local_dev(ch, dev.as_ptr());
         ares_set_socket_callback(ch, None, ptr::null_mut());
         ares_set_socket_configure_callback(ch, None, ptr::null_mut());
-        assert_eq!(ares_set_socket_functions_ex(ch, ptr::null(), ptr::null_mut()), 0); // null-guarded
+        // NULL funcs is misuse: upstream returns ARES_EFORMERR (2).
+        assert_eq!(ares_set_socket_functions_ex(ch, ptr::null(), ptr::null_mut()), 2);
 
         // save/restore options round-trip (malloc'd arrays -> ares_destroy_options)
         let mut opts: ares_options = std::mem::zeroed();
@@ -675,12 +675,12 @@ fn set_servers_stack_chain_no_bad_free() {
             family: AF_INET,
             addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([1, 1, 1, 1]) } },
         };
-        let mut n1 = ares_addr_node {
+        let n1 = ares_addr_node {
             next: &mut n2,
             family: AF_INET,
             addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([8, 8, 8, 8]) } },
         };
-        assert_eq!(ares_set_servers(ch, &mut n1), ARES_SUCCESS);
+        assert_eq!(ares_set_servers(ch, &n1), ARES_SUCCESS);
 
         let mut p2 = AresAddrPortNode {
             next: ptr::null_mut(),
@@ -689,14 +689,14 @@ fn set_servers_stack_chain_no_bad_free() {
             udp_port: 53,
             tcp_port: 53,
         };
-        let mut p1 = AresAddrPortNode {
+        let p1 = AresAddrPortNode {
             next: &mut p2,
             family: AF_INET,
             addr: AresAddrUnion { addr4: libc::in_addr { s_addr: u32::from_ne_bytes([9, 9, 9, 9]) } },
             udp_port: 53,
             tcp_port: 53,
         };
-        assert_eq!(ares_set_servers_ports(ch, &mut p1), ARES_SUCCESS);
+        assert_eq!(ares_set_servers_ports(ch, &p1), ARES_SUCCESS);
 
         ares_destroy(ch);
         // n1/n2/p1/p2 drop here as plain stack values — must free nothing.

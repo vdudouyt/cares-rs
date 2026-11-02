@@ -3,11 +3,11 @@
 // contract, so per-function `# Safety` docs would just be noise.
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr, CString};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::ffi::convert::malloc_bytes;
-use crate::ffi::error::{ARES_EBADRESP, ARES_ENOMEM, ARES_SUCCESS};
+use crate::ffi::convert::{malloc_bytes, malloc_cstr};
+use crate::ffi::error::{ARES_EBADRESP, ARES_EFORMERR, ARES_ENOMEM, ARES_SUCCESS};
 
 pub use crate::core::dns_record::{ares_dns_record_t, ares_dns_rr_t};
 pub(crate) use crate::core::dns_record::parse_record;
@@ -30,6 +30,7 @@ pub const ARES_REC_TYPE_PTR: u16 = 12;
 pub const ARES_REC_TYPE_HINFO: u16 = 13;
 pub const ARES_REC_TYPE_MX: u16 = 15;
 pub const ARES_REC_TYPE_TXT: u16 = 16;
+pub const ARES_REC_TYPE_SIG: u16 = 24;
 pub const ARES_REC_TYPE_AAAA: u16 = 28;
 pub const ARES_REC_TYPE_SRV: u16 = 33;
 pub const ARES_REC_TYPE_NAPTR: u16 = 35;
@@ -81,6 +82,7 @@ pub const ARES_RCODE_YXRRSET: u16 = 7;
 pub const ARES_RCODE_NXRRSET: u16 = 8;
 pub const ARES_RCODE_NOTAUTH: u16 = 9;
 pub const ARES_RCODE_NOTZONE: u16 = 10;
+pub const ARES_RCODE_DSOTYPEI: u16 = 11;
 pub const ARES_RCODE_BADSIG: u16 = 16;
 pub const ARES_RCODE_BADKEY: u16 = 17;
 pub const ARES_RCODE_BADTIME: u16 = 18;
@@ -115,6 +117,73 @@ pub const ARES_DATATYPE_OPT: u16 = 10;
 pub const ARES_DATATYPE_ABINP: u16 = 11;
 
 // ---------------------------------------------------------------------------
+// ares_dns_parse_flags_t
+// ---------------------------------------------------------------------------
+pub const ARES_DNS_PARSE_AN_BASE_RAW: u32 = 1 << 0;
+pub const ARES_DNS_PARSE_NS_BASE_RAW: u32 = 1 << 1;
+pub const ARES_DNS_PARSE_AR_BASE_RAW: u32 = 1 << 2;
+pub const ARES_DNS_PARSE_AN_EXT_RAW: u32 = 1 << 3;
+pub const ARES_DNS_PARSE_NS_EXT_RAW: u32 = 1 << 4;
+pub const ARES_DNS_PARSE_AR_EXT_RAW: u32 = 1 << 5;
+
+// ---------------------------------------------------------------------------
+// ares_dns_opt_datatype_t
+// ---------------------------------------------------------------------------
+pub const ARES_OPT_DATATYPE_NONE: u32 = 1;
+pub const ARES_OPT_DATATYPE_STR_LIST: u32 = 2;
+pub const ARES_OPT_DATATYPE_U8_LIST: u32 = 3;
+pub const ARES_OPT_DATATYPE_U16: u32 = 4;
+pub const ARES_OPT_DATATYPE_U16_LIST: u32 = 5;
+pub const ARES_OPT_DATATYPE_U32: u32 = 6;
+pub const ARES_OPT_DATATYPE_U32_LIST: u32 = 7;
+pub const ARES_OPT_DATATYPE_INADDR4_LIST: u32 = 8;
+pub const ARES_OPT_DATATYPE_INADDR6_LIST: u32 = 9;
+pub const ARES_OPT_DATATYPE_BIN: u32 = 10;
+pub const ARES_OPT_DATATYPE_NAME: u32 = 11;
+
+// ---------------------------------------------------------------------------
+// ares_opt_param_t
+// ---------------------------------------------------------------------------
+pub const ARES_OPT_PARAM_LLQ: u32 = 1;
+pub const ARES_OPT_PARAM_UL: u32 = 2;
+pub const ARES_OPT_PARAM_NSID: u32 = 3;
+pub const ARES_OPT_PARAM_DAU: u32 = 5;
+pub const ARES_OPT_PARAM_DHU: u32 = 6;
+pub const ARES_OPT_PARAM_N3U: u32 = 7;
+pub const ARES_OPT_PARAM_EDNS_CLIENT_SUBNET: u32 = 8;
+pub const ARES_OPT_PARAM_EDNS_EXPIRE: u32 = 9;
+pub const ARES_OPT_PARAM_COOKIE: u32 = 10;
+pub const ARES_OPT_PARAM_EDNS_TCP_KEEPALIVE: u32 = 11;
+pub const ARES_OPT_PARAM_PADDING: u32 = 12;
+pub const ARES_OPT_PARAM_CHAIN: u32 = 13;
+pub const ARES_OPT_PARAM_EDNS_KEY_TAG: u32 = 14;
+pub const ARES_OPT_PARAM_EXTENDED_DNS_ERROR: u32 = 15;
+
+// ---------------------------------------------------------------------------
+// ares_svcb_param_t
+// ---------------------------------------------------------------------------
+pub const ARES_SVCB_PARAM_MANDATORY: u32 = 0;
+pub const ARES_SVCB_PARAM_ALPN: u32 = 1;
+pub const ARES_SVCB_PARAM_NO_DEFAULT_ALPN: u32 = 2;
+pub const ARES_SVCB_PARAM_PORT: u32 = 3;
+pub const ARES_SVCB_PARAM_IPV4HINT: u32 = 4;
+pub const ARES_SVCB_PARAM_ECH: u32 = 5;
+pub const ARES_SVCB_PARAM_IPV6HINT: u32 = 6;
+
+// ---------------------------------------------------------------------------
+// ares_tlsa_usage_t / ares_tlsa_selector_t / ares_tlsa_match_t
+// ---------------------------------------------------------------------------
+pub const ARES_TLSA_USAGE_CA: u32 = 0;
+pub const ARES_TLSA_USAGE_SERVICE: u32 = 1;
+pub const ARES_TLSA_USAGE_TRUSTANCHOR: u32 = 2;
+pub const ARES_TLSA_USAGE_DOMAIN: u32 = 3;
+pub const ARES_TLSA_SELECTOR_FULL: u32 = 0;
+pub const ARES_TLSA_SELECTOR_SUBJPUBKEYINFO: u32 = 1;
+pub const ARES_TLSA_MATCH_EXACT: u32 = 0;
+pub const ARES_TLSA_MATCH_SHA256: u32 = 1;
+pub const ARES_TLSA_MATCH_SHA512: u32 = 2;
+
+// ---------------------------------------------------------------------------
 // ares_dns_rr_key_t
 // ---------------------------------------------------------------------------
 // RR keys — formula: RECORD_TYPE * 100 + index (matches c-ares ares_dns_rr_key_t)
@@ -142,6 +211,16 @@ pub const ARES_RR_MX_PREFERENCE: u32 = 15 * 100 + 1;
 pub const ARES_RR_MX_EXCHANGE: u32 = 15 * 100 + 2;
 // TXT record keys (type=16)
 pub const ARES_RR_TXT_DATA: u32 = 16 * 100 + 1;
+// SIG record keys (type=24)
+pub const ARES_RR_SIG_TYPE_COVERED: u32 = 24 * 100 + 1;
+pub const ARES_RR_SIG_ALGORITHM: u32 = 24 * 100 + 2;
+pub const ARES_RR_SIG_LABELS: u32 = 24 * 100 + 3;
+pub const ARES_RR_SIG_ORIGINAL_TTL: u32 = 24 * 100 + 4;
+pub const ARES_RR_SIG_EXPIRATION: u32 = 24 * 100 + 5;
+pub const ARES_RR_SIG_INCEPTION: u32 = 24 * 100 + 6;
+pub const ARES_RR_SIG_KEY_TAG: u32 = 24 * 100 + 7;
+pub const ARES_RR_SIG_SIGNERS_NAME: u32 = 24 * 100 + 8;
+pub const ARES_RR_SIG_SIGNATURE: u32 = 24 * 100 + 9;
 // AAAA record keys (type=28)
 pub const ARES_RR_AAAA_ADDR: u32 = 28 * 100 + 1;
 // SRV record keys (type=33)
@@ -197,15 +276,15 @@ pub const ARES_RR_RAW_RR_DATA: u32 = 65536 * 100 + 2;
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_create(
     dnsrec: *mut *mut ares_dns_record_t,
-    id: c_uint,
-    flags: c_uint,
+    id: c_ushort,
+    flags: c_ushort,
     opcode: c_uint,
     rcode: c_uint,
-) -> c_int {
+) -> crate::ffi::ares_status_t {
     if dnsrec.is_null() {
-        return ARES_EBADRESP;
+        return ARES_EFORMERR;
     }
-    let rec = ares_dns_record_t::new(id as u16, flags as u16, opcode as u16, rcode as u16);
+    let rec = ares_dns_record_t::new(id, flags, opcode as u16, rcode as u16);
     unsafe { *dnsrec = Box::into_raw(Box::new(rec)); }
     ARES_SUCCESS
 }
@@ -239,51 +318,53 @@ pub unsafe extern "C" fn ares_dns_record_duplicate(
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_get_id(
     dnsrec: *const ares_dns_record_t,
-) -> c_uint {
+) -> c_ushort {
     if dnsrec.is_null() {
         return 0;
     }
-    unsafe { &*dnsrec }.id() as c_uint
+    unsafe { &*dnsrec }.id()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_get_flags(
     dnsrec: *const ares_dns_record_t,
-) -> c_uint {
+) -> c_ushort {
     if dnsrec.is_null() {
         return 0;
     }
-    unsafe { &*dnsrec }.flags() as c_uint
+    unsafe { &*dnsrec }.flags()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_get_opcode(
     dnsrec: *const ares_dns_record_t,
-) -> c_uint {
+) -> crate::ffi::ares_dns_opcode_t {
     if dnsrec.is_null() {
         return 0;
     }
-    unsafe { &*dnsrec }.opcode() as c_uint
+    unsafe { &*dnsrec }.opcode() as crate::ffi::ares_dns_opcode_t
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_get_rcode(
     dnsrec: *const ares_dns_record_t,
-) -> c_uint {
+) -> crate::ffi::ares_dns_rcode_t {
     if dnsrec.is_null() {
         return 0;
     }
-    unsafe { &*dnsrec }.rcode() as c_uint
+    unsafe { &*dnsrec }.rcode() as crate::ffi::ares_dns_rcode_t
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_set_id(
     dnsrec: *mut ares_dns_record_t,
-    id: c_uint,
-) {
-    if !dnsrec.is_null() {
-        unsafe { &mut *dnsrec }.set_id(id as u16);
+    id: c_ushort,
+) -> crate::ffi::ares_bool_t {
+    if dnsrec.is_null() {
+        return ARES_FALSE;
     }
+    unsafe { &mut *dnsrec }.set_id(id);
+    ARES_TRUE
 }
 
 // ---------------------------------------------------------------------------
@@ -760,26 +841,24 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt(
     rr: *const ares_dns_rr_t,
     key: c_uint,
     idx: libc::size_t,
-    opt: *mut c_uint,
     val: *mut *const u8,
     val_len: *mut libc::size_t,
-) -> c_int {
+) -> c_ushort {
+    // ABI-mandated sentinel: 65535 means "misuse / not found".
+    const NO_OPT: c_ushort = u16::MAX;
     if rr.is_null() {
-        return ARES_EBADRESP;
+        return NO_OPT;
     }
     let Some((code, data)) = (unsafe { &*rr }).opt_at(idx) else {
-        return ARES_EBADRESP;
+        return NO_OPT;
     };
-    if !opt.is_null() {
-        unsafe { *opt = code as c_uint; }
-    }
     if !val.is_null() {
         unsafe { *val = data.as_ptr(); }
     }
     if !val_len.is_null() {
         unsafe { *val_len = data.len(); }
     }
-    ARES_SUCCESS
+    code
 }
 
 #[no_mangle]
@@ -908,9 +987,9 @@ pub unsafe extern "C" fn ares_dns_class_tostr(qclass: c_uint) -> *const c_char {
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_class_fromstr(
+    qclass: *mut crate::ffi::ares_dns_class_t,
     str_ptr: *const c_char,
-    qclass: *mut c_uint,
-) -> c_int {
+) -> crate::ffi::ares_bool_t {
     if str_ptr.is_null() || qclass.is_null() {
         return ARES_FALSE;
     }
@@ -924,6 +1003,92 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
             ARES_TRUE
         }
         None => ARES_FALSE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Address helpers (ares_dns_pton / ares_dns_addr_to_ptr)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_dns_pton(
+    ipaddr: *const c_char,
+    addr: *mut crate::ffi::ares_addr,
+    out_len: *mut libc::size_t,
+) -> *const c_void {
+    if ipaddr.is_null() || addr.is_null() || out_len.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: the caller guarantees valid input pointer and a writable ares_addr.
+    let parsed = unsafe { CStr::from_ptr(ipaddr) }
+        .to_str()
+        .ok()
+        .and_then(|s| crate::core::dns_record::dns_pton(s, unsafe { (*addr).family }));
+    let Some((new_family, parsed)) = parsed else {
+        unsafe { *out_len = 0; }
+        return std::ptr::null();
+    };
+    // SAFETY: `addr`/`out_len` are non-NULL and writable per the C contract.
+    unsafe {
+        (*addr).family = new_family;
+        *out_len = parsed.len();
+        match &parsed {
+            crate::core::dns_record::PtonAddr::V4(octets) => {
+                (*addr).addr.addr4 = libc::in_addr { s_addr: u32::from_ne_bytes(*octets) };
+                &(*addr).addr.addr4 as *const _ as *const c_void
+            }
+            crate::core::dns_record::PtonAddr::V6(octets) => {
+                (*addr).addr.addr6 = crate::ffi::ares_in6_addr::from_octets(*octets);
+                &(*addr).addr.addr6 as *const _ as *const c_void
+            }
+        }
+    }
+}
+
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_dns_addr_to_ptr(
+    addr: *const crate::ffi::ares_addr,
+) -> *mut c_char {
+    if addr.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `addr` is a valid, initialized ares_addr per the C contract.
+    let family = unsafe { (*addr).family };
+    let ptr = match family {
+        libc::AF_INET => crate::core::dns_record::addr_to_ptr_v4(
+            unsafe { (*addr).addr.addr4.s_addr.to_ne_bytes() },
+        ),
+        libc::AF_INET6 => crate::core::dns_record::addr_to_ptr_v6(
+            unsafe { (*addr).addr.addr6._S6_un._S6_u8 },
+        ),
+        _ => return std::ptr::null_mut(),
+    };
+    // The PTR string never contains an interior NUL; NULL signals OOM.
+    unsafe { malloc_cstr(ptr.as_bytes()) }
+}
+
+// ---------------------------------------------------------------------------
+// OPT / SVCB option metadata
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ares_dns_opt_get_datatype(
+    key: crate::ffi::ares_dns_rr_key_t,
+    opt: c_ushort,
+) -> crate::ffi::ares_dns_opt_datatype_t {
+    crate::core::dns_record::opt_datatype(key, opt)
+}
+
+#[no_mangle]
+pub extern "C" fn ares_dns_opt_get_name(
+    key: crate::ffi::ares_dns_rr_key_t,
+    opt: c_ushort,
+) -> *const c_char {
+    match crate::core::dns_record::opt_name(key, opt) {
+        Some(name) => name.as_ptr(),
+        None => std::ptr::null(),
     }
 }
 
@@ -1009,6 +1174,49 @@ pub unsafe extern "C" fn ares_dns_rr_get_abin(
             std::ptr::null()
         }
     }
+}
+
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_dns_rr_add_abin(
+    rr: *mut ares_dns_rr_t,
+    key: c_uint,
+    val: *const u8,
+    len: libc::size_t,
+) -> crate::ffi::ares_status_t {
+    if rr.is_null() || (val.is_null() && len != 0) {
+        return ARES_EFORMERR;
+    }
+    if crate::core::dns_record::rr_key_datatype_of(key) != ARES_DATATYPE_ABINP as u32 {
+        return ARES_EFORMERR;
+    }
+    let data = if len == 0 {
+        &[] as &[u8]
+    } else {
+        // SAFETY: `val` points to `len` readable bytes per the C contract.
+        unsafe { std::slice::from_raw_parts(val, len) }
+    };
+    // SAFETY: the caller guarantees a live, writable record.
+    unsafe { &mut *rr }.append_bin(key, data);
+    ARES_SUCCESS
+}
+
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_dns_rr_del_abin(
+    rr: *mut ares_dns_rr_t,
+    key: c_uint,
+    idx: libc::size_t,
+) -> crate::ffi::ares_status_t {
+    if rr.is_null() {
+        return ARES_EFORMERR;
+    }
+    if crate::core::dns_record::rr_key_datatype_of(key) != ARES_DATATYPE_ABINP as u32 || idx != 0 {
+        return ARES_EFORMERR;
+    }
+    // The Phase 1 model holds one logical ABINP blob at index 0.
+    unsafe { &mut *rr }.set_bin(key, &[]);
+    ARES_SUCCESS
 }
 
 #[no_mangle]

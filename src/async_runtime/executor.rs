@@ -252,13 +252,18 @@ impl<A> Executor<A> {
     /// (and gate on timeout expiry vs `now`); return the ids that should be re-polled
     /// this cycle. Expiry gates the re-poll but isn't stored — the timeout arms read
     /// the clock directly.
-    pub(crate) fn drive_ready(&mut self, now: Instant, ready: impl Fn(i32, bool) -> bool) -> Vec<usize> {
+    pub(crate) fn drive_ready(
+        &mut self,
+        now: Instant,
+        skip_timeouts: bool,
+        ready: impl Fn(i32, bool) -> bool,
+    ) -> Vec<usize> {
         let mut go = Vec::new();
         for (id, slot) in self.slots.iter_mut().enumerate() {
             let Some(t) = slot.as_mut() else { continue };
             let mut m = t.io().borrow_mut();
             let fired: Vec<Wait> = m.waits.iter().copied().filter(|w| ready(w.fd, w.writable)).collect();
-            let expired = m.timeout.is_some_and(|d| now >= d);
+            let expired = !skip_timeouts && m.timeout.is_some_and(|d| now >= d);
             if fired.is_empty() && !expired {
                 continue;
             }

@@ -67,18 +67,18 @@ struct Reentrant {
     inner_status: c_int,
 }
 
-unsafe extern "C" fn prime_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *mut ares_dns_record_t) {
+unsafe extern "C" fn prime_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
     let out = &mut *(arg as *mut (bool, c_int));
     *out = (true, status);
 }
 
-unsafe extern "C" fn inner_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *mut ares_dns_record_t) {
+unsafe extern "C" fn inner_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
     let st = &mut *(arg as *mut Reentrant);
     st.inner_done = true;
     st.inner_status = status;
 }
 
-unsafe extern "C" fn outer_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *mut ares_dns_record_t) {
+unsafe extern "C" fn outer_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
     let st = &mut *(arg as *mut Reentrant);
     st.outer_done = true;
     st.outer_status = status;

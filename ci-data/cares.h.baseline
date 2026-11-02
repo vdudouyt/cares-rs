@@ -28,6 +28,15 @@
 #define ARES_GETSOCK_READABLE(bits, num) ((bits) & (1 << (num)))
 #define ARES_GETSOCK_WRITABLE(bits, num) ((bits) & (1 << ((num) + ARES_GETSOCK_MAXNUM)))
 
+/* Addrinfo flag mask (upstream defines it as a function-like composition). */
+#define ARES_AI_MASK \
+  (ARES_AI_CANONNAME | ARES_AI_NUMERICHOST | ARES_AI_PASSIVE | \
+   ARES_AI_NUMERICSERV | ARES_AI_V4MAPPED | ARES_AI_ALL | ARES_AI_ADDRCONFIG)
+
+/* Library-init capability markers (upstream ares.h). */
+#define CARES_HAVE_ARES_LIBRARY_INIT 1
+#define CARES_HAVE_ARES_LIBRARY_CLEANUP 1
+
 
 #define ARES_SUCCESS 0
 
@@ -85,6 +94,14 @@
 
 #define ARES_AI_ENVHOSTS (1 << 8)
 
+#define ARES_AI_IDN (1 << 10)
+
+#define ARES_AI_IDN_ALLOW_UNASSIGNED (1 << 11)
+
+#define ARES_AI_IDN_USE_STD3_ASCII_RULES (1 << 12)
+
+#define ARES_AI_CANONIDN (1 << 13)
+
 #define ARES_NI_NOFQDN (1 << 0)
 
 #define ARES_NI_NUMERICHOST (1 << 1)
@@ -108,6 +125,32 @@
 #define ARES_NI_LOOKUPHOST (1 << 8)
 
 #define ARES_NI_LOOKUPSERVICE (1 << 9)
+
+#define ARES_NI_IDN (1 << 10)
+
+#define ARES_NI_IDN_ALLOW_UNASSIGNED (1 << 11)
+
+#define ARES_NI_IDN_USE_STD3_ASCII_RULES (1 << 12)
+
+#define ARES_LIB_INIT_NONE 0
+
+#define ARES_LIB_INIT_WIN32 (1 << 0)
+
+#define ARES_SERV_STATE_UDP (1 << 0)
+
+#define ARES_SERV_STATE_TCP (1 << 1)
+
+#define ARES_EVSYS_DEFAULT 0
+
+#define ARES_EVSYS_WIN32 1
+
+#define ARES_EVSYS_EPOLL 2
+
+#define ARES_EVSYS_KQUEUE 3
+
+#define ARES_EVSYS_POLL 4
+
+#define ARES_EVSYS_SELECT 5
 
 #define ARES_GETSOCK_MAXNUM 16
 
@@ -159,6 +202,54 @@
 
 #define ARES_OPT_SERVER_FAILOVER (1 << 23)
 
+#define ARES_FLAG_USEVC (1 << 0)
+
+#define ARES_FLAG_PRIMARY (1 << 1)
+
+#define ARES_FLAG_IGNTC (1 << 2)
+
+#define ARES_FLAG_NORECURSE (1 << 3)
+
+#define ARES_FLAG_STAYOPEN (1 << 4)
+
+#define ARES_FLAG_NOSEARCH (1 << 5)
+
+#define ARES_FLAG_NOALIASES (1 << 6)
+
+#define ARES_FLAG_NOCHECKRESP (1 << 7)
+
+#define ARES_FLAG_EDNS (1 << 8)
+
+#define ARES_FLAG_NO_DFLT_SVR (1 << 9)
+
+#define ARES_FLAG_DNS0x20 (1 << 10)
+
+#define ARES_FD_EVENT_NONE 0
+
+#define ARES_FD_EVENT_READ (1 << 0)
+
+#define ARES_FD_EVENT_WRITE (1 << 1)
+
+#define ARES_PROCESS_FLAG_NONE 0
+
+#define ARES_PROCESS_FLAG_SKIP_NON_FD (1 << 0)
+
+#define ARES_SOCKET_OPT_SENDBUF_SIZE 0
+
+#define ARES_SOCKET_OPT_RECVBUF_SIZE 1
+
+#define ARES_SOCKET_OPT_BIND_DEVICE 2
+
+#define ARES_SOCKET_OPT_TCP_FASTOPEN 3
+
+#define ARES_SOCKET_CONN_TCP_FASTOPEN (1 << 0)
+
+#define ARES_SOCKET_BIND_TCP (1 << 0)
+
+#define ARES_SOCKET_BIND_CLIENT (1 << 1)
+
+#define ARES_SOCKFUNC_FLAG_NONBLOCKING (1 << 0)
+
 #define ARES_TRUE 1
 
 #define ARES_FALSE 0
@@ -178,6 +269,8 @@
 #define ARES_REC_TYPE_MX 15
 
 #define ARES_REC_TYPE_TXT 16
+
+#define ARES_REC_TYPE_SIG 24
 
 #define ARES_REC_TYPE_AAAA 28
 
@@ -249,6 +342,8 @@
 
 #define ARES_RCODE_NOTZONE 10
 
+#define ARES_RCODE_DSOTYPEI 11
+
 #define ARES_RCODE_BADSIG 16
 
 #define ARES_RCODE_BADKEY 17
@@ -297,6 +392,100 @@
 
 #define ARES_DATATYPE_ABINP 11
 
+#define ARES_DNS_PARSE_AN_BASE_RAW (1 << 0)
+
+#define ARES_DNS_PARSE_NS_BASE_RAW (1 << 1)
+
+#define ARES_DNS_PARSE_AR_BASE_RAW (1 << 2)
+
+#define ARES_DNS_PARSE_AN_EXT_RAW (1 << 3)
+
+#define ARES_DNS_PARSE_NS_EXT_RAW (1 << 4)
+
+#define ARES_DNS_PARSE_AR_EXT_RAW (1 << 5)
+
+#define ARES_OPT_DATATYPE_NONE 1
+
+#define ARES_OPT_DATATYPE_STR_LIST 2
+
+#define ARES_OPT_DATATYPE_U8_LIST 3
+
+#define ARES_OPT_DATATYPE_U16 4
+
+#define ARES_OPT_DATATYPE_U16_LIST 5
+
+#define ARES_OPT_DATATYPE_U32 6
+
+#define ARES_OPT_DATATYPE_U32_LIST 7
+
+#define ARES_OPT_DATATYPE_INADDR4_LIST 8
+
+#define ARES_OPT_DATATYPE_INADDR6_LIST 9
+
+#define ARES_OPT_DATATYPE_BIN 10
+
+#define ARES_OPT_DATATYPE_NAME 11
+
+#define ARES_OPT_PARAM_LLQ 1
+
+#define ARES_OPT_PARAM_UL 2
+
+#define ARES_OPT_PARAM_NSID 3
+
+#define ARES_OPT_PARAM_DAU 5
+
+#define ARES_OPT_PARAM_DHU 6
+
+#define ARES_OPT_PARAM_N3U 7
+
+#define ARES_OPT_PARAM_EDNS_CLIENT_SUBNET 8
+
+#define ARES_OPT_PARAM_EDNS_EXPIRE 9
+
+#define ARES_OPT_PARAM_COOKIE 10
+
+#define ARES_OPT_PARAM_EDNS_TCP_KEEPALIVE 11
+
+#define ARES_OPT_PARAM_PADDING 12
+
+#define ARES_OPT_PARAM_CHAIN 13
+
+#define ARES_OPT_PARAM_EDNS_KEY_TAG 14
+
+#define ARES_OPT_PARAM_EXTENDED_DNS_ERROR 15
+
+#define ARES_SVCB_PARAM_MANDATORY 0
+
+#define ARES_SVCB_PARAM_ALPN 1
+
+#define ARES_SVCB_PARAM_NO_DEFAULT_ALPN 2
+
+#define ARES_SVCB_PARAM_PORT 3
+
+#define ARES_SVCB_PARAM_IPV4HINT 4
+
+#define ARES_SVCB_PARAM_ECH 5
+
+#define ARES_SVCB_PARAM_IPV6HINT 6
+
+#define ARES_TLSA_USAGE_CA 0
+
+#define ARES_TLSA_USAGE_SERVICE 1
+
+#define ARES_TLSA_USAGE_TRUSTANCHOR 2
+
+#define ARES_TLSA_USAGE_DOMAIN 3
+
+#define ARES_TLSA_SELECTOR_FULL 0
+
+#define ARES_TLSA_SELECTOR_SUBJPUBKEYINFO 1
+
+#define ARES_TLSA_MATCH_EXACT 0
+
+#define ARES_TLSA_MATCH_SHA256 1
+
+#define ARES_TLSA_MATCH_SHA512 2
+
 #define ARES_RR_A_ADDR (100 + 1)
 
 #define ARES_RR_NS_NSDNAME ((2 * 100) + 1)
@@ -328,6 +517,24 @@
 #define ARES_RR_MX_EXCHANGE ((15 * 100) + 2)
 
 #define ARES_RR_TXT_DATA ((16 * 100) + 1)
+
+#define ARES_RR_SIG_TYPE_COVERED ((24 * 100) + 1)
+
+#define ARES_RR_SIG_ALGORITHM ((24 * 100) + 2)
+
+#define ARES_RR_SIG_LABELS ((24 * 100) + 3)
+
+#define ARES_RR_SIG_ORIGINAL_TTL ((24 * 100) + 4)
+
+#define ARES_RR_SIG_EXPIRATION ((24 * 100) + 5)
+
+#define ARES_RR_SIG_INCEPTION ((24 * 100) + 6)
+
+#define ARES_RR_SIG_KEY_TAG ((24 * 100) + 7)
+
+#define ARES_RR_SIG_SIGNERS_NAME ((24 * 100) + 8)
+
+#define ARES_RR_SIG_SIGNATURE ((24 * 100) + 9)
 
 #define ARES_RR_AAAA_ADDR ((28 * 100) + 1)
 
@@ -504,12 +711,16 @@ typedef struct ares_socket_functions {
   ares_ssize_t (*asendv)(ares_socket_t fd, const struct iovec*, int, void *user_data);
 } ares_socket_functions;
 
+typedef int ares_status_t;
+
+typedef unsigned int ares_socket_opt_t;
+
 typedef struct ares_socket_functions_ex {
   unsigned int version;
   unsigned int flags;
   ares_socket_t (*asocket)(int, int, int, void*);
   int (*aclose)(ares_socket_t, void*);
-  int (*asetsockopt)(ares_socket_t, int, const void*, socklen_t, void*);
+  int (*asetsockopt)(ares_socket_t, ares_socket_opt_t, const void*, socklen_t, void*);
   int (*aconnect)(ares_socket_t, const struct sockaddr*, socklen_t, unsigned int, void*);
   ares_ssize_t (*arecvfrom)(ares_socket_t, void*, size_t, int, struct sockaddr*, socklen_t*, void*);
   ares_ssize_t (*asendto)(ares_socket_t,
@@ -519,7 +730,17 @@ typedef struct ares_socket_functions_ex {
                           const struct sockaddr*,
                           socklen_t,
                           void*);
+  int (*agetsockname)(ares_socket_t, struct sockaddr*, socklen_t*, void*);
+  int (*abind)(ares_socket_t, unsigned int, const struct sockaddr*, socklen_t, void*);
+  unsigned int (*aif_nametoindex)(const char*, void*);
+  const char *(*aif_indextoname)(unsigned int, char*, size_t, void*);
 } ares_socket_functions_ex;
+
+typedef unsigned int ares_dns_opcode_t;
+
+typedef unsigned int ares_dns_rcode_t;
+
+typedef int ares_bool_t;
 
 typedef struct ares_in6_addr_un {
   uint8_t _S6_u8[16];
@@ -528,6 +749,22 @@ typedef struct ares_in6_addr_un {
 typedef struct ares_in6_addr {
   struct ares_in6_addr_un _S6_un;
 } ares_in6_addr;
+
+typedef unsigned int ares_dns_class_t;
+
+typedef union ares_addr_union {
+  struct in_addr addr4;
+  struct ares_in6_addr addr6;
+} ares_addr_union;
+
+typedef struct ares_addr {
+  int family;
+  union ares_addr_union addr;
+} ares_addr;
+
+typedef unsigned int ares_dns_opt_datatype_t;
+
+typedef unsigned int ares_dns_rr_key_t;
 
 typedef struct ares_addrinfo_cname {
   int ttl;
@@ -553,11 +790,6 @@ typedef struct ares_addrinfo {
   char *name;
 } ares_addrinfo;
 
-typedef union ares_addr_union {
-  struct in_addr addr4;
-  struct ares_in6_addr addr6;
-} ares_addr_union;
-
 typedef struct ares_addr_node {
   struct ares_addr_node *next;
   int family;
@@ -581,6 +813,8 @@ typedef void (*ares_server_state_callback)(const char *server_string,
                                            int flags,
                                            void *arg);
 
+typedef void (*ares_pending_write_cb)(void *data);
+
 typedef void (*ares_host_callback)(void *arg, int status, int timeouts, struct hostent *hostent);
 
 typedef void (*ares_callback)(void *arg, int status, int timeouts, uint8_t *abuf, int alen);
@@ -588,7 +822,7 @@ typedef void (*ares_callback)(void *arg, int status, int timeouts, uint8_t *abuf
 typedef void (*ares_callback_dnsrec)(void *arg,
                                      int status,
                                      size_t timeouts,
-                                     struct ares_dns_record_t *dnsrec);
+                                     const struct ares_dns_record_t *dnsrec);
 
 typedef void (*ares_nameinfo_callback)(void *arg,
                                        int status,
@@ -682,27 +916,42 @@ typedef struct ares_soa_reply {
   unsigned int minttl;
 } ares_soa_reply;
 
-typedef int ares_status_t;
-
-typedef int ares_bool_t;
+typedef struct ares_fd_events_t {
+  ares_socket_t fd;
+  unsigned int events;
+} ares_fd_events_t;
 
 typedef socklen_t ares_socklen_t;
 
 typedef unsigned int ares_dns_rec_type_t;
 
-typedef unsigned int ares_dns_class_t;
-
 typedef unsigned int ares_dns_section_t;
-
-typedef unsigned int ares_dns_opcode_t;
-
-typedef unsigned int ares_dns_rcode_t;
 
 typedef unsigned int ares_dns_flags_t;
 
 typedef unsigned int ares_dns_datatype_t;
 
-typedef unsigned int ares_dns_rr_key_t;
+typedef unsigned int ares_dns_parse_flags_t;
+
+typedef unsigned int ares_tlsa_usage_t;
+
+typedef unsigned int ares_tlsa_selector_t;
+
+typedef unsigned int ares_tlsa_match_t;
+
+typedef unsigned int ares_svcb_param_t;
+
+typedef unsigned int ares_opt_param_t;
+
+typedef unsigned int ares_socket_bind_flags_t;
+
+typedef unsigned int ares_socket_connect_flags_t;
+
+typedef unsigned int ares_sockfunc_flags_t;
+
+typedef unsigned int ares_fd_eventflag_t;
+
+typedef unsigned int ares_process_flag_t;
 
 #define ARES_SOCKET_BAD -1
 
@@ -711,6 +960,11 @@ extern "C" {
 #endif // __cplusplus
 
 int ares_library_init(int _flags);
+
+int ares_library_init_mem(int flags,
+                          void *(*amalloc)(size_t size),
+                          void (*afree)(void *ptr),
+                          void *(*arealloc)(void *ptr, size_t size));
 
 void ares_library_cleanup(void);
 
@@ -724,7 +978,9 @@ void ares_free_data(void *dataptr);
 
 int ares_init_options(ares_channel *out_channel, const struct ares_options *options, int optmask);
 
-int ares_save_options(ares_channel channel, struct ares_options *options, int *optmask);
+int ares_save_options(const struct ares_channeldata *channel,
+                      struct ares_options *options,
+                      int *optmask);
 
 void ares_destroy_options(struct ares_options *options);
 
@@ -732,29 +988,29 @@ void ares_set_socket_functions(ares_channel channel,
                                const struct ares_socket_functions *funcs,
                                void *user_data);
 
-int ares_set_socket_functions_ex(ares_channel channel,
-                                 const struct ares_socket_functions_ex *funcs,
-                                 void *user_data);
+ares_status_t ares_set_socket_functions_ex(ares_channel channel,
+                                           const struct ares_socket_functions_ex *funcs,
+                                           void *user_data);
 
-int ares_dns_record_create(struct ares_dns_record_t **dnsrec,
-                           unsigned int id,
-                           unsigned int flags,
-                           unsigned int opcode,
-                           unsigned int rcode);
+ares_status_t ares_dns_record_create(struct ares_dns_record_t **dnsrec,
+                                     unsigned short id,
+                                     unsigned short flags,
+                                     unsigned int opcode,
+                                     unsigned int rcode);
 
 void ares_dns_record_destroy(struct ares_dns_record_t *dnsrec);
 
 struct ares_dns_record_t *ares_dns_record_duplicate(const struct ares_dns_record_t *dnsrec);
 
-unsigned int ares_dns_record_get_id(const struct ares_dns_record_t *dnsrec);
+unsigned short ares_dns_record_get_id(const struct ares_dns_record_t *dnsrec);
 
-unsigned int ares_dns_record_get_flags(const struct ares_dns_record_t *dnsrec);
+unsigned short ares_dns_record_get_flags(const struct ares_dns_record_t *dnsrec);
 
-unsigned int ares_dns_record_get_opcode(const struct ares_dns_record_t *dnsrec);
+ares_dns_opcode_t ares_dns_record_get_opcode(const struct ares_dns_record_t *dnsrec);
 
-unsigned int ares_dns_record_get_rcode(const struct ares_dns_record_t *dnsrec);
+ares_dns_rcode_t ares_dns_record_get_rcode(const struct ares_dns_record_t *dnsrec);
 
-void ares_dns_record_set_id(struct ares_dns_record_t *dnsrec, unsigned int id);
+ares_bool_t ares_dns_record_set_id(struct ares_dns_record_t *dnsrec, unsigned short id);
 
 int ares_dns_record_query_add(struct ares_dns_record_t *dnsrec,
                               const char *name,
@@ -841,12 +1097,11 @@ int ares_dns_rr_set_opt(struct ares_dns_rr_t *rr,
 
 size_t ares_dns_rr_get_opt_cnt(const struct ares_dns_rr_t *rr, unsigned int key);
 
-int ares_dns_rr_get_opt(const struct ares_dns_rr_t *rr,
-                        unsigned int key,
-                        size_t idx,
-                        unsigned int *opt,
-                        const uint8_t **val,
-                        size_t *val_len);
+unsigned short ares_dns_rr_get_opt(const struct ares_dns_rr_t *rr,
+                                   unsigned int key,
+                                   size_t idx,
+                                   const uint8_t **val,
+                                   size_t *val_len);
 
 int ares_dns_rr_get_opt_byid(const struct ares_dns_rr_t *rr,
                              unsigned int key,
@@ -869,7 +1124,15 @@ int ares_dns_rec_type_fromstr(unsigned int *rtype, const char *str_ptr);
 
 const char *ares_dns_class_tostr(unsigned int qclass);
 
-int ares_dns_class_fromstr(const char *str_ptr, unsigned int *qclass);
+ares_bool_t ares_dns_class_fromstr(ares_dns_class_t *qclass, const char *str_ptr);
+
+const void *ares_dns_pton(const char *ipaddr, struct ares_addr *addr, size_t *out_len);
+
+char *ares_dns_addr_to_ptr(const struct ares_addr *addr);
+
+ares_dns_opt_datatype_t ares_dns_opt_get_datatype(ares_dns_rr_key_t key, unsigned short opt);
+
+const char *ares_dns_opt_get_name(ares_dns_rr_key_t key, unsigned short opt);
 
 const char *ares_dns_rr_key_tostr(unsigned int key);
 
@@ -892,6 +1155,13 @@ const uint8_t *ares_dns_rr_get_abin(const struct ares_dns_rr_t *rr,
                                     size_t idx,
                                     size_t *len);
 
+ares_status_t ares_dns_rr_add_abin(struct ares_dns_rr_t *rr,
+                                   unsigned int key,
+                                   const uint8_t *val,
+                                   size_t len);
+
+ares_status_t ares_dns_rr_del_abin(struct ares_dns_rr_t *rr, unsigned int key, size_t idx);
+
 void ares_free(void *ptr);
 
 const char *ares_strerror(int code);
@@ -900,27 +1170,28 @@ void ares_freeaddrinfo(struct ares_addrinfo *ai);
 
 int ares_init(ares_channel *out_channel);
 
-int ares_dup(ares_channel *dest, ares_channel source);
+int ares_dup(ares_channel *dest, const struct ares_channeldata *source);
 
 void ares_cancel(ares_channel channel);
 
 void ares_destroy(ares_channel channel);
 
-int ares_fds(ares_channel channel, fd_set *read_fds, fd_set *write_fds);
+int ares_fds(const struct ares_channeldata *channel, fd_set *read_fds, fd_set *write_fds);
 
 struct timeval *ares_timeout(ares_channel channel, struct timeval *maxtv, struct timeval *tv);
 
-int ares_set_servers(ares_channel channel, struct ares_addr_node *head);
+int ares_set_servers(ares_channel channel, const struct ares_addr_node *head);
 
-int ares_set_servers_ports(ares_channel channel, struct ares_addr_port_node *head);
+int ares_set_servers_ports(ares_channel channel, const struct ares_addr_port_node *head);
 
-int ares_get_servers_ports(ares_channel channel, struct ares_addr_port_node **out);
+int ares_get_servers_ports(const struct ares_channeldata *channel,
+                           struct ares_addr_port_node **out);
 
 int ares_set_servers_ports_csv(ares_channel channel, const char *servers);
 
 int ares_set_servers_csv(ares_channel channel, const char *servers);
 
-int ares_getsock(ares_channel channel, ares_socket_t *socks, int numsocks);
+int ares_getsock(const struct ares_channeldata *channel, ares_socket_t *socks, int numsocks);
 
 void ares_set_local_ip4(ares_channel _channel, uint32_t _local_ip);
 
@@ -930,9 +1201,9 @@ void ares_set_local_dev(ares_channel _channel, const char *_local_dev_name);
 
 void ares_set_socket_callback(ares_channel channel, ares_sock_create_callback callback, void *arg);
 
-int ares_get_servers(ares_channel channel, struct ares_addr_node **out);
+int ares_get_servers(const struct ares_channeldata *channel, struct ares_addr_node **out);
 
-char *ares_get_servers_csv(ares_channel channel);
+char *ares_get_servers_csv(const struct ares_channeldata *channel);
 
 int ares_set_sortlist(ares_channel channel, const char *sortstr);
 
@@ -946,7 +1217,11 @@ void ares_set_server_state_callback(ares_channel channel,
                                     ares_server_state_callback callback,
                                     void *arg);
 
-int ares_queue_active_queries(ares_channel channel);
+size_t ares_queue_active_queries(const struct ares_channeldata *channel);
+
+void ares_set_pending_write_cb(ares_channel channel, ares_pending_write_cb callback, void *arg);
+
+void ares_process_pending_write(ares_channel channel);
 
 int ares_queue_wait_empty(ares_channel _channel, int _timeout_ms);
 
@@ -962,7 +1237,7 @@ int ares_gethostbyname_file(struct ares_channeldata *channel,
                             struct hostent **host);
 
 void ares_gethostbyaddr(ares_channel channel,
-                        void *addr,
+                        const void *addr,
                         int addrlen,
                         int family,
                         ares_host_callback callback,
@@ -982,18 +1257,18 @@ void ares_query(ares_channel channel,
                 ares_callback callback,
                 void *arg);
 
-void ares_query_dnsrec(ares_channel channel,
-                       const char *name,
-                       int _dnsclass,
-                       int dnstype,
-                       ares_callback_dnsrec callback,
-                       void *arg,
-                       int *_qid);
+ares_status_t ares_query_dnsrec(ares_channel channel,
+                                const char *name,
+                                int dnsclass,
+                                int dnstype,
+                                ares_callback_dnsrec callback,
+                                void *arg,
+                                unsigned short *qid);
 
-void ares_search_dnsrec(ares_channel channel,
-                        struct ares_dns_record_t *dnsrec,
-                        ares_callback_dnsrec callback,
-                        void *arg);
+ares_status_t ares_search_dnsrec(ares_channel channel,
+                                 const struct ares_dns_record_t *dnsrec,
+                                 ares_callback_dnsrec callback,
+                                 void *arg);
 
 void ares_getnameinfo(ares_channel channel,
                       const struct sockaddr *sa,
@@ -1014,6 +1289,12 @@ void ares_send(ares_channel channel,
                int qlen,
                ares_callback callback,
                void *arg);
+
+ares_status_t ares_send_dnsrec(ares_channel channel,
+                               const struct ares_dns_record_t *dnsrec,
+                               ares_callback_dnsrec callback,
+                               void *arg,
+                               unsigned short *qid);
 
 int ares_parse_mx_reply(const uint8_t *abuf, int alen, struct ares_mx_reply **out);
 
@@ -1088,6 +1369,11 @@ int ares_mkquery(const char *name,
 void ares_process_fd(ares_channel channel, int read_fd, int write_fd);
 
 void ares_process(ares_channel channel, fd_set *read_fds, fd_set *write_fds);
+
+int ares_process_fds(ares_channel channel,
+                     const struct ares_fd_events_t *events,
+                     size_t nevents,
+                     unsigned int flags);
 
 #ifdef __cplusplus
 }  // extern "C"

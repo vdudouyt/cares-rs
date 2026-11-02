@@ -67,9 +67,39 @@ pub type ares_socket_t = c_int;
 #[allow(non_camel_case_types)] pub type ares_dns_flags_t = c_uint;
 #[allow(non_camel_case_types)] pub type ares_dns_datatype_t = c_uint;
 #[allow(non_camel_case_types)] pub type ares_dns_rr_key_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_opt_datatype_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_dns_parse_flags_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_tlsa_usage_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_tlsa_selector_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_tlsa_match_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_svcb_param_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_opt_param_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_socket_opt_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_socket_bind_flags_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_socket_connect_flags_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_sockfunc_flags_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_fd_eventflag_t = c_uint;
+#[allow(non_camel_case_types)] pub type ares_process_flag_t = c_uint;
+
+#[allow(non_camel_case_types)]
+pub type ares_pending_write_cb = Option<unsafe extern "C" fn(data: *mut c_void)>;
 
 #[no_mangle]
 pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
+    ARES_SUCCESS
+}
+
+/// `ares_library_init_mem`: the allocator hooks are accepted but not yet used.
+/// Full allocator interception is deferred; the library continues to use the
+/// system allocator, matching the pre-hook behavior.
+#[no_mangle]
+pub extern "C" fn ares_library_init_mem(
+    flags: c_int,
+    amalloc: Option<unsafe extern "C" fn(size: libc::size_t) -> *mut c_void>,
+    afree: Option<unsafe extern "C" fn(ptr: *mut c_void)>,
+    arealloc: Option<unsafe extern "C" fn(ptr: *mut c_void, size: libc::size_t) -> *mut c_void>,
+) -> c_int {
+    let _ = (flags, amalloc, afree, arealloc);
     ARES_SUCCESS
 }
 
@@ -109,6 +139,15 @@ impl ares_in6_addr {
     }
 }
 
+/// Single address + family, as used by `ares_dns_pton()` / `ares_dns_addr_to_ptr()`.
+/// Mirrors upstream `struct ares_addr` (family + anonymous in4/in6 union).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct ares_addr {
+    pub family: c_int,
+    pub addr: AresAddrUnion,
+}
+
 // Dual-role: caller-allocatable input to `ares_set_servers`, and cares-rs-allocated
 // output of `ares_get_servers`. Intentionally NO `Drop` — a chain-walking Drop would
 // free caller-owned stack instances. See the ownership taxonomy in `ffi/ares_data.rs`.
@@ -137,7 +176,7 @@ pub const RECORD_TYPE_URI: u16 = 0x100;
 // typedefs below, which is what public signatures and cbindgen use.
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 pub type AresCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int);
-pub type AresCallbackDnsRec = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: usize, dnsrec: *mut dns_record::ares_dns_record_t);
+pub type AresCallbackDnsRec = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: usize, dnsrec: *const dns_record::ares_dns_record_t);
 pub type AresSockCreateCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int;
 pub type AresNameinfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, node: *mut c_char, service: *mut c_char);
 pub type AresAddrInfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, res: *mut ares_addrinfo);
@@ -148,7 +187,7 @@ pub type AresAddrInfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c
 // for `Option<TypeAlias>`). Signatures must mirror the bare aliases above.
 #[allow(non_camel_case_types)] pub type ares_host_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent)>;
 #[allow(non_camel_case_types)] pub type ares_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int)>;
-#[allow(non_camel_case_types)] pub type ares_callback_dnsrec = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: libc::size_t, dnsrec: *mut dns_record::ares_dns_record_t)>;
+#[allow(non_camel_case_types)] pub type ares_callback_dnsrec = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: libc::size_t, dnsrec: *const dns_record::ares_dns_record_t)>;
 #[allow(non_camel_case_types)] pub type ares_sock_create_callback = Option<unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int>;
 #[allow(non_camel_case_types)] pub type ares_nameinfo_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, node: *mut c_char, service: *mut c_char)>;
 #[allow(non_camel_case_types)] pub type ares_addrinfo_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, res: *mut ares_addrinfo)>;
@@ -162,6 +201,11 @@ pub const ARES_AI_ALL: c_int = 1 << 5;
 pub const ARES_AI_ADDRCONFIG: c_int = 1 << 6;
 pub const ARES_AI_NOSORT: c_int = 1 << 7;
 pub const ARES_AI_ENVHOSTS: c_int = 1 << 8;
+// Reserved for future use (upstream values; kept for source compatibility).
+pub const ARES_AI_IDN: c_int = 1 << 10;
+pub const ARES_AI_IDN_ALLOW_UNASSIGNED: c_int = 1 << 11;
+pub const ARES_AI_IDN_USE_STD3_ASCII_RULES: c_int = 1 << 12;
+pub const ARES_AI_CANONIDN: c_int = 1 << 13;
 
 // ares_getnameinfo flags
 pub const ARES_NI_NOFQDN: c_int = 1 << 0;
@@ -176,6 +220,26 @@ pub const ARES_NI_DCCP: c_int = 1 << 6;
 pub const ARES_NI_NUMERICSCOPE: c_int = 1 << 7;
 pub const ARES_NI_LOOKUPHOST: c_int = 1 << 8;
 pub const ARES_NI_LOOKUPSERVICE: c_int = 1 << 9;
+// Reserved for future use (upstream values; kept for source compatibility).
+pub const ARES_NI_IDN: c_int = 1 << 10;
+pub const ARES_NI_IDN_ALLOW_UNASSIGNED: c_int = 1 << 11;
+pub const ARES_NI_IDN_USE_STD3_ASCII_RULES: c_int = 1 << 12;
+
+// c-ares library initialization flag values.
+pub const ARES_LIB_INIT_NONE: c_int = 0;
+pub const ARES_LIB_INIT_WIN32: c_int = 1 << 0;
+
+// Server state callback flag values.
+pub const ARES_SERV_STATE_UDP: c_int = 1 << 0;
+pub const ARES_SERV_STATE_TCP: c_int = 1 << 1;
+
+// Values for ARES_OPT_EVENT_THREAD.
+pub const ARES_EVSYS_DEFAULT: c_int = 0;
+pub const ARES_EVSYS_WIN32: c_int = 1;
+pub const ARES_EVSYS_EPOLL: c_int = 2;
+pub const ARES_EVSYS_KQUEUE: c_int = 3;
+pub const ARES_EVSYS_POLL: c_int = 4;
+pub const ARES_EVSYS_SELECT: c_int = 5;
 
 /// # Safety
 /// `version` must be null or a valid, writable pointer to a `c_int`.

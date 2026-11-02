@@ -116,10 +116,18 @@ pub const ARES_OPT_QUERY_CACHE    : c_int = 1 << 21;
 pub const ARES_OPT_EVENT_THREAD   : c_int = 1 << 22;
 pub const ARES_OPT_SERVER_FAILOVER: c_int = 1 << 23;
 
-pub(crate) const ARES_FLAG_USEVC: c_int = 1 << 0;
-pub(crate) const ARES_FLAG_PRIMARY: c_int = 1 << 1;
-pub(crate) const ARES_FLAG_NOCHECKRESP: c_int = 1 << 7;
-pub(crate) const ARES_FLAG_EDNS: c_int = 1 << 8;
+pub const ARES_FLAG_USEVC: c_int = 1 << 0;
+pub const ARES_FLAG_PRIMARY: c_int = 1 << 1;
+pub const ARES_FLAG_IGNTC: c_int = 1 << 2;
+pub const ARES_FLAG_NORECURSE: c_int = 1 << 3;
+pub const ARES_FLAG_STAYOPEN: c_int = 1 << 4;
+pub const ARES_FLAG_NOSEARCH: c_int = 1 << 5;
+pub const ARES_FLAG_NOALIASES: c_int = 1 << 6;
+pub const ARES_FLAG_NOCHECKRESP: c_int = 1 << 7;
+pub const ARES_FLAG_EDNS: c_int = 1 << 8;
+pub const ARES_FLAG_NO_DFLT_SVR: c_int = 1 << 9;
+#[allow(non_upper_case_globals)] // upstream spelling
+pub const ARES_FLAG_DNS0x20: c_int = 1 << 10;
 
 /// # Safety
 /// `out_channel` must be non-null; `options` must be NULL or a valid `ares_options` consistent with `optmask`.
@@ -193,7 +201,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn ares_save_options(channel: Channel, options: *mut ares_options, optmask: *mut c_int) -> c_int {
+pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options: *mut ares_options, optmask: *mut c_int) -> c_int {
     if options.is_null() || optmask.is_null() { return ARES_ENODATA; }
     let Some(channeldata) = (unsafe { channel.as_ref() }) else { return ARES_ENODATA; };
     let saved = channeldata.state.saved_options();
