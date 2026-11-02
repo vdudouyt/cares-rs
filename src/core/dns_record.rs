@@ -1672,12 +1672,7 @@ impl ares_dns_record_t {
     ) -> Result<&mut ares_dns_rr_t, AresError> {
         if !rec_type_isvalid(rtype, false)
             || rclass > u16::MAX as u32
-            || (!class_isvalid(rclass as u16, rtype, false)
-                // The checked-in accessor test constructs an OPT record with
-                // class 1232 (its wire meaning is the UDP payload size); keep
-                // that one legacy construction working while still rejecting
-                // every other invalid class.
-                && !(rtype == ARES_REC_TYPE_OPT as u32 && rclass == 1232))
+            || !class_isvalid(rclass as u16, rtype, false)
         {
             return Err(ARES_EFORMERR.into());
         }
