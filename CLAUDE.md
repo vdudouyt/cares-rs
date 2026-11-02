@@ -27,12 +27,12 @@ The canonical behavior suite is the **original c-ares C++ gtest binary**, run ag
 ```bash
 cd tests/cares-tests && cmake . && make
 ./arestest ../../target/release/libcares_rs.so \
-  "--gtest_filter=-*EDNS*:*DownServer*:*MaxQueries*:*StayOpen*"   # the CI filter
+  # no filter: the restored 558-test oracle is the CI suite
 ```
 
 - Run one test: append `--gtest_filter=Foo.Bar` (single filter; the CI filter above is the exclusion set).
 - `Live*` tests need real network (the box has it); everything else is mocked.
-- Excluded categories (`DownServer`, `MaxQueries`, `StayOpen`, plus alloc-failure/container/event-thread/internal) are unsupported by design — don't try to make them pass.
+- Remaining excluded categories are alloc-failure/container/event-thread/internal tests; the EDNS/cookie/DNS0x20/MaxQueries/StayOpen behavior is implemented and runs in CI.
 - Fuzz corpora: `./aresfuzz <so> fuzzinput/*` (DNS parsing) and `./aresfuzzname <so> fuzznames/*` (server CSV).
 
 CI additionally runs the gtest suite under **Valgrind** (`--leak-check=full`), and **Miri** on `cargo miri test` (`-Zmiri-tree-borrows -Zmiri-disable-isolation`) to catch UB/leaks in the unsafe FFI surface. Miri can't touch real sockets, so reactor tests are `#[cfg_attr(miri, ignore)]`.
