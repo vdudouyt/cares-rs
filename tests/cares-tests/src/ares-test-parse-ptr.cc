@@ -223,6 +223,10 @@ TEST_F(LibraryTest, ParsePtrReplyErrors) {
                                                   addrv4, sizeof(addrv4), AF_INET, &host));
     EXPECT_EQ(nullptr, host);
   }
+
+  // Negative Length
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_ptr_reply(data.data(), -1,
+                                                addrv4, sizeof(addrv4), AF_INET, &host));
 }
 
 #ifdef ENABLE_ALLOC_FAIL_TESTS
@@ -245,7 +249,8 @@ TEST_F(LibraryTest, ParsePtrReplyAllocFailSome) {
                                                 addrv4, sizeof(addrv4), AF_INET, &host)) << ii;
   }
 }
-
+#endif
+#ifdef ENABLE_ALLOC_FAIL_TESTS
 TEST_F(LibraryTest, ParsePtrReplyAllocFailMany) {
   byte addrv4[4] = {0x10, 0x20, 0x30, 0x40};
   DNSPacket pkt;
@@ -277,7 +282,6 @@ TEST_F(LibraryTest, ParsePtrReplyAllocFailMany) {
   }
 }
 #endif
-
 
 }  // namespace test
 }  // namespace ares

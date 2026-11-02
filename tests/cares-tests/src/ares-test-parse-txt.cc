@@ -38,7 +38,7 @@ TEST_F(LibraryTest, ParseTxtReplyOK) {
   std::string expected2a = "txt2a";
   std::string expected2b("ABC\0ABC", 7);
   pkt.set_qid(0x1234).set_response().set_aa()
-    .add_question(new DNSQuestion("example.com", T_MX))
+    .add_question(new DNSQuestion("example.com", T_TXT))
     .add_answer(new DNSTxtRR("example.com", 100, {expected1}))
     .add_answer(new DNSTxtRR("example.com", 100, {expected2a, expected2b}));
   std::vector<byte> data = pkt.data();
@@ -51,11 +51,14 @@ TEST_F(LibraryTest, ParseTxtReplyOK) {
 
   struct ares_txt_reply* txt2 = txt->next;
   ASSERT_NE(nullptr, txt2);
-  std::vector<byte> rsp = std::vector<byte>(expected2a.data(), expected2a.data() + expected2a.size());
-  rsp.insert(rsp.end(), expected2b.data(), expected2b.data() + expected2b.size());
-  EXPECT_EQ(rsp,
+  EXPECT_EQ(std::vector<byte>(expected2a.data(), expected2a.data() + expected2a.size()),
             std::vector<byte>(txt2->txt, txt2->txt + txt2->length));
 
+  struct ares_txt_reply* txt3 = txt2->next;
+  ASSERT_NE(nullptr, txt3);
+  EXPECT_EQ(std::vector<byte>(expected2b.data(), expected2b.data() + expected2b.size()),
+            std::vector<byte>(txt3->txt, txt3->txt + txt3->length));
+  EXPECT_EQ(nullptr, txt3->next);
   ares_free_data(txt);
 }
 
@@ -90,6 +93,39 @@ TEST_F(LibraryTest, ParseTxtExtReplyOK) {
   EXPECT_EQ(nullptr, txt3->next);
   EXPECT_EQ(0, txt3->record_start);
   ares_free_data(txt);
+}
+
+TEST_F(LibraryTest, ParseTxtEmpty) {
+  DNSPacket pkt;
+  std::string expected1 = "";
+  pkt.set_qid(0x1234).set_response().set_aa()
+    .add_question(new DNSQuestion("example.com", T_TXT))
+    .add_answer(new DNSTxtRR("example.com", 100, {expected1}));
+  std::vector<byte> data = pkt.data();
+
+  ares_dns_record_t   *dnsrec = NULL;
+  ares_dns_rr_t       *rr     = NULL;
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_parse(data.data(), data.size(), 0, &dnsrec));
+  EXPECT_EQ(1, ares_dns_record_rr_cnt(dnsrec, ARES_SECTION_ANSWER));
+  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ANSWER, 0);
+  ASSERT_NE(nullptr, rr);
+  EXPECT_EQ(ARES_REC_TYPE_TXT, ares_dns_rr_get_type(rr));
+
+  size_t txtdata_len;
+  const unsigned char *txtdata;
+
+  /* Using array methodology */
+  EXPECT_EQ(1, ares_dns_rr_get_abin_cnt(rr, ARES_RR_TXT_DATA));
+  txtdata = ares_dns_rr_get_abin(rr, ARES_RR_TXT_DATA, 0, &txtdata_len);
+  EXPECT_EQ(txtdata_len, 0);
+  EXPECT_NE(nullptr, txtdata);
+
+  /* Using combined methodology */
+  txtdata = ares_dns_rr_get_bin(rr, ARES_RR_TXT_DATA, &txtdata_len);
+  EXPECT_EQ(txtdata_len, 0);
+  EXPECT_NE(nullptr, txtdata);
+
+  ares_dns_record_destroy(dnsrec); dnsrec = NULL;
 }
 
 TEST_F(LibraryTest, ParseTxtMalformedReply1) {
@@ -210,12 +246,13 @@ TEST_F(LibraryTest, ParseTxtReplyErrors) {
   std::string expected2a = "txt2a";
   std::string expected2b = "txt2b";
   pkt.set_qid(0x1234).set_response().set_aa()
-    .add_question(new DNSQuestion("example.com", T_MX))
+    .add_question(new DNSQuestion("example.com", T_TXT))
     .add_answer(new DNSTxtRR("example.com", 100, {expected1}))
     .add_answer(new DNSTxtRR("example.com", 100, {expected1}))
     .add_answer(new DNSTxtRR("example.com", 100, {expected2a, expected2b}));
   std::vector<byte> data = pkt.data();
   struct ares_txt_reply* txt = nullptr;
+  struct ares_txt_ext* txt_ext = nullptr;
 
   // No question.
   pkt.questions_.clear();
@@ -223,7 +260,7 @@ TEST_F(LibraryTest, ParseTxtReplyErrors) {
   txt = nullptr;
   EXPECT_EQ(ARES_EBADRESP, ares_parse_txt_reply(data.data(), (int)data.size(), &txt));
   EXPECT_EQ(nullptr, txt);
-  pkt.add_question(new DNSQuestion("example.com", T_MX));
+  pkt.add_question(new DNSQuestion("example.com", T_TXT));
 
 #ifdef DISABLED
   // Question != answer
@@ -236,13 +273,13 @@ TEST_F(LibraryTest, ParseTxtReplyErrors) {
 #endif
 
   // Two questions.
-  pkt.add_question(new DNSQuestion("example.com", T_MX));
+  pkt.add_question(new DNSQuestion("example.com", T_TXT));
   data = pkt.data();
   txt = nullptr;
   EXPECT_EQ(ARES_EBADRESP, ares_parse_txt_reply(data.data(), (int)data.size(), &txt));
   EXPECT_EQ(nullptr, txt);
   pkt.questions_.clear();
-  pkt.add_question(new DNSQuestion("example.com", T_MX));
+  pkt.add_question(new DNSQuestion("example.com", T_TXT));
 
   // No answer.
   pkt.answers_.clear();
@@ -258,40 +295,10 @@ TEST_F(LibraryTest, ParseTxtReplyErrors) {
     EXPECT_NE(ARES_SUCCESS, ares_parse_txt_reply(data.data(), (int)len, &txt));
     EXPECT_EQ(nullptr, txt);
   }
-}
 
-TEST_F(LibraryTest, ParseTxtEmpty) {
-  DNSPacket pkt;
-  std::string expected1 = "";
-  pkt.set_qid(0x1234).set_response().set_aa()
-    .add_question(new DNSQuestion("example.com", T_TXT))
-    .add_answer(new DNSTxtRR("example.com", 100, {expected1}));
-  std::vector<byte> data = pkt.data();
-
-  ares_dns_record_t   *dnsrec = NULL;
-  ares_dns_rr_t       *rr     = NULL;
-  EXPECT_EQ(ARES_SUCCESS, ares_dns_parse(data.data(), data.size(), 0, &dnsrec));
-  EXPECT_EQ(1, ares_dns_record_rr_cnt(dnsrec, ARES_SECTION_ANSWER));
-  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ANSWER, 0);
-  ASSERT_NE(nullptr, rr);
-  EXPECT_EQ(ARES_REC_TYPE_TXT, ares_dns_rr_get_type(rr));
-
-  size_t txtdata_len;
-  const unsigned char *txtdata;
-
-  /* Using array methodology - commented out, ares_dns_rr_get_abin not available
-  EXPECT_EQ(1, ares_dns_rr_get_abin_cnt(rr, ARES_RR_TXT_DATA));
-  txtdata = ares_dns_rr_get_abin(rr, ARES_RR_TXT_DATA, 0, &txtdata_len);
-  EXPECT_EQ(txtdata_len, 0);
-  EXPECT_NE(nullptr, txtdata);
-  */
-
-  /* Using combined methodology */
-  txtdata = ares_dns_rr_get_bin(rr, ARES_RR_TXT_DATA, &txtdata_len);
-  EXPECT_EQ(txtdata_len, 0);
-  EXPECT_NE(nullptr, txtdata);
-
-  ares_dns_record_destroy(dnsrec); dnsrec = NULL;
+  // Negative Length
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_txt_reply(data.data(), -1, &txt));
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_txt_reply_ext(data.data(), -1, &txt_ext));
 }
 
 #ifdef ENABLE_ALLOC_FAIL_TESTS
@@ -301,7 +308,7 @@ TEST_F(LibraryTest, ParseTxtReplyAllocFail) {
   std::string expected2a = "txt2a";
   std::string expected2b = "txt2b";
   pkt.set_qid(0x1234).set_response().set_aa()
-    .add_question(new DNSQuestion("example.com", T_MX))
+    .add_question(new DNSQuestion("example.com", T_TXT))
     .add_answer(new DNSCnameRR("example.com", 300, "c.example.com"))
     .add_answer(new DNSTxtRR("c.example.com", 100, {expected1}))
     .add_answer(new DNSTxtRR("c.example.com", 100, {expected1}))
@@ -316,7 +323,6 @@ TEST_F(LibraryTest, ParseTxtReplyAllocFail) {
   }
 }
 #endif
-
 
 }  // namespace test
 }  // namespace ares

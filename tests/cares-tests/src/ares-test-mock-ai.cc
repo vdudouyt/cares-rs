@@ -1011,6 +1011,7 @@ TEST_P(MockChannelTestAI, TriggerResendThenConnFailSERVFAIL) {
 
   Process();
   EXPECT_TRUE(result.done_);
+  EXPECT_TRUE(result.done_);
   EXPECT_THAT(result.ai_, IncludesNumAddresses(2));
   EXPECT_THAT(result.ai_, IncludesV4Address("1.2.3.4"));
   EXPECT_THAT(result.ai_, IncludesV6Address("2121:0000:0000:0000:0000:0000:0000:0303"));

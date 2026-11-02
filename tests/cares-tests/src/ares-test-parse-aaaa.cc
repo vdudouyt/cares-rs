@@ -148,7 +148,7 @@ TEST_F(LibraryTest, ParseAaaaReplyErrors) {
   ASSERT_NE(nullptr, host);
   std::stringstream ss;
   ss << HostEnt(host);
-  EXPECT_EQ("{'Axample.com' aliases=[] addrs=[0101:0101:0202:0202:0303:0303:0404:0404]}", ss.str());
+  EXPECT_EQ("{'axample.com' aliases=[] addrs=[0101:0101:0202:0202:0303:0303:0404:0404]}", ss.str());
   ares_free_hostent(host);
 
   host = nullptr;
@@ -195,6 +195,10 @@ TEST_F(LibraryTest, ParseAaaaReplyErrors) {
     EXPECT_EQ(ARES_EBADRESP, ares_parse_aaaa_reply(data.data(), (int)len,
                                                    nullptr, info, &count));
   }
+
+  // Negative length
+  EXPECT_EQ(ARES_EBADRESP, ares_parse_aaaa_reply(data.data(), -1,
+                                                 &host, info, &count));
 }
 
 #ifdef ENABLE_ALLOC_FAIL_TESTS
@@ -220,6 +224,5 @@ TEST_F(LibraryTest, ParseAaaaReplyAllocFail) {
   }
 }
 #endif
-
 }  // namespace test
 }  // namespace ares

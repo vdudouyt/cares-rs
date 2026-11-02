@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "description": "Exact set of gtest cases expected to fail when the restored c-ares 1.34.6 oracle suite runs against cares-rs. Later phases must match this set exactly: new failures are regressions, and fixed tests must be removed from this list.",
+  "oracle": {
+    "upstream": "c-ares 1.34.6",
+    "upstream_test_tree": "/home/user/c-ares-1.34.6/test",
+    "test_binary": "tests/cares-tests (arestest, gtest 1.14.0)",
+    "cares_rs_library": "target/release/libcares_rs.so",
+    "upstream_library": "/tmp/cares-build/lib/libcares.so"
+  },
+  "recorded_at": "2026-11-02",
+  "counts": {
+    "total_tests": 526,
+    "passed": 521,
+    "failed": 5
+  },
+  "expected_failures": [
+    {
+      "name": "AddressFamilies/MockUDPMaxQueriesTest.GetHostByNameParallelLookups/ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_UDP_MAX_QUERIES is not enforced; parallel lookups exceed the configured in-flight limit",
+      "phase": "4A",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 355
+    },
+    {
+      "name": "AddressFamilies/MockUDPMaxQueriesTest.GetHostByNameParallelLookups/ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_UDP_MAX_QUERIES is not enforced; parallel lookups exceed the configured in-flight limit",
+      "phase": "4A",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 355
+    },
+    {
+      "name": "LibraryTest.DNSMapping",
+      "status": "FAILED",
+      "reason": "ares_dns_rec_type_fromstr(ares_dns_rec_type_tostr(SIG)) round-trips to A (16) instead of SIG (24)",
+      "phase": "2",
+      "source": "tests/cares-tests/src/ares-test-misc.cc",
+      "source_line": 443
+    },
+    {
+      "name": "LibraryTest.ParseTxtEmpty",
+      "status": "FAILED",
+      "reason": "ares_dns_rr_get_abin_cnt() returns 0 for an empty TXT RR; upstream modern DNS API exposes one zero-length character-string",
+      "phase": "2",
+      "source": "tests/cares-tests/src/ares-test-parse-txt.cc",
+      "source_line": 98
+    },
+    {
+      "name": "LibraryTest.ParseTxtReplyOK",
+      "status": "FAILED",
+      "reason": "ares_parse_txt_reply merges all character-strings of one TXT RR into a single node; upstream contract is one ares_txt_reply node per character-string",
+      "phase": "2",
+      "source": "tests/cares-tests/src/ares-test-parse-txt.cc",
+      "source_line": 35
+    }
+  ]
+}

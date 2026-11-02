@@ -165,6 +165,15 @@ TEST_F(DefaultChannelTest, SetServersCSV) {
   EXPECT_EQ(expected2, GetNameServers(channel2));
   ares_destroy(channel2);
 
+  // Allocation failure cases
+#ifdef ENABLE_ALLOC_FAIL_TESTS
+  for (int fail = 1; fail <= 5; fail++) {
+    SetAllocFail(fail);
+    EXPECT_EQ(ARES_ENOMEM,
+              ares_set_servers_csv(channel_, "1.2.3.4,0102:0304:0506:0708:0910:1112:1314:1516,2.3.4.5"));
+  }
+#endif
+
   EXPECT_EQ(ARES_EBADSTR, ares_set_servers_csv(channel_, "2.3.4.5,1.2.3.4:,3.4.5.6"));
   EXPECT_EQ(ARES_EBADSTR, ares_set_servers_csv(channel_, "2.3.4.5,1.2.3.4:Z,3.4.5.6"));
 }
@@ -423,6 +432,12 @@ TEST_F(LibraryTest, ExpandString) {
   EXPECT_EQ(ARES_EBADSTR,
             ares_expand_string(s1.data() + 4, s1.data(), (int)s1.size(),
                                (unsigned char**)&result, &len));
+#ifdef ENABLE_ALLOC_FAIL_TESTS
+  SetAllocFail(1);
+  EXPECT_EQ(ARES_ENOMEM,
+            ares_expand_string(s1.data(), s1.data(), (int)s1.size(),
+                               (unsigned char**)&result, &len));
+#endif
 }
 
 TEST_F(LibraryTest, DNSMapping) {
@@ -435,6 +450,7 @@ TEST_F(LibraryTest, DNSMapping) {
     ARES_REC_TYPE_HINFO,
     ARES_REC_TYPE_MX,
     ARES_REC_TYPE_TXT,
+    ARES_REC_TYPE_SIG,
     ARES_REC_TYPE_AAAA,
     ARES_REC_TYPE_SRV,
     ARES_REC_TYPE_NAPTR,
@@ -491,12 +507,12 @@ TEST_F(DefaultChannelTest, GetServersFailures) {
   EXPECT_EQ(ARES_SUCCESS,
             ares_set_servers_csv(channel_, "1.2.3.4,2.3.4.5"));
   struct ares_addr_node* servers = nullptr;
-  /* Alloc failure tests commented out - not applicable for cares-rs
+#ifdef ENABLE_ALLOC_FAIL_TESTS
   SetAllocFail(1);
   EXPECT_EQ(ARES_ENOMEM, ares_get_servers(channel_, &servers));
   SetAllocFail(2);
   EXPECT_EQ(ARES_ENOMEM, ares_get_servers(channel_, &servers));
-  */
+#endif
   EXPECT_EQ(ARES_ENODATA, ares_get_servers(nullptr, &servers));
 }
 
@@ -504,12 +520,12 @@ TEST_F(LibraryTest, ExpandNameFailure) {
   std::vector<byte> data1 = {0x03, 'c', 'o', 'm', 0x00};
   char *name = nullptr;
   long enclen;
-  /* Alloc failure test commented out - not applicable for cares-rs
+#ifdef ENABLE_ALLOC_FAIL_TESTS
   SetAllocFail(1);
   EXPECT_EQ(ARES_ENOMEM,
             ares_expand_name(data1.data(), data1.data(), (int)data1.size(),
                              &name, &enclen));
-  */
+#endif
 
   // Empty packet
   EXPECT_EQ(ARES_EBADNAME,
@@ -598,14 +614,14 @@ TEST_F(LibraryTest, CreateQueryFailures) {
                     &p, &len, 0));
   if (p) ares_free_string(p);
 
-  /* Alloc failure test commented out - not applicable for cares-rs
+#ifdef ENABLE_ALLOC_FAIL_TESTS
   SetAllocFail(1);
   p = nullptr;
   EXPECT_EQ(ARES_ENOMEM,
             ares_create_query("example.com", C_IN, T_A, 0x1234, 0,
                     &p, &len, 0));
   if (p) ares_free_string(p);
-  */
+#endif
 
   // 63-char limit on a single label
   std::string longlabel = "a.a123456789b123456789c123456789d123456789e123456789f123456789g123456789.org";

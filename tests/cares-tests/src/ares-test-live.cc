@@ -74,7 +74,7 @@ MATCHER_P(IncludesAddrType, addrtype, "") {
 }
 
 //VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetAddrInfoV4) {
-  //struct ares_addrinfo_hints hints = {};
+  //struct ares_addrinfo_hints hints = {0, 0, 0, 0};
   //hints.ai_family = AF_INET;
   //AddrInfoResult result;
   //ares_getaddrinfo(channel_, "www.google.com.", NULL, &hints, AddrInfoCallback, &result);
@@ -86,7 +86,7 @@ MATCHER_P(IncludesAddrType, addrtype, "") {
 //}
 
 //VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetAddrInfoV6) {
-  //struct ares_addrinfo_hints hints = {};
+  //struct ares_addrinfo_hints hints = {0, 0, 0, 0};
   //hints.ai_family = AF_INET6;
   //AddrInfoResult result;
   //ares_getaddrinfo(channel_, "www.google.com.", NULL, &hints, AddrInfoCallback, &result);
@@ -98,7 +98,7 @@ MATCHER_P(IncludesAddrType, addrtype, "") {
 //}
 
 //VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetAddrInfoUnspec) {
-  //struct ares_addrinfo_hints hints = {};
+  //struct ares_addrinfo_hints hints = {0, 0, 0, 0};
   //hints.ai_family = AF_UNSPEC;
   //AddrInfoResult result;
   //ares_getaddrinfo(channel_, "www.google.com.", NULL, &hints, AddrInfoCallback, &result);
@@ -190,6 +190,8 @@ TEST_P(DefaultChannelModeTest, LiveGetLocalhostByNameV6) {
     EXPECT_EQ(ARES_SUCCESS, result.status_);
     EXPECT_EQ(1, (int)result.host_.addrs_.size());
     EXPECT_EQ(AF_INET6, result.host_.addrtype_);
+    std::stringstream ss;
+    ss << HostEnt(result.host_);
     EXPECT_NE(std::string::npos, result.host_.name_.find("localhost"));
   }
 }
@@ -216,6 +218,8 @@ TEST_P(DefaultChannelModeTest, LiveGetNonExistLocalhostByNameV6) {
     EXPECT_EQ(ARES_SUCCESS, result.status_);
     EXPECT_EQ(1, (int)result.host_.addrs_.size());
     EXPECT_EQ(AF_INET6, result.host_.addrtype_);
+    std::stringstream ss;
+    ss << HostEnt(result.host_);
     EXPECT_NE(std::string::npos, result.host_.name_.find("idonotexist.localhost"));
   }
 }
@@ -399,6 +403,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4) {
   Process();
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
+  if (verbose) std::cerr << "8.8.8.8:53 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4NoPort) {
@@ -414,6 +419,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4NoPort) {
   Process();
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
+  if (verbose) std::cerr << "8.8.8.8:0 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4UnassignedPort) {
@@ -429,6 +435,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4UnassignedPort) {
   Process();
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
+  if (verbose) std::cerr << "8.8.8.8:4 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6Both) {
@@ -444,6 +451,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6Both) {
   Process();
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
+  if (verbose) std::cerr << "[2001:4860:4860::8888]:53 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6Neither) {
@@ -459,6 +467,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6Neither) {
   Process();
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
+  if (verbose) std::cerr << "[2001:4860:4860::8888]:53 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4Numeric) {
@@ -475,6 +484,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4Numeric) {
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
   EXPECT_EQ("8.8.8.8", result.node_);
+  if (verbose) std::cerr << "8.8.8.8:53 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6Numeric) {
@@ -491,6 +501,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6Numeric) {
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
   EXPECT_EQ("2606:4700:4700::1111%0", result.node_);
+  if (verbose) std::cerr << "[2606:4700:4700::1111]:53 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6LinkLocal) {
@@ -509,6 +520,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6LinkLocal) {
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
   EXPECT_EQ("fe80:102:102::304%0", result.node_);
+  if (verbose) std::cerr << "[fe80:102:102::304]:53 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4NotFound) {
@@ -526,6 +538,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4NotFound) {
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
   EXPECT_EQ("192.0.2.0", result.node_);
+  if (verbose) std::cerr << "192.0.2.0:53 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV4NotFoundFail) {
@@ -561,6 +574,7 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInfoV6NotFound) {
   EXPECT_TRUE(result.done_);
   EXPECT_EQ(ARES_SUCCESS, result.status_);
   EXPECT_EQ("2001:db8:102::304%0", result.node_);
+  if (verbose) std::cerr << "[2001:db8:102::304]:53 => " << result.node_ << "/" << result.service_ << std::endl;
 }
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetNameInvalidFamily) {
@@ -628,6 +642,54 @@ VIRT_NONVIRT_TEST_F(DefaultChannelTest, LiveGetServiceInfoNumeric) {
   EXPECT_EQ("", result.node_);
   EXPECT_EQ("53", result.service_);
 }
+
+TEST_F(DefaultChannelTest, LiveSetServers) {
+  struct ares_addr_node server1;
+  struct ares_addr_node server2;
+  server1.next = &server2;
+  server1.family = AF_INET;
+  server1.addr.addr4.s_addr = htonl(0x01020304);
+  server2.next = nullptr;
+  server2.family = AF_INET;
+  server2.addr.addr4.s_addr = htonl(0x02030405);
+
+  HostResult result;
+  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
+  EXPECT_EQ(ARES_SUCCESS, ares_set_servers(channel_, &server1));
+  ares_cancel(channel_);
+}
+
+TEST_F(DefaultChannelTest, LiveSetServersPorts) {
+  struct ares_addr_port_node server1;
+  struct ares_addr_port_node server2;
+  server1.next = &server2;
+  server1.family = AF_INET;
+  server1.addr.addr4.s_addr = htonl(0x01020304);
+  server1.udp_port = 111;
+  server1.tcp_port = 111;
+  server2.next = nullptr;
+  server2.family = AF_INET;
+  server2.addr.addr4.s_addr = htonl(0x02030405);
+  server2.udp_port = 0;
+  server2.tcp_port = 0;
+  EXPECT_EQ(ARES_ENODATA, ares_set_servers_ports(nullptr, &server1));
+
+  // Change while pending will requeue any requests to new servers
+  HostResult result;
+  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
+  EXPECT_EQ(ARES_SUCCESS, ares_set_servers_ports(channel_, &server1));
+  ares_cancel(channel_);
+}
+
+TEST_F(DefaultChannelTest, LiveSetServersCSV) {
+  HostResult result;
+  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
+  // Change while pending will requeue any requests to new servers
+  EXPECT_EQ(ARES_SUCCESS, ares_set_servers_csv(channel_, "1.2.3.4,2.3.4.5"));
+  EXPECT_EQ(ARES_SUCCESS, ares_set_servers_ports_csv(channel_, "1.2.3.4:56,2.3.4.5:67"));
+  ares_cancel(channel_);
+}
+
 
 VIRT_NONVIRT_TEST_F(DefaultChannelTest, GetSock) {
   ares_socket_t socks[3] = {ARES_SOCKET_BAD, ARES_SOCKET_BAD, ARES_SOCKET_BAD};
@@ -737,53 +799,6 @@ TEST_F(DefaultChannelTest, VerifySocketFunctionCallback) {
     EXPECT_NE((size_t)0, count);
   }
 
-}
-
-TEST_F(DefaultChannelTest, LiveSetServers) {
-  struct ares_addr_node server1;
-  struct ares_addr_node server2;
-  server1.next = &server2;
-  server1.family = AF_INET;
-  server1.addr.addr4.s_addr = htonl(0x01020304);
-  server2.next = nullptr;
-  server2.family = AF_INET;
-  server2.addr.addr4.s_addr = htonl(0x02030405);
-
-  HostResult result;
-  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
-  EXPECT_EQ(ARES_SUCCESS, ares_set_servers(channel_, &server1));
-  ares_cancel(channel_);
-}
-
-TEST_F(DefaultChannelTest, LiveSetServersPorts) {
-  struct ares_addr_port_node server1;
-  struct ares_addr_port_node server2;
-  server1.next = &server2;
-  server1.family = AF_INET;
-  server1.addr.addr4.s_addr = htonl(0x01020304);
-  server1.udp_port = 111;
-  server1.tcp_port = 111;
-  server2.next = nullptr;
-  server2.family = AF_INET;
-  server2.addr.addr4.s_addr = htonl(0x02030405);
-  server2.udp_port = 0;
-  server2.tcp_port = 0;;
-  EXPECT_EQ(ARES_ENODATA, ares_set_servers_ports(nullptr, &server1));
-
-  // Change while pending will requeue any requests to new servers
-  HostResult result;
-  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
-  EXPECT_EQ(ARES_SUCCESS, ares_set_servers_ports(channel_, &server1));
-  ares_cancel(channel_);
-}
-
-TEST_F(DefaultChannelTest, LiveSetServersCSV) {
-  HostResult result;
-  ares_gethostbyname(channel_, "www.google.com.", AF_INET, HostCallback, &result);
-  // Change while pending will requeue any requests to new servers
-  EXPECT_EQ(ARES_SUCCESS, ares_set_servers_csv(channel_, "1.2.3.4,2.3.4.5"));
-  EXPECT_EQ(ARES_SUCCESS, ares_set_servers_ports_csv(channel_, "1.2.3.4:56,2.3.4.5:67"));
-  ares_cancel(channel_);
 }
 
 }  // namespace test
