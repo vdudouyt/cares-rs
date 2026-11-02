@@ -35,6 +35,7 @@ mod process;
 pub use addrinfo::*;
 pub(crate) use convert::*;
 pub use channel::*;
+pub(crate) use channel::channel_access;
 pub use lookups::*;
 pub use parsers::*;
 pub use process::*;
@@ -107,11 +108,11 @@ pub extern "C" fn ares_library_init_mem(
 pub extern "C" fn ares_library_cleanup() {
 }
 
-/// We do not provide the built-in event thread, so the library is not
-/// thread-safe. Report ARES_FALSE (0), matching c-ares on non-threaded builds.
+/// The built-in event thread is available, so report ARES_TRUE (1). Channels
+/// are independent; each has its own event thread and lock.
 #[no_mangle]
 pub extern "C" fn ares_threadsafety() -> i32 {
-    0
+    1
 }
 
 pub type Channel = *mut ChannelData;

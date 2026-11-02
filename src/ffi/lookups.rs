@@ -19,7 +19,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
         unsafe { callback(arg, ARES_ENOTFOUND, 0, std::ptr::null_mut()) };
         return;
     }
-    let channeldata = unsafe { &mut *channel };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let hostname = unsafe { cstr_lossy(hostname) };
     // Build the resource bundle + the self-contained future and register it. A
     // synchronous preflight hit fires re-entrantly on this first `advance`.
@@ -34,7 +34,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 /// `channel` must be a valid channel, `name` a valid NUL-terminated C string, and `host` a writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENOTFOUND; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENOTFOUND; };
     let name_str = unsafe { cstr_lossy(name) };
 
     match channeldata.state.gethostbyname_file(name_str, family) {
@@ -53,7 +53,7 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *const c_void, addrlen: c_int, family: c_int, callback: ares_host_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     if addr.is_null() || addrlen < 0 {
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
         return;
@@ -92,7 +92,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
         return;
     }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = client.search(
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
 #[no_mangle]
 pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let name = unsafe { cstr_lossy(name) };
     // Preflight in core, then spawn an fd-owning async query lifecycle that
     // creates the socket, sends, and drives its own failover/TC/timeout.
@@ -150,9 +150,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     }
     let name = unsafe { cstr_lossy(name) };
     // SAFETY: the caller guarantees a live channel handle.
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else {
-        return ARES_EFORMERR;
-    };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
     query_dnsrec_record(channeldata, name, dnsclass, dnstype, callback, arg, qid)
 }
 
@@ -232,8 +230,8 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     if channel.is_null() || dnsrec.is_null() { return ARES_EFORMERR; }
     // SAFETY: the caller guarantees live channel/record handles.
     let rec = unsafe { &*dnsrec };
-    let channeldata = unsafe { channel.as_mut() };
-    search_dnsrec_record(channeldata, rec, callback, arg)
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
+    search_dnsrec_record(Some(channeldata), rec, callback, arg)
 }
 
 /// Safe body of ares_search_dnsrec: validate the template, duplicate it for
@@ -291,7 +289,7 @@ fn search_dnsrec_record(
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: ares_nameinfo_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
 
     // Sockaddr unmarshal stays in the shim (reads raw C `*const sockaddr`).
     let addr_info = match extract_addr_port(sa, salen) {
@@ -490,7 +488,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     arg: *mut c_void,
 ) {
     let Some(callback) = callback else { return; };
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
 
     let (ai_family, ai_flags, ai_socktype, ai_protocol) = decode_addrinfo_hints(hints);
 
@@ -531,7 +529,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     }
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
     // SAFETY: the caller guarantees a live channel handle.
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     send_raw_packet(channeldata, query_buf, callback, arg);
 }
 
@@ -688,9 +686,9 @@ pub unsafe extern "C" fn ares_send_dnsrec(
     let Some(callback) = callback else { return ARES_EFORMERR; };
     if channel.is_null() || dnsrec.is_null() { return ARES_EFORMERR; }
     // SAFETY: the caller guarantees live channel/record handles.
-    let channeldata = unsafe { channel.as_mut() };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
     let rec = unsafe { &*dnsrec };
-    send_dnsrec_record(channeldata, rec, callback, arg, qid)
+    send_dnsrec_record(Some(channeldata), rec, callback, arg, qid)
 }
 
 /// Safe body of ares_send_dnsrec: shared cache/qid/transport path plus the

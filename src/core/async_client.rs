@@ -408,7 +408,13 @@ impl AsyncClient {
                         }
                     }
                     Err(_) => {
-                        // Dead socket (EOF / hard error).
+                        // Dead socket (EOF / hard error). For UDP this is the
+                        // ICMP port-unreachable case (upstream issue #819):
+                        // upstream treats it as a critical connection failure,
+                        // not as a timeout, so the query retries without
+                        // incrementing the timeout counter and finally reports
+                        // ECONNREFUSED.
+                        let refused = !use_tcp;
                         if use_tcp {
                             self.tcp_pool.borrow_mut().remove(server);
                         } else {
@@ -422,12 +428,16 @@ impl AsyncClient {
                         match verdict {
                             TimeoutVerdict::Retry { server: next } => {
                                 tries += 1;
-                                timeouts += 1;
+                                if !refused {
+                                    timeouts += 1;
+                                }
                                 try_count += 1;
                                 server = next;
                                 continue 'attempt;
                             }
-                            TimeoutVerdict::Expire => return (Err(ARES_ETIMEOUT), timeouts),
+                            TimeoutVerdict::Expire => {
+                                return (Err(if refused { ARES_ECONNREFUSED } else { ARES_ETIMEOUT }), timeouts);
+                            }
                         }
                     }
                 }
@@ -877,11 +887,21 @@ impl AsyncClient {
             let (result, io_timeouts) = match probe_payload {
                 Some(pp) => {
                     let mut probe = pin!(self.clone().run_probe(pp, use_vc).fuse());
-                    loop {
-                        select_biased! {
-                            _ = probe => continue,
-                            r = primary => break r,
+                    // Race the primary against the probe (probe-biased). If the
+                    // primary finishes first, still drive the probe to
+                    // completion: upstream's probe is an independent query, so
+                    // dropping it mid-flight would leave a recovered server
+                    // marked failed and make failover ordering scheduling-
+                    // dependent.
+                    match select_biased! {
+                        _ = probe => None,
+                        r = primary => Some(r),
+                    } {
+                        Some(r) => {
+                            probe.await;
+                            r
                         }
+                        None => primary.await,
                     }
                 }
                 None => primary.await,
@@ -1012,11 +1032,19 @@ impl AsyncClient {
                 Some(probe_payload) => {
                     let mut b = pin!(batch.fuse());
                     let mut p = pin!(self.clone().run_probe(probe_payload, use_vc).fuse());
-                    loop {
-                        select_biased! {
-                            _ = p => continue,
-                            r = b => break r,
+                    // Probe-biased race, but drive an in-flight probe to
+                    // completion after the batch returns: upstream's probe is
+                    // an independent query, so dropping it mid-flight would
+                    // leave a recovered server marked failed.
+                    match select_biased! {
+                        _ = p => None,
+                        r = b => Some(r),
+                    } {
+                        Some(r) => {
+                            p.await;
+                            r
                         }
+                        None => b.await,
                     }
                 }
                 None => batch.await,

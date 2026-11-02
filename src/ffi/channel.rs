@@ -1,5 +1,11 @@
 //! Channel lifecycle and configuration: init/dup/destroy/cancel, server
 //! lists, reactor fd/timeout accessors, and the channel-level callbacks.
+//!
+//! With `ARES_OPT_EVENT_THREAD` a background thread drives the reactor, so
+//! every shim serializes on the channel lock. Completion callbacks fire while
+//! that lock is held: an event-mode callback must not call back into the same
+//! channel. Non-event channels keep the historical single-thread model, where
+//! completion callbacks may re-enter.
 
 use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
@@ -7,7 +13,15 @@ use crate::core::async_client::{DnsMailbox, DnsSignals, Effect};
 use crate::async_runtime::executor::Executor;
 use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
+/// How long the built-in event thread parks in `poll` when no task publishes
+/// a shorter timeout. 10 ms keeps response latency low while still sleeping
+/// when there is nothing to do.
+const EVENT_POLL_MS: u128 = 10;
 
 /// The C-visible channel: the pure core state plus the channel-level C
 /// callbacks. Everything the shims marshal lives behind `.state`; the six
@@ -33,6 +47,17 @@ pub struct ChannelData {
     /// The in-flight resolver ops — the executor's task set (each future owns
     /// its socket(s)).
     executor: Executor<DnsSignals>,
+    /// True when ARES_OPT_EVENT_THREAD was supplied: a background thread owns
+    /// the reactor loop and the channel is serialized by `lock`.
+    pub(crate) event_mode: bool,
+    /// Set by `ares_destroy` to ask the event thread to leave its loop.
+    pub(crate) event_stop: Arc<AtomicBool>,
+    /// Handle of the built-in event thread (present while `event_mode`).
+    pub(crate) event_join: Option<JoinHandle<()>>,
+    /// Per-channel serialization for every shim that touches channel state.
+    /// The event thread also takes it around its process cycle; user callbacks
+    /// fire while it is held (see the module docs in `channel.rs`).
+    pub(crate) lock: Arc<Mutex<()>>,
 }
 
 impl ChannelData {
@@ -48,6 +73,10 @@ impl ChannelData {
             sock_state_cb: None,
             sock_state_cb_data: std::ptr::null_mut(),
             executor: Executor::default(),
+            event_mode: false,
+            event_stop: Arc::new(AtomicBool::new(false)),
+            event_join: None,
+            lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -63,6 +92,10 @@ impl ChannelData {
             sock_state_cb: self.sock_state_cb,
             sock_state_cb_data: self.sock_state_cb_data,
             executor: Executor::default(),
+            event_mode: self.event_mode,
+            event_stop: Arc::new(AtomicBool::new(false)),
+            event_join: None,
+            lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -236,6 +269,125 @@ impl ChannelData {
     }
 }
 
+/// The built-in event thread: snapshot the fds/timeout under the channel lock,
+/// `poll` without holding it, then lock again and drive the futures whose fds
+/// became ready (or whose timeout expired).
+fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Mutex<()>) {
+    use crate::ffi::ares_socket::{ares_fd_events_t, ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+
+        // Snapshot the reactor interests while serialized. The channel pointer
+        // stays valid until `ares_destroy` joins this thread.
+        let (waits, next_timeout) = {
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            // SAFETY: the channel is alive for the lifetime of this thread and
+            // the lock excludes every other access while we read it.
+            let data = unsafe { &*(channel as *const ChannelData) };
+            (data.all_poll_fds(), data.next_timeout_ms())
+        };
+
+        // Poll rather than select: no FD_SETSIZE ceiling and no fd_set
+        // marshalling in the loop. The readiness oracle handed to the executor
+        // is the same one `ares_process_fds` uses.
+        let mut pollfds: Vec<libc::pollfd> = waits
+            .iter()
+            .map(|(fd, wants_write)| libc::pollfd {
+                fd: *fd,
+                events: if *wants_write { libc::POLLOUT } else { libc::POLLIN },
+                revents: 0,
+            })
+            .collect();
+        let timeout_ms = match next_timeout {
+            Some(0) => 0,
+            Some(ms) => ms.clamp(1, EVENT_POLL_MS) as libc::c_int,
+            None => EVENT_POLL_MS as libc::c_int,
+        };
+        let count = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+
+        let mut events: Vec<ares_fd_events_t> = Vec::new();
+        for p in &pollfds {
+            if p.revents == 0 {
+                continue;
+            }
+            let mut flags = 0;
+            // Errors/hangups wake both interests so a failed connect (write)
+            // and a dead read socket are both driven without waiting for the
+            // timeout arm.
+            if p.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                flags |= ARES_FD_EVENT_READ;
+            }
+            if p.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                flags |= ARES_FD_EVENT_WRITE;
+            }
+            events.push(ares_fd_events_t { fd: p.fd, events: flags });
+        }
+
+        {
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            // SAFETY: as above; the lock excludes all other channel access.
+            let data = unsafe { &mut *(channel as *mut ChannelData) };
+            data.process_events(&events, false);
+        }
+
+        // A zero return means poll timed out; yield briefly so an idle channel
+        // does not spin at 100% CPU.
+        if count == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// Lock a channel and hand back the guard (for event-mode channels) together
+/// with a mutable view of its state. `None` for a NULL handle. The guard is
+/// `'static` because the channel owns its lock for as long as it lives and
+/// `ares_destroy` joins the event thread before dropping the channel; the
+/// caller must not retain the returned reference past its own frame.
+///
+/// # Safety
+/// `channel` must be NULL or a live channel handle.
+pub(crate) unsafe fn channel_access<'a>(channel: *const ChannelData) -> Option<(Option<std::sync::MutexGuard<'static, ()>>, &'a mut ChannelData)> {
+    if channel.is_null() { return None; }
+    // SAFETY: caller guarantees a live channel; event_mode and the lock handle are immutable once published.
+    let guard = unsafe { (*channel).event_mode.then(|| { let lock: &'static Mutex<()> = &*((*channel).lock.as_ref() as *const Mutex<()>); lock.lock().unwrap_or_else(|e| e.into_inner()) }) };
+    // SAFETY: as above.
+    Some((guard, unsafe { &mut *(channel as *mut ChannelData) }))
+}
+
+/// Start the built-in event thread for `channel`. The thread only owns a raw
+/// address cast to `usize`, so `ChannelData` itself need not be `Send`.
+/// Returns false when the OS refused the thread; the caller then treats init
+/// as failed.
+pub(crate) fn start_event_thread(channel: *mut ChannelData) -> bool {
+    // SAFETY: the caller passes a freshly boxed, live channel.
+    let (stop, lock) = unsafe {
+        (
+            (*channel).event_stop.clone(),
+            &*((*channel).lock.as_ref() as *const Mutex<()>),
+        )
+    };
+    let raw = channel as usize;
+    match std::thread::Builder::new()
+        .name("cares-event".to_string())
+        .spawn(move || event_thread_main(raw, stop, lock))
+    {
+        Ok(handle) => {
+            // SAFETY: the thread never reads `event_join`.
+            unsafe { (*channel).event_join = Some(handle) };
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
@@ -247,35 +399,66 @@ pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: *const ChannelData) -> c_int {
+    dup_impl(dest, source)
+}
+
+/// Safe body of ares_dup: copy under the source lock, then start the
+/// duplicate's own event thread.
+fn dup_impl(dest: *mut Channel, source: *const ChannelData) -> c_int {
     if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
-    let src = unsafe { &*source };
-    let channeldata = src.dup_from();
-    unsafe { *dest = Box::into_raw(Box::new(channeldata)) };
+    let event_lock = unsafe { (*source).event_mode.then(|| (*source).lock.clone()) };
+    let guard = event_lock.as_ref().map(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()));
+    let channeldata = unsafe { &*source }.dup_from();
+    drop(guard);
+    let channel = Box::into_raw(Box::new(channeldata));
+    let event_mode = unsafe { (*channel).event_mode };
+    if event_mode && !start_event_thread(channel) {
+        drop(unsafe { Box::from_raw(channel) });
+        return ARES_ENOMEM;
+    }
+    unsafe { *dest = channel };
     ARES_SUCCESS
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_cancel(channel: Channel) {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    // Aborts every in-flight future and clears the shared TCP pool.
+    cancel_impl(channel)
+}
+
+/// Safe body of ares_cancel: abort every in-flight future.
+fn cancel_impl(channel: *mut ChannelData) {
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     channeldata.abort_all(ARES_ECANCELLED);
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_destroy(channel: Channel) {
-    if let Some(channeldata) = unsafe { channel.as_mut() } {
-        // Fire callbacks with ARES_EDESTRUCTION for all pending tasks.
-        channeldata.abort_all(ARES_EDESTRUCTION);
-        unsafe { drop(Box::from_raw(channel)); }
+    destroy_impl(channel)
+}
+
+/// Safe body of ares_destroy: stop and join the event thread (without holding
+/// the lock across the join), abort every query, then free the channel.
+fn destroy_impl(channel: *mut ChannelData) {
+    if channel.is_null() { return; }
+    let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return; };
+    let stop = data.event_stop.clone();
+    let join = data.event_join.take();
+    drop(guard);
+    if let Some(handle) = join {
+        stop.store(true, Ordering::Release);
+        let _ = handle.join();
     }
+    let Some((_guard, data)) = (unsafe { channel_access(channel) }) else { return; };
+    data.abort_all(ARES_EDESTRUCTION);
+    drop(unsafe { Box::from_raw(channel) });
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_fds(channel: *const ChannelData, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
-    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return 0; };
     unsafe { libc::FD_ZERO(write_fds) };
     unsafe { libc::FD_ZERO(read_fds) };
 
@@ -294,8 +477,8 @@ pub unsafe extern "C" fn ares_fds(channel: *const ChannelData, read_fds: &mut li
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
     // Upstream: NULL channel or output buffer -> return NULL.
-    if tv.is_null() { return std::ptr::null_mut(); }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return std::ptr::null_mut(); };
+    if tv.is_null() || channel.is_null() { return std::ptr::null_mut(); }
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return std::ptr::null_mut(); };
     let maxtv_ms = (!maxtv.is_null())
         .then(|| unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 });
     match crate::core::async_client::clamp_timeout(channeldata.next_timeout_ms(), maxtv_ms) {
@@ -317,7 +500,7 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers(channel: Channel, head: *const ares_addr_node) -> c_int {
     let mut head = head;
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
     let mut servers = Vec::new();
     while !head.is_null() {
         let node = unsafe { &(*head) };
@@ -342,7 +525,7 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, head: *const ares_ad
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, head: *const AresAddrPortNode) -> c_int {
     let mut head = head;
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
     let mut servers = Vec::new();
     while !head.is_null() {
         let node = unsafe { &*head };
@@ -368,7 +551,14 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, head: *const A
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_ports(channel: *const ChannelData, out: *mut *mut AresAddrPortNode) -> c_int {
-    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return ARES_ENODATA; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
+    let Some(ptr) = get_servers_ports_ptr(channeldata) else { unsafe { *out = std::ptr::null_mut() }; return ARES_ENODATA; };
+    unsafe { *out = ptr };
+    ARES_SUCCESS
+}
+
+/// Build the ares_addr_port_node chain for ares_get_servers_ports.
+fn get_servers_ports_ptr(channeldata: &ChannelData) -> Option<*mut AresAddrPortNode> {
     let mut data: Vec<AresAddrPortNode> = vec![];
     for (ip, udp_port, tcp_port) in channeldata.state.server_list() {
         let (family, addr) = match ip {
@@ -388,20 +578,22 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: *const ChannelData, out
             tcp_port: tcp_port as c_int,
         });
     }
-    let Some(replies) = clinkedlist::chain_nodes(data) else {
-        unsafe { *out = std::ptr::null_mut() };
-        return ARES_ENODATA;
-    };
+    let replies = clinkedlist::chain_nodes(data)?;
     let aresdata: AresData<AresAddrPortNode> = AresData { data_type: AresAddrPortNode::datatype(), data: replies };
     let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut (*aresdata).data };
-    ARES_SUCCESS
+    // SAFETY: aresdata was just allocated and is owned by the caller.
+    Some(unsafe { &mut (*aresdata).data })
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
+    unsafe { set_servers_ports_csv_impl(channeldata, servers) }
+}
+
+/// Unlocked body of `ares_set_servers[_ports]_csv` (both public wrappers lock).
+unsafe fn set_servers_ports_csv_impl(channeldata: &mut ChannelData, servers: *const c_char) -> c_int {
     // NULL or empty string clears servers
     if servers.is_null() {
         channeldata.state.clear_servers();
@@ -425,7 +617,8 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const c_char) -> c_int {
-    unsafe { ares_set_servers_ports_csv(channel, servers) }
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
+    unsafe { set_servers_ports_csv_impl(channeldata, servers) }
 }
 
 /// # Safety
@@ -433,8 +626,8 @@ pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const 
 #[no_mangle]
 pub unsafe extern "C" fn ares_getsock(channel: *const ChannelData, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
     // Upstream: NULL channel or non-positive numsocks -> return 0 (no sockets).
-    if numsocks <= 0 { return 0; }
-    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
+    if numsocks <= 0 || channel.is_null() { return 0; }
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return 0; };
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
 
     let fds = channeldata.all_poll_fds();
@@ -449,9 +642,8 @@ pub unsafe extern "C" fn ares_getsock(channel: *const ChannelData, socks: *mut a
 /// `channel` must be NULL or a live channel handle.
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_local_ip4(channel: Channel, local_ip: u32) {
-    if let Some(channeldata) = unsafe { channel.as_mut() } {
-        set_local_ip4_state(channeldata, local_ip);
-    }
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
+    set_local_ip4_state(channeldata, local_ip);
 }
 
 /// # Safety
@@ -459,10 +651,9 @@ pub unsafe extern "C" fn ares_set_local_ip4(channel: Channel, local_ip: u32) {
 /// or point to 16 readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_local_ip6(channel: Channel, local_ip6: *const u8) {
-    if local_ip6.is_null() { return; }
-    if let Some(channeldata) = unsafe { channel.as_mut() } {
-        set_local_ip6_state(channeldata, unsafe { std::slice::from_raw_parts(local_ip6, 16) });
-    }
+    if local_ip6.is_null() || channel.is_null() { return; }
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
+    set_local_ip6_state(channeldata, unsafe { std::slice::from_raw_parts(local_ip6, 16) });
 }
 
 /// # Safety
@@ -470,11 +661,10 @@ pub unsafe extern "C" fn ares_set_local_ip6(channel: Channel, local_ip6: *const 
 /// NULL or a valid NUL-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_local_dev(channel: Channel, local_dev_name: *const c_char) {
-    if local_dev_name.is_null() { return; }
-    if let Some(channeldata) = unsafe { channel.as_mut() } {
-        if let Some(name) = unsafe { cstr_opt(local_dev_name) } {
-            set_local_dev_state(channeldata, name);
-        }
+    if local_dev_name.is_null() || channel.is_null() { return; }
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
+    if let Some(name) = unsafe { cstr_opt(local_dev_name) } {
+        set_local_dev_state(channeldata, name);
     }
 }
 
@@ -497,7 +687,7 @@ fn set_local_dev_state(channeldata: &mut ChannelData, name: &str) {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ares_sock_create_callback, arg: *mut c_void) {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let factory = channeldata.socket_factory.with_create_cb(callback, arg);
     channeldata.apply_socket_factory(factory);
 }
@@ -506,10 +696,15 @@ pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ar
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers(channel: *const ChannelData, out: *mut *mut ares_addr_node) -> c_int {
     if out.is_null() { return ARES_ENODATA; }
-    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return ARES_ENODATA; };
-    // Build the list the same way as ares_get_servers_ports: an AresData-wrapped
-    // chain so the caller can free it with ares_free_data (the c-ares contract).
-    // (A plain Box chain here corrupted the heap under ares_free_data.)
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
+    let Some(ptr) = get_servers_ptr(channeldata) else { unsafe { *out = std::ptr::null_mut() }; return ARES_ENODATA; };
+    unsafe { *out = ptr };
+    ARES_SUCCESS
+}
+
+/// Build the ares_addr_node chain for ares_get_servers (an AresData wrapper so
+/// the caller can free it with ares_free_data, the c-ares contract).
+fn get_servers_ptr(channeldata: &ChannelData) -> Option<*mut ares_addr_node> {
     let mut data: Vec<ares_addr_node> = vec![];
     for (ip, _, _) in channeldata.state.server_list() {
         let (family, addr) = match ip {
@@ -521,20 +716,17 @@ pub unsafe extern "C" fn ares_get_servers(channel: *const ChannelData, out: *mut
         };
         data.push(ares_addr_node { next: std::ptr::null_mut(), family, addr });
     }
-    let Some(chain) = clinkedlist::chain_nodes(data) else {
-        unsafe { *out = std::ptr::null_mut() };
-        return ARES_ENODATA;
-    };
+    let chain = clinkedlist::chain_nodes(data)?;
     let aresdata: AresData<ares_addr_node> = AresData { data_type: ares_addr_node::datatype(), data: chain };
     let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut (*aresdata).data };
-    ARES_SUCCESS
+    // SAFETY: aresdata was just allocated and is owned by the caller.
+    Some(unsafe { &mut (*aresdata).data })
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *mut c_char {
-    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return std::ptr::null_mut(); };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return std::ptr::null_mut(); };
     let csv = channeldata.state.servers_csv_string();
     // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
     unsafe { malloc_cstr(csv.as_bytes()) }
@@ -543,7 +735,7 @@ pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *m
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_char) -> c_int {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_ENODATA; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
     if sortstr.is_null() {
         channeldata.state.sortlist = Vec::new();
         // An explicit clear is still an explicit sortlist option, so reinit
@@ -568,10 +760,7 @@ pub unsafe extern "C" fn ares_reinit(channel: Channel) -> c_int {
     if channel.is_null() {
         return ARES_EFORMERR;
     }
-    // SAFETY: the caller guarantees a live channel handle.
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else {
-        return ARES_EFORMERR;
-    };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
     reinit_channel(channeldata)
 }
 
@@ -586,7 +775,7 @@ fn reinit_channel(channeldata: &mut ChannelData) -> c_int {
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, callback: ares_sock_config_callback, arg: *mut c_void) {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let factory = channeldata.socket_factory.with_config_cb(callback, arg);
     channeldata.apply_socket_factory(factory);
 }
@@ -594,7 +783,7 @@ pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, ca
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callback: ares_server_state_callback, arg: *mut c_void) {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     channeldata.server_state_callback = callback;
     channeldata.server_state_callback_arg = arg;
 }
@@ -604,7 +793,7 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 /// `ares_init`/`ares_init_options` and not yet destroyed.
 #[no_mangle]
 pub unsafe extern "C" fn ares_queue_active_queries(channel: *const ChannelData) -> libc::size_t {
-    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return 0; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return 0; };
     channeldata.executor.active_count()
 }
 
@@ -618,8 +807,7 @@ pub unsafe extern "C" fn ares_set_pending_write_cb(
     callback: ares_pending_write_cb,
     arg: *mut c_void,
 ) {
-    // SAFETY: the caller guarantees a live channel handle.
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     channeldata.pending_write_cb = callback;
     channeldata.pending_write_arg = arg;
 }
@@ -631,9 +819,25 @@ pub extern "C" fn ares_process_pending_write(channel: Channel) {
     if channel.is_null() {}
 }
 
+/// # Safety
+/// `channel` must be NULL or a live channel handle.
 #[no_mangle]
-pub extern "C" fn ares_queue_wait_empty(_channel: Channel, _timeout_ms: c_int) -> c_int {
-    // Only meaningful with the built-in event thread, which we no longer
-    // provide. Match upstream c-ares on a non-threaded build (!ares_threadsafety()).
-    ARES_ENOTIMP
+pub unsafe extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_int) -> c_int {
+    wait_empty_impl(channel, timeout_ms)
+}
+
+/// Safe body of ares_queue_wait_empty: poll the executor's active count,
+/// releasing the channel lock while sleeping so the event thread can run.
+fn wait_empty_impl(channel: *mut ChannelData, timeout_ms: c_int) -> c_int {
+    let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
+    if !data.event_mode { return ARES_ENOTIMP; }
+    drop(guard);
+    let start = Instant::now();
+    loop {
+        let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
+        if data.executor.active_count() == 0 { return ARES_SUCCESS; }
+        drop(guard);
+        if timeout_ms >= 0 && start.elapsed().as_millis() >= timeout_ms as u128 { return ARES_ETIMEOUT; }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }

@@ -8,6 +8,7 @@ use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use crate::ffi::error::*;
 use crate::core::async_client::DecodedOptions;
 use crate::ffi::channel::ChannelData;
+use crate::ffi::channel::channel_access;
 use crate::ares_socket_t;
 
 /// Upstream's private sortlist pattern: an address + prefix length. The public
@@ -161,11 +162,6 @@ pub const ARES_FLAG_DNS0x20: c_int = 1 << 10;
 /// `out_channel` must be non-null; `options` must be NULL or a valid `ares_options` consistent with `optmask`.
 #[no_mangle]
 pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
-    // The built-in event thread is not supported. Match upstream c-ares on a
-    // non-threaded build: report ARES_ENOTIMP and leave *out_channel untouched.
-    if optmask & ARES_OPT_EVENT_THREAD != 0 {
-        return ARES_ENOTIMP;
-    }
     // Upstream allows a NULL options pointer only when optmask == 0 (equivalent
     // to ares_init); a non-zero optmask with NULL options is ARES_ENODATA.
     if options.is_null() && optmask != 0 {
@@ -182,7 +178,13 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     };
     match init_options_from(optmask, options) {
         Ok(channeldata) => {
-            unsafe { *out_channel = Box::into_raw(Box::new(channeldata)) };
+            let channel = Box::into_raw(Box::new(channeldata));
+            let event_mode = unsafe { (*channel).event_mode };
+            if event_mode && !crate::ffi::channel::start_event_thread(channel) {
+                drop(unsafe { Box::from_raw(channel) });
+                return crate::ffi::error::ARES_ENOMEM;
+            }
+            unsafe { *out_channel = channel };
             ARES_SUCCESS
         }
         Err(status) => status,
@@ -192,6 +194,11 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
 /// Safe body of ares_init_options: decode the C option struct, apply the core
 /// cascade, and build the unfinalized channel.
 fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelData, c_int> {
+    // The built-in event thread owns the socket-state notifications itself, so
+    // upstream rejects combining it with a caller state callback.
+    if optmask & ARES_OPT_EVENT_THREAD != 0 && optmask & ARES_OPT_SOCK_STATE_CB != 0 {
+        return Err(crate::ffi::error::ARES_EFORMERR);
+    }
     // Marshal every C field into an owned mirror before any logic runs.
     let decoded_sortlist = match (optmask & ARES_OPT_SORTLIST != 0)
         .then(|| decode_sortlist_options(options))
@@ -249,6 +256,7 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
         None
     };
     let mut channeldata = ChannelData::new_unfinalized(resolvconf.as_deref());
+    channeldata.event_mode = optmask & ARES_OPT_EVENT_THREAD != 0;
     channeldata.state.apply_options(optmask, decoded);
     install_socket_options(&mut channeldata, optmask, options);
     Ok(channeldata)
@@ -324,8 +332,8 @@ fn save_sortlist(entries: &[crate::core::sortlist::SortlistEntry]) -> Option<(*m
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options: *mut ares_options, optmask: *mut c_int) -> c_int {
-    if options.is_null() || optmask.is_null() { return ARES_ENODATA; }
-    let Some(channeldata) = (unsafe { channel.as_ref() }) else { return ARES_ENODATA; };
+    if options.is_null() || optmask.is_null() || channel.is_null() { return ARES_ENODATA; }
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
     let saved = channeldata.state.saved_options();
 
     let out = unsafe { &mut *options };
@@ -391,6 +399,10 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
         out.hosts_path = path.into_raw();
     }
     save_socket_options(channeldata, out, &mut mask);
+    if channeldata.event_mode {
+        mask |= ARES_OPT_EVENT_THREAD;
+        out.evsys = crate::ffi::ARES_EVSYS_DEFAULT;
+    }
 
     unsafe { *optmask = mask };
     ARES_SUCCESS

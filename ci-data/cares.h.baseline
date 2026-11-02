@@ -1238,7 +1238,7 @@ void ares_set_pending_write_cb(ares_channel channel, ares_pending_write_cb callb
 
 void ares_process_pending_write(ares_channel channel);
 
-int ares_queue_wait_empty(ares_channel _channel, int _timeout_ms);
+int ares_queue_wait_empty(ares_channel channel, int timeout_ms);
 
 void ares_gethostbyname(ares_channel channel,
                         const char *hostname,

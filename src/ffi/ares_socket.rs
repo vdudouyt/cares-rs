@@ -7,6 +7,7 @@ use std::io;
 use std::io::{Error, ErrorKind};
 use crate::ffi::ares_options::ares_sock_state_cb;
 use crate::ffi::channel::ChannelData;
+use crate::ffi::channel::channel_access;
 use crate::ffi::{ares_sock_config_callback, ares_sock_create_callback};
 use crate::{Channel, ARES_SOCKET_BAD};
 
@@ -53,11 +54,10 @@ pub const ARES_SOCKFUNC_FLAG_NONBLOCKING: c_uint = 1 << 0;
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
 pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
-    if funcs.is_null() { return; }
+    if funcs.is_null() || channel.is_null() { return; }
     let funcs = unsafe { &*funcs };
-    if let Some(channeldata) = unsafe { channel.as_mut() } {
-        install_socket_functions(channeldata, funcs, user_data);
-    }
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
+    install_socket_functions(channeldata, funcs, user_data);
 }
 
 /// Safe body of the legacy socket-function install.
@@ -96,9 +96,8 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
         return crate::ffi::error::ARES_EFORMERR;
     }
     // SAFETY: the caller guarantees valid channel + function-table pointers.
-    let (Some(channeldata), ex) = (unsafe { channel.as_mut() }, unsafe { &*funcs }) else {
-        return crate::ffi::error::ARES_EFORMERR;
-    };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return crate::ffi::error::ARES_EFORMERR; };
+    let ex = unsafe { &*funcs };
     install_socket_functions_ex(channeldata, ex, user_data)
 }
 

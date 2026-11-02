@@ -12,7 +12,7 @@ use crate::ffi::ares_socket::{
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process_fd(channel: Channel, read_fd: c_int, write_fd: c_int) {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let mut events = [
         ares_fd_events_t { fd: ARES_SOCKET_BAD, events: 0 },
         ares_fd_events_t { fd: ARES_SOCKET_BAD, events: 0 },
@@ -32,7 +32,7 @@ pub unsafe extern "C" fn ares_process_fd(channel: Channel, read_fd: c_int, write
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     channeldata.process_channel(read_fds, write_fds, false);
 }
 
@@ -51,9 +51,7 @@ pub unsafe extern "C" fn ares_process_fds(
         return ARES_EFORMERR;
     }
     // SAFETY: the caller guarantees a live channel handle.
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else {
-        return ARES_EFORMERR;
-    };
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
     let events: &[ares_fd_events_t] = if events.is_null() {
         &[]
     } else {
