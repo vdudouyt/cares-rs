@@ -1266,7 +1266,7 @@ void ares_search(ares_channel channel,
 
 void ares_query(ares_channel channel,
                 const char *name,
-                int _dnsclass,
+                int dnsclass,
                 int dnstype,
                 ares_callback callback,
                 void *arg);

@@ -498,8 +498,7 @@ pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_c
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
+pub unsafe extern "C" fn ares_reinit(channel: Channel) -> c_int {
     if channel.is_null() {
         return ARES_EFORMERR;
     }
@@ -507,6 +506,11 @@ pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
     let Some(channeldata) = (unsafe { channel.as_mut() }) else {
         return ARES_EFORMERR;
     };
+    reinit_channel(channeldata)
+}
+
+/// Safe body of ares_reinit (the pointer deref stays in the shim).
+fn reinit_channel(channeldata: &mut ChannelData) -> c_int {
     match channeldata.state.reinit() {
         Ok(()) => ARES_SUCCESS,
         Err(e) => e.code(),

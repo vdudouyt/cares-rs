@@ -7,6 +7,10 @@ pub struct SysConfig {
     pub tcp_ports: Vec<Option<u16>>, // per-server TCP port overrides
     pub domain: Option<String>,
     pub search: Vec<String>,
+    /// Raw `lookup`/`hostresorder` tokens mapped to c-ares's `b`/`f` order.
+    pub lookups: Option<String>,
+    /// Raw `sortlist` value, parsed by the channel when applied.
+    pub sortlist: Option<String>,
     pub options: SysConfigOptions,
 }
 
@@ -62,6 +66,13 @@ impl FromStr for SysConfig {
                 }
                 "domain" => conf.domain = Some(arg1.to_string()),
                 "search" => conf.search.extend(rest.iter().map(|s| s.to_string())),
+                "lookup" | "hostresorder" => {
+                    let lookups = parse_lookups(&rest);
+                    if !lookups.is_empty() {
+                        conf.lookups = Some(lookups);
+                    }
+                }
+                "sortlist" => conf.sortlist = Some(rest.join(" ")),
                 "options" => parse_options_into(&mut conf.options, &rest.join(" "))?,
                 _ => continue,
             }
@@ -69,6 +80,25 @@ impl FromStr for SysConfig {
 
         Ok(conf)
     }
+}
+
+/// Map resolv.conf `lookup`/`hostresorder` tokens to upstream's compact
+/// order string (`b` = DNS, `f` = hosts file), de-duplicated in input order.
+fn parse_lookups(tokens: &[&str]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        let ch = match token.to_ascii_lowercase().as_str() {
+            "dns" | "bind" | "resolv" | "resolve" => Some('b'),
+            "files" | "file" | "local" => Some('f'),
+            _ => None,
+        };
+        if let Some(ch) = ch {
+            if !out.contains(ch) {
+                out.push(ch);
+            }
+        }
+    }
+    out
 }
 
 fn strip_comment(line: &str) -> &str {

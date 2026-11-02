@@ -178,12 +178,12 @@ pub struct ReplyPolicy {
     pub no_check_resp: bool,
 }
 
-/// The process-level decisions for one received datagram, in the historical
-/// order: rcode-based failover, server-health bookkeeping + notifications,
-/// then the TC check. A failover retry preempts the TC check; everything else
-/// falls through to it. `tries` is the task's failover count so far — the
-/// budget is monotonic (`nservers * attempts` total sends), so a single server
-/// is retried in place rather than skipped.
+/// The process-level decisions for one received datagram, in upstream order:
+/// the TC check first (a truncated UDP reply retries over TCP without touching
+/// server health), then rcode-based failover/server-health bookkeeping, then
+/// delivery. `tries` is the task's failover count so far — the budget is
+/// monotonic (`nservers * attempts` total sends), so a single server is
+/// retried in place rather than skipped.
 pub fn on_datagram(
     summary: &ReplySummary,
     server: usize,
@@ -194,6 +194,14 @@ pub fn on_datagram(
     health: &mut ServerHealth,
 ) -> (Vec<ReactorAction>, TaskVerdict) {
     let mut actions = Vec::new();
+
+    // ARES_FLAG_IGNTC: accept a truncated UDP reply as-is instead of retrying
+    // the query over TCP. Upstream checks TC before the rcode, so an error
+    // rcode on a truncated UDP reply still triggers the TCP retry.
+    if summary.truncated && !is_tcp && !policy.ignore_tc {
+        return (actions, TaskVerdict::RetryTcp);
+    }
+
     // ARES_FLAG_NOCHECKRESP: pass server-error rcodes through to the caller
     // instead of treating them as failover errors (upstream still marks the
     // server good and delivers).
@@ -209,16 +217,11 @@ pub fn on_datagram(
             return (actions, TaskVerdict::RetryNextServer { server: health.pick_next(), tries });
         }
     } else {
-        // Success response — notify + reset failure counters
+        // Accepted non-truncated response — notify + reset failure counters.
         actions.push(ReactorAction::NotifyServerState { server, ok: true, tcp: is_tcp });
         health.record_success(server);
     }
 
-    // ARES_FLAG_IGNTC: accept a truncated UDP reply as-is instead of retrying
-    // the query over TCP.
-    if summary.truncated && !is_tcp && !policy.ignore_tc {
-        return (actions, TaskVerdict::RetryTcp);
-    }
     (actions, TaskVerdict::Deliver)
 }
 
@@ -530,6 +533,25 @@ mod tests {
             &mut h,
         );
         assert_eq!(v, TaskVerdict::Deliver);
+
+        // TC is checked before the rcode: a truncated SERVFAIL UDP reply goes
+        // to TCP and must not mark the server good or bad.
+        let tc_servfail = [0u8, 0, 0x02, 2, 0, 1, 0, 0];
+        let mut h = ServerHealth::default();
+        h.reset(1);
+        let (a, v) = on_datagram(
+            &summarize(&tc_servfail, 0),
+            0,
+            false,
+            2,
+            0,
+            ReplyPolicy::default(),
+            &mut h,
+        );
+        assert_eq!(v, TaskVerdict::RetryTcp);
+        assert!(a.is_empty());
+        assert_eq!(h.failures[0], 0);
+        assert_eq!(h.last_failure[0], None);
 
         // NOCHECKRESP: deliver SERVFAIL/NOTIMP/REFUSED, notifying success
         // (upstream's pass-through path marks the server good).

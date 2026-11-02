@@ -24,7 +24,7 @@ use bytes::{BufMut, BytesMut};
 use futures_util::{select_biased, FutureExt};
 use rand::Rng;
 
-use crate::core::cache::QueryCache;
+use crate::core::cache::{CacheKey, QueryCache};
 use crate::core::conn::Conn;
 use crate::core::tcp_pool::{TcpConn, TcpPool};
 use crate::async_runtime::executor::{sleep_until, Mailbox};
@@ -35,12 +35,12 @@ use crate::core::lookup::{
     summarize, ReactorAction, ReplyPolicy, SearchPlan, ServerHealth, TaskVerdict,
     TimeoutVerdict, AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
 };
-use crate::core::dns_record::{parse_record, write_record, ares_dns_record_t};
+use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
 use crate::core::packets::AddrRecord;
 use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedRRs, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
 use crate::async_runtime::socket::SocketFactory;
-use crate::core::sortlist::{apply_sortlist, SortlistEntry};
+use crate::core::sortlist::{apply_sortlist, parse_sortlist, SortlistEntry};
 use crate::core::sysconfig::SysConfig;
 use crate::core::AresError;
 use crate::ffi::dns_record::ARES_CLASS_IN;
@@ -56,8 +56,8 @@ use crate::ffi::ares_options::{
 };
 use crate::ffi::error::{
     ARES_ECONNREFUSED, ARES_EBADFLAGS, ARES_EBADNAME, ARES_EBADQUERY, ARES_EBADSTR, ARES_EFILE,
-    ARES_ENODATA, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED, ARES_ESERVFAIL,
-    ARES_ETIMEOUT,
+    ARES_EFORMERR, ARES_ENODATA, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED,
+    ARES_ESERVFAIL, ARES_ETIMEOUT,
 };
 use crate::ffi::{
     ARES_NI_DGRAM, ARES_NI_LOOKUPHOST, ARES_NI_LOOKUPSERVICE, ARES_NI_NAMEREQD, ARES_NI_NOFQDN,
@@ -400,13 +400,13 @@ impl AsyncClient {
 
         // HOSTALIASES (single-label names): resolve via env-pointed file.
         // ARES_FLAG_NOALIASES disables the lookup entirely.
-        let resolved = if self.flags & ARES_FLAG_NOALIASES != 0 {
-            hostname.clone()
-        } else {
-            match resolve_hostaliases(&hostname) {
-                Ok(name) => name,
-                Err(status) => return Err(status.into()),
-            }
+        let resolved = match hostaliases_lookup(
+            &hostname,
+            self.flags & ARES_FLAG_NOALIASES != 0,
+        ) {
+            Ok(Some(alias)) => alias,
+            Ok(None) => hostname.clone(),
+            Err(status) => return Err(status.into()),
         };
 
         if self.endpoints.is_empty() {
@@ -420,7 +420,15 @@ impl AsyncClient {
         let cache_family = if matches!(filter, AddressFamily::Ipv4) { AF_INET } else { AF_INET6 };
         // Hoisted out of the `if let` scrutinee: edition 2021 would keep the
         // cache RefMut alive for the whole body otherwise (fragile).
-        let cached = self.cache.borrow_mut().get(&resolved, cache_rtype, Instant::now());
+        let cache_key = CacheKey::new(
+            &resolved,
+            cache_rtype,
+            ARES_CLASS_IN,
+            0,
+            self.recursion_desired(),
+            false,
+        );
+        let cached = self.cache.borrow_mut().get(&cache_key, Instant::now());
         if let Some(cached) = cached {
             if let Ok(mut rrs) = addr_reply(&cached, cache_rtype, ReplyRequire::Items) {
                 if !self.sortlist.is_empty() {
@@ -473,7 +481,15 @@ impl AsyncClient {
                 store.push(resolved.clone());
             }
             let ttl = reply.rrs.items.iter().map(|r| r.ttl).min().unwrap_or(0);
-            self.cache.borrow_mut().store_names(store, reply.rtype, ttl, &reply.buf, Instant::now());
+            let template = CacheKey::new(
+                &lookup.name,
+                reply.rtype,
+                ARES_CLASS_IN,
+                0,
+                self.recursion_desired(),
+                false,
+            );
+            self.cache.borrow_mut().store_names(store, &template, ttl, &reply.buf, Instant::now());
         }
         let mut rrs = reply.rrs;
         if !self.sortlist.is_empty() {
@@ -504,7 +520,7 @@ impl AsyncClient {
             RECORD_TYPE_PTR,
             ARES_CLASS_IN,
             self.recursion_desired(),
-        );
+        )?;
         let use_vc = self.config.options.use_vc;
         let (result, io_timeouts) = self.clone().request(payload, use_vc).await;
 
@@ -564,12 +580,22 @@ impl AsyncClient {
         }
 
         // ===== DNS phase: single PTR query =====
-        let payload = dns_query_payload(
+        let payload = match dns_query_payload(
             &rdns_name(addr.ip),
             RECORD_TYPE_PTR,
             ARES_CLASS_IN,
             self.recursion_desired(),
-        );
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return NameinfoReply {
+                    status: e,
+                    node: None,
+                    service: None,
+                    timeouts: 0,
+                }
+            }
+        };
         let use_vc = self.config.options.use_vc;
         let (result, io_timeouts) = self.clone().request(payload, use_vc).await;
 
@@ -592,10 +618,13 @@ impl AsyncClient {
         dnstype: u16,
         retry_server_error: bool,
     ) -> Delivery {
+        if let Err(e) = validate_query(&name, dnsclass, dnstype) {
+            return Delivery::Raw { result: Err(e.code()), timeouts: 0 };
+        }
         let rd = self.recursion_desired();
         self.search_plan(
             name,
-            move |candidate| Ok(dns_query_payload(candidate, dnstype, dnsclass, rd)),
+            move |candidate| dns_query_payload(candidate, dnstype, dnsclass, rd),
             retry_server_error,
         )
         .await
@@ -638,9 +667,17 @@ impl AsyncClient {
             return Delivery::Raw { result: Err(ARES_ENOSERVER), timeouts: 0 };
         }
 
-        let no_search = self.flags & ARES_FLAG_NOSEARCH != 0;
+        let (search_name, alias_found) = match hostaliases_lookup(
+            &name,
+            self.flags & ARES_FLAG_NOALIASES != 0,
+        ) {
+            Ok(Some(alias)) => (alias, true),
+            Ok(None) => (name, false),
+            Err(status) => return Delivery::Raw { result: Err(status), timeouts: 0 },
+        };
+        let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
         let mut plan =
-            SearchPlan::for_search(&name, self.config.options.ndots, &self.config.search, no_search);
+            SearchPlan::for_search(&search_name, self.config.options.ndots, &self.config.search, no_search);
         let mut had_nodata = false;
         let mut timeouts: c_int = 0;
         let mut first = true;
@@ -731,8 +768,14 @@ impl AsyncClient {
         // `select_biased!` needs a statically-known arm count; the batch is
         // one family (single await) or two (AF_UNSPEC — race both).
         let sub = |i: usize| {
-            self.clone()
-                .request(dns_query_payload(name, rtypes[i], ARES_CLASS_IN, rd), use_vc)
+            let this = self.clone();
+            let payload = dns_query_payload(name, rtypes[i], ARES_CLASS_IN, rd);
+            async move {
+                match payload {
+                    Ok(p) => this.request(p, use_vc).await,
+                    Err(e) => (Err(e.code()), 0),
+                }
+            }
         };
         if rtypes.len() == 1 {
             results[0] = Some(sub(0).await);
@@ -782,18 +825,23 @@ impl AsyncClient {
             // one-shot failover probe alongside the batch (biased probe → batch;
             // the probe folds into ServerHealth then terminates).
             let batch = self.clone().query_families(name, rtypes);
-            let results = if probe && i == 0 {
-                let mut b = pin!(batch.fuse());
-                let probe_payload = dns_query_payload(name, rtypes[0], ARES_CLASS_IN, rd);
-                let mut p = pin!(self.clone().run_probe(probe_payload, use_vc).fuse());
-                loop {
-                    select_biased! {
-                        _ = p => continue,
-                        r = b => break r,
+            let probe_payload = if probe && i == 0 {
+                dns_query_payload(name, rtypes[0], ARES_CLASS_IN, rd).ok()
+            } else {
+                None
+            };
+            let results = match probe_payload {
+                Some(probe_payload) => {
+                    let mut b = pin!(batch.fuse());
+                    let mut p = pin!(self.clone().run_probe(probe_payload, use_vc).fuse());
+                    loop {
+                        select_biased! {
+                            _ = p => continue,
+                            r = b => break r,
+                        }
                     }
                 }
-            } else {
-                batch.await
+                None => batch.await,
             };
 
             // Parse each family; collect the ones that yielded records.
@@ -851,6 +899,7 @@ impl AsyncClient {
         self: Rc<Self>,
         hostname_raw: String,
         ai_family: c_int,
+        ai_flags: c_int,
     ) -> AddrInfoOut {
         // ===== preflight (synchronous) — order is behavior =====
         // The raw name keeps its trailing dot for the SearchPlan; the checks and
@@ -896,14 +945,23 @@ impl AsyncClient {
         }
 
         // ===== DNS phase: the shared resolver, parallel A+AAAA, no probe =====
+        // ARES_AI_ENVHOSTS is accepted here so Phase 3B can wire the hosts-file
+        // environment lookup without another signature change.
+        let _env_hosts = ai_flags & crate::ffi::ARES_AI_ENVHOSTS != 0;
         let rtypes: Vec<u16> = match ai_family {
             libc::AF_INET => vec![RTYPE_A],
             libc::AF_INET6 => vec![RTYPE_AAAA],
             _ => vec![RTYPE_A, RTYPE_AAAA],
         };
-        let no_search = self.flags & ARES_FLAG_NOSEARCH != 0;
+        let no_aliases = self.flags & ARES_FLAG_NOALIASES != 0;
+        let (search_name, alias_found) = match hostaliases_lookup(&hostname_raw, no_aliases) {
+            Ok(Some(alias)) => (alias, true),
+            Ok(None) => (hostname_raw.clone(), false),
+            Err(status) => return fail(status),
+        };
+        let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
         let names = SearchPlan::for_search(
-            &hostname_raw,
+            &search_name,
             self.config.options.ndots,
             &self.config.search,
             no_search,
@@ -953,25 +1011,27 @@ fn fail(status: c_int) -> AddrInfoOut {
 
 /// HOSTALIASES for single-label names: read the env-pointed file, return the
 /// alias target (or the name unchanged). `PermissionDenied` → `ARES_EFILE`.
-fn resolve_hostaliases(hostname: &str) -> Result<String, c_int> {
-    if hostname.contains('.') {
-        return Ok(hostname.to_string());
+fn hostaliases_lookup(hostname: &str, no_aliases: bool) -> Result<Option<String>, c_int> {
+    // Upstream ares_lookup_hostaliases: flag, dotted names and a missing env
+    // var all mean "no alias"; a real alias suppresses search-domain expansion.
+    if no_aliases || hostname.contains('.') {
+        return Ok(None);
     }
     let Ok(aliases_path) = std::env::var("HOSTALIASES") else {
-        return Ok(hostname.to_string());
+        return Ok(None);
     };
     match std::fs::read_to_string(&aliases_path) {
         Ok(content) => {
             for line in content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 && parts[0].eq_ignore_ascii_case(hostname) {
-                    return Ok(parts[1].to_string());
+                    return Ok(Some(parts[1].to_string()));
                 }
             }
-            Ok(hostname.to_string())
+            Ok(None)
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(ARES_EFILE),
-        Err(_) => Ok(hostname.to_string()),
+        Err(_) => Ok(None),
     }
 }
 
@@ -1097,42 +1157,24 @@ fn frame_tcp(payload: &[u8]) -> BytesMut {
     framed
 }
 
-/// Write a DNS query directly to the buffer from a hostname string,
-/// avoiding intermediate Vec<String>, DnsQuery, and DnsFrame allocations.
-/// `rd` controls the RD header bit (ARES_FLAG_NORECURSE clears it) and
-/// `qclass` is written verbatim.
-fn write_dns_query_direct(
-    buf: &mut BytesMut,
-    hostname: &str,
-    qtype: u16,
-    qclass: u16,
-    transaction_id: u16,
-    rd: bool,
-) {
-    // Header: 12 bytes
-    buf.put_u16(transaction_id);
-    buf.put_u16(if rd { 0x0100 } else { 0x0000 }); // flags: standard query, RD
-    buf.put_u16(1); // qdcount
-    buf.put_u16(0); // ancount
-    buf.put_u16(0); // nscount
-    buf.put_u16(0); // arcount
-
-    // Question: labels
-    for label in hostname.split('.').filter(|t| !t.is_empty()) {
-        buf.put_u8(label.len() as u8);
-        buf.put_slice(label.as_bytes());
-    }
-    buf.put_u8(0); // root label
-    buf.put_u16(qtype);
-    buf.put_u16(qclass);
+/// Validate a query's name/class/type exactly like `build_query` (and thus
+/// ares_dns_record_create_query) without keeping the wire packet.
+pub(crate) fn validate_query(name: &str, qclass: u16, qtype: u16) -> Result<(), AresError> {
+    build_query(name, qclass, qtype, 0, true, 0).map(|_| ())
 }
 
-/// Build a UDP-form DNS query payload (with a fresh random transaction id).
-pub(crate) fn dns_query_payload(name: &str, qtype: u16, qclass: u16, rd: bool) -> BytesMut {
+/// Build a UDP-form DNS query payload (fresh random transaction id) through
+/// the shared `build_query` validator/writer, so class/type/name validation is
+/// identical for ares_query/search and ares_create_query.
+pub(crate) fn dns_query_payload(
+    name: &str,
+    qtype: u16,
+    qclass: u16,
+    rd: bool,
+) -> Result<BytesMut, AresError> {
     let transaction_id = rand::thread_rng().r#gen::<u16>();
-    let mut buf = BytesMut::with_capacity(12 + name.len() + 2 + 4);
-    write_dns_query_direct(&mut buf, name, qtype, qclass, transaction_id, rd);
-    buf
+    let packet = build_query(name, qclass, qtype, transaction_id, rd, 0)?;
+    Ok(BytesMut::from(packet.as_slice()))
 }
 
 /// Duplicate a caller-supplied record via serialize/parse, replace query[0]'s
@@ -1186,16 +1228,20 @@ pub(crate) fn build_query(
         return Err(ARES_ENOTFOUND.into());
     }
 
+    // ares_dns_record_query_add validation: type and class are checked before
+    // the name is written (unknown query types are accepted, RAW_RR is not).
+    if !rec_type_isvalid(qtype as u32, true)
+        || !class_isvalid(dnsclass, qtype as u32, true)
+    {
+        return Err(ARES_EFORMERR.into());
+    }
+
     // Validate name length
     let clean_name = if has_unescaped_trailing_dot {
         name_str.strip_suffix('.').unwrap_or(name_str)
     } else {
         name_str
     };
-    if clean_name.len() > 253 {
-        return Err(ARES_EBADNAME.into());
-    }
-
     // Check for escaped dots and handle them
     let labels: Vec<&str> = if clean_name.is_empty() {
         vec![] // root query
@@ -1225,7 +1271,9 @@ pub(crate) fn build_query(
         result
     };
 
-    // Validate label lengths and reject empty labels
+    // Validate label lengths and reject empty labels; total is the
+    // unescaped presentation length (upstream's 255-byte check).
+    let mut total_len = 0usize;
     for label in &labels {
         let unescaped = unescape_label(label);
         if unescaped.is_empty() {
@@ -1234,6 +1282,10 @@ pub(crate) fn build_query(
         if unescaped.len() > 63 {
             return Err(ARES_EBADNAME.into());
         }
+        total_len += unescaped.len();
+    }
+    if !labels.is_empty() && total_len + labels.len() - 1 > 255 {
+        return Err(ARES_EBADNAME.into());
     }
 
     // Build DNS packet
@@ -1511,9 +1563,15 @@ impl AsyncClient {
     /// fallback server) are applied separately so options/flags set afterwards
     /// can change the outcome.
     pub fn from_sysconfig_path(factory: Rc<dyn SocketFactory>, path: Option<&str>) -> Self {
-        let client = AsyncClient::build(build_sysconfig(path), factory, 53, 53);
+        let mut client = AsyncClient::build(build_sysconfig(path), factory, 53, 53);
         let n = client.config.nameservers.len();
         client.health.borrow_mut().reset(n);
+        if let Some(lookups) = client.config.lookups.clone() {
+            client.lookups = lookups;
+        }
+        if let Some(sortlist) = client.config.sortlist.as_deref() {
+            client.sortlist = parse_sortlist(sortlist).unwrap_or_default();
+        }
         client
     }
 
@@ -1550,6 +1608,16 @@ impl AsyncClient {
         if self.optmask & (ARES_OPT_ROTATE | ARES_OPT_NOROTATE) == 0 {
             self.config.options.rotate = sys.options.rotate;
         }
+        if self.optmask & ARES_OPT_LOOKUPS == 0 {
+            if let Some(lookups) = sys.lookups {
+                self.lookups = lookups;
+            }
+        }
+        if self.optmask & ARES_OPT_SORTLIST == 0 {
+            if let Some(sortlist) = sys.sortlist.as_deref() {
+                self.sortlist = parse_sortlist(sortlist).unwrap_or_default();
+            }
+        }
         if sys.options.use_vc {
             self.flags |= ARES_FLAG_USEVC;
             self.config.options.use_vc = true;
@@ -1573,7 +1641,7 @@ impl AsyncClient {
     }
 
     /// ARES_FLAG_NORECURSE clears the RD bit in constructed queries.
-    fn recursion_desired(&self) -> bool {
+    pub(crate) fn recursion_desired(&self) -> bool {
         self.flags & ARES_FLAG_NORECURSE == 0
     }
 
@@ -1816,9 +1884,11 @@ impl AsyncClient {
         self.health.borrow_mut().clear();
     }
 
-    /// Install a parsed CSV server list (ares_set_servers_ports_csv).
+    /// Install a parsed CSV server list (ares_set_servers_ports_csv). A CSV
+    /// `ip:port` sets both transports, matching upstream; the separate
+    /// ares_set_servers_ports path can still override TCP independently.
     pub fn install_csv_servers(&mut self, ns: Vec<(IpAddr, Option<u16>)>) {
-        self.config.tcp_ports = vec![None; ns.len()];
+        self.config.tcp_ports = ns.iter().map(|&(_, port)| port).collect();
         self.health.borrow_mut().reset(ns.len());
         self.config.nameservers = ns;
         self.optmask |= ARES_OPT_SERVERS;
@@ -1977,10 +2047,11 @@ impl AsyncClient {
         qtype: u16,
         qclass: u16,
     ) -> Result<BytesMut, AresError> {
+        let payload = dns_query_payload(name, qtype, qclass, self.recursion_desired())?;
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        Ok(dns_query_payload(name, qtype, qclass, self.recursion_desired()))
+        Ok(payload)
     }
 
     /// ares_send / ares_send_dnsrec: length + `no_servers` preflight, then the
@@ -2159,11 +2230,11 @@ mod tests {
 
     #[test]
     fn query_payload_writes_class_and_rd_flag() {
-        let p = dns_query_payload("example.com", 1, 3, true);
+        let p = dns_query_payload("example.com", 1, 3, true).expect("payload");
         assert_eq!(p[2], 0x01); // RD set
         assert_eq!(&p[p.len() - 2..], &3u16.to_be_bytes()); // CH reaches the wire
 
-        let p = dns_query_payload("example.com", 1, 1, false);
+        let p = dns_query_payload("example.com", 1, 1, false).expect("payload");
         assert_eq!(p[2] & 0x01, 0); // NORECURSE clears RD
         assert_eq!(&p[p.len() - 2..], &1u16.to_be_bytes());
     }
@@ -2200,6 +2271,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_query_validation_rejects_bad_class_and_name() {
+        assert_eq!(
+            validate_query("example.com", 17, 1).expect_err("bad class").code(),
+            ARES_EFORMERR
+        );
+        let long_label = "a".repeat(64);
+        assert_eq!(
+            validate_query(&long_label, 1, 1).expect_err("long label").code(),
+            ARES_EBADNAME
+        );
+        assert_eq!(
+            validate_query("example..com", 1, 1).expect_err("empty label").code(),
+            ARES_EBADNAME
+        );
+        assert!(validate_query("example.com", 1, 1).is_ok());
+        assert!(validate_query("example.com", 255, 255).is_ok());
+    }
+
+    #[test]
     fn template_rewrite_preserves_flags_and_class() {
         use crate::ffi::dns_record::ARES_FLAG_RD;
         let mut rec = ares_dns_record_t::new(7, ARES_FLAG_RD, 0, 0);
@@ -2231,20 +2321,20 @@ mod reinit_tests {
     #[test]
     fn reinit_reloads_sysconfig_and_flushes_cache() {
         let path = temp_conf(
-            "nameserver 9.9.9.9\nsearch example.test\noptions ndots:3 attempts:2 timeout:1\n",
+            "nameserver 9.9.9.9\nsearch example.test\nlookup bind files\nsortlist 10.0.0.0/8\noptions ndots:3 attempts:2 timeout:1\n",
         );
         let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53);
         client.resolvconf_path = path.to_string_lossy().into_owned();
         client.cache.borrow_mut().set_max_ttl(3600);
-        let key = ("cached.test".to_string(), 1u16);
+        let key = CacheKey::new("cached.test", 1, ARES_CLASS_IN, 0, true, false);
         client.cache.borrow_mut().store_names(
-            vec![key.0.clone()],
-            key.1,
+            vec![key.name.clone()],
+            &key,
             60,
             &[0u8; 12],
             Instant::now(),
         );
-        assert!(client.cache.borrow_mut().get(&key.0, key.1, Instant::now()).is_some());
+        assert!(client.cache.borrow_mut().get(&key, Instant::now()).is_some());
 
         client.reinit().expect("reinit");
 
@@ -2256,7 +2346,9 @@ mod reinit_tests {
         assert_eq!(client.config.options.ndots, 3);
         assert_eq!(client.config.options.attempts, 2);
         assert_eq!(client.config.options.timeout_ms, 1000);
-        assert!(client.cache.borrow_mut().get(&key.0, key.1, Instant::now()).is_none());
+        assert_eq!(client.lookups, "bf");
+        assert!(!client.sortlist.is_empty());
+        assert!(client.cache.borrow_mut().get(&key, Instant::now()).is_none());
         let _ = std::fs::remove_file(path);
     }
 

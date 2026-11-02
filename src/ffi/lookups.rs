@@ -4,9 +4,9 @@
 use super::*;
 use crate::core::async_client::search_precheck;
 use crate::core::hostent::Hostent;
-use crate::core::async_client::{service_to_port, ServicePort};
+use crate::core::async_client::{service_to_port, validate_query, ServicePort};
 use crate::core::async_client::{AddrInfoOut, Delivery, DnsMailbox, NameinfoReply};
-use crate::core::cache::QueryCache;
+use crate::core::cache::{CacheKey, QueryCache};
 use crate::core::AresError;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -140,14 +140,44 @@ pub unsafe extern "C" fn ares_query_dnsrec(
         unsafe { callback(arg, ARES_EFORMERR, 0, std::ptr::null_mut()) };
         return ARES_EFORMERR;
     }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_EFORMERR; };
     let name = unsafe { cstr_lossy(name) };
+    // SAFETY: the caller guarantees a live channel handle.
+    let channeldata = unsafe { channel.as_mut() };
+    query_dnsrec_record(channeldata, name, dnsclass, dnstype, callback, arg, qid)
+}
+
+/// Safe body of ares_query_dnsrec: synchronous validation, cache probe, qid
+/// reporting and the async query lifecycle.
+fn query_dnsrec_record(
+    channeldata: Option<&mut ChannelData>,
+    name: &str,
+    dnsclass: crate::ffi::ares_dns_class_t,
+    dnstype: crate::ffi::ares_dns_rec_type_t,
+    callback: AresCallbackDnsRec,
+    arg: *mut c_void,
+    qid: *mut libc::c_ushort,
+) -> crate::ffi::ares_status_t {
+    // Upstream constructs (and validates) the query before touching the cache.
+    if let Err(e) = validate_query(name, dnsclass as u16, dnstype as u16) {
+        let status = e.code();
+        unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+        return status;
+    }
+    let Some(channeldata) = channeldata else { return ARES_EFORMERR; };
     // Cache probe: if a fresh cached reply parses, deliver synchronously.
     // Hoisted out of the `if let` scrutinee so the cache RefMut drops at the
     // `;` — a scrutinee guard would be held across the C callback below, and
     // a callback re-entering any cache path would then panic (regression
     // test: tests/reentrant_callback.rs).
-    let cached = channeldata.state.cache.borrow_mut().get(name.strip_suffix('.').unwrap_or(name.as_ref()), dnstype as u16, Instant::now());
+    let cache_key = CacheKey::new(
+        name,
+        dnstype as u16,
+        dnsclass as u16,
+        0,
+        channeldata.state.recursion_desired(),
+        false,
+    );
+    let cached = channeldata.state.cache.borrow_mut().get(&cache_key, Instant::now());
     if let Some(cached_buf) = cached {
         if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf, 0) {
             let dnsrec = Box::into_raw(Box::new(rec));
@@ -158,7 +188,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     }
     let payload = match channeldata
         .state
-        .query_payload(name.as_ref(), dnstype as u16, dnsclass as u16)
+        .query_payload(name, dnstype as u16, dnsclass as u16)
     {
         Ok(p) => p,
         Err(e) => {
@@ -175,7 +205,9 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     let cache = client.cache.clone();
     let io = client.io.clone();
     let fut = client.query_raw(payload);
-    channeldata.spawn(io, fut, move |r| on_dnsrec_reply(callback, arg, &cache, r));
+    channeldata.spawn(io, fut, move |r| {
+        on_dnsrec_reply(callback, arg, &cache, Some(cache_key), r)
+    });
     ARES_SUCCESS
 }
 
@@ -231,7 +263,7 @@ fn search_dnsrec_record(
     let cache = client.cache.clone();
     let io = client.io.clone();
     let fut = client.search_dnsrec(template, true);
-    channeldata.spawn(io, fut, move |r| on_dnsrec_reply(callback, arg, &cache, r));
+    channeldata.spawn(io, fut, move |r| on_dnsrec_reply(callback, arg, &cache, None, r));
     ARES_SUCCESS
 }
 
@@ -292,14 +324,16 @@ pub(crate) fn on_raw_reply(callback: AresCallback, arg: *mut c_void, r: Result<D
 /// ares_send → `ares_callback` over the send path shared with
 /// ares_send_dnsrec: store the reply in the query cache and hand the caller the
 /// raw response bytes exactly as received.
-pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, r: Result<Delivery, c_int>) {
+pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, key: Option<CacheKey>, r: Result<Delivery, c_int>) {
     let (result, timeouts) = match r {
         Ok(Delivery::Raw { result, timeouts }) => (result, timeouts),
         Err(status) => (Err(status), 0),
     };
     match result {
         Ok(buf) => {
-            cache.borrow_mut().store_reply(&buf, Instant::now());
+            if let Some(key) = key {
+                cache.borrow_mut().store_reply(&key, &buf, Instant::now());
+            }
             unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) };
         }
         Err(status) => unsafe { callback(arg, status, timeouts, std::ptr::null_mut(), 0) },
@@ -308,14 +342,16 @@ pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache:
 
 /// ares_query_dnsrec / ares_search_dnsrec → `ares_callback_dnsrec`: cache-store +
 /// parse the reply into an `ares_dns_record_t` on success, else the status.
-pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, r: Result<Delivery, c_int>) {
+pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, key: Option<CacheKey>, r: Result<Delivery, c_int>) {
     let (result, timeouts) = match r {
         Ok(Delivery::Raw { result, timeouts }) => (result, timeouts),
         Err(status) => (Err(status), 0),
     };
     match result {
         Ok(buf) => {
-            cache.borrow_mut().store_reply(&buf, Instant::now());
+            if let Some(key) = key {
+                cache.borrow_mut().store_reply(&key, &buf, Instant::now());
+            }
             match crate::core::dns_record::parse_record(&buf, 0) {
                 Ok(rec) => {
                     let dnsrec = Box::into_raw(Box::new(rec));
@@ -389,7 +425,11 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     let Some(callback) = callback else { return; };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
 
-    let ai_family = if hints.is_null() { libc::AF_UNSPEC } else { unsafe { (*hints).ai_family } };
+    let (ai_family, ai_flags) = if hints.is_null() {
+        (libc::AF_UNSPEC, 0)
+    } else {
+        unsafe { ((*hints).ai_family, (*hints).ai_flags) }
+    };
 
     // Resolve the service name to a port (order decided in core; the
     // libc::getservbyname fallback is inherently a C call, so it runs here).
@@ -415,7 +455,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     let hostname_raw = unsafe { cstr_lossy(name) };
     let client = channeldata.state.derive();
     let io = client.io.clone();
-    let fut = client.getaddrinfo(hostname_raw.to_string(), ai_family);
+    let fut = client.getaddrinfo(hostname_raw.to_string(), ai_family, ai_flags);
     channeldata.spawn(io, fut, move |r| on_addrinfo_reply(callback, arg, port, r));
 }
 #[no_mangle]
@@ -455,7 +495,7 @@ fn send_raw_packet(
         channeldata,
         &rec,
         std::ptr::null_mut(),
-        move |r| on_send_raw_reply(callback, arg, &cache, r),
+        move |r, key| on_send_raw_reply(callback, arg, &cache, key, r),
     );
     match outcome {
         Ok(Some(buf)) => unsafe {
@@ -486,10 +526,18 @@ fn serialize_send_record(
 
 /// Cache key for a caller-supplied record: its first question's name (without
 /// a trailing dot, matching the cache writer) and type.
-fn record_cache_key(rec: &dns_record::ares_dns_record_t) -> Option<(String, u16)> {
-    let (name, qtype, _) = rec.query_at(0)?;
+fn record_cache_key(rec: &dns_record::ares_dns_record_t) -> Option<CacheKey> {
+    let (name, qtype, qclass) = rec.query_at(0)?;
     let name = name.to_string_lossy();
-    Some((name.strip_suffix('.').unwrap_or(&name).to_string(), qtype))
+    let flags = rec.flags();
+    Some(CacheKey::new(
+        &name,
+        qtype,
+        qclass,
+        rec.opcode(),
+        flags & dns_record::ARES_FLAG_RD != 0,
+        flags & dns_record::ARES_FLAG_CD != 0,
+    ))
 }
 
 /// The shared ares_send / ares_send_dnsrec path: no-server preflight, query
@@ -504,17 +552,18 @@ fn send_record<F>(
     on_reply: F,
 ) -> Result<Option<Vec<u8>>, crate::ffi::ares_status_t>
 where
-    F: FnOnce(Result<Delivery, c_int>) + 'static,
+    F: FnOnce(Result<Delivery, c_int>, Option<CacheKey>) + 'static,
 {
     if channeldata.state.config.nameservers.is_empty() {
         return Err(ARES_ENOSERVER);
     }
-    if let Some((name, qtype)) = record_cache_key(rec) {
+    let cache_key = record_cache_key(rec);
+    if let Some(key) = cache_key.as_ref() {
         let cached = channeldata
             .state
             .cache
             .borrow_mut()
-            .get(&name, qtype, Instant::now());
+            .get(key, Instant::now());
         if let Some(buf) = cached {
             return Ok(Some(buf));
         }
@@ -552,7 +601,7 @@ where
     let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = client.query_raw(payload);
-    channeldata.spawn(io, fut, on_reply);
+    channeldata.spawn(io, fut, move |r| on_reply(r, cache_key));
     Ok(None)
 }
 
@@ -589,7 +638,7 @@ fn send_dnsrec_record(
         channeldata,
         rec,
         qid,
-        move |r| on_dnsrec_reply(callback, arg, &cache, r),
+        move |r, key| on_dnsrec_reply(callback, arg, &cache, key, r),
     );
     match outcome {
         Ok(Some(buf)) => {
