@@ -1,5 +1,4 @@
 {
-  "total_code_lines": 8801,
-  "unsafe_context_lines": 1978,
-  "note": "One-time phase-1 correction: +193 lines are safe\u2192unsafe reclassification of ten FFI entry points that dereference raw pointers; +13 lines are deliberate new unsafe work (clearing get_opt/get_opt_byid outputs and the process_fd event rewrite). No new raw-pointer arithmetic or FFI calls. Future phases must not exceed this value."
+  "total_code_lines": 10106,
+  "unsafe_context_lines": 1969
 }

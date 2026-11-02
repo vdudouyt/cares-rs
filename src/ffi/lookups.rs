@@ -143,7 +143,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     // test: tests/reentrant_callback.rs).
     let cached = channeldata.state.cache.borrow_mut().get(name.strip_suffix('.').unwrap_or(name.as_ref()), dnstype as u16, Instant::now());
     if let Some(cached_buf) = cached {
-        if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf) {
+        if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf, 0) {
             let dnsrec = Box::into_raw(Box::new(rec));
             unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
             unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
@@ -269,7 +269,7 @@ pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, ca
     match result {
         Ok(buf) => {
             cache.borrow_mut().store_reply(&buf, Instant::now());
-            match crate::core::dns_record::parse_record(&buf) {
+            match crate::core::dns_record::parse_record(&buf, 0) {
                 Ok(rec) => {
                     let dnsrec = Box::into_raw(Box::new(rec));
                     unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };

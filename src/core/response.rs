@@ -110,7 +110,15 @@ impl<'a> ParsedResponse<'a> {
         let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
         let mut success = 0;
         let mut aliases: Vec<CString> = vec![];
-        let mut limit_ttl: Option<u32> = None;
+        // Upstream clamps every A/AAAA TTL to the smallest CNAME TTL anywhere in
+        // the answer section, regardless of record order.
+        let min_cname_ttl = self
+            .answers
+            .iter()
+            .filter(|a| a.record_type == RECORD_TYPE_CNAME)
+            .map(|a| a.ttl)
+            .min();
+        let mut first_cname: Option<CString> = None;
         for mut answer in self.answers {
             if answer.record_type == RECORD_TYPE_CNAME {
                 let mut cname_buf = SliceBuf::new(answer.data);
@@ -118,8 +126,10 @@ impl<'a> ParsedResponse<'a> {
                 let alias_of = alias_of.build_cstring(buf).ok_or(AresError::from(ARES_EBADRESP))?;
                 if expected_record_type != RECORD_TYPE_PTR {
                     aliases.push(name);
+                    if first_cname.is_none() {
+                        first_cname = Some(alias_of.clone());
+                    }
                     name = alias_of;
-                    limit_ttl = Some(answer.ttl);
                 }
             }
 
@@ -138,7 +148,7 @@ impl<'a> ParsedResponse<'a> {
             }
 
             if expected_record_type == RECORD_TYPE_A || expected_record_type == RECORD_TYPE_AAAA {
-                if let Some(limit_ttl) = limit_ttl {
+                if let Some(limit_ttl) = min_cname_ttl {
                     if answer.ttl > limit_ttl {
                         answer.ttl = limit_ttl;
                     }
@@ -151,7 +161,13 @@ impl<'a> ParsedResponse<'a> {
             success += 1;
             items.push(parsed);
         }
-        Ok(ParsedRRs { items, name, aliases, _limit_ttl: limit_ttl, success })
+        // hostent h_name is the first CNAME target, not the end of the chain.
+        if matches!(expected_record_type, RECORD_TYPE_A | RECORD_TYPE_AAAA) {
+            if let Some(first) = first_cname {
+                name = first;
+            }
+        }
+        Ok(ParsedRRs { items, name, aliases, _limit_ttl: min_cname_ttl, success })
     }
 }
 
@@ -186,15 +202,6 @@ pub fn addr_reply(buf: &[u8], expected_rtype: u16, require: ReplyRequire) -> Res
 /// alongside the resolved names (both the async and the legacy parser path).
 pub fn push_synthetic_ptr(rrs: &mut ParsedRRs<crate::core::packets::AddrRecord>, ip: std::net::IpAddr) {
     rrs.items.push(crate::core::packets::AddrRecord { ip, ttl: 0 });
-}
-
-/// The TXT-ext answer set: per-answer chunk lists flattened in order, plus
-/// how many RRs of the type parsed (the empty-chain status depends on it).
-#[allow(clippy::type_complexity)]
-pub fn txt_ext_items(buf: &[u8]) -> Result<(Vec<crate::core::packets::TxtReplyExt<'_>>, usize), AresError> {
-    let res = ParsedResponse::from_buf(buf)?;
-    let rrs = res.process_answers::<Vec<crate::core::packets::TxtReplyExt>>(buf, crate::ffi::RECORD_TYPE_TXT)?;
-    Ok((rrs.items.into_iter().flatten().collect(), rrs.success))
 }
 
 /// A reply whose typed chain came out empty still parsed: report success if

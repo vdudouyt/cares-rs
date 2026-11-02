@@ -49,7 +49,7 @@ use crate::core::hostent::{addrttl_fill, Hostent};
 use crate::core::async_client::build_query;
 use crate::core::response::{
     addr_reply, empty_chain_status, expand_name_at, expand_string_at, push_synthetic_ptr,
-    soa_status, txt_ext_items, ReplyRequire,
+    soa_status, ReplyRequire,
 };
 use crate::ffi::convert::malloc_bytes;
 
@@ -86,39 +86,102 @@ pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: 
     unsafe { parse_to_clinkedlist::<AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
 }
 
+/// Validate a C (buffer, length) pair; the only unsafe step is the slice view.
+fn checked_slice<'a>(abuf: *const u8, alen: c_int) -> Option<&'a [u8]> {
+    if abuf.is_null() || alen < 0 {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(abuf, alen as usize) })
+}
+
+/// Build the TXT (or TXT-ext) reply chain from a parsed message. Pure safe
+/// code so the FFI shims below stay thin.
+fn txt_reply_from_buf(buf: &[u8], ext: bool) -> Result<*mut c_void, c_int> {
+    let rec = crate::ffi::dns_record::parse_record(buf, 0).map_err(|e| e.code())?;
+    if rec.answers.is_empty() {
+        return Err(ARES_ENODATA);
+    }
+    let is_txt = |rr: &crate::core::dns_record::ares_dns_rr_t| {
+        (rr.rclass() == crate::ffi::dns_record::ARES_CLASS_IN
+            || rr.rclass() == crate::ffi::dns_record::ARES_CLASS_CHAOS)
+            && rr.rtype() == crate::ffi::dns_record::ARES_REC_TYPE_TXT as u32
+    };
+    if ext {
+        let mut nodes = Vec::new();
+        for rr in rec.answers.iter().filter(|rr| is_txt(rr)) {
+            let count = rr.abin_count(crate::ffi::dns_record::ARES_RR_TXT_DATA);
+            for idx in 0..count {
+                if let Some(data) =
+                    rr.abin_at(crate::ffi::dns_record::ARES_RR_TXT_DATA, idx)
+                {
+                    nodes.push(txt_ext_node(data, idx == 0));
+                }
+            }
+        }
+        let Some(reply) = clinkedlist::chain_nodes(nodes) else {
+            return Ok(std::ptr::null_mut());
+        };
+        let aresdata: AresData<AresTxtReplyExt> =
+            AresData { data_type: AresTxtReplyExt::datatype(), data: reply };
+        let aresdata = Box::into_raw(Box::new(aresdata));
+        Ok((aresdata as *mut u8)
+            .wrapping_add(std::mem::offset_of!(AresData<AresTxtReplyExt>, data))
+            as *mut c_void)
+    } else {
+        let mut nodes = Vec::new();
+        for rr in rec.answers.iter().filter(|rr| is_txt(rr)) {
+            let count = rr.abin_count(crate::ffi::dns_record::ARES_RR_TXT_DATA);
+            for idx in 0..count {
+                if let Some(data) =
+                    rr.abin_at(crate::ffi::dns_record::ARES_RR_TXT_DATA, idx)
+                {
+                    nodes.push(txt_reply_node(data));
+                }
+            }
+        }
+        let Some(reply) = clinkedlist::chain_nodes(nodes) else {
+            return Ok(std::ptr::null_mut());
+        };
+        let aresdata: AresData<AresTxtReply> =
+            AresData { data_type: AresTxtReply::datatype(), data: reply };
+        let aresdata = Box::into_raw(Box::new(aresdata));
+        Ok((aresdata as *mut u8)
+            .wrapping_add(std::mem::offset_of!(AresData<AresTxtReplyExt>, data))
+            as *mut c_void)
+    }
+}
+
+fn txt_reply_entry(
+    abuf: *const u8,
+    alen: c_int,
+    ext: bool,
+    out: *mut *mut c_void,
+) -> c_int {
+    let Some(buf) = checked_slice(abuf, alen) else { return ARES_EBADRESP; };
+    if out.is_null() {
+        return ARES_EBADRESP;
+    }
+    match txt_reply_from_buf(buf, ext) {
+        Ok(ptr) => {
+            unsafe { *out = ptr; }
+            ARES_SUCCESS
+        }
+        Err(err) => err,
+    }
+}
+
 /// # Safety
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<AresTxtReply>(abuf, alen, out, RECORD_TYPE_TXT) }
+    txt_reply_entry(abuf, alen, false, out as *mut *mut c_void)
 }
 
 /// # Safety
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, out: *mut *mut AresTxtReplyExt) -> c_int {
-    if abuf.is_null() || alen < 0 {
-        return ARES_EBADRESP;
-    }
-    let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-    let (answers, parsed_count) = match txt_ext_items(buf) {
-        Ok(parts) => parts,
-        Err(err) => return err.code(),
-    };
-    let Some(aresreplies) = answers.into_iter().map(|x| x.into_ares_data(buf)).collect::<Option<Vec<_>>>() else {
-        unsafe { *out = std::ptr::null_mut() };
-        return ARES_EBADRESP;
-    };
-
-    let Some(reply) = clinkedlist::chain_nodes(aresreplies) else {
-        unsafe { *out = std::ptr::null_mut() };
-        return empty_chain_status(parsed_count).code();
-    };
-
-    let aresdata: AresData<AresTxtReplyExt> = AresData { data_type: AresTxtReplyExt::datatype(), data: reply };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    unsafe { *out = &mut (*aresdata).data };
-    ARES_SUCCESS
+    txt_reply_entry(abuf, alen, true, out as *mut *mut c_void)
 }
 
 pub(crate) unsafe fn parse_to_vec<'a, T1, T2>(buf: &'a [u8], expected_record_type: u16) -> Result<Vec<T2>, c_int>

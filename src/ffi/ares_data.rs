@@ -45,6 +45,30 @@ impl IntoAresData<AresTxtReply> for TxtReply<'_> {
     }
 }
 
+/// Build one TXT reply node from raw character-string bytes (embedded NULs are
+/// preserved; `length` excludes the added terminator).
+pub(crate) fn txt_reply_node(data: &[u8]) -> AresTxtReply {
+    let mut bytes = data.to_vec();
+    let length = bytes.len();
+    bytes.push(0);
+    let txt = Box::into_raw(bytes.into_boxed_slice());
+    AresTxtReply { next: std::ptr::null_mut(), txt: txt as *mut u8, length }
+}
+
+/// EXT sibling of [`txt_reply_node`].
+pub(crate) fn txt_ext_node(data: &[u8], record_start: bool) -> AresTxtReplyExt {
+    let mut bytes = data.to_vec();
+    let length = bytes.len();
+    bytes.push(0);
+    let txt = Box::into_raw(bytes.into_boxed_slice());
+    AresTxtReplyExt {
+        next: std::ptr::null_mut(),
+        txt: txt as *mut u8,
+        length,
+        record_start: record_start as u8,
+    }
+}
+
 impl IntoAresData<AresTxtReplyExt> for TxtReplyExt<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresTxtReplyExt> {
         let mut bytes = self.txt.as_bytes().to_vec();
