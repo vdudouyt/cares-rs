@@ -52,12 +52,12 @@ pub const ARES_SOCKFUNC_FLAG_NONBLOCKING: c_uint = 1 << 0;
 /// # Safety
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
+pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
     if funcs.is_null() { return; }
     let funcs = unsafe { &*funcs };
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    install_socket_functions(channeldata, funcs, user_data);
+    if let Some(channeldata) = unsafe { channel.as_mut() } {
+        install_socket_functions(channeldata, funcs, user_data);
+    }
 }
 
 /// Safe body of the legacy socket-function install.

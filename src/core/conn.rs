@@ -43,6 +43,7 @@ struct UdpLease {
     pool: Rc<RefCell<UdpPool>>,
     server: usize,
     stayopen: bool,
+    max_queries: usize,
 }
 
 /// The transport behind a [`Conn`]: an exclusively owned datagram socket, an
@@ -80,7 +81,7 @@ impl Conn {
         qid: u16,
         reroll: impl FnMut() -> u16,
     ) -> (Self, u16) {
-        let tag = conn.borrow_mut().reserve(qid, reroll);
+        let tag = conn.borrow_mut().reserve(qid, reroll, io.clone());
         (Conn { io, wire: Wire::Shared(conn, tag), udp_lease: None }, tag)
     }
 
@@ -95,14 +96,20 @@ impl Conn {
         qid: u16,
         reroll: impl FnMut() -> u16,
     ) -> (Self, u16) {
-        let tag = conn.borrow_mut().reserve(qid, reroll);
+        let tag = conn.borrow_mut().reserve(qid, reroll, io.clone());
         (Conn { io, wire: Wire::SharedUdp(conn, tag), udp_lease: None }, tag)
     }
 
     /// Attach the pool lease for a shared-UDP checkout (used by the query
-    /// engine so the last query on a non-stay-open conn can retire it).
-    pub fn with_udp_lease(mut self, pool: Rc<RefCell<UdpPool>>, server: usize, stayopen: bool) -> Self {
-        self.udp_lease = Some(UdpLease { pool, server, stayopen });
+    /// engine so an exhausted/idle conn can retire when its queries finish).
+    pub fn with_udp_lease(
+        mut self,
+        pool: Rc<RefCell<UdpPool>>,
+        server: usize,
+        stayopen: bool,
+        max_queries: usize,
+    ) -> Self {
+        self.udp_lease = Some(UdpLease { pool, server, stayopen, max_queries });
         self
     }
 
@@ -227,8 +234,12 @@ impl Drop for Conn {
             }
             (Wire::SharedUdp(c, tag), Some(lease)) => {
                 c.borrow_mut().release(*tag);
-                let retired =
-                    lease.pool.borrow_mut().release_if_idle(lease.server, c, lease.stayopen);
+                let retired = lease.pool.borrow_mut().release_if_done(
+                    lease.server,
+                    c,
+                    lease.stayopen,
+                    lease.max_queries,
+                );
                 retired
             }
             (Wire::SharedUdp(c, tag), None) => {

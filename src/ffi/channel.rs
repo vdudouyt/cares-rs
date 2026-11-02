@@ -445,33 +445,37 @@ pub unsafe extern "C" fn ares_getsock(channel: *const ChannelData, socks: *mut a
     getsock_mask(&fds, n)
 }
 
+/// # Safety
+/// `channel` must be NULL or a live channel handle.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_set_local_ip4(channel: Channel, local_ip: u32) {
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    set_local_ip4_state(channeldata, local_ip);
+pub unsafe extern "C" fn ares_set_local_ip4(channel: Channel, local_ip: u32) {
+    if let Some(channeldata) = unsafe { channel.as_mut() } {
+        set_local_ip4_state(channeldata, local_ip);
+    }
 }
 
+/// # Safety
+/// `channel` must be NULL or a live channel handle; `local_ip6` must be NULL
+/// or point to 16 readable bytes.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_set_local_ip6(channel: Channel, local_ip6: *const u8) {
-    if local_ip6.is_null() {
-        return;
+pub unsafe extern "C" fn ares_set_local_ip6(channel: Channel, local_ip6: *const u8) {
+    if local_ip6.is_null() { return; }
+    if let Some(channeldata) = unsafe { channel.as_mut() } {
+        set_local_ip6_state(channeldata, unsafe { std::slice::from_raw_parts(local_ip6, 16) });
     }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    let bytes = unsafe { std::slice::from_raw_parts(local_ip6, 16) };
-    set_local_ip6_state(channeldata, bytes);
 }
 
+/// # Safety
+/// `channel` must be NULL or a live channel handle; `local_dev_name` must be
+/// NULL or a valid NUL-terminated C string.
 #[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn ares_set_local_dev(channel: Channel, local_dev_name: *const c_char) {
-    if local_dev_name.is_null() {
-        return;
+pub unsafe extern "C" fn ares_set_local_dev(channel: Channel, local_dev_name: *const c_char) {
+    if local_dev_name.is_null() { return; }
+    if let Some(channeldata) = unsafe { channel.as_mut() } {
+        if let Some(name) = unsafe { cstr_opt(local_dev_name) } {
+            set_local_dev_state(channeldata, name);
+        }
     }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    let Some(name) = (unsafe { cstr_opt(local_dev_name) }) else { return; };
-    set_local_dev_state(channeldata, name);
 }
 
 fn set_local_ip4_state(channeldata: &mut ChannelData, local_ip: u32) {

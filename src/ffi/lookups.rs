@@ -207,9 +207,15 @@ fn query_dnsrec_record(
     let cache = client.cache.clone();
     let io = client.io.clone();
     let fut = client.query_raw(payload);
-    channeldata.spawn(io, fut, move |r| {
+    channeldata.spawn(io.clone(), fut, move |r| {
         on_dnsrec_reply(callback, arg, &cache, Some(cache_key), r)
     });
+    // The first advance may have re-rolled the qid on a shared socket; report
+    // the id that is actually on the wire (a zero means nothing was reserved).
+    let final_qid = io.borrow().app.qid;
+    if !qid.is_null() && final_qid != 0 {
+        unsafe { *qid = final_qid; }
+    }
     ARES_SUCCESS
 }
 
@@ -656,7 +662,13 @@ where
     let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = client.query_raw(payload);
-    channeldata.spawn(io, fut, move |r| on_reply(r, cache_key));
+    channeldata.spawn(io.clone(), fut, move |r| on_reply(r, cache_key));
+    // Report the qid set by connect_failover, which may have re-rolled it on a
+    // shared socket after the caller was given the pre-send value above.
+    let final_qid = io.borrow().app.qid;
+    if !qid.is_null() && final_qid != 0 {
+        unsafe { *qid = final_qid; }
+    }
     Ok(None)
 }
 

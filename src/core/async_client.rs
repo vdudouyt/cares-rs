@@ -1295,6 +1295,11 @@ pub(crate) struct DnsSignals {
     /// retrying (checked at its timeout / dead-socket branches — an in-flight reply
     /// still delivers). Fresh per lookup, so it starts `false`.
     pub cancelled: Cell<bool>,
+    /// The transaction id actually reserved on the wire for the current query
+    /// (after any shared-socket reroll). The ffi reads this after the first
+    /// spawn/advance to report a `*qid` that matches the sent payload; `0`
+    /// means no query was reserved (e.g. a cache hit or pre-send failure).
+    pub qid: u16,
 }
 
 /// The DNS-application instantiation of the reactor mailbox — the only one the
@@ -2369,10 +2374,18 @@ impl AsyncClient {
                     if payload.len() >= 2 {
                         payload[0..2].copy_from_slice(&tag.to_be_bytes());
                     }
-                    conn.with_udp_lease(self.udp_pool.clone(), s, stayopen)
+                    conn.with_udp_lease(
+                        self.udp_pool.clone(),
+                        s,
+                        stayopen,
+                        self.udp_max_queries,
+                    )
                 })
             };
             if let Some(conn) = conn {
+                // The shared-socket tag reservation may have re-stamped the
+                // payload; publish the final wire qid for the ffi out-param.
+                self.io.borrow_mut().app.qid = qid_of(payload);
                 return Ok((conn, s));
             }
             if self.health.borrow().len() > 1 {
@@ -2594,6 +2607,59 @@ mod tests {
         let p = dns_query_payload("example.com", 1, 1, false).expect("payload");
         assert_eq!(p[2] & 0x01, 0); // NORECURSE clears RD
         assert_eq!(&p[p.len() - 2..], &1u16.to_be_bytes());
+    }
+
+    struct TestSock;
+    impl crate::async_runtime::socket::Socket for TestSock {
+        fn as_raw_fd(&self) -> i32 {
+            21
+        }
+        fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
+            Ok(())
+        }
+        fn recv(&self, _buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+        fn send(&self, data: &[u8]) -> io::Result<usize> {
+            Ok(data.len())
+        }
+    }
+
+    struct TestFactory;
+    impl SocketFactory for TestFactory {
+        fn create_udp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
+            Ok(Rc::new(TestSock))
+        }
+        fn create_tcp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
+            Ok(Rc::new(TestSock))
+        }
+    }
+
+    /// A shared-socket collision rerolls the tag and re-stamps the payload; the
+    /// mailbox's `qid` must match the actual wire bytes (the ffi reports it).
+    #[test]
+    fn shared_udp_reroll_updates_payload_and_app_qid() {
+        let config = SysConfig {
+            nameservers: vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)],
+            ..SysConfig::default()
+        };
+        let mut client = AsyncClient::build(config, Rc::new(TestFactory), 53, 53);
+        client.endpoints = Rc::new(client.endpoint_snapshot());
+
+        let payload = || BytesMut::from(&[0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]);
+        let mut first = payload();
+        let (conn_a, _) = client.connect_failover(&mut first, 0, false).expect("first checkout");
+        assert_eq!(qid_of(&first), 0x1234);
+        assert_eq!(client.io.borrow().app.qid, 0x1234);
+
+        let mut second = payload();
+        let (conn_b, _) = client.connect_failover(&mut second, 0, false).expect("second checkout");
+        let final_qid = client.io.borrow().app.qid;
+        assert_ne!(final_qid, 0x1234, "colliding qid must be rerolled");
+        assert_eq!(qid_of(&second), final_qid, "payload must carry the reserved qid");
+
+        drop(conn_a);
+        drop(conn_b);
     }
 
     #[test]

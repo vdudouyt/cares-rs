@@ -25,6 +25,7 @@ use std::task::Poll;
 
 use crate::async_runtime::io::{dead, recv_stream};
 use crate::async_runtime::socket::Socket;
+use crate::core::async_client::DnsMailbox;
 
 /// The mux tag of a DNS frame — its transaction ID (header bytes 0..2), the
 /// demux key shared-TCP replies are routed by. `None` for a frame too short to
@@ -51,6 +52,14 @@ pub(crate) fn dns_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(msg)
 }
 
+/// One tag's inbox slot: the routed reply (once it arrives) plus the target
+/// lookup's mailbox, which is flagged `routed` so a sibling drain can wake a
+/// future that had already suspended with no fd readiness of its own.
+struct InboxSlot {
+    reply: Option<Vec<u8>>,
+    notify: Rc<RefCell<DnsMailbox>>,
+}
+
 /// A shared stream connection to one server, cooperatively driven by every
 /// future that has an outstanding query on it: a per-connection reassembly
 /// buffer plus the tag-demuxed inbox the futures share. `core::conn::Conn`
@@ -60,9 +69,8 @@ pub(crate) struct TcpConn {
     sock: Rc<dyn Socket>,
     fd: i32,
     rbuf: Vec<u8>,
-    /// tag -> reply slot: `None` = still awaited, `Some` = delivered, waiting
-    /// to be taken by that future.
-    inbox: HashMap<u16, Option<Vec<u8>>>,
+    /// tag -> reply slot (reply + target mailbox).
+    inbox: HashMap<u16, InboxSlot>,
 }
 
 impl TcpConn {
@@ -75,18 +83,25 @@ impl TcpConn {
         Rc::new(RefCell::new(TcpConn { sock, fd, rbuf: Vec::new(), inbox: HashMap::new() }))
     }
 
-    /// Reserve a free inbox tag for a query. Starts from the query's current
-    /// transaction id `qid`; if an in-flight sibling on this conn already owns
-    /// it, fresh ids are drawn from `reroll` until one is free (≈ upstream
-    /// `generate_unique_qid` in `ares_send.c` — without this the two queries
-    /// would clobber one inbox slot and a reply would be lost). Returns the tag
-    /// actually reserved; on a re-roll the caller must re-stamp its payload.
-    pub(crate) fn reserve(&mut self, qid: u16, mut reroll: impl FnMut() -> u16) -> u16 {
+    /// Reserve a free inbox tag for a query, registering `io` as the mailbox to
+    /// flag when a sibling routes this tag's reply. Starts from the query's
+    /// current transaction id `qid`; if an in-flight sibling on this conn
+    /// already owns it, fresh ids are drawn from `reroll` until one is free
+    /// (≈ upstream `generate_unique_qid` in `ares_send.c` — without this the
+    /// two queries would clobber one inbox slot and a reply would be lost).
+    /// Returns the tag actually reserved; on a re-roll the caller must
+    /// re-stamp its payload.
+    pub(crate) fn reserve(
+        &mut self,
+        qid: u16,
+        mut reroll: impl FnMut() -> u16,
+        io: Rc<RefCell<DnsMailbox>>,
+    ) -> u16 {
         let mut tag = qid;
         while self.inbox.contains_key(&tag) {
             tag = reroll();
         }
-        self.inbox.insert(tag, None);
+        self.inbox.insert(tag, InboxSlot { reply: None, notify: io });
         tag
     }
 
@@ -110,7 +125,7 @@ impl TcpConn {
     /// without reading the socket (the draining sibling consumed the fd's
     /// readiness). `None` for an empty or unknown slot.
     pub(crate) fn take(&mut self, tag: u16) -> Option<Vec<u8>> {
-        self.inbox.get_mut(&tag).and_then(|slot| slot.take())
+        self.inbox.get_mut(&tag).and_then(|slot| slot.reply.take())
     }
 
     /// Drain + route this cycle, then resolve `tag`'s next message: `Ready(Ok)`
@@ -135,13 +150,15 @@ impl TcpConn {
         while let Some(frame) = dns_frame(&mut self.rbuf) {
             if let Some(tag) = dns_tag(&frame) {
                 if let Some(slot) = self.inbox.get_mut(&tag) {
-                    *slot = Some(frame);
+                    slot.reply = Some(frame);
+                    slot.notify.borrow_mut().routed = true;
                 }
                 // Unknown tag → drop (a stray/late frame).
-            } else if let Some((_, slot)) = self.inbox.iter_mut().find(|(_, s)| s.is_none()) {
+            } else if let Some(slot) = self.inbox.values_mut().find(|s| s.reply.is_none()) {
                 // An untaggable frame: hand it to one awaiting waiter so the
                 // application sees (and rejects) it.
-                *slot = Some(frame);
+                slot.reply = Some(frame);
+                slot.notify.borrow_mut().routed = true;
             }
         }
         alive
@@ -233,14 +250,15 @@ mod tests {
     #[test]
     fn reserve_rerolls_colliding_tag() {
         let mut tc = TcpConn { sock: Rc::new(DummySock), fd: 5, rbuf: Vec::new(), inbox: HashMap::new() };
+        let io = Rc::new(RefCell::new(DnsMailbox::default()));
 
         // Free qid kept as-is; reroll never consulted.
-        assert_eq!(tc.reserve(7, || panic!("free qid must not reroll")), 7);
+        assert_eq!(tc.reserve(7, || panic!("free qid must not reroll"), io.clone()), 7);
 
         // Collision on 7: the reroll may collide again (7) before drawing a
         // free id (9) — the loop must keep drawing.
         let rolls = RefCell::new(vec![9u16, 7u16]); // popped back-to-front: 7, then 9
-        assert_eq!(tc.reserve(7, || rolls.borrow_mut().pop().unwrap()), 9);
+        assert_eq!(tc.reserve(7, || rolls.borrow_mut().pop().unwrap(), io.clone()), 9);
         assert!(rolls.borrow().is_empty()); // both rolls consumed
         assert!(tc.has_waiter(7) && tc.has_waiter(9));
 

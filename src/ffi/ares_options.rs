@@ -180,12 +180,23 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     } else {
         unsafe { & *options }
     };
+    match init_options_from(optmask, options) {
+        Ok(channeldata) => {
+            unsafe { *out_channel = Box::into_raw(Box::new(channeldata)) };
+            ARES_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
 
+/// Safe body of ares_init_options: decode the C option struct, apply the core
+/// cascade, and build the unfinalized channel.
+fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelData, c_int> {
     // Marshal every C field into an owned mirror before any logic runs.
     let decoded_sortlist = match (optmask & ARES_OPT_SORTLIST != 0)
         .then(|| decode_sortlist_options(options))
     {
-        Some(Err(status)) => return status,
+        Some(Err(status)) => return Err(status),
         Some(Ok(list)) => list,
         None => None,
     };
@@ -239,9 +250,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     let mut channeldata = ChannelData::new_unfinalized(resolvconf.as_deref());
     channeldata.state.apply_options(optmask, decoded);
     install_socket_options(&mut channeldata, optmask, options);
-    let channel = Box::into_raw(Box::new(channeldata));
-    unsafe { *out_channel = channel };
-    ARES_SUCCESS
+    Ok(channeldata)
 }
 
 /// Apply the socket-related options (state callback + buffer sizes / local

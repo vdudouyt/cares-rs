@@ -65,6 +65,11 @@ pub(crate) struct Mailbox<A> {
     /// one fd with opposite interests a write-readiness isn't consumed by a
     /// read-arm (or vice versa).
     pub fired: Vec<Wait>,
+    /// A sibling future sharing this lookup routed a reply into one of our
+    /// inbox slots after we last suspended. The socket readiness was consumed
+    /// by that sibling, so `drive_ready` must still re-poll us even though no
+    /// `waits` entry fired.
+    pub routed: bool,
     /// This lookup's reusable receive scratch (grown to 64 KB by `conn` on
     /// first use — a fresh `[0u8; 65535]` per recv would zero 64 KB every
     /// call). Borrowed only for the synchronous span of one recv; empty for
@@ -264,10 +269,12 @@ impl<A> Executor<A> {
             let mut m = t.io().borrow_mut();
             let fired: Vec<Wait> = m.waits.iter().copied().filter(|w| ready(w.fd, w.writable)).collect();
             let expired = !skip_timeouts && m.timeout.is_some_and(|d| now >= d);
-            if fired.is_empty() && !expired {
+            let routed = m.routed;
+            if fired.is_empty() && !expired && !routed {
                 continue;
             }
             m.fired = fired;
+            m.routed = false;
             go.push(id);
         }
         go
@@ -310,5 +317,18 @@ mod tests {
         let io = mailbox();
         let past = Instant::now() - Duration::from_secs(1);
         assert!(matches!(poll_timeout(&io, past), Poll::Ready(())));
+    }
+
+    #[test]
+    fn drive_ready_wakes_routed_mailbox_without_fd() {
+        let mut ex = Executor::<()>::default();
+        let io = mailbox();
+        let id = ex.spawn(io.clone(), std::future::pending::<()>(), |_| {});
+        io.borrow_mut().routed = true;
+
+        let go = ex.drive_ready(Instant::now(), true, |_, _| false);
+
+        assert_eq!(go, vec![id]);
+        assert!(!io.borrow().routed, "routed wake must be consumed");
     }
 }
