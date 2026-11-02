@@ -516,7 +516,7 @@ pub unsafe extern "C" fn ares_create_query(
     }
     let Some(name_str) = (unsafe { cstr_opt(name) }) else { return ARES_EBADNAME };
 
-    let packet = match build_query(name_str, dnsclass as u16, qtype as u16, id as u16, rd != 0, max_udp_size) {
+    let packet = match build_query(name_str, dnsclass as u32, qtype as u32, id as u16, rd != 0, max_udp_size) {
         Ok(p) => p,
         Err(e) => return e.code(),
     };

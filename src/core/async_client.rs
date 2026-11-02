@@ -400,12 +400,12 @@ impl AsyncClient {
 
         // HOSTALIASES (single-label names): resolve via env-pointed file.
         // ARES_FLAG_NOALIASES disables the lookup entirely.
-        let resolved = match hostaliases_lookup(
+        let (resolved, alias_found) = match hostaliases_lookup(
             &hostname,
             self.flags & ARES_FLAG_NOALIASES != 0,
         ) {
-            Ok(Some(alias)) => alias,
-            Ok(None) => hostname.clone(),
+            Ok(Some(alias)) => (alias, true),
+            Ok(None) => (hostname.clone(), false),
             Err(status) => return Err(status.into()),
         };
 
@@ -443,7 +443,7 @@ impl AsyncClient {
         // so the query / cache-store / cache-probe keys all match): below ndots with a
         // search list, each `name.domain` then the bare name; otherwise just the name.
         let dots = resolved.chars().filter(|&c| c == '.').count() as u32;
-        let no_search = self.flags & ARES_FLAG_NOSEARCH != 0;
+        let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
         let names: Vec<String> = if !no_search && dots < self.config.options.ndots && !self.config.search.is_empty() {
             let mut v: Vec<String> = self.config.search.iter().map(|d| format!("{resolved}.{d}")).collect();
             v.push(resolved.clone());
@@ -517,8 +517,8 @@ impl AsyncClient {
         // ===== DNS phase: single PTR query =====
         let payload = dns_query_payload(
             &rdns_name(ip),
-            RECORD_TYPE_PTR,
-            ARES_CLASS_IN,
+            u32::from(RECORD_TYPE_PTR),
+            u32::from(ARES_CLASS_IN),
             self.recursion_desired(),
         )?;
         let use_vc = self.config.options.use_vc;
@@ -582,8 +582,8 @@ impl AsyncClient {
         // ===== DNS phase: single PTR query =====
         let payload = match dns_query_payload(
             &rdns_name(addr.ip),
-            RECORD_TYPE_PTR,
-            ARES_CLASS_IN,
+            u32::from(RECORD_TYPE_PTR),
+            u32::from(ARES_CLASS_IN),
             self.recursion_desired(),
         ) {
             Ok(p) => p,
@@ -614,11 +614,11 @@ impl AsyncClient {
     pub(crate) async fn search(
         self: Rc<Self>,
         name: String,
-        dnsclass: u16,
-        dnstype: u16,
+        dnsclass: u32,
+        dnstype: u32,
         retry_server_error: bool,
     ) -> Delivery {
-        if let Err(e) = validate_query(&name, dnsclass, dnstype) {
+        if let Err(e) = validate_query_class_type(dnsclass, dnstype) {
             return Delivery::Raw { result: Err(e.code()), timeouts: 0 };
         }
         let rd = self.recursion_desired();
@@ -769,7 +769,7 @@ impl AsyncClient {
         // one family (single await) or two (AF_UNSPEC — race both).
         let sub = |i: usize| {
             let this = self.clone();
-            let payload = dns_query_payload(name, rtypes[i], ARES_CLASS_IN, rd);
+            let payload = dns_query_payload(name, u32::from(rtypes[i]), u32::from(ARES_CLASS_IN), rd);
             async move {
                 match payload {
                     Ok(p) => this.request(p, use_vc).await,
@@ -826,7 +826,7 @@ impl AsyncClient {
             // the probe folds into ServerHealth then terminates).
             let batch = self.clone().query_families(name, rtypes);
             let probe_payload = if probe && i == 0 {
-                dns_query_payload(name, rtypes[0], ARES_CLASS_IN, rd).ok()
+                dns_query_payload(name, u32::from(rtypes[0]), u32::from(ARES_CLASS_IN), rd).ok()
             } else {
                 None
             };
@@ -1009,8 +1009,11 @@ fn fail(status: c_int) -> AddrInfoOut {
     AddrInfoOut { name: String::new(), records: Vec::new(), status: status.into() }
 }
 
-/// HOSTALIASES for single-label names: read the env-pointed file, return the
-/// alias target (or the name unchanged). `PermissionDenied` → `ARES_EFILE`.
+/// HOSTALIASES for single-label names: read the env-pointed file. `Ok(Some)`
+/// means an alias fired and the caller must use exactly that target as its sole
+/// query name (no search-domain expansion, upstream ares_search_name_list);
+/// `Ok(None)` means no alias and normal search applies. `PermissionDenied` →
+/// `ARES_EFILE`.
 fn hostaliases_lookup(hostname: &str, no_aliases: bool) -> Result<Option<String>, c_int> {
     // Upstream ares_lookup_hostaliases: flag, dotted names and a missing env
     // var all mean "no alias"; a real alias suppresses search-domain expansion.
@@ -1157,10 +1160,19 @@ fn frame_tcp(payload: &[u8]) -> BytesMut {
     framed
 }
 
-/// Validate a query's name/class/type exactly like `build_query` (and thus
-/// ares_dns_record_create_query) without keeping the wire packet.
-pub(crate) fn validate_query(name: &str, qclass: u16, qtype: u16) -> Result<(), AresError> {
-    build_query(name, qclass, qtype, 0, true, 0).map(|_| ())
+/// Validate an untruncated class/type pair exactly like
+/// ares_dns_record_query_add: class must fit 16 bits and pass class_isvalid,
+/// type must fit 16 bits and pass rec_type_isvalid (unknown in-range types are
+/// accepted for queries). Called before any `as u16` narrowing.
+pub(crate) fn validate_query_class_type(qclass: u32, qtype: u32) -> Result<(), AresError> {
+    if qclass > u16::MAX as u32
+        || qtype > u16::MAX as u32
+        || !rec_type_isvalid(qtype, true)
+        || !class_isvalid(qclass as u16, qtype, true)
+    {
+        return Err(ARES_EFORMERR.into());
+    }
+    Ok(())
 }
 
 /// Build a UDP-form DNS query payload (fresh random transaction id) through
@@ -1168,8 +1180,8 @@ pub(crate) fn validate_query(name: &str, qclass: u16, qtype: u16) -> Result<(), 
 /// identical for ares_query/search and ares_create_query.
 pub(crate) fn dns_query_payload(
     name: &str,
-    qtype: u16,
-    qclass: u16,
+    qtype: u32,
+    qclass: u32,
     rd: bool,
 ) -> Result<BytesMut, AresError> {
     let transaction_id = rand::thread_rng().r#gen::<u16>();
@@ -1195,8 +1207,8 @@ fn payload_from_template(template: &ares_dns_record_t, name: &str) -> Result<Byt
 /// negative means "no EDNS" (the historical ares_create_query gate).
 pub(crate) fn build_query(
     name_str: &str,
-    dnsclass: u16,
-    qtype: u16,
+    dnsclass: u32,
+    qtype: u32,
     id: u16,
     rd: bool,
     max_udp_size: i32,
@@ -1229,12 +1241,8 @@ pub(crate) fn build_query(
     }
 
     // ares_dns_record_query_add validation: type and class are checked before
-    // the name is written (unknown query types are accepted, RAW_RR is not).
-    if !rec_type_isvalid(qtype as u32, true)
-        || !class_isvalid(dnsclass, qtype as u32, true)
-    {
-        return Err(ARES_EFORMERR.into());
-    }
+    // the name is written (unknown in-range query types are accepted).
+    validate_query_class_type(dnsclass, qtype)?;
 
     // Validate name length
     let clean_name = if has_unescaped_trailing_dot {
@@ -1310,8 +1318,8 @@ pub(crate) fn build_query(
         packet.extend_from_slice(&unescaped);
     }
     packet.push(0); // root label
-    packet.extend_from_slice(&qtype.to_be_bytes());
-    packet.extend_from_slice(&dnsclass.to_be_bytes());
+    packet.extend_from_slice(&(qtype as u16).to_be_bytes());
+    packet.extend_from_slice(&(dnsclass as u16).to_be_bytes());
 
     // OPT pseudo-RR for EDNS if max_udp_size > 0
     if max_udp_size > 0 {
@@ -2044,8 +2052,8 @@ impl AsyncClient {
     pub(crate) fn query_payload(
         &self,
         name: &str,
-        qtype: u16,
-        qclass: u16,
+        qtype: u32,
+        qclass: u32,
     ) -> Result<BytesMut, AresError> {
         let payload = dns_query_payload(name, qtype, qclass, self.recursion_desired())?;
         if no_servers(self) {
@@ -2273,20 +2281,36 @@ mod tests {
     #[test]
     fn legacy_query_validation_rejects_bad_class_and_name() {
         assert_eq!(
-            validate_query("example.com", 17, 1).expect_err("bad class").code(),
+            validate_query_class_type(17, 1).expect_err("bad class").code(),
+            ARES_EFORMERR
+        );
+        assert_eq!(
+            validate_query_class_type(0x1_0000, 1)
+                .expect_err("class too wide")
+                .code(),
+            ARES_EFORMERR
+        );
+        assert_eq!(
+            validate_query_class_type(1, 0x1_0000)
+                .expect_err("type too wide")
+                .code(),
             ARES_EFORMERR
         );
         let long_label = "a".repeat(64);
         assert_eq!(
-            validate_query(&long_label, 1, 1).expect_err("long label").code(),
+            build_query(&long_label, 1, 1, 0, true, 0)
+                .expect_err("long label")
+                .code(),
             ARES_EBADNAME
         );
         assert_eq!(
-            validate_query("example..com", 1, 1).expect_err("empty label").code(),
+            build_query("example..com", 1, 1, 0, true, 0)
+                .expect_err("empty label")
+                .code(),
             ARES_EBADNAME
         );
-        assert!(validate_query("example.com", 1, 1).is_ok());
-        assert!(validate_query("example.com", 255, 255).is_ok());
+        assert!(build_query("example.com", 1, 1, 0, true, 0).is_ok());
+        assert!(validate_query_class_type(255, 255).is_ok());
     }
 
     #[test]
