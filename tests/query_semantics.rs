@@ -895,7 +895,6 @@ fn noaliases_suppresses_hostaliases_lookup() {
 }
 
 #[test]
-#[ignore = "known source bug: gethostbyname search-expands a HOSTALIASES alias target; upstream uses the alias as-is"]
 fn hostaliases_alias_suppresses_search_domains() {
     let _serial = serial();
     let aliases = TempFile::new("aliasname alias-target.example\n");
@@ -1018,6 +1017,51 @@ fn send_and_query_validation_is_synchronous() {
         );
         assert!(result.done);
         assert_eq!(result.status, ARES_EBADNAME);
+
+        ares_destroy(channel);
+    }
+}
+
+#[test]
+fn raw_out_of_range_class_is_rejected_synchronously() {
+    let _serial = serial();
+    unsafe {
+        let channel = init_flags(0);
+        let name = CString::new("wide-class.example").unwrap();
+
+        // ares_query takes a signed int; both a value above u16 and -1 must
+        // fail before any wire request (no server configured/needed).
+        for class in [0x10001, -1] {
+            let mut result = RawResult::default();
+            ares_query(
+                channel,
+                name.as_ptr(),
+                class,
+                c_int::from(ARES_REC_TYPE_A),
+                Some(raw_cb),
+                &mut result as *mut _ as *mut c_void,
+            );
+            assert!(result.done, "class {class} must fail synchronously");
+            assert_eq!(result.status, ARES_EFORMERR, "class {class}");
+        }
+
+        // ares_query_dnsrec takes an unsigned 32-bit class; 0x10001 and the
+        // u32 representation of -1 must both fail via the callback.
+        for class in [0x10001u32, u32::MAX] {
+            let mut result = DnsResult::default();
+            let rc = ares_query_dnsrec(
+                channel,
+                name.as_ptr(),
+                class,
+                u32::from(ARES_REC_TYPE_A),
+                Some(dnsrec_cb),
+                &mut result as *mut _ as *mut c_void,
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, ARES_EFORMERR, "class {class} return");
+            assert!(result.done, "class {class} must invoke the callback");
+            assert_eq!(result.status, ARES_EFORMERR, "class {class}");
+        }
 
         ares_destroy(channel);
     }
