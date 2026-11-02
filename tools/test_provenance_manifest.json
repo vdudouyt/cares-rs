@@ -195,82 +195,10 @@
         "phase": "3"
       },
       {
-        "name": "MockEDNSChannelTest::RetryWithoutEDNS",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockTCPChannelTest::SearchOptVal",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTest::DNS0x20BadReply",
-        "reason": "DNS 0x20 (mixed-case query names) not implemented (deferred)",
-        "category": "deferred-dns0x20",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTest::DNSCookieBadLen",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTest::DNSCookieMissingAfterGood",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTest::DNSCookieServerRotate",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTest::DNSCookieSingle",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTest::DNSCookieSpoof",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTest::DNSCookieTCPUpgrade",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTest::RetryWithoutEDNSNonCompliant",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
         "name": "MockUDPChannelTest::SearchDomainsAllocFail",
         "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
         "category": "deferred-alloc",
         "phase": "3"
-      },
-      {
-        "name": "MockUDPChannelTest::TriggerResendThenConnFailEDNS",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "NoDNS0x20MockTest::Basic",
-        "reason": "DNS 0x20 (mixed-case query names) not implemented (deferred)",
-        "category": "deferred-dns0x20",
-        "phase": "4B"
       }
     ],
     "ares-test-mock-ai.cc": [
@@ -327,18 +255,6 @@
         "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
         "category": "non-portable",
         "phase": "3"
-      },
-      {
-        "name": "MockEDNSChannelTestAI::RetryWithoutEDNS",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
-      },
-      {
-        "name": "MockUDPChannelTestAI::TriggerResendThenConnFailEDNS",
-        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
-        "category": "deferred-edns",
-        "phase": "4B"
       }
     ],
     "ares-test-misc.cc": [

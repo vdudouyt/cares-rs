@@ -10,9 +10,234 @@
   },
   "recorded_at": "2026-11-02",
   "counts": {
-    "total_tests": 526,
-    "passed": 526,
-    "failed": 0
+    "total_tests": 558,
+    "passed": 530,
+    "failed": 28
   },
-  "expected_failures": []
+  "expected_failures": [
+    {
+      "name": "AddressFamilies/MockEDNSChannelTest.RetryWithoutEDNS/ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 703
+    },
+    {
+      "name": "AddressFamilies/MockEDNSChannelTest.RetryWithoutEDNS/ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 703
+    },
+    {
+      "name": "AddressFamilies/MockEDNSChannelTest.RetryWithoutEDNS/ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 703
+    },
+    {
+      "name": "AddressFamilies/MockEDNSChannelTest.RetryWithoutEDNS/ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 703
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNS0x20BadReply/ipv4",
+      "status": "FAILED",
+      "reason": "DNS 0x20 mixed-case query protection not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 108
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNS0x20BadReply/ipv6",
+      "status": "FAILED",
+      "reason": "DNS 0x20 mixed-case query protection not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 108
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieBadLen/ipv4",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2158
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieBadLen/ipv6",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2158
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieMissingAfterGood/ipv4",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2107
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieMissingAfterGood/ipv6",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2107
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieServerRotate/ipv4",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2185
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieServerRotate/ipv6",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2185
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieSingle/ipv4",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2085
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieSingle/ipv6",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2085
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieSpoof/ipv4",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2237
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieSpoof/ipv6",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2237
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieTCPUpgrade/ipv4",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2266
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.DNSCookieTCPUpgrade/ipv6",
+      "status": "FAILED",
+      "reason": "DNS cookie support not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 2266
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.RetryWithoutEDNSNonCompliant/ipv4",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 725
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.RetryWithoutEDNSNonCompliant/ipv6",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 725
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.TriggerResendThenConnFailEDNS/ipv4",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 1471
+    },
+    {
+      "name": "AddressFamilies/MockUDPChannelTest.TriggerResendThenConnFailEDNS/ipv6",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock.cc",
+      "source_line": 1471
+    },
+    {
+      "name": "AddressFamiliesAI/MockEDNSChannelTestAI.RetryWithoutEDNS/ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock-ai.cc",
+      "source_line": 1104
+    },
+    {
+      "name": "AddressFamiliesAI/MockEDNSChannelTestAI.RetryWithoutEDNS/ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock-ai.cc",
+      "source_line": 1104
+    },
+    {
+      "name": "AddressFamiliesAI/MockEDNSChannelTestAI.RetryWithoutEDNS/ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock-ai.cc",
+      "source_line": 1104
+    },
+    {
+      "name": "AddressFamiliesAI/MockEDNSChannelTestAI.RetryWithoutEDNS/ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock-ai.cc",
+      "source_line": 1104
+    },
+    {
+      "name": "AddressFamiliesAI/MockUDPChannelTestAI.TriggerResendThenConnFailEDNS/ipv4",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock-ai.cc",
+      "source_line": 1022
+    },
+    {
+      "name": "AddressFamiliesAI/MockUDPChannelTestAI.TriggerResendThenConnFailEDNS/ipv6",
+      "status": "FAILED",
+      "reason": "EDNS fallback/OPT behavior not implemented",
+      "phase": "4B",
+      "source": "tests/cares-tests/src/ares-test-mock-ai.cc",
+      "source_line": 1022
+    }
+  ]
 }

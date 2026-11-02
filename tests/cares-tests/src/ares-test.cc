@@ -420,16 +420,30 @@ void MockServer::ProcessRequest(ares_socket_t fd, struct sockaddr_storage* addr,
                                 ares_socklen_t addrlen, const std::vector<byte> &req,
                                 const std::string &reqstr,
                                 int qid, const char *name, int rrtype) {
+  /* DNS 0x20 will mix case, do case-insensitive matching of name in request */
+  char lower_name[256];
   int flags = 0;
 
-  OnRequest(name, rrtype);
+  arestest_strtolower(lower_name, name, sizeof(lower_name));
+
+  OnRequest(lower_name, rrtype);
 
   if (expected_request_.length() > 0) {
     ASSERT_EQ(expected_request_, reqstr);
   }
 
   if (reply_ != nullptr) {
-    exact_reply_ = reply_->data();
+    ares_dns_record_t *dnsrec = NULL;
+    /* We will *attempt* to parse the request string.  It may be malformed that
+     * will lead to a parse failure.  If so, we just ignore it.  We want to
+     * pass this parsed data structure to the reply generator in case it needs
+     * to extract metadata (such as a DNS client cookie) from the original
+     * request.  If we can't parse it, oh well, we'll just pass NULL, most
+     * replies don't need anything from the request other than the name which
+     * is passed separately. */
+    ares_dns_parse(req.data(), req.size(), 0, &dnsrec);
+    exact_reply_ = reply_->data(name, dnsrec);
+    ares_dns_record_destroy(dnsrec);
   }
 
   if (exact_reply_.size() == 0) {
@@ -526,6 +540,12 @@ MockChannelOptsTest::MockChannelOptsTest(int count,
   if (!(optmask & ARES_OPT_QUERY_CACHE)) {
     opts.qcache_max_ttl = 0;
     optmask |= ARES_OPT_QUERY_CACHE;
+  }
+
+  /* Enable DNS0x20 by default. Need to also turn on default flag of EDNS */
+  if (!(optmask & ARES_OPT_FLAGS)) {
+    optmask |= ARES_OPT_FLAGS;
+    opts.flags = ARES_FLAG_DNS0x20|ARES_FLAG_EDNS;
   }
 
   EXPECT_EQ(ARES_SUCCESS, ares_init_options(&channel_, &opts, optmask));
