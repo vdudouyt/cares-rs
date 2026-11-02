@@ -8,11 +8,1420 @@
     "cares_rs_library": "target/release/libcares_rs.so",
     "upstream_library": "/tmp/cares-build/lib/libcares.so"
   },
-  "recorded_at": "2026-11-02",
+  "recorded_at": "2026-11-03",
   "counts": {
-    "total_tests": 558,
+    "total_tests": 734,
     "passed": 558,
-    "failed": 0
+    "failed": 176
   },
-  "expected_failures": []
+  "expected_failures": [
+    {
+      "name": "AddressFamilies/CacheQueriesEventThreadTest.GetHostByNameCache/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 429
+    },
+    {
+      "name": "AddressFamilies/CacheQueriesEventThreadTest.GetHostByNameCache/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 429
+    },
+    {
+      "name": "AddressFamilies/MockEDNSEventThreadTest.RetryWithoutEDNS/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 705
+    },
+    {
+      "name": "AddressFamilies/MockEDNSEventThreadTest.RetryWithoutEDNS/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 705
+    },
+    {
+      "name": "AddressFamilies/MockEDNSEventThreadTest.RetryWithoutEDNS/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 705
+    },
+    {
+      "name": "AddressFamilies/MockEDNSEventThreadTest.RetryWithoutEDNS/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 705
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.BulkCancel/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 988
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.BulkCancel/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 988
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.BulkCancel/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 988
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.BulkCancel/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 988
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.CancelImmediate/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1224
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.CancelImmediate/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1224
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.CancelImmediate/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1224
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.CancelImmediate/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1224
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.CancelImmediateGetHostByAddr/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1233
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.CancelImmediateGetHostByAddr/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1233
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.CancelImmediateGetHostByAddr/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1233
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.CancelImmediateGetHostByAddr/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1233
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.DestroyQuick/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 952
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.DestroyQuick/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 952
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.DestroyQuick/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 952
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.DestroyQuick/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 952
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.DisconnectFirstAttempt/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1262
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.DisconnectFirstAttempt/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1262
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.DisconnectFirstAttempt/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1262
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.DisconnectFirstAttempt/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1262
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.ExplicitIP/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1116
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.ExplicitIP/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1116
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.ExplicitIP/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1116
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.ExplicitIP/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1116
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.GetHostByNameCNAMENoData/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1284
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.GetHostByNameCNAMENoData/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1284
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.GetHostByNameCNAMENoData/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1284
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.GetHostByNameCNAMENoData/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1284
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAlias/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1300
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAlias/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1300
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAlias/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1300
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAlias/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1300
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasMissing/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1320
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasMissing/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1320
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasMissing/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1320
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasMissing/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1320
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasMissingFile/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1339
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasMissingFile/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1339
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasMissingFile/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1339
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasMissingFile/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1339
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasUnreadable/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1357
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasUnreadable/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1357
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasUnreadable/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1357
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.HostAliasUnreadable/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1357
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.PartialQueryCancel/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 964
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.PartialQueryCancel/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 964
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.PartialQueryCancel/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 964
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.PartialQueryCancel/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 964
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.ReInit/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 291
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.ReInit/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 291
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.ReInit/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 291
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.ReInit/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 291
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchDomains/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 725
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchDomains/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 725
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchDomains/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 725
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchDomains/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 725
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchDomainsBare/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 784
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchDomainsBare/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 784
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchDomainsBare/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 784
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchDomainsBare/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 784
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchHighNdots/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 904
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchHighNdots/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 904
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchHighNdots/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 904
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchHighNdots/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 904
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenFail/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 874
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenFail/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 874
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenFail/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 874
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenFail/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 874
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenNoDataBare/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 844
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenNoDataBare/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 844
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenNoDataBare/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 844
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenNoDataBare/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 844
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenSuccess/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 816
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenSuccess/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 816
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenSuccess/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 816
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SearchNoDataThenSuccess/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 816
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SockCallback/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 253
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SockCallback/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 253
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SockCallback/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 253
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SockCallback/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 253
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SockFailCallback/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 276
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SockFailCallback/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 276
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SockFailCallback/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 276
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SockFailCallback/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 276
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SortListV4/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1126
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SortListV4/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1126
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SortListV4/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1126
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SortListV4/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1126
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SortListV6/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1164
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SortListV6/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1164
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SortListV6/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1164
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.SortListV6/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1164
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyCname6A4/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1093
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyCname6A4/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1093
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyCname6A4/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1093
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyCname6A4/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1093
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyNoData/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1071
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyNoData/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1071
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyNoData/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1071
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyNoData/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1071
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyV4/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1049
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyV4/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1049
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyV4/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1049
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyV4/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1049
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyV6/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1023
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyV6/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1023
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyV6/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1023
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.UnspecifiedFamilyV6/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1023
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.V4WorksV6Timeout/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 929
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.V4WorksV6Timeout/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 929
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.V4WorksV6Timeout/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 929
+    },
+    {
+      "name": "AddressFamilies/MockEventThreadTest.V4WorksV6Timeout/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 929
+    },
+    {
+      "name": "AddressFamilies/MockExtraOptsEventThreadTest.SimpleQuery/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 614
+    },
+    {
+      "name": "AddressFamilies/MockExtraOptsEventThreadTest.SimpleQuery/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 614
+    },
+    {
+      "name": "AddressFamilies/MockExtraOptsEventThreadTest.SimpleQuery/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 614
+    },
+    {
+      "name": "AddressFamilies/MockExtraOptsEventThreadTest.SimpleQuery/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 614
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.NotImplResponse/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 672
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.NotImplResponse/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 672
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.NotImplResponse/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 672
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.NotImplResponse/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 672
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.RefusedResponse/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 686
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.RefusedResponse/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 686
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.RefusedResponse/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 686
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.RefusedResponse/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 686
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.ServFailResponse/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 658
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.ServFailResponse/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 658
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.ServFailResponse/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 658
+    },
+    {
+      "name": "AddressFamilies/MockNoCheckRespEventThreadTest.ServFailResponse/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 658
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadStayOpenTest.GetHostByNameParallelLookups/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 483
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadStayOpenTest.GetHostByNameParallelLookups/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 483
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.FormErrResponse/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 525
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.FormErrResponse/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 525
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.MalformedResponse/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 513
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.MalformedResponse/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 513
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.NotImplResponse/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 553
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.NotImplResponse/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 553
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.RefusedResponse/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 567
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.RefusedResponse/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 567
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.ServFailResponse/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 539
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.ServFailResponse/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 539
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.YXDomainResponse/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 581
+    },
+    {
+      "name": "AddressFamilies/MockTCPEventThreadTest.YXDomainResponse/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 581
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadMaxQueriesTest.GetHostByNameParallelLookups/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 330
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadMaxQueriesTest.GetHostByNameParallelLookups/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 330
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.BadLoopbackServerNoTimeouts/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 82
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.BadLoopbackServerNoTimeouts/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 82
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.CancelLater/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1246
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.CancelLater/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1246
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.DownServer/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 196
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.DownServer/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 196
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.GetHostByNameParallelLookups/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 46
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.GetHostByNameParallelLookups/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 46
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.Resend/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1202
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.Resend/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1202
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.SearchDomainsWithResentReply/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 753
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.SearchDomainsWithResentReply/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 753
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.TruncationRetry/SELECT_ipv4",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 224
+    },
+    {
+      "name": "AddressFamilies/MockUDPEventThreadTest.TruncationRetry/SELECT_ipv6",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 224
+    },
+    {
+      "name": "TransportModes/NoRotateMultiMockEventThreadTest.ServerNoResponseFailover/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1460
+    },
+    {
+      "name": "TransportModes/NoRotateMultiMockEventThreadTest.ServerNoResponseFailover/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1460
+    },
+    {
+      "name": "TransportModes/NoRotateMultiMockEventThreadTest.ServerNoResponseFailover/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1460
+    },
+    {
+      "name": "TransportModes/NoRotateMultiMockEventThreadTest.ServerNoResponseFailover/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1460
+    },
+    {
+      "name": "TransportModes/NoRotateMultiMockEventThreadTest.ThirdServer/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1409
+    },
+    {
+      "name": "TransportModes/NoRotateMultiMockEventThreadTest.ThirdServer/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1409
+    },
+    {
+      "name": "TransportModes/NoRotateMultiMockEventThreadTest.ThirdServer/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1409
+    },
+    {
+      "name": "TransportModes/NoRotateMultiMockEventThreadTest.ThirdServer/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1409
+    },
+    {
+      "name": "TransportModes/ServerFailoverOptsMockEventThreadTest.ServerFailoverOpts/SELECT_ipv4_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1565
+    },
+    {
+      "name": "TransportModes/ServerFailoverOptsMockEventThreadTest.ServerFailoverOpts/SELECT_ipv4_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1565
+    },
+    {
+      "name": "TransportModes/ServerFailoverOptsMockEventThreadTest.ServerFailoverOpts/SELECT_ipv6_DefaultUDP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1565
+    },
+    {
+      "name": "TransportModes/ServerFailoverOptsMockEventThreadTest.ServerFailoverOpts/SELECT_ipv6_ForceTCP",
+      "status": "FAILED",
+      "reason": "ARES_OPT_EVENT_THREAD returns ARES_ENOTIMP; event-thread support not implemented",
+      "phase": "4C",
+      "source": "tests/cares-tests/src/ares-test-mock-et.cc",
+      "source_line": 1565
+    }
+  ]
 }

@@ -44,9 +44,41 @@ const std::vector<std::pair<int, bool>> ipv6_family_both_modes = {
   std::make_pair<int, bool>(AF_INET6, true)
 };
 
+const std::vector<std::tuple<ares_evsys_t, int, bool>> all_evsys_ipv4_family_both_modes = {
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET, true),
+};
+
+const std::vector<std::tuple<ares_evsys_t, int, bool>> all_evsys_ipv6_family_both_modes = {
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET6, true),
+};
+
+const std::vector<std::tuple<ares_evsys_t, int, bool>> all_evsys_both_families_both_modes = {
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET, true),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET6, true),
+};
+
+const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_ipv4_family = {
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_SELECT, AF_INET),
+};
+
+const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_ipv6_family = {
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_SELECT, AF_INET6),
+};
+
+const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_both_families = {
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_SELECT, AF_INET),
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_SELECT, AF_INET6),
+};
+
 // Which parameters to use in tests
 std::vector<int> families = both_families;
 std::vector<std::pair<int, bool>> families_modes = both_families_both_modes;
+std::vector<std::tuple<ares_evsys_t, int>> evsys_families = all_evsys_both_families;
+std::vector<std::tuple<ares_evsys_t, int, bool>> evsys_families_modes = all_evsys_both_families_both_modes;
 
 unsigned long long LibraryTest::fails_ = 0;
 std::map<size_t, int> LibraryTest::size_fails_;
@@ -618,6 +650,65 @@ void MockChannelOptsTest::ProcessAltChannel(ares_channel_t *chan, unsigned int c
 
 void MockChannelOptsTest::Process(unsigned int cancel_ms) {
   ProcessAltChannel(channel_, cancel_ms);
+}
+
+void MockEventThreadOptsTest::Process(unsigned int cancel_ms) {
+  std::set<ares_socket_t> fds;
+
+  auto tv_begin = std::chrono::high_resolution_clock::now();
+  auto tv_cancel = tv_begin;
+
+  if (cancel_ms) {
+    if (verbose) std::cerr << "ares_cancel will be called after " << cancel_ms << "ms" << std::endl;
+    tv_cancel += std::chrono::milliseconds(cancel_ms);
+  }
+
+  while (ares_queue_active_queries(channel_)) {
+    int nfds = 0;
+    fd_set readers;
+    struct timeval tv;
+
+    /* c-ares is using its own event thread, so we only need to monitor the
+     * extrafds passed in */
+    FD_ZERO(&readers);
+    fds = MockEventThreadOptsTest::fds();
+    for (ares_socket_t fd : fds) {
+      FD_SET(fd, &readers);
+      if (fd >= (ares_socket_t)nfds) {
+        nfds = (int)fd + 1;
+      }
+    }
+
+    /* We just always wait 20ms then recheck if we're done. Not doing any
+     * complex signaling. */
+    tv.tv_sec  = 0;
+    tv.tv_usec = 20000;
+
+    if (cancel_ms) {
+      auto tv_now       = std::chrono::high_resolution_clock::now();
+      auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tv_cancel - tv_now).count();
+
+      if (remaining_ms <= 0) {
+        if (verbose) std::cerr << "Issuing ares_cancel()" << std::endl;
+        ares_cancel(channel_);
+        cancel_ms = 0;
+      } else {
+        tv.tv_sec = remaining_ms / 1000;
+        tv.tv_usec = (int)(remaining_ms % 1000);
+      }
+    }
+
+    if (select(nfds, &readers, nullptr, nullptr, &tv) < 0) {
+      fprintf(stderr, "select() failed, errno %d\n", errno);
+      return;
+    }
+
+    for (ares_socket_t fd : fds) {
+      if (FD_ISSET(fd, &readers)) {
+        ProcessFD(fd);
+      }
+    }
+  }
 }
 
 std::ostream& operator<<(std::ostream& os, const HostResult& result) {

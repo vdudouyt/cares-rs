@@ -45,9 +45,22 @@ extern const std::vector<std::pair<int, bool>> both_families_both_modes;
 extern const std::vector<std::pair<int, bool>> ipv4_family_both_modes;
 extern const std::vector<std::pair<int, bool>> ipv6_family_both_modes;
 
+extern const std::vector<std::tuple<ares_evsys_t, int, bool>>
+  all_evsys_ipv4_family_both_modes;
+extern const std::vector<std::tuple<ares_evsys_t, int, bool>>
+  all_evsys_ipv6_family_both_modes;
+extern const std::vector<std::tuple<ares_evsys_t, int, bool>>
+  all_evsys_both_families_both_modes;
+
+extern const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_ipv4_family;
+extern const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_ipv6_family;
+extern const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_both_families;
+
 // Which parameters to use in tests
-extern std::vector<int>                  families;
-extern std::vector<std::pair<int, bool>> families_modes;
+extern std::vector<int>                                 families;
+extern std::vector<std::tuple<ares_evsys_t, int>>       evsys_families;
+extern std::vector<std::pair<int, bool>>                families_modes;
+extern std::vector<std::tuple<ares_evsys_t, int, bool>> evsys_families_modes;
 
 // Hopefully a more accurate sleep than sleep_for()
 void                    ares_sleep_time(unsigned int ms);
@@ -306,6 +319,74 @@ class MockTCPChannelTest : public MockChannelOptsTest,
 public:
   MockTCPChannelTest()
     : MockChannelOptsTest(1, GetParam(), true, false, nullptr, 0)
+  {
+  }
+};
+
+class MockEventThreadOptsTest : public MockChannelOptsTest {
+public:
+  MockEventThreadOptsTest(int count, ares_evsys_t evsys, int family,
+                          bool force_tcp, struct ares_options *givenopts,
+                          int optmask)
+    : MockChannelOptsTest(count, family, force_tcp, false,
+                          FillOptionsET(&evopts_, givenopts, evsys),
+                          optmask | ARES_OPT_EVENT_THREAD)
+  {
+  }
+
+  ~MockEventThreadOptsTest()
+  {
+  }
+
+  static struct ares_options *FillOptionsET(struct ares_options *opts,
+                                            struct ares_options *givenopts,
+                                            ares_evsys_t         evsys)
+  {
+    if (givenopts) {
+      memcpy(opts, givenopts, sizeof(*opts));
+    } else {
+      memset(opts, 0, sizeof(*opts));
+    }
+    opts->evsys = evsys;
+    return opts;
+  }
+
+  void Process(unsigned int cancel_ms = 0);
+
+private:
+  struct ares_options evopts_;
+};
+
+class MockEventThreadTest
+  : public MockEventThreadOptsTest,
+    public ::testing::WithParamInterface<std::tuple<ares_evsys_t, int, bool>> {
+public:
+  MockEventThreadTest()
+    : MockEventThreadOptsTest(1, std::get<0>(GetParam()),
+                              std::get<1>(GetParam()), std::get<2>(GetParam()),
+                              nullptr, 0)
+  {
+  }
+};
+
+class MockUDPEventThreadTest
+  : public MockEventThreadOptsTest,
+    public ::testing::WithParamInterface<std::tuple<ares_evsys_t, int>> {
+public:
+  MockUDPEventThreadTest()
+    : MockEventThreadOptsTest(1, std::get<0>(GetParam()),
+                              std::get<1>(GetParam()), false, nullptr, 0)
+  {
+  }
+};
+
+class MockTCPEventThreadTest
+  : public MockEventThreadOptsTest,
+    public ::testing::WithParamInterface<std::tuple<ares_evsys_t, int>> {
+public:
+  MockTCPEventThreadTest()
+    : MockEventThreadOptsTest(1, std::get<0>(GetParam()),
+                              std::get<1>(GetParam()), true, nullptr, 0)
   {
   }
 };

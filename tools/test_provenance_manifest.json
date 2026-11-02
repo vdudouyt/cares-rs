@@ -104,7 +104,8 @@
     "ares-test-parse-srv.cc",
     "ares-test-parse-txt.cc",
     "ares-test-parse-uri.cc",
-    "dns-proto-test.cc"
+    "dns-proto-test.cc",
+    "ares-test-mock-et.cc"
   ],
   "verbatim_files": [
     "ares-test-parse.cc",
@@ -124,12 +125,6 @@
       "reason": "c-ares private/internal API not exposed via FFI",
       "category": "non-portable",
       "phase": "3"
-    },
-    {
-      "file": "ares-test-mock-et.cc",
-      "reason": "event-thread API not supported",
-      "category": "deferred-event-thread",
-      "phase": "4C"
     },
     {
       "file": "ares-test-ns.cc",
