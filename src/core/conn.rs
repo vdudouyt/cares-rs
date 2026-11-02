@@ -2,12 +2,13 @@
 //! byte-level IO arms. A `Conn` owns its mailbox handle, so IO reads
 //! tokio-style: `conn.send(bytes, timeout).await` / `conn.recv(timeout).await`.
 //!
-//! The wire behind a `Conn` is one of three transports — an owned datagram
-//! socket, an owned one-shot stream (framed by [`dns_frame`]), or a checkout of
-//! a shared, multiplexed TCP connection ([`TcpConn`]) — and the
-//! datagram-vs-demuxed-stream asymmetry is hidden behind the methods.
-//! Connection pooling and QID multiplexing live in [`crate::core::tcp_pool`];
-//! this module only routes a `Conn` to the right transport and drives it.
+//! The wire behind a `Conn` is one of four transports — an owned datagram
+//! socket, an owned one-shot stream (framed by [`dns_frame`]), a checkout of a
+//! shared, multiplexed TCP connection ([`TcpConn`]), or a checkout of a shared
+//! datagram connection ([`UdpConn`]) — and the datagram-vs-demuxed asymmetry
+//! is hidden behind the methods. Connection pooling and QID multiplexing live
+//! in [`crate::core::tcp_pool`] / [`crate::core::udp_pool`]; this module only
+//! routes a `Conn` to the right transport and drives it.
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -24,6 +25,7 @@ use crate::async_runtime::io::{dead, poll_recv, recv_datagram, recv_stream, send
 use crate::async_runtime::socket::Socket;
 use crate::core::async_client::DnsMailbox;
 use crate::core::tcp_pool::{dns_frame, TcpConn};
+use crate::core::udp_pool::{UdpConn, UdpPool};
 
 /// A query's connection — the socket object the lifecycle drives, tokio-style.
 /// It **owns its mailbox** (`io`), so `send`/`recv` take no reactor handle:
@@ -32,27 +34,39 @@ use crate::core::tcp_pool::{dns_frame, TcpConn};
 pub(crate) struct Conn {
     io: Rc<RefCell<DnsMailbox>>,
     wire: Wire,
+    /// Set only on a shared-UDP checkout: the pool + server + stay-open policy,
+    /// so dropping the last query on a non-stay-open conn can retire it.
+    udp_lease: Option<UdpLease>,
+}
+
+struct UdpLease {
+    pool: Rc<RefCell<UdpPool>>,
+    server: usize,
+    stayopen: bool,
 }
 
 /// The transport behind a [`Conn`]: an exclusively owned datagram socket, an
-/// exclusively owned one-shot stream, or this query's tag on a shared stream
-/// connection from the [`tcp_pool`](crate::core::tcp_pool).
+/// exclusively owned one-shot stream, this query's tag on a shared stream
+/// connection from the [`tcp_pool`](crate::core::tcp_pool), or this query's tag
+/// on a shared datagram connection from the
+/// [`udp_pool`](crate::core::udp_pool).
 enum Wire {
     Datagram { sock: Rc<dyn Socket> },
     Stream { sock: Rc<dyn Socket>, rbuf: Vec<u8> },
     Shared(Rc<RefCell<TcpConn>>, u16),
+    SharedUdp(Rc<RefCell<UdpConn>>, u16),
 }
 
 impl Conn {
     /// An owned datagram socket, already connected. One recv = one message.
     pub fn datagram(io: Rc<RefCell<DnsMailbox>>, sock: Rc<dyn Socket>) -> Self {
-        Conn { io, wire: Wire::Datagram { sock } }
+        Conn { io, wire: Wire::Datagram { sock }, udp_lease: None }
     }
 
     /// An owned one-shot stream socket, already connected; [`dns_frame`] cuts
     /// its bytes into messages.
     pub fn stream(io: Rc<RefCell<DnsMailbox>>, sock: Rc<dyn Socket>) -> Self {
-        Conn { io, wire: Wire::Stream { sock, rbuf: Vec::new() } }
+        Conn { io, wire: Wire::Stream { sock, rbuf: Vec::new() }, udp_lease: None }
     }
 
     /// A query's handle on a shared stream conn. Reserves an inbox tag on the
@@ -67,18 +81,50 @@ impl Conn {
         reroll: impl FnMut() -> u16,
     ) -> (Self, u16) {
         let tag = conn.borrow_mut().reserve(qid, reroll);
-        (Conn { io, wire: Wire::Shared(conn, tag) }, tag)
+        (Conn { io, wire: Wire::Shared(conn, tag), udp_lease: None }, tag)
+    }
+
+    /// A query's handle on a shared datagram conn. Reserves an inbox tag on the
+    /// `UdpConn` (rerolling `qid` on collision — see [`UdpConn::reserve`]) so a
+    /// sibling future's read routes this query's reply here; the slot is
+    /// released when this handle drops. Returns the handle plus the tag
+    /// actually reserved — on a re-roll the caller must re-stamp its payload.
+    pub fn shared_udp(
+        io: Rc<RefCell<DnsMailbox>>,
+        conn: Rc<RefCell<UdpConn>>,
+        qid: u16,
+        reroll: impl FnMut() -> u16,
+    ) -> (Self, u16) {
+        let tag = conn.borrow_mut().reserve(qid, reroll);
+        (Conn { io, wire: Wire::SharedUdp(conn, tag), udp_lease: None }, tag)
+    }
+
+    /// Attach the pool lease for a shared-UDP checkout (used by the query
+    /// engine so the last query on a non-stay-open conn can retire it).
+    pub fn with_udp_lease(mut self, pool: Rc<RefCell<UdpPool>>, server: usize, stayopen: bool) -> Self {
+        self.udp_lease = Some(UdpLease { pool, server, stayopen });
+        self
+    }
+
+    /// The shared datagram handle behind this conn, if it is a shared-UDP
+    /// checkout (for removing a dead conn from the pool).
+    pub fn shared_udp_handle(&self) -> Option<Rc<RefCell<UdpConn>>> {
+        match &self.wire {
+            Wire::SharedUdp(c, _) => Some(c.clone()),
+            _ => None,
+        }
     }
 
     fn fd(&self) -> i32 {
         match &self.wire {
             Wire::Datagram { sock } | Wire::Stream { sock, .. } => sock.as_raw_fd(),
             Wire::Shared(c, _) => c.borrow().fd(),
+            Wire::SharedUdp(c, _) => c.borrow().fd(),
         }
     }
 
     pub fn is_tcp(&self) -> bool {
-        !matches!(&self.wire, Wire::Datagram { .. })
+        matches!(&self.wire, Wire::Stream { .. } | Wire::Shared(..))
     }
 
     /// Await writability, then send `bytes` once (WouldBlock re-awaits). The
@@ -88,6 +134,7 @@ impl Conn {
         let sock: Rc<dyn Socket> = match &self.wire {
             Wire::Datagram { sock } | Wire::Stream { sock, .. } => sock.clone(),
             Wire::Shared(c, _) => c.borrow().sock(),
+            Wire::SharedUdp(c, _) => c.borrow().sock(),
         };
         send_when_writable(&self.io, &*sock, bytes, timeout).await
     }
@@ -101,6 +148,7 @@ impl Conn {
     fn take_routed_slot(&mut self) -> Option<Vec<u8>> {
         match &self.wire {
             Wire::Shared(c, tag) => c.borrow_mut().take(*tag),
+            Wire::SharedUdp(c, tag) => c.borrow_mut().take(*tag),
             _ => None,
         }
     }
@@ -128,6 +176,7 @@ impl Conn {
             }
             // The shared conn owns the drain+route+demux (per-tag inbox).
             Wire::Shared(c, tag) => c.borrow_mut().poll_read(*tag, &mut scratch),
+            Wire::SharedUdp(c, tag) => c.borrow_mut().poll_read(*tag, &mut scratch),
         };
         self.io.borrow_mut().scratch = scratch; // put back (grown on first use)
         r
@@ -171,9 +220,26 @@ impl Conn {
 /// manual register/clear), so retries, delivery, and abandonment can't leak slots.
 impl Drop for Conn {
     fn drop(&mut self) {
-        if let Wire::Shared(c, tag) = &self.wire {
-            c.borrow_mut().release(*tag);
-        }
+        let retired = match (&self.wire, &self.udp_lease) {
+            (Wire::Shared(c, tag), _) => {
+                c.borrow_mut().release(*tag);
+                Vec::new()
+            }
+            (Wire::SharedUdp(c, tag), Some(lease)) => {
+                c.borrow_mut().release(*tag);
+                let retired =
+                    lease.pool.borrow_mut().release_if_idle(lease.server, c, lease.stayopen);
+                retired
+            }
+            (Wire::SharedUdp(c, tag), None) => {
+                c.borrow_mut().release(*tag);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+        // Drop retired handles only after the pool borrow above has ended, so
+        // any socket close callback fires with no pool cell held.
+        drop(retired);
     }
 }
 

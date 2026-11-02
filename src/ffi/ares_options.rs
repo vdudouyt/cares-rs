@@ -224,6 +224,9 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
             .then(|| unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned()),
         maxtimeout: options.maxtimeout,
         qcache_max_ttl: options.qcache_max_ttl,
+        udp_max_queries: options.udp_max_queries,
+        socket_send_buffer_size: options.socket_send_buffer_size,
+        socket_receive_buffer_size: options.socket_receive_buffer_size,
         failover_retry_chance: options.server_failover_opts.retry_chance,
         failover_retry_delay: options.server_failover_opts.retry_delay as u64,
     };
@@ -235,9 +238,30 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     };
     let mut channeldata = ChannelData::new_unfinalized(resolvconf.as_deref());
     channeldata.state.apply_options(optmask, decoded);
+    install_socket_options(&mut channeldata, optmask, options);
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
+}
+
+/// Apply the socket-related options (state callback + buffer sizes / local
+/// bind settings) after the core option cascade, then install them in a
+/// rebuilt socket factory. Safe body so the unsafe init shim stays thin.
+fn install_socket_options(channeldata: &mut ChannelData, optmask: c_int, options: &ares_options) {
+    if optmask & ARES_OPT_SOCK_STATE_CB != 0 {
+        channeldata.sock_state_cb = options.sock_state_cb;
+        channeldata.sock_state_cb_data = options.sock_state_cb_data;
+    }
+    channeldata.refresh_socket_config();
+}
+
+/// Report the stored socket state callback in ares_save_options.
+fn save_socket_options(channeldata: &ChannelData, out: &mut ares_options, mask: &mut c_int) {
+    if channeldata.state.optmask & ARES_OPT_SOCK_STATE_CB != 0 {
+        out.sock_state_cb = channeldata.sock_state_cb;
+        out.sock_state_cb_data = channeldata.sock_state_cb_data;
+        *mask |= ARES_OPT_SOCK_STATE_CB;
+    }
 }
 
 /// Decode `ARES_OPT_SORTLIST` from the caller's option struct. `Some(empty)`
@@ -304,6 +328,15 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
     out.ndots = saved.ndots;
     out.udp_port = saved.udp_port;
     out.tcp_port = saved.tcp_port;
+    if mask & ARES_OPT_UDP_MAX_QUERIES != 0 {
+        out.udp_max_queries = saved.udp_max_queries;
+    }
+    if mask & ARES_OPT_SOCK_SNDBUF != 0 {
+        out.socket_send_buffer_size = saved.socket_send_buffer_size;
+    }
+    if mask & ARES_OPT_SOCK_RCVBUF != 0 {
+        out.socket_receive_buffer_size = saved.socket_receive_buffer_size;
+    }
 
     // servers / domains transfer through libc::malloc; their mask bits are
     // reported only when the allocation lands (matches the historical shape).
@@ -347,6 +380,7 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
     if let Some(path) = saved.hosts_path {
         out.hosts_path = path.into_raw();
     }
+    save_socket_options(channeldata, out, &mut mask);
 
     unsafe { *optmask = mask };
     ARES_SUCCESS

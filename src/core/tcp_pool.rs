@@ -30,7 +30,7 @@ use crate::async_runtime::socket::Socket;
 /// demux key shared-TCP replies are routed by. `None` for a frame too short to
 /// carry one: it is then handed to any awaiting waiter, which rejects it in
 /// parsing (EBADRESP) — matching `qid_matches`'s acceptance of short buffers.
-fn dns_tag(frame: &[u8]) -> Option<u16> {
+pub(crate) fn dns_tag(frame: &[u8]) -> Option<u16> {
     frame.get(0..2).map(|b| u16::from_be_bytes([b[0], b[1]]))
 }
 

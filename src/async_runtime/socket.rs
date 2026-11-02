@@ -14,6 +14,12 @@ pub trait Socket {
     fn connect(&self, addr: SocketAddr) -> io::Result<()>;
     fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)>;
     fn send(&self, data: &[u8]) -> io::Result<usize>;
+    /// Whether repeated non-blocking `recv` calls are guaranteed to stop with
+    /// `WouldBlock` rather than block. Draining loops (UDP connection sharing)
+    /// must not re-read when a caller-supplied socket may be blocking.
+    fn drain_safe(&self) -> bool {
+        true
+    }
 }
 
 /// Creates fresh non-blocking sockets appropriate for a bind address.

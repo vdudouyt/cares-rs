@@ -1,9 +1,12 @@
-use libc::{close, connect, fcntl, iovec, recvfrom, sockaddr, socket, socklen_t, writev, F_GETFL, F_SETFL, O_NONBLOCK, sockaddr_in, sockaddr_in6, AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM};
+use libc::{bind, close, connect, fcntl, iovec, recvfrom, setsockopt, sockaddr, socket, socklen_t, writev, F_GETFL, F_SETFL, O_NONBLOCK, sockaddr_in, sockaddr_in6, AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use std::cell::Cell;
 use std::ffi::{c_int, c_uint, c_void};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::Rc;
 use std::io;
 use std::io::{Error, ErrorKind};
+use crate::ffi::ares_options::ares_sock_state_cb;
+use crate::ffi::channel::ChannelData;
 use crate::ffi::{ares_sock_config_callback, ares_sock_create_callback};
 use crate::{Channel, ARES_SOCKET_BAD};
 
@@ -49,10 +52,21 @@ pub const ARES_SOCKFUNC_FLAG_NONBLOCKING: c_uint = 1 << 0;
 /// # Safety
 /// `channel` must be a valid channel and `funcs` must be NULL or point to a valid function table.
 #[no_mangle]
-pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *const AresSocketFunctions, user_data: *mut c_void) {
     if funcs.is_null() { return; }
+    let funcs = unsafe { &*funcs };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    let factory = CSocketFactory::with_funcs((unsafe { &*funcs }).clone(), user_data, &channeldata.socket_factory);
+    install_socket_functions(channeldata, funcs, user_data);
+}
+
+/// Safe body of the legacy socket-function install.
+fn install_socket_functions(
+    channeldata: &mut ChannelData,
+    funcs: &AresSocketFunctions,
+    user_data: *mut c_void,
+) {
+    let factory = CSocketFactory::with_funcs(funcs.clone(), user_data, &channeldata.socket_factory);
     channeldata.apply_socket_factory(factory);
 }
 
@@ -81,8 +95,20 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
     if channel.is_null() || funcs.is_null() {
         return crate::ffi::error::ARES_EFORMERR;
     }
-    // SAFETY: the caller guarantees a valid function table.
-    let ex = unsafe { &*funcs };
+    // SAFETY: the caller guarantees valid channel + function-table pointers.
+    let (Some(channeldata), ex) = (unsafe { channel.as_mut() }, unsafe { &*funcs }) else {
+        return crate::ffi::error::ARES_EFORMERR;
+    };
+    install_socket_functions_ex(channeldata, ex, user_data)
+}
+
+/// Safe body of the extended-socket-function install: validate the ABI, then
+/// rebuild the channel's factory with both the legacy and extended callbacks.
+fn install_socket_functions_ex(
+    channeldata: &mut ChannelData,
+    ex: &AresSocketFunctionsEx,
+    user_data: *mut c_void,
+) -> crate::ffi::ares_status_t {
     // Version 1 is the only ABI we implement; every required callback must be
     // present (optional ones are the getname/bind/ifname trio).
     if ex.version != 1
@@ -98,16 +124,17 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
     let basic = AresSocketFunctions {
         asocket: ex.asocket,
         aclose: ex.aclose,
-        aconnect: None, // ex.aconnect has different signature (extra flags param)
+        aconnect: None, // ex.aconnect has a different signature (extra flags)
         arecvfrom: ex.arecvfrom,
-        asendv: None, // ex.asendto has different signature
+        asendv: None, // ex.asendto has a different signature
     };
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else {
-        return crate::ffi::error::ARES_EFORMERR;
+    let exfuncs = ExFuncs {
+        asetsockopt: ex.asetsockopt,
+        aconnect: ex.aconnect,
+        asendto: ex.asendto,
     };
-    let factory = CSocketFactory::with_funcs(basic, user_data, &channeldata.socket_factory);
-    channeldata.socket_factory = factory.clone();
-    channeldata.state.factory = factory;
+    let factory = CSocketFactory::with_ex_funcs(basic, exfuncs, user_data, &channeldata.socket_factory);
+    channeldata.apply_socket_factory(factory);
     crate::ffi::error::ARES_SUCCESS
 }
 
@@ -119,6 +146,42 @@ pub struct AresSocketFunctions {
     pub aconnect: Option<unsafe extern "C" fn(fd: ares_socket_t, *const sockaddr, socklen_t, user_data: *mut c_void) -> c_int>,
     pub arecvfrom: Option<unsafe extern "C" fn(fd: ares_socket_t, *mut c_void, libc::size_t, c_int, *mut sockaddr, *mut socklen_t, user_data: *mut c_void) -> ares_ssize_t>,
     pub asendv: Option<unsafe extern "C" fn(fd: ares_socket_t, *const iovec, c_int, user_data: *mut c_void) -> ares_ssize_t>,
+}
+
+/// The extra callbacks only the extended (`ares_set_socket_functions_ex`)
+/// table carries. Kept out of the C-visible `AresSocketFunctions` so the
+/// legacy struct's ABI does not change.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ExFuncs {
+    pub asetsockopt: Option<unsafe extern "C" fn(ares_socket_t, crate::ffi::ares_socket_opt_t, *const c_void, socklen_t, *mut c_void) -> c_int>,
+    pub aconnect: Option<unsafe extern "C" fn(ares_socket_t, *const sockaddr, socklen_t, c_uint, *mut c_void) -> c_int>,
+    pub asendto: Option<unsafe extern "C" fn(ares_socket_t, *const c_void, libc::size_t, c_int, *const sockaddr, socklen_t, *mut c_void) -> ares_ssize_t>,
+}
+
+/// The per-channel socket settings applied to each freshly created fd.
+#[derive(Clone)]
+pub(crate) struct SocketConfig {
+    pub send_buf: c_int,
+    pub recv_buf: c_int,
+    pub local_ip4: u32,
+    pub local_ip6: [u8; 16],
+    pub local_dev: String,
+    pub sock_state_cb: ares_sock_state_cb,
+    pub sock_state_cb_data: *mut c_void,
+}
+
+impl Default for SocketConfig {
+    fn default() -> Self {
+        SocketConfig {
+            send_buf: 0,
+            recv_buf: 0,
+            local_ip4: 0,
+            local_ip6: [0; 16],
+            local_dev: String::new(),
+            sock_state_cb: None,
+            sock_state_cb_data: std::ptr::null_mut(),
+        }
+    }
 }
 
 unsafe extern "C" fn default_asocket(domain: c_int, socket_type: c_int, protocol: c_int, _user_data: *mut c_void) -> ares_socket_t {
@@ -206,6 +269,28 @@ fn raw_to_socket_addr(storage: &libc::sockaddr_storage, len: socklen_t) -> Optio
     }
 }
 
+/// Map an `ares_socket_opt_t` onto the platform `setsockopt` call.
+fn default_setsockopt(fd: ares_socket_t, opt: c_uint, value: &[u8]) -> c_int {
+    let (level, name) = match opt {
+        ARES_SOCKET_OPT_SENDBUF_SIZE => (SOL_SOCKET, SO_SNDBUF),
+        ARES_SOCKET_OPT_RECVBUF_SIZE => (SOL_SOCKET, SO_RCVBUF),
+        ARES_SOCKET_OPT_BIND_DEVICE => {
+            #[cfg(target_os = "linux")]
+            {
+                (SOL_SOCKET, libc::SO_BINDTODEVICE)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return 0;
+            }
+        }
+        _ => return 0,
+    };
+    let ptr = value.as_ptr() as *const c_void;
+    let len = value.len() as socklen_t;
+    unsafe { setsockopt(fd, level, name, ptr, len) }
+}
+
 /// The channel's socket source: the (user-replaceable) C function table.
 /// Implements the core `SocketFactory` trait, so the engine never sees
 /// the table or the user_data pointer.
@@ -222,6 +307,14 @@ pub struct CSocketFactory {
     create_arg: *mut c_void,
     config_cb: ares_sock_config_callback,
     config_arg: *mut c_void,
+    /// Extended-table callbacks, present only after
+    /// `ares_set_socket_functions_ex`.
+    ex: Option<ExFuncs>,
+    /// True once the caller installed a custom socket table (legacy or ex).
+    custom: bool,
+    /// Socket-option / local-bind / state-callback settings (`ARES_OPT_*` and
+    /// `ares_set_local_*`), copied by every rebuild of the factory.
+    socket: SocketConfig,
 }
 
 impl Default for CSocketFactory {
@@ -233,6 +326,9 @@ impl Default for CSocketFactory {
             create_arg: std::ptr::null_mut(),
             config_cb: None,
             config_arg: std::ptr::null_mut(),
+            ex: None,
+            custom: false,
+            socket: SocketConfig::default(),
         }
     }
 }
@@ -244,7 +340,16 @@ impl Default for CSocketFactory {
 struct CSocket {
     fd: ares_socket_t,
     funcs: AresSocketFunctions,
+    ex: Option<ExFuncs>,
     user_data: *mut c_void,
+    sock_state_cb: ares_sock_state_cb,
+    sock_state_cb_data: *mut c_void,
+    /// Caller-supplied sockets may be blocking (legacy tables are not required
+    /// to install O_NONBLOCK), so the shared-UDP drain must not loop on them.
+    drain_safe: bool,
+    /// Set once the open notification has fired, so a refused/failed creation
+    /// does not emit a spurious close notification.
+    notified_open: Cell<bool>,
 }
 
 impl crate::async_runtime::socket::Socket for CSocket {
@@ -253,9 +358,13 @@ impl crate::async_runtime::socket::Socket for CSocket {
     }
 
     fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        let aconnect = self.funcs.aconnect.unwrap_or(default_aconnect);
         let (sockaddr, len) = socket_addr_to_raw(addr);
-        let result = unsafe { aconnect(self.fd, &sockaddr as *const _ as *const sockaddr, len, self.user_data) };
+        let result = if let Some(aconnect) = self.ex.and_then(|ex| ex.aconnect) {
+            unsafe { aconnect(self.fd, &sockaddr as *const _ as *const sockaddr, len, 0, self.user_data) }
+        } else {
+            let aconnect = self.funcs.aconnect.unwrap_or(default_aconnect);
+            unsafe { aconnect(self.fd, &sockaddr as *const _ as *const sockaddr, len, self.user_data) }
+        };
         if result == -1 {
             let err = Error::last_os_error();
             if err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EINPROGRESS) {
@@ -280,10 +389,22 @@ impl crate::async_runtime::socket::Socket for CSocket {
         Ok((result as usize, sock_addr))
     }
 
+    fn drain_safe(&self) -> bool {
+        self.drain_safe
+    }
+
     fn send(&self, data: &[u8]) -> io::Result<usize> {
-        let asendv = self.funcs.asendv.unwrap_or(default_asendv);
-        let iovecs = [iovec { iov_base: data.as_ptr() as *mut c_void, iov_len: data.len() }];
-        let result = unsafe { asendv(self.fd, iovecs.as_ptr(), 1, self.user_data) };
+        let result = if let Some(asendto) = self.ex.and_then(|ex| ex.asendto) {
+            // The socket is connected; a NULL destination means "use the
+            // connected peer", matching upstream's UDP write path.
+            let ptr = data.as_ptr() as *const c_void;
+            let user = self.user_data;
+            unsafe { asendto(self.fd, ptr, data.len(), 0, std::ptr::null(), 0, user) }
+        } else {
+            let asendv = self.funcs.asendv.unwrap_or(default_asendv);
+            let iovecs = [iovec { iov_base: data.as_ptr() as *mut c_void, iov_len: data.len() }];
+            unsafe { asendv(self.fd, iovecs.as_ptr(), 1, self.user_data) }
+        };
         if result == -1 {
             return Err(Error::last_os_error());
         }
@@ -293,6 +414,11 @@ impl crate::async_runtime::socket::Socket for CSocket {
 
 impl Drop for CSocket {
     fn drop(&mut self) {
+        if self.notified_open.get() {
+            if let Some(cb) = self.sock_state_cb {
+                cb(self.sock_state_cb_data, self.fd, 0, 0);
+            }
+        }
         let aclose = self.funcs.aclose.unwrap_or(default_aclose);
         unsafe { aclose(self.fd, self.user_data) };
     }
@@ -301,7 +427,7 @@ impl Drop for CSocket {
 impl CSocketFactory {
     /// ares_set_socket_functions[_ex]: a new function table, but the
     /// socket-state callbacks are an independent setting — carry them over.
-    pub fn with_funcs(funcs: AresSocketFunctions, user_data: *mut c_void, prev: &CSocketFactory) -> Rc<Self> {
+    pub(crate) fn with_funcs(funcs: AresSocketFunctions, user_data: *mut c_void, prev: &CSocketFactory) -> Rc<Self> {
         Rc::new(Self {
             funcs,
             user_data,
@@ -309,17 +435,79 @@ impl CSocketFactory {
             create_arg: prev.create_arg,
             config_cb: prev.config_cb,
             config_arg: prev.config_arg,
+            ex: None,
+            custom: true,
+            socket: prev.socket.clone(),
+        })
+    }
+
+    /// ares_set_socket_functions_ex: keep the extended callbacks the legacy
+    /// table cannot express (asetsockopt / aconnect / asendto) alongside the
+    /// basic ones.
+    pub(crate) fn with_ex_funcs(
+        funcs: AresSocketFunctions,
+        ex: ExFuncs,
+        user_data: *mut c_void,
+        prev: &CSocketFactory,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            funcs,
+            user_data,
+            create_cb: prev.create_cb,
+            create_arg: prev.create_arg,
+            config_cb: prev.config_cb,
+            config_arg: prev.config_arg,
+            ex: Some(ex),
+            custom: true,
+            socket: prev.socket.clone(),
+        })
+    }
+
+    /// Copy the current socket-option / local-bind / state-callback settings
+    /// into a rebuilt factory (configuration exports mutate a channel's own
+    /// factory copy-on-write; ares_dup keeps its own handle).
+    pub(crate) fn with_config(&self, socket: SocketConfig) -> Rc<Self> {
+        Rc::new(Self {
+            funcs: self.funcs.clone(),
+            user_data: self.user_data,
+            create_cb: self.create_cb,
+            create_arg: self.create_arg,
+            config_cb: self.config_cb,
+            config_arg: self.config_arg,
+            ex: self.ex,
+            custom: self.custom,
+            socket,
         })
     }
 
     /// ares_set_socket_callback: keep everything, set the create callback.
     pub fn with_create_cb(&self, cb: ares_sock_create_callback, arg: *mut c_void) -> Rc<Self> {
-        Rc::new(Self { create_cb: cb, create_arg: arg, funcs: self.funcs.clone(), ..*self })
+        Rc::new(Self {
+            funcs: self.funcs.clone(),
+            user_data: self.user_data,
+            create_cb: cb,
+            create_arg: arg,
+            config_cb: self.config_cb,
+            config_arg: self.config_arg,
+            ex: self.ex,
+            custom: self.custom,
+            socket: self.socket.clone(),
+        })
     }
 
     /// ares_set_socket_configure_callback: keep everything, set the config callback.
     pub fn with_config_cb(&self, cb: ares_sock_config_callback, arg: *mut c_void) -> Rc<Self> {
-        Rc::new(Self { config_cb: cb, config_arg: arg, funcs: self.funcs.clone(), ..*self })
+        Rc::new(Self {
+            funcs: self.funcs.clone(),
+            user_data: self.user_data,
+            create_cb: self.create_cb,
+            create_arg: self.create_arg,
+            config_cb: cb,
+            config_arg: arg,
+            ex: self.ex,
+            custom: self.custom,
+            socket: self.socket.clone(),
+        })
     }
 
     fn create(&self, addr: SocketAddr, socket_type: c_int) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
@@ -329,13 +517,106 @@ impl CSocketFactory {
         if fd == ARES_SOCKET_BAD {
             return Err(Error::last_os_error());
         }
-        let sock = Rc::new(CSocket { fd, funcs: self.funcs.clone(), user_data: self.user_data });
+        let sock = Rc::new(CSocket {
+            fd,
+            funcs: self.funcs.clone(),
+            ex: self.ex,
+            user_data: self.user_data,
+            sock_state_cb: self.socket.sock_state_cb,
+            sock_state_cb_data: self.socket.sock_state_cb_data,
+            drain_safe: !self.custom,
+            notified_open: Cell::new(false),
+        });
+        // Apply buffer/device/local-address settings first, then the
+        // create/configure callbacks. Any failure drops `sock`, closing the fd
+        // (CSocket::drop -> aclose) and surfacing ECONNREFUSED.
+        self.configure(fd, addr.is_ipv4())?;
         // A socket-state callback may refuse the fresh fd; dropping `sock`
-        // closes it (CSocket::drop -> aclose) and the Err becomes ECONNREFUSED.
+        // closes it and the Err becomes ECONNREFUSED.
         if !self.run_sock_callbacks(fd, socket_type == SOCK_STREAM) {
             return Err(Error::from_raw_os_error(libc::ECONNREFUSED));
         }
+        // Approximation of upstream's state machine: report the fd readable
+        // once it is live, and (0,0) when it closes. Write-interest transitions
+        // while a datagram is pending are not modeled by this reactor.
+        if let Some(cb) = self.socket.sock_state_cb {
+            sock.notified_open.set(true);
+            cb(self.socket.sock_state_cb_data, fd, 1, 0);
+        }
         Ok(sock)
+    }
+
+    /// Apply `ARES_OPT_SOCK_SNDBUF`/`RCVBUF`, `SO_BINDTODEVICE`, and the
+    /// configured local source address (the default path only; a custom socket
+    /// table owns its own addressing).
+    fn configure(&self, fd: ares_socket_t, is_ipv4: bool) -> io::Result<()> {
+        if self.socket.send_buf > 0 {
+            self.setsockopt(fd, ARES_SOCKET_OPT_SENDBUF_SIZE, &self.socket.send_buf.to_ne_bytes())?;
+        }
+        if self.socket.recv_buf > 0 {
+            self.setsockopt(fd, ARES_SOCKET_OPT_RECVBUF_SIZE, &self.socket.recv_buf.to_ne_bytes())?;
+        }
+        if !self.socket.local_dev.is_empty() {
+            // Prior c-ares versions silently ignore device-bind failure.
+            let _ = self.setsockopt(
+                fd,
+                ARES_SOCKET_OPT_BIND_DEVICE,
+                self.socket.local_dev.as_bytes(),
+            );
+        }
+        if self.custom {
+            return Ok(());
+        }
+        let local = if is_ipv4 && self.socket.local_ip4 != 0 {
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(self.socket.local_ip4)),
+                0,
+            ))
+        } else if !is_ipv4 && self.socket.local_ip6 != [0; 16] {
+            Some(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(self.socket.local_ip6)),
+                0,
+            ))
+        } else {
+            None
+        };
+        if let Some(addr) = local {
+            let (storage, len) = socket_addr_to_raw(addr);
+            let rv = unsafe { bind(fd, &storage as *const _ as *const sockaddr, len) };
+            if rv != 0 {
+                return Err(Error::from_raw_os_error(libc::ECONNREFUSED));
+            }
+        }
+        Ok(())
+    }
+
+    /// One `setsockopt` through the extended callback when present, else the
+    /// platform default (the legacy table reports ENOSYS, which upstream
+    /// treats as success).
+    fn setsockopt(&self, fd: ares_socket_t, opt: c_uint, value: &[u8]) -> io::Result<()> {
+        let rv = if let Some(ex) = self.ex {
+            match ex.asetsockopt {
+                Some(cb) => {
+                    let ptr = value.as_ptr() as *const c_void;
+                    let len = value.len() as socklen_t;
+                    let user = self.user_data;
+                    unsafe { cb(fd, opt, ptr, len, user) }
+                }
+                None => 0,
+            }
+        } else if self.custom {
+            0
+        } else {
+            default_setsockopt(fd, opt, value)
+        };
+        if rv != 0 {
+            let err = Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOSYS) {
+                return Ok(());
+            }
+            return Err(Error::from_raw_os_error(libc::ECONNREFUSED));
+        }
+        Ok(())
     }
 
     /// Run the create then configure callbacks on a fresh fd; false = refused.

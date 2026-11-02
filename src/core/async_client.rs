@@ -27,6 +27,7 @@ use rand::Rng;
 use crate::core::cache::{CacheKey, QueryCache};
 use crate::core::conn::Conn;
 use crate::core::tcp_pool::{TcpConn, TcpPool};
+use crate::core::udp_pool::{UdpConn, UdpPool};
 use crate::async_runtime::executor::{sleep_until, Mailbox};
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
@@ -47,12 +48,13 @@ use crate::ffi::dns_record::ARES_CLASS_IN;
 use crate::ffi::ares_options::{
     ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
     ARES_FLAG_NOCHECKRESP, ARES_FLAG_NORECURSE, ARES_FLAG_NOSEARCH, ARES_FLAG_PRIMARY,
-    ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_FLAGS,
+    ARES_FLAG_STAYOPEN, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_FLAGS,
     ARES_OPT_HOSTS_FILE, ARES_OPT_LOOKUPS, ARES_OPT_MAXTIMEOUTMS, ARES_OPT_NDOTS,
     ARES_OPT_NOROTATE, ARES_OPT_QUERY_CACHE, ARES_OPT_RESOLVCONF, ARES_OPT_ROTATE,
-    ARES_OPT_SERVERS, ARES_OPT_SERVER_FAILOVER, ARES_OPT_SORTLIST, ARES_OPT_TCP_PORT,
+    ARES_OPT_SERVERS, ARES_OPT_SERVER_FAILOVER, ARES_OPT_SOCK_RCVBUF,
+    ARES_OPT_SOCK_SNDBUF, ARES_OPT_SORTLIST, ARES_OPT_TCP_PORT,
     ARES_OPT_TIMEOUT, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES,
-    ARES_OPT_UDP_PORT,
+    ARES_OPT_UDP_MAX_QUERIES, ARES_OPT_UDP_PORT,
 };
 use crate::ffi::error::{
     ARES_ECONNREFUSED, ARES_EBADFLAGS, ARES_EBADNAME, ARES_EBADQUERY, ARES_EBADSTR, ARES_EFILE,
@@ -83,6 +85,15 @@ pub(crate) struct AsyncClient {
     hosts: Option<Rc<Hosts>>,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
+    /// `ARES_OPT_SOCK_SNDBUF` / `ARES_OPT_SOCK_RCVBUF` (0 = leave the OS
+    /// default), applied to every socket the default factory creates.
+    pub socket_send_buffer_size: i32,
+    pub socket_receive_buffer_size: i32,
+    /// `ares_set_local_ip4` / `_ip6` / `_dev`: the source address/device new
+    /// sockets bind to (empty/zero = unbound/OS-chosen).
+    pub local_ip4: u32,
+    pub local_ip6: [u8; 16],
+    pub local_dev: String,
     /// Shared with the in-flight lookup futures (`Rc<RefCell<_>>`) so
     /// failover accounting and the probe agree across queries.
     pub health: Rc<RefCell<ServerHealth>>,
@@ -100,6 +111,13 @@ pub(crate) struct AsyncClient {
     pub cache: Rc<RefCell<QueryCache>>,
     /// Shared TCP connections (parallel lookups to one server share a socket).
     pub tcp_pool: Rc<RefCell<TcpPool>>,
+    /// Shared UDP connections (parallel lookups to one server share a socket,
+    /// split across several once [`udp_max_queries`](Self::udp_max_queries) is
+    /// reached).
+    pub udp_pool: Rc<RefCell<UdpPool>>,
+    /// `ARES_OPT_UDP_MAX_QUERIES`: max in-flight queries per UDP socket; 0 =
+    /// unlimited (upstream default).
+    pub udp_max_queries: usize,
     /// Per-server connect endpoints, snapshotted from `config` by `derive` so
     /// the lookup futures never re-read the config.
     pub endpoints: Rc<Vec<ServerEndpoint>>,
@@ -124,6 +142,11 @@ impl AsyncClient {
             hosts: Some(hosts),
             default_udp_port: self.default_udp_port,
             default_tcp_port: self.default_tcp_port,
+            socket_send_buffer_size: self.socket_send_buffer_size,
+            socket_receive_buffer_size: self.socket_receive_buffer_size,
+            local_ip4: self.local_ip4,
+            local_ip6: self.local_ip6,
+            local_dev: self.local_dev.clone(),
             health: self.health.clone(),
             sortlist: self.sortlist.clone(),
             flags: self.flags,
@@ -134,6 +157,8 @@ impl AsyncClient {
             hosts_path: self.hosts_path.clone(),
             cache: self.cache.clone(),
             tcp_pool: self.tcp_pool.clone(),
+            udp_pool: self.udp_pool.clone(),
+            udp_max_queries: self.udp_max_queries,
             endpoints: Rc::new(self.endpoint_snapshot()),
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
@@ -214,6 +239,8 @@ impl AsyncClient {
             if conn.send(wire, timeout).await.is_err() {
                 if use_tcp {
                     self.tcp_pool.borrow_mut().remove(server);
+                } else {
+                    self.retire_udp(server, &conn);
                 }
                 if tries + 1 < opts.attempts.max(1) {
                     tries += 1;
@@ -270,6 +297,9 @@ impl AsyncClient {
                         let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                         match verdict {
                             TimeoutVerdict::Retry { server: next } => {
+                                if !use_tcp {
+                                    self.retire_udp(server, &conn);
+                                }
                                 tries += 1;
                                 timeouts += 1;
                                 try_count += 1;
@@ -283,6 +313,8 @@ impl AsyncClient {
                         // Dead socket (EOF / hard error).
                         if use_tcp {
                             self.tcp_pool.borrow_mut().remove(server);
+                        } else {
+                            self.retire_udp(server, &conn);
                         }
                         if io.borrow().app.cancelled.get() {
                             return (Err(ARES_ETIMEOUT), timeouts);
@@ -1828,6 +1860,8 @@ impl AsyncClient {
         }
         if servers_changed {
             self.health.borrow_mut().reset(self.config.nameservers.len());
+            let retired = self.udp_pool.borrow_mut().clear();
+            drop(retired);
         }
         self.cache.borrow_mut().flush();
         Ok(())
@@ -1861,6 +1895,11 @@ impl AsyncClient {
             hosts: None,
             default_udp_port,
             default_tcp_port,
+            socket_send_buffer_size: 0,
+            socket_receive_buffer_size: 0,
+            local_ip4: 0,
+            local_ip6: [0; 16],
+            local_dev: String::new(),
             health: Rc::new(RefCell::new(ServerHealth::default())),
             sortlist: vec![],
             flags: 0,
@@ -1871,6 +1910,8 @@ impl AsyncClient {
             hosts_path: String::new(),
             cache: Rc::new(RefCell::new(QueryCache::default())),
             tcp_pool: Rc::new(RefCell::new(TcpPool::new())),
+            udp_pool: Rc::new(RefCell::new(UdpPool::new())),
+            udp_max_queries: 0,
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
@@ -1912,6 +1953,12 @@ impl AsyncClient {
         dup.sortlist = self.sortlist.clone();
         dup.flags = self.flags;
         dup.maxtimeout = self.maxtimeout;
+        dup.udp_max_queries = self.udp_max_queries;
+        dup.socket_send_buffer_size = self.socket_send_buffer_size;
+        dup.socket_receive_buffer_size = self.socket_receive_buffer_size;
+        dup.local_ip4 = self.local_ip4;
+        dup.local_ip6 = self.local_ip6;
+        dup.local_dev = self.local_dev.clone();
         dup.optmask = self.optmask;
         dup.lookups = self.lookups.clone();
         dup.resolvconf_path = self.resolvconf_path.clone();
@@ -2009,6 +2056,28 @@ impl AsyncClient {
         if optmask & ARES_OPT_QUERY_CACHE != 0 {
             self.cache.borrow_mut().set_max_ttl(o.qcache_max_ttl);
         }
+        if optmask & ARES_OPT_UDP_MAX_QUERIES != 0 {
+            // Upstream drops the bit for a non-positive value (= unlimited).
+            if o.udp_max_queries <= 0 {
+                stored_mask &= !ARES_OPT_UDP_MAX_QUERIES;
+            } else {
+                self.udp_max_queries = o.udp_max_queries as usize;
+            }
+        }
+        if optmask & ARES_OPT_SOCK_SNDBUF != 0 {
+            if o.socket_send_buffer_size <= 0 {
+                stored_mask &= !ARES_OPT_SOCK_SNDBUF;
+            } else {
+                self.socket_send_buffer_size = o.socket_send_buffer_size;
+            }
+        }
+        if optmask & ARES_OPT_SOCK_RCVBUF != 0 {
+            if o.socket_receive_buffer_size <= 0 {
+                stored_mask &= !ARES_OPT_SOCK_RCVBUF;
+            } else {
+                self.socket_receive_buffer_size = o.socket_receive_buffer_size;
+            }
+        }
         if optmask & ARES_OPT_SERVER_FAILOVER != 0 {
             self.server_failover_retry_chance = o.failover_retry_chance;
             self.server_failover_retry_delay = o.failover_retry_delay;
@@ -2071,6 +2140,16 @@ impl AsyncClient {
             base_mask |= ARES_OPT_HOSTS_FILE;
         }
 
+        if self.optmask & ARES_OPT_UDP_MAX_QUERIES != 0 && self.udp_max_queries > 0 {
+            base_mask |= ARES_OPT_UDP_MAX_QUERIES;
+        }
+        if self.optmask & ARES_OPT_SOCK_SNDBUF != 0 && self.socket_send_buffer_size > 0 {
+            base_mask |= ARES_OPT_SOCK_SNDBUF;
+        }
+        if self.optmask & ARES_OPT_SOCK_RCVBUF != 0 && self.socket_receive_buffer_size > 0 {
+            base_mask |= ARES_OPT_SOCK_RCVBUF;
+        }
+
         SavedOptions {
             flags: self.flags,
             timeout: opts.timeout_ms as i32,
@@ -2085,6 +2164,9 @@ impl AsyncClient {
             lookups,
             resolvconf_path,
             hosts_path,
+            udp_max_queries: self.udp_max_queries as i32,
+            socket_send_buffer_size: self.socket_send_buffer_size,
+            socket_receive_buffer_size: self.socket_receive_buffer_size,
             base_mask,
         }
     }
@@ -2099,6 +2181,8 @@ impl AsyncClient {
         }
         self.optmask |= ARES_OPT_SERVERS;
         self.health.borrow_mut().reset(self.config.nameservers.len());
+        let retired = self.udp_pool.borrow_mut().clear();
+        drop(retired);
     }
 
     /// NULL/empty CSV clears every configured server (ares_set_servers*_csv).
@@ -2107,6 +2191,8 @@ impl AsyncClient {
         self.config.tcp_ports.clear();
         self.optmask |= ARES_OPT_SERVERS;
         self.health.borrow_mut().clear();
+        let retired = self.udp_pool.borrow_mut().clear();
+        drop(retired);
     }
 
     /// Install a parsed CSV server list (ares_set_servers_ports_csv). A CSV
@@ -2117,6 +2203,8 @@ impl AsyncClient {
         self.health.borrow_mut().reset(ns.len());
         self.config.nameservers = ns;
         self.optmask |= ARES_OPT_SERVERS;
+        let retired = self.udp_pool.borrow_mut().clear();
+        drop(retired);
     }
 
     /// The configured servers with per-entry defaults applied, in order:
@@ -2211,16 +2299,26 @@ impl AsyncClient {
         }
     }
 
+    /// Remove a dead/timed-out shared UDP conn from the pool so the next
+    /// attempt opens a fresh socket. The `Rc` is dropped after the pool borrow
+    /// ends (its last drop may fire a socket close callback).
+    fn retire_udp(&self, server: usize, conn: &Conn) {
+        let Some(c) = conn.shared_udp_handle() else { return };
+        let retired = self.udp_pool.borrow_mut().remove(server, &c);
+        drop(retired);
+    }
+
     /// Connect-with-failover: create + connect the socket for `start`, retrying
     /// across servers on a creation failure (matches upstream `ares_conn.c`).
     /// Returns the live `Conn` + the server index it landed on, or `Err(())` when
     /// the attempt budget is spent (callers map that to `ARES_ECONNREFUSED`).
-    /// On a shared-TCP checkout the query's transaction id is re-rolled if an
-    /// in-flight sibling on that conn already holds it (≈ upstream
-    /// `generate_unique_qid`), and `payload` is re-stamped with the reserved id
-    /// so framing and `qid_matches` see the wire truth.
+    /// A TCP/UDP checkout shares the server's socket; the query's transaction
+    /// id is re-rolled if an in-flight sibling on that conn already holds it
+    /// (≈ upstream `generate_unique_qid`), and `payload` is re-stamped with the
+    /// reserved id so framing and `qid_matches` see the wire truth.
     fn connect_failover(&self, payload: &mut BytesMut, start: usize, use_tcp: bool) -> Result<(Conn, usize), ()> {
         let opts = self.opts();
+        let stayopen = self.flags & ARES_FLAG_STAYOPEN != 0;
         let mut s = start;
         for _ in 0..opts.attempts.max(1) {
             let Some(ep) = self.endpoints.get(s) else { break };
@@ -2245,9 +2343,33 @@ impl AsyncClient {
                     conn
                 })
             } else {
-                self.factory.create_udp(ep.bind).ok().map(|sk| {
+                // Checkout an existing shared datagram conn (pruning idle ones
+                // when not staying open), or create a fresh socket when every
+                // conn has hit `udp_max_queries`. Creation/connect happen with
+                // the pool unborrowed so C socket callbacks fire cleanly.
+                let (pooled, retired) = {
+                    let mut pool = self.udp_pool.borrow_mut();
+                    pool.pick_or_none(s, self.udp_max_queries, stayopen)
+                };
+                drop(retired);
+                let checked_out = pooled.or_else(|| {
+                    let sk = self.factory.create_udp(ep.bind).ok()?;
                     let _ = sk.connect(ep.udp_addr);
-                    Conn::datagram(self.io.clone(), sk)
+                    let c = UdpConn::new(sk);
+                    self.udp_pool.borrow_mut().insert(s, c.clone());
+                    Some(c)
+                });
+                checked_out.map(|c| {
+                    let (conn, tag) = Conn::shared_udp(
+                        self.io.clone(),
+                        c,
+                        qid_of(payload),
+                        || rand::thread_rng().r#gen(),
+                    );
+                    if payload.len() >= 2 {
+                        payload[0..2].copy_from_slice(&tag.to_be_bytes());
+                    }
+                    conn.with_udp_lease(self.udp_pool.clone(), s, stayopen)
                 })
             };
             if let Some(conn) = conn {
@@ -2383,6 +2505,9 @@ pub(crate) struct DecodedOptions {
     pub hosts_path: Option<String>,
     pub maxtimeout: i32,
     pub qcache_max_ttl: u32,
+    pub udp_max_queries: i32,
+    pub socket_send_buffer_size: i32,
+    pub socket_receive_buffer_size: i32,
     pub failover_retry_chance: u16,
     pub failover_retry_delay: u64,
 }
@@ -2404,6 +2529,9 @@ pub(crate) struct SavedOptions {
     pub lookups: Option<CString>,
     pub resolvconf_path: Option<CString>,
     pub hosts_path: Option<CString>,
+    pub udp_max_queries: i32,
+    pub socket_send_buffer_size: i32,
+    pub socket_receive_buffer_size: i32,
     pub base_mask: i32,
 }
 

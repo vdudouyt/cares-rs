@@ -5,7 +5,8 @@ use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
 use crate::core::async_client::{DnsMailbox, DnsSignals, Effect};
 use crate::async_runtime::executor::Executor;
-use crate::ffi::ares_options::ARES_OPT_SORTLIST;
+use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
+use crate::ffi::ares_socket::SocketConfig;
 
 
 /// The C-visible channel: the pure core state plus the channel-level C
@@ -25,6 +26,10 @@ pub struct ChannelData {
     /// for API parity and are copied by ares_dup.
     pub(crate) pending_write_cb: ares_pending_write_cb,
     pub(crate) pending_write_arg: *mut libc::c_void,
+    /// ARES_OPT_SOCK_STATE_CB (stored here for ares_save_options; also copied
+    /// into the socket factory that fires it).
+    pub(crate) sock_state_cb: ares_sock_state_cb,
+    pub(crate) sock_state_cb_data: *mut libc::c_void,
     /// The in-flight resolver ops — the executor's task set (each future owns
     /// its socket(s)).
     executor: Executor<DnsSignals>,
@@ -40,6 +45,8 @@ impl ChannelData {
             server_state_callback_arg: std::ptr::null_mut(),
             pending_write_cb: None,
             pending_write_arg: std::ptr::null_mut(),
+            sock_state_cb: None,
+            sock_state_cb_data: std::ptr::null_mut(),
             executor: Executor::default(),
         }
     }
@@ -53,8 +60,26 @@ impl ChannelData {
             server_state_callback_arg: self.server_state_callback_arg,
             pending_write_cb: self.pending_write_cb,
             pending_write_arg: self.pending_write_arg,
+            sock_state_cb: self.sock_state_cb,
+            sock_state_cb_data: self.sock_state_cb_data,
             executor: Executor::default(),
         }
+    }
+
+    /// Push the channel's socket settings (buffers, local bind, state
+    /// callback) into a rebuilt factory. Called after option/local setters.
+    pub(crate) fn refresh_socket_config(&mut self) {
+        let socket = SocketConfig {
+            send_buf: self.state.socket_send_buffer_size,
+            recv_buf: self.state.socket_receive_buffer_size,
+            local_ip4: self.state.local_ip4,
+            local_ip6: self.state.local_ip6,
+            local_dev: self.state.local_dev.clone(),
+            sock_state_cb: self.sock_state_cb,
+            sock_state_cb_data: self.sock_state_cb_data,
+        };
+        let factory = self.socket_factory.with_config(socket);
+        self.apply_socket_factory(factory);
     }
 
     /// A fresh channel with the default (libc) socket factory, before the
@@ -147,8 +172,10 @@ impl ChannelData {
         for id in self.executor.ids() {
             self.executor.deliver(id, Some(status));
         }
-        // Drop any shared TCP connections the aborted futures held.
+        // Drop any shared TCP/UDP connections the aborted futures held.
         self.state.tcp_pool.borrow_mut().clear();
+        let retired = self.state.udp_pool.borrow_mut().clear();
+        drop(retired);
     }
 
     /// Every (fd, wants_write) the caller should select on.
@@ -419,18 +446,48 @@ pub unsafe extern "C" fn ares_getsock(channel: *const ChannelData, socks: *mut a
 }
 
 #[no_mangle]
-pub extern "C" fn ares_set_local_ip4(_channel: Channel, _local_ip: u32) {
-    if _channel.is_null() {}
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_set_local_ip4(channel: Channel, local_ip: u32) {
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    set_local_ip4_state(channeldata, local_ip);
 }
 
 #[no_mangle]
-pub extern "C" fn ares_set_local_ip6(_channel: Channel, _local_ip6: *const u8) {
-    if _channel.is_null() {}
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_set_local_ip6(channel: Channel, local_ip6: *const u8) {
+    if local_ip6.is_null() {
+        return;
+    }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let bytes = unsafe { std::slice::from_raw_parts(local_ip6, 16) };
+    set_local_ip6_state(channeldata, bytes);
 }
 
 #[no_mangle]
-pub extern "C" fn ares_set_local_dev(_channel: Channel, _local_dev_name: *const c_char) {
-    if _channel.is_null() {}
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ares_set_local_dev(channel: Channel, local_dev_name: *const c_char) {
+    if local_dev_name.is_null() {
+        return;
+    }
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
+    let Some(name) = (unsafe { cstr_opt(local_dev_name) }) else { return; };
+    set_local_dev_state(channeldata, name);
+}
+
+fn set_local_ip4_state(channeldata: &mut ChannelData, local_ip: u32) {
+    channeldata.state.local_ip4 = local_ip;
+    channeldata.refresh_socket_config();
+}
+
+fn set_local_ip6_state(channeldata: &mut ChannelData, bytes: &[u8]) {
+    channeldata.state.local_ip6.copy_from_slice(bytes);
+    channeldata.refresh_socket_config();
+}
+
+fn set_local_dev_state(channeldata: &mut ChannelData, name: &str) {
+    // Upstream's local_dev_name buffer is 32 bytes including the NUL.
+    channeldata.state.local_dev = name.chars().take(31).collect();
+    channeldata.refresh_socket_config();
 }
 
 #[no_mangle]
