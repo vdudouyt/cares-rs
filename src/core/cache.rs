@@ -26,6 +26,11 @@ impl QueryCache {
         self.max_ttl > 0
     }
 
+    /// Drop every cached reply (ares_reinit flushes the query cache).
+    pub fn flush(&mut self) {
+        self.map.clear();
+    }
+
     /// Read a cached reply for `(name, qtype)`, evicting an expired entry.
     /// `None` when the cache is disabled, missing the key, or the entry expired.
     pub fn get(&mut self, name: &str, qtype: u16, now: Instant) -> Option<Vec<u8>> {

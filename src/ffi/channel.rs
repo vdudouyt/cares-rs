@@ -56,11 +56,21 @@ impl ChannelData {
         }
     }
 
-    /// A fresh channel with the default (libc) socket factory.
-    pub(crate) fn new_default() -> Self {
+    /// A fresh channel with the default (libc) socket factory, before the
+    /// no-nameserver fallback is applied (ares_init_options applies options
+    /// first so ARES_FLAG_NO_DFLT_SVR and explicit servers win). `resolvconf`
+    /// is the caller's ARES_OPT_RESOLVCONF path, if any.
+    pub(crate) fn new_unfinalized(resolvconf: Option<&str>) -> Self {
         let factory = std::rc::Rc::new(CSocketFactory::default());
-        let state = AsyncClient::from_sysconfig(factory.clone());
+        let state = AsyncClient::from_sysconfig_path(factory.clone(), resolvconf);
         ChannelData::new(state, factory)
+    }
+
+    /// A fresh, fully initialized channel with the default (libc) socket factory.
+    pub(crate) fn new_default() -> Self {
+        let mut channel = ChannelData::new_unfinalized(None);
+        channel.state.apply_defaults();
+        channel
     }
 
     /// Install a rebuilt socket factory, keeping the concrete handle and the
@@ -487,11 +497,20 @@ pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_c
 }
 
 #[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn ares_reinit(channel: Channel) -> c_int {
-    if channel.is_null() { return ARES_ENODATA; }
-    // Re-read sysconfig but preserve explicitly configured servers
-    // For now, this is a no-op to avoid overwriting mock/test nameservers
-    ARES_SUCCESS
+    if channel.is_null() {
+        return ARES_EFORMERR;
+    }
+    // SAFETY: the caller guarantees a live channel handle.
+    let Some(channeldata) = (unsafe { channel.as_mut() }) else {
+        return ARES_EFORMERR;
+    };
+    match channeldata.state.reinit() {
+        Ok(()) => ARES_SUCCESS,
+        Err(e) => e.code(),
+    }
 }
 
 #[no_mangle]

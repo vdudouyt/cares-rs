@@ -7,6 +7,8 @@ use std::ffi::CString;
 
 use crate::core::packets::{DnsAnswer, DnsHeader, DnsLabel, DnsQuery, RRParser, SliceBuf};
 use crate::core::AresError;
+use crate::core::dns_record::{class_isvalid, rec_type_isvalid};
+use crate::ffi::dns_record::ARES_REC_TYPE_OPT;
 use crate::ffi::error::{
     ARES_EBADRESP, ARES_EFORMERR, ARES_ENODATA, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED,
     ARES_ESERVFAIL,
@@ -92,6 +94,20 @@ impl<'a> ParsedResponse<'a> {
         // Only parse answer section (ancount); authority and additional sections are skipped
         for _ in 0..answer_count {
             let answer = DnsAnswer::parse(&mut sbuf).ok_or(ARES_EBADRESP)?;
+            // Mirror ares_dns_parse's class validation: unknown/raw types skip
+            // it, OPT is stored with class IN, and anything else must be a
+            // valid class (ANY only for SIG). This is the same check the
+            // ares_dns_record path applies, now enforced for the legacy parsers.
+            if rec_type_isvalid(answer.record_type as u32, false)
+                && answer.record_type != ARES_REC_TYPE_OPT
+                && !class_isvalid(
+                    answer.class,
+                    answer.record_type as u32,
+                    false,
+                )
+            {
+                return Err(ARES_EFORMERR.into());
+            }
             answers.push(answer);
         }
         if answers.is_empty() {
@@ -219,8 +235,49 @@ pub(crate) fn empty_chain_status(success: usize) -> AresError {
     if success > 0 { crate::ffi::error::ARES_SUCCESS.into() } else { ARES_EBADRESP.into() }
 }
 
+
 /// ares_parse_soa_reply reports a missing SOA as EBADRESP where the generic
 /// machinery says ENODATA.
 pub fn soa_status(status: AresError) -> AresError {
     if status.code() == ARES_ENODATA { ARES_EBADRESP.into() } else { status }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal one-question/one-A-answer reply with a caller-chosen RR class.
+    fn a_reply(class: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0, 1]); // id
+        buf.extend_from_slice(&[0x80, 0]); // response
+        buf.extend_from_slice(&[0, 1]); // qdcount
+        buf.extend_from_slice(&[0, 1]); // ancount
+        buf.extend_from_slice(&[0, 0, 0, 0]); // nscount, arcount
+        buf.extend_from_slice(&[1, b'a', 0]); // question name
+        buf.extend_from_slice(&[0, 1]); // qtype A
+        buf.extend_from_slice(&[0, 1]); // qclass IN
+        buf.extend_from_slice(&[0xc0, 0x0c]); // answer name ptr
+        buf.extend_from_slice(&[0, 1]); // type A
+        buf.extend_from_slice(&class.to_be_bytes());
+        buf.extend_from_slice(&[0, 0, 0, 0]); // ttl
+        buf.extend_from_slice(&[0, 4, 1, 2, 3, 4]); // rdlength + rdata
+        buf
+    }
+
+    #[test]
+    fn valid_rr_classes_are_accepted() {
+        for class in [1u16, 3, 4, 254] {
+            let buf = a_reply(class);
+            assert!(ParsedResponse::from_buf(&buf).is_ok(), "class {class}");
+        }
+    }
+
+    #[test]
+    fn invalid_rr_class_is_formerr() {
+        let buf = a_reply(2);
+        let err = ParsedResponse::from_buf(&buf).unwrap_err();
+        assert_eq!(err.code(), ARES_EFORMERR);
+    }
+}
+

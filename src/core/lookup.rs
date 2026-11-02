@@ -84,11 +84,12 @@ pub struct SearchPlan {
 }
 
 impl SearchPlan {
-    /// ares_search / ares_search_dnsrec style plan: a trailing dot suppresses
-    /// search entirely; at or above `ndots` the bare name is tried first with
-    /// the search domains as fallback; below `ndots` the first search domain
-    /// is appended up front and the bare name becomes the last resort.
-    pub fn for_search(name_str: &str, ndots: u32, search: &[String]) -> Self {
+    /// ares_search / ares_search_dnsrec style plan: a trailing dot (or
+    /// `no_search`, the channel's ARES_FLAG_NOSEARCH) suppresses search
+    /// entirely; at or above `ndots` the bare name is tried first with the
+    /// search domains as fallback; below `ndots` the first search domain is
+    /// appended up front and the bare name becomes the last resort.
+    pub fn for_search(name_str: &str, ndots: u32, search: &[String], no_search: bool) -> Self {
         let has_trailing_dot = name_str.ends_with('.');
         let name_clean = name_str.strip_suffix('.').unwrap_or(name_str);
         let dot_count = name_clean.chars().filter(|&c| c == '.').count() as u32;
@@ -96,7 +97,7 @@ impl SearchPlan {
         let mut domains: Vec<String> = Vec::new();
         let mut current = name_clean.to_string();
 
-        if !has_trailing_dot && !search.is_empty() {
+        if !has_trailing_dot && !no_search && !search.is_empty() {
             if dot_count >= ndots {
                 // High dots: try bare name first, then search domains as fallback
                 domains = search.to_vec();
@@ -168,6 +169,15 @@ pub enum TaskVerdict {
     Deliver,
 }
 
+/// The channel flags that change datagram handling (snapshotted per query).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplyPolicy {
+    /// ARES_FLAG_IGNTC: accept a truncated UDP reply instead of retrying TCP.
+    pub ignore_tc: bool,
+    /// ARES_FLAG_NOCHECKRESP: deliver SERVFAIL/NOTIMP/REFUSED responses.
+    pub no_check_resp: bool,
+}
+
 /// The process-level decisions for one received datagram, in the historical
 /// order: rcode-based failover, server-health bookkeeping + notifications,
 /// then the TC check. A failover retry preempts the TC check; everything else
@@ -180,10 +190,15 @@ pub fn on_datagram(
     is_tcp: bool,
     attempts: u32,
     tries: u32,
+    policy: ReplyPolicy,
     health: &mut ServerHealth,
 ) -> (Vec<ReactorAction>, TaskVerdict) {
     let mut actions = Vec::new();
-    let is_server_error = matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
+    // ARES_FLAG_NOCHECKRESP: pass server-error rcodes through to the caller
+    // instead of treating them as failover errors (upstream still marks the
+    // server good and delivers).
+    let is_server_error =
+        !policy.no_check_resp && matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
     let nservers = health.len();
 
     if is_server_error {
@@ -199,7 +214,9 @@ pub fn on_datagram(
         health.record_success(server);
     }
 
-    if summary.truncated && !is_tcp {
+    // ARES_FLAG_IGNTC: accept a truncated UDP reply as-is instead of retrying
+    // the query over TCP.
+    if summary.truncated && !is_tcp && !policy.ignore_tc {
         return (actions, TaskVerdict::RetryTcp);
     }
     (actions, TaskVerdict::Deliver)
@@ -375,7 +392,7 @@ mod tests {
     #[test]
     fn search_plan_low_dots_appends_first_domain() {
         let search = vec!["a.com".to_string(), "b.com".to_string()];
-        let mut p = SearchPlan::for_search("www", 1, &search);
+        let mut p = SearchPlan::for_search("www", 1, &search, false);
         assert_eq!(p.current, "www.a.com");
         assert_eq!(p.advance(), Some("www.b.com".to_string()));
         assert_eq!(p.advance(), Some("www".to_string())); // bare-name fallback
@@ -385,7 +402,7 @@ mod tests {
     #[test]
     fn search_plan_high_dots_tries_bare_first() {
         let search = vec!["a.com".to_string()];
-        let mut p = SearchPlan::for_search("x.y", 1, &search);
+        let mut p = SearchPlan::for_search("x.y", 1, &search, false);
         assert_eq!(p.current, "x.y");
         assert_eq!(p.advance(), Some("x.y.a.com".to_string()));
         // current != base ("x.y.a.com" vs "x.y") -> bare fallback fires once
@@ -396,8 +413,16 @@ mod tests {
     #[test]
     fn search_plan_trailing_dot_suppresses_search() {
         let search = vec!["a.com".to_string()];
-        let mut p = SearchPlan::for_search("www.example.", 1, &search);
+        let mut p = SearchPlan::for_search("www.example.", 1, &search, false);
         assert_eq!(p.current, "www.example");
+        assert_eq!(p.advance(), None);
+    }
+
+    #[test]
+    fn search_plan_no_search_uses_name_as_is() {
+        let search = vec!["a.com".to_string()];
+        let mut p = SearchPlan::for_search("www", 1, &search, true);
+        assert_eq!(p.current, "www");
         assert_eq!(p.advance(), None);
     }
 
@@ -450,7 +475,7 @@ mod tests {
         let mut h = ServerHealth::default();
         h.reset(2);
         h.record_failure(0);
-        let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), 0, false, 2, 0, &mut h);
+        let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), 0, false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
         assert_eq!(a, vec![notify_ok(0)]);
         assert_eq!(h.failures[0], 0, "success resets failures");
@@ -458,7 +483,7 @@ mod tests {
         // SERVFAIL, 2 servers: fail over to the next server, notify fail.
         let mut h = ServerHealth::default();
         h.reset(2);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 0, &mut h);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::RetryNextServer { server: 1, tries: 1 });
         assert_eq!(a, vec![notify_fail(0)]);
         assert_eq!(h.failures[0], 1);
@@ -467,7 +492,7 @@ mod tests {
         // server), failure recorded, still notified.
         let mut h = ServerHealth::default();
         h.reset(1);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 0, &mut h);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::RetryNextServer { server: 0, tries: 1 });
         assert_eq!(a, vec![notify_fail(0)]);
         assert_eq!(h.failures[0], 1);
@@ -475,17 +500,58 @@ mod tests {
         // budget exhausted: tries+1 >= nservers*attempts falls through to Deliver
         let mut h = ServerHealth::default();
         h.reset(2);
-        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 3, &mut h);
+        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 3, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
 
         // TC flag on UDP: RetryTcp; already-TCP never TC-retries.
         let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
         let mut h = ServerHealth::default();
         h.reset(1);
-        let (_, v) = on_datagram(&summarize(&tc, 0), 0, false, 2, 0, &mut h);
+        let (_, v) = on_datagram(&summarize(&tc, 0), 0, false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::RetryTcp);
-        let (_, v) = on_datagram(&summarize(&tc, 0), 0, true, 2, 0, &mut h);
+        let (_, v) = on_datagram(&summarize(&tc, 0), 0, true, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
+    }
+
+    #[test]
+    fn on_datagram_honors_igntc_and_nocheckresp() {
+        let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
+
+        // IGNTC: deliver the truncated UDP reply instead of retrying over TCP.
+        let mut h = ServerHealth::default();
+        h.reset(1);
+        let (_, v) = on_datagram(
+            &summarize(&tc, 0),
+            0,
+            false,
+            2,
+            0,
+            ReplyPolicy { ignore_tc: true, no_check_resp: false },
+            &mut h,
+        );
+        assert_eq!(v, TaskVerdict::Deliver);
+
+        // NOCHECKRESP: deliver SERVFAIL/NOTIMP/REFUSED, notifying success
+        // (upstream's pass-through path marks the server good).
+        for rcode in [2u8, 4, 5] {
+            let mut h = ServerHealth::default();
+            h.reset(2);
+            let (a, v) = on_datagram(
+                &summarize(&reply(rcode, 0), 0),
+                0,
+                false,
+                2,
+                0,
+                ReplyPolicy { ignore_tc: false, no_check_resp: true },
+                &mut h,
+            );
+            assert_eq!(v, TaskVerdict::Deliver);
+            assert_eq!(
+                a,
+                vec![ReactorAction::NotifyServerState { server: 0, ok: true, tcp: false }]
+            );
+            assert_eq!(h.failures[0], 0);
+        }
     }
 
     #[test]

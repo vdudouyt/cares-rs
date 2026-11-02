@@ -32,9 +32,10 @@ use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
     is_localhost, is_onion_domain, on_datagram, on_timeout, qid_matches,
-    summarize, ReactorAction, SearchPlan, ServerHealth, TaskVerdict, TimeoutVerdict, AF_INET,
-    AF_INET6, RTYPE_A, RTYPE_AAAA,
+    summarize, ReactorAction, ReplyPolicy, SearchPlan, ServerHealth, TaskVerdict,
+    TimeoutVerdict, AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
 };
+use crate::core::dns_record::{parse_record, write_record, ares_dns_record_t};
 use crate::core::packets::AddrRecord;
 use crate::core::response::{addr_reply, push_synthetic_ptr, ParsedRRs, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
@@ -42,8 +43,11 @@ use crate::async_runtime::socket::SocketFactory;
 use crate::core::sortlist::{apply_sortlist, SortlistEntry};
 use crate::core::sysconfig::SysConfig;
 use crate::core::AresError;
+use crate::ffi::dns_record::ARES_CLASS_IN;
 use crate::ffi::ares_options::{
-    ARES_FLAG_EDNS, ARES_FLAG_PRIMARY, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_FLAGS,
+    ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
+    ARES_FLAG_NOCHECKRESP, ARES_FLAG_NORECURSE, ARES_FLAG_NOSEARCH, ARES_FLAG_PRIMARY,
+    ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_FLAGS,
     ARES_OPT_HOSTS_FILE, ARES_OPT_LOOKUPS, ARES_OPT_MAXTIMEOUTMS, ARES_OPT_NDOTS,
     ARES_OPT_NOROTATE, ARES_OPT_QUERY_CACHE, ARES_OPT_RESOLVCONF, ARES_OPT_ROTATE,
     ARES_OPT_SERVERS, ARES_OPT_SERVER_FAILOVER, ARES_OPT_SORTLIST, ARES_OPT_TCP_PORT,
@@ -85,6 +89,9 @@ pub(crate) struct AsyncClient {
     pub sortlist: Vec<SortlistEntry>,
     pub flags: i32,
     pub maxtimeout: i32,
+    /// The option mask the channel was initialized with. `ares_reinit` uses it
+    /// to preserve values the caller set explicitly (upstream `channel->optmask`).
+    pub optmask: i32,
     pub lookups: String,
     pub resolvconf_path: String,
     pub hosts_path: String,
@@ -121,6 +128,7 @@ impl AsyncClient {
             sortlist: self.sortlist.clone(),
             flags: self.flags,
             maxtimeout: self.maxtimeout,
+            optmask: self.optmask,
             lookups: self.lookups.clone(),
             resolvconf_path: self.resolvconf_path.clone(),
             hosts_path: self.hosts_path.clone(),
@@ -157,6 +165,10 @@ impl AsyncClient {
         let mut timeouts: c_int = 0;
         let mut tries: u32 = 0;
         let mut failover_tries: u32 = 0;
+        // Upstream's query->try_count: incremented for every retry (timeout,
+        // server-error failover, or send failure); the timeout backoff below is
+        // a function of how many full server rounds it represents.
+        let mut try_count: u32 = 0;
         let mut server = self.health.borrow().pick_next();
         'attempt: loop {
             let (mut conn, si) = match self.connect_failover(&mut payload, server, use_tcp) {
@@ -166,13 +178,20 @@ impl AsyncClient {
             server = si;
             let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
             let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
-            let timeout = Instant::now() + opts.timeout;
+            let timeout = Instant::now()
+                + calc_query_timeout(
+                    opts.timeout,
+                    try_count,
+                    self.endpoints.len(),
+                    opts.maxtimeout,
+                );
             if conn.send(wire, timeout).await.is_err() {
                 if use_tcp {
                     self.tcp_pool.borrow_mut().remove(server);
                 }
                 if tries + 1 < opts.attempts.max(1) {
                     tries += 1;
+                    try_count += 1;
                     if self.health.borrow().len() > 1 {
                         self.health.borrow_mut().record_failure(server);
                         server = self.health.borrow().pick_next();
@@ -194,6 +213,10 @@ impl AsyncClient {
                             use_tcp,
                             opts.attempts,
                             failover_tries,
+                            ReplyPolicy {
+                                ignore_tc: opts.ignore_tc,
+                                no_check_resp: opts.no_check_resp,
+                            },
                             &mut self.health.borrow_mut(),
                         );
                         notify(&io, actions);
@@ -201,6 +224,7 @@ impl AsyncClient {
                             TaskVerdict::RetryNextServer { server: next, tries: ft } => {
                                 server = next;
                                 failover_tries = ft;
+                                try_count += 1;
                                 continue 'attempt;
                             }
                             TaskVerdict::RetryTcp => {
@@ -222,6 +246,7 @@ impl AsyncClient {
                             TimeoutVerdict::Retry { server: next } => {
                                 tries += 1;
                                 timeouts += 1;
+                                try_count += 1;
                                 server = next;
                                 continue 'attempt;
                             }
@@ -242,6 +267,7 @@ impl AsyncClient {
                             TimeoutVerdict::Retry { server: next } => {
                                 tries += 1;
                                 timeouts += 1;
+                                try_count += 1;
                                 server = next;
                                 continue 'attempt;
                             }
@@ -253,10 +279,12 @@ impl AsyncClient {
         }
     }
 
-    /// ares_query / ares_send: the raw single query (UDP-start, no probe/USEVC),
-    /// wrapping [`request`](Self::request) into the ffi's `Delivery::Raw`.
+    /// ares_query / ares_send: the raw single query, wrapping
+    /// [`request`](Self::request) into the ffi's `Delivery::Raw`. The starting
+    /// transport honors ARES_FLAG_USEVC (surfaced as `config.options.use_vc`).
     pub(crate) async fn query_raw(self: Rc<Self>, payload: BytesMut) -> Delivery {
-        let (result, timeouts) = self.request(payload, false).await;
+        let use_vc = self.config.options.use_vc;
+        let (result, timeouts) = self.request(payload, use_vc).await;
         Delivery::Raw { result, timeouts }
     }
 
@@ -371,9 +399,14 @@ impl AsyncClient {
         }
 
         // HOSTALIASES (single-label names): resolve via env-pointed file.
-        let resolved = match resolve_hostaliases(&hostname) {
-            Ok(name) => name,
-            Err(status) => return Err(status.into()),
+        // ARES_FLAG_NOALIASES disables the lookup entirely.
+        let resolved = if self.flags & ARES_FLAG_NOALIASES != 0 {
+            hostname.clone()
+        } else {
+            match resolve_hostaliases(&hostname) {
+                Ok(name) => name,
+                Err(status) => return Err(status.into()),
+            }
         };
 
         if self.endpoints.is_empty() {
@@ -402,7 +435,8 @@ impl AsyncClient {
         // so the query / cache-store / cache-probe keys all match): below ndots with a
         // search list, each `name.domain` then the bare name; otherwise just the name.
         let dots = resolved.chars().filter(|&c| c == '.').count() as u32;
-        let names: Vec<String> = if dots < self.config.options.ndots && !self.config.search.is_empty() {
+        let no_search = self.flags & ARES_FLAG_NOSEARCH != 0;
+        let names: Vec<String> = if !no_search && dots < self.config.options.ndots && !self.config.search.is_empty() {
             let mut v: Vec<String> = self.config.search.iter().map(|d| format!("{resolved}.{d}")).collect();
             v.push(resolved.clone());
             v
@@ -465,8 +499,14 @@ impl AsyncClient {
         }
 
         // ===== DNS phase: single PTR query =====
-        let payload = dns_query_payload(&rdns_name(ip), RECORD_TYPE_PTR);
-        let (result, io_timeouts) = self.clone().request(payload, false).await;
+        let payload = dns_query_payload(
+            &rdns_name(ip),
+            RECORD_TYPE_PTR,
+            ARES_CLASS_IN,
+            self.recursion_desired(),
+        );
+        let use_vc = self.config.options.use_vc;
+        let (result, io_timeouts) = self.clone().request(payload, use_vc).await;
 
         match result {
             Ok(buf) => {
@@ -524,8 +564,14 @@ impl AsyncClient {
         }
 
         // ===== DNS phase: single PTR query =====
-        let payload = dns_query_payload(&rdns_name(addr.ip), RECORD_TYPE_PTR);
-        let (result, io_timeouts) = self.clone().request(payload, false).await;
+        let payload = dns_query_payload(
+            &rdns_name(addr.ip),
+            RECORD_TYPE_PTR,
+            ARES_CLASS_IN,
+            self.recursion_desired(),
+        );
+        let use_vc = self.config.options.use_vc;
+        let (result, io_timeouts) = self.clone().request(payload, use_vc).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -537,29 +583,75 @@ impl AsyncClient {
         reply
     }
 
-    /// ares_search / ares_search_dnsrec: iterate the search plan, retrying on
-    /// NXDOMAIN/NODATA/timeout (and, for the dnsrec flavor with
-    /// `retry_server_error`, also on SERVFAIL/REFUSED/NOTIMP). The rcode→status
-    /// mapping mirrors the old search state machine step.
+    /// ares_search (legacy): iterate the search plan with raw, freshly built
+    /// query payloads carrying the caller's class/type.
     pub(crate) async fn search(
         self: Rc<Self>,
         name: String,
+        dnsclass: u16,
         dnstype: u16,
         retry_server_error: bool,
     ) -> Delivery {
+        let rd = self.recursion_desired();
+        self.search_plan(
+            name,
+            move |candidate| Ok(dns_query_payload(candidate, dnstype, dnsclass, rd)),
+            retry_server_error,
+        )
+        .await
+    }
+
+    /// ares_search_dnsrec: iterate the search plan over a duplicate of the
+    /// caller's record, preserving its class, flags and every RR section
+    /// (including an OPT additional record) and only replacing query[0]'s name.
+    pub(crate) async fn search_dnsrec(
+        self: Rc<Self>,
+        template: ares_dns_record_t,
+        retry_server_error: bool,
+    ) -> Delivery {
+        let name = match template.query_at(0) {
+            Some((name, _, _)) => name.to_string_lossy().into_owned(),
+            None => return Delivery::Raw { result: Err(ARES_EBADQUERY), timeouts: 0 },
+        };
+        self.search_plan(
+            name,
+            move |candidate| payload_from_template(&template, candidate),
+            retry_server_error,
+        )
+        .await
+    }
+
+    /// Shared search-domain driver: build a payload for each candidate name,
+    /// retrying on NXDOMAIN/NODATA/timeout (and, for the dnsrec flavor with
+    /// `retry_server_error`, also on SERVFAIL/REFUSED/NOTIMP). The rcode→status
+    /// mapping mirrors the old search state machine step.
+    async fn search_plan<F>(
+        self: Rc<Self>,
+        name: String,
+        make_payload: F,
+        retry_server_error: bool,
+    ) -> Delivery
+    where
+        F: Fn(&str) -> Result<BytesMut, AresError>,
+    {
         if self.endpoints.is_empty() {
             return Delivery::Raw { result: Err(ARES_ENOSERVER), timeouts: 0 };
         }
 
-        let mut plan = SearchPlan::for_search(&name, self.config.options.ndots, &self.config.search);
+        let no_search = self.flags & ARES_FLAG_NOSEARCH != 0;
+        let mut plan =
+            SearchPlan::for_search(&name, self.config.options.ndots, &self.config.search, no_search);
         let mut had_nodata = false;
         let mut timeouts: c_int = 0;
         let mut first = true;
 
         loop {
-            let payload = dns_query_payload(&plan.current, dnstype);
+            let payload = match make_payload(&plan.current) {
+                Ok(p) => p,
+                Err(e) => return Delivery::Raw { result: Err(e.code()), timeouts },
+            };
             // Only the first query of a lookup is eligible to spawn a failover probe.
-            let probe_payload = if first { Some(dns_query_payload(&plan.current, dnstype)) } else { None };
+            let probe_payload = if first { make_payload(&plan.current).ok() } else { None };
             first = false;
             let use_vc = self.config.options.use_vc;
             // Race the primary query against a one-shot failover probe (first query
@@ -631,13 +723,17 @@ impl AsyncClient {
     /// family, in `rtypes` order. (≈ upstream `next_dns_lookup` + `terminate_retries`.)
     async fn query_families(self: Rc<Self>, name: &str, rtypes: &[u16]) -> Vec<QueryOutcome> {
         let use_vc = self.config.options.use_vc;
+        let rd = self.recursion_desired();
         let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
         self.io.borrow().app.cancelled.set(false);
         let mut results: Vec<Option<QueryOutcome>> = (0..rtypes.len()).map(|_| None).collect();
 
         // `select_biased!` needs a statically-known arm count; the batch is
         // one family (single await) or two (AF_UNSPEC — race both).
-        let sub = |i: usize| self.clone().request(dns_query_payload(name, rtypes[i]), use_vc);
+        let sub = |i: usize| {
+            self.clone()
+                .request(dns_query_payload(name, rtypes[i], ARES_CLASS_IN, rd), use_vc)
+        };
         if rtypes.len() == 1 {
             results[0] = Some(sub(0).await);
         } else {
@@ -676,6 +772,7 @@ impl AsyncClient {
     /// that timed out adds 1, anything else adds 0 (getaddrinfo's count is unpinned).
     async fn resolve_addrinfo(self: Rc<Self>, names: &[String], rtypes: &[u16], probe: bool) -> AddrLookup {
         let use_vc = self.config.options.use_vc;
+        let rd = self.recursion_desired();
         let mut timeouts: c_int = 0;
         let mut last_error: AresError = ARES_ENODATA.into();
         let mut had_nodata = false;
@@ -687,7 +784,8 @@ impl AsyncClient {
             let batch = self.clone().query_families(name, rtypes);
             let results = if probe && i == 0 {
                 let mut b = pin!(batch.fuse());
-                let mut p = pin!(self.clone().run_probe(dns_query_payload(name, rtypes[0]), use_vc).fuse());
+                let probe_payload = dns_query_payload(name, rtypes[0], ARES_CLASS_IN, rd);
+                let mut p = pin!(self.clone().run_probe(probe_payload, use_vc).fuse());
                 loop {
                     select_biased! {
                         _ = p => continue,
@@ -803,8 +901,14 @@ impl AsyncClient {
             libc::AF_INET6 => vec![RTYPE_AAAA],
             _ => vec![RTYPE_A, RTYPE_AAAA],
         };
-        let names =
-            SearchPlan::for_search(&hostname_raw, self.config.options.ndots, &self.config.search).into_names();
+        let no_search = self.flags & ARES_FLAG_NOSEARCH != 0;
+        let names = SearchPlan::for_search(
+            &hostname_raw,
+            self.config.options.ndots,
+            &self.config.search,
+            no_search,
+        )
+        .into_names();
         let lookup = self.clone().resolve_addrinfo(&names, &rtypes, false).await;
         self.io.borrow_mut().app.timeouts = lookup.timeouts;
         if lookup.replies.is_empty() {
@@ -945,8 +1049,43 @@ pub(crate) struct ServerEndpoint {
 pub(crate) struct QueryOpts {
     pub attempts: u32,
     pub timeout: Duration,
+    pub maxtimeout: Option<Duration>,
     pub failover_chance: u16,
     pub failover_delay: u64,
+    pub ignore_tc: bool,
+    pub no_check_resp: bool,
+}
+
+/// Upstream `ares_calc_query_timeout`: base channel timeout, doubled once per
+/// full server round, capped by ARES_OPT_MAXTIMEOUTMS, and jittered into
+/// [0.5, 1.0] × the doubled value for retry rounds. Never below the base.
+fn calc_query_timeout(
+    base: Duration,
+    try_count: u32,
+    nservers: usize,
+    maxtimeout: Option<Duration>,
+) -> Duration {
+    let mut timeout = base;
+    let rounds = (try_count as usize)
+        .checked_div(nservers)
+        .unwrap_or(0);
+    if rounds > 0 {
+        let factor = 1u32.checked_shl(rounds as u32).unwrap_or(u32::MAX);
+        timeout = timeout.saturating_mul(factor);
+        if let Some(max) = maxtimeout.filter(|m| !m.is_zero()) {
+            if timeout > max {
+                timeout = max;
+            }
+        }
+        // Jitter: r / u16::MAX * 0.5 subtracted (upstream float arithmetic).
+        let r = rand::thread_rng().r#gen::<u16>();
+        let delta_multiplier = (r as f64 / u16::MAX as f64) * 0.5;
+        timeout = timeout.mul_f64(1.0 - delta_multiplier);
+    }
+    if timeout < base {
+        timeout = base;
+    }
+    timeout
 }
 
 /// Wrap a DNS payload in the 2-byte big-endian length prefix used for TCP
@@ -960,10 +1099,19 @@ fn frame_tcp(payload: &[u8]) -> BytesMut {
 
 /// Write a DNS query directly to the buffer from a hostname string,
 /// avoiding intermediate Vec<String>, DnsQuery, and DnsFrame allocations.
-fn write_dns_query_direct(buf: &mut BytesMut, hostname: &str, qtype: u16, transaction_id: u16) {
+/// `rd` controls the RD header bit (ARES_FLAG_NORECURSE clears it) and
+/// `qclass` is written verbatim.
+fn write_dns_query_direct(
+    buf: &mut BytesMut,
+    hostname: &str,
+    qtype: u16,
+    qclass: u16,
+    transaction_id: u16,
+    rd: bool,
+) {
     // Header: 12 bytes
     buf.put_u16(transaction_id);
-    buf.put_u16(0x0100); // flags: standard query, recursion desired
+    buf.put_u16(if rd { 0x0100 } else { 0x0000 }); // flags: standard query, RD
     buf.put_u16(1); // qdcount
     buf.put_u16(0); // ancount
     buf.put_u16(0); // nscount
@@ -976,15 +1124,26 @@ fn write_dns_query_direct(buf: &mut BytesMut, hostname: &str, qtype: u16, transa
     }
     buf.put_u8(0); // root label
     buf.put_u16(qtype);
-    buf.put_u16(1); // qclass: IN
+    buf.put_u16(qclass);
 }
 
 /// Build a UDP-form DNS query payload (with a fresh random transaction id).
-pub(crate) fn dns_query_payload(name: &str, qtype: u16) -> BytesMut {
+pub(crate) fn dns_query_payload(name: &str, qtype: u16, qclass: u16, rd: bool) -> BytesMut {
     let transaction_id = rand::thread_rng().r#gen::<u16>();
     let mut buf = BytesMut::with_capacity(12 + name.len() + 2 + 4);
-    write_dns_query_direct(&mut buf, name, qtype, transaction_id);
+    write_dns_query_direct(&mut buf, name, qtype, qclass, transaction_id, rd);
     buf
+}
+
+/// Duplicate a caller-supplied record via serialize/parse, replace query[0]'s
+/// name, and stamp a fresh id — preserving the class, flags and all sections.
+fn payload_from_template(template: &ares_dns_record_t, name: &str) -> Result<BytesMut, AresError> {
+    let wire = write_record(template)?;
+    let mut rec = parse_record(&wire, 0)?;
+    rec.query_set_name(0, name)?;
+    rec.set_id(rand::thread_rng().r#gen::<u16>());
+    let out = write_record(&rec)?;
+    Ok(BytesMut::from(out.as_slice()))
 }
 
 /// The pure body of ares_create_query/ares_mkquery: escaped-name analysis
@@ -1348,9 +1507,74 @@ pub(crate) fn nfds(fds: &[(i32, bool)]) -> i32 {
 
 impl AsyncClient {
     /// A fresh channel from the system config (resolv.conf + env overrides) —
-    /// shared by ares_init and ares_init_options.
-    pub fn from_sysconfig(factory: Rc<dyn SocketFactory>) -> Self {
-        AsyncClient::build(build_sysconfig(), factory, 53, 53)
+    /// shared by ares_init and ares_init_options. Defaults (the loopback
+    /// fallback server) are applied separately so options/flags set afterwards
+    /// can change the outcome.
+    pub fn from_sysconfig_path(factory: Rc<dyn SocketFactory>, path: Option<&str>) -> Self {
+        let client = AsyncClient::build(build_sysconfig(path), factory, 53, 53);
+        let n = client.config.nameservers.len();
+        client.health.borrow_mut().reset(n);
+        client
+    }
+
+    /// Re-read system configuration and apply it like upstream
+    /// `ares_init_by_sysconfig`: values the caller configured explicitly via
+    /// `ARES_OPT_*` win, then the query cache is flushed.
+    pub fn reinit(&mut self) -> Result<(), AresError> {
+        let path = (!self.resolvconf_path.is_empty()).then_some(self.resolvconf_path.as_str());
+        let sys = build_sysconfig(path);
+
+        let mut servers_changed = false;
+        if self.optmask & ARES_OPT_SERVERS == 0
+            && !sys.nameservers.is_empty()
+            && sys.nameservers != self.config.nameservers
+        {
+            self.config.nameservers = sys.nameservers;
+            self.config.tcp_ports = sys.tcp_ports;
+            servers_changed = true;
+        }
+        if self.optmask & ARES_OPT_DOMAINS == 0 && !sys.search.is_empty() {
+            self.config.search = sys.search;
+        }
+        if self.optmask & ARES_OPT_NDOTS == 0 {
+            self.config.options.ndots = sys.options.ndots;
+        }
+        if self.optmask & ARES_OPT_TRIES == 0 && sys.options.attempts != 0 {
+            self.config.options.attempts = sys.options.attempts;
+        }
+        if self.optmask & (ARES_OPT_TIMEOUTMS | ARES_OPT_TIMEOUT) == 0
+            && sys.options.timeout_ms != 0
+        {
+            self.config.options.timeout_ms = sys.options.timeout_ms;
+        }
+        if self.optmask & (ARES_OPT_ROTATE | ARES_OPT_NOROTATE) == 0 {
+            self.config.options.rotate = sys.options.rotate;
+        }
+        if sys.options.use_vc {
+            self.flags |= ARES_FLAG_USEVC;
+            self.config.options.use_vc = true;
+        }
+        if servers_changed {
+            self.health.borrow_mut().reset(self.config.nameservers.len());
+        }
+        self.cache.borrow_mut().flush();
+        Ok(())
+    }
+
+    /// Upstream `init_by_defaults`: when no nameserver is configured, add the
+    /// loopback default unless ARES_FLAG_NO_DFLT_SVR asks for an empty list
+    /// (lookups then report ARES_ENOSERVER).
+    pub fn apply_defaults(&mut self) {
+        if self.config.nameservers.is_empty() && self.flags & ARES_FLAG_NO_DFLT_SVR == 0 {
+            self.config.nameservers.push((IpAddr::V4(Ipv4Addr::LOCALHOST), None));
+            self.config.tcp_ports.push(None);
+        }
+        self.health.borrow_mut().reset(self.config.nameservers.len());
+    }
+
+    /// ARES_FLAG_NORECURSE clears the RD bit in constructed queries.
+    fn recursion_desired(&self) -> bool {
+        self.flags & ARES_FLAG_NORECURSE == 0
     }
 
     fn build(
@@ -1369,6 +1593,7 @@ impl AsyncClient {
             sortlist: vec![],
             flags: 0,
             maxtimeout: 0,
+            optmask: 0,
             lookups: String::new(),
             resolvconf_path: String::new(),
             hosts_path: String::new(),
@@ -1407,6 +1632,7 @@ impl AsyncClient {
         dup.sortlist = self.sortlist.clone();
         dup.flags = self.flags;
         dup.maxtimeout = self.maxtimeout;
+        dup.optmask = self.optmask;
         dup.lookups = self.lookups.clone();
         dup.resolvconf_path = self.resolvconf_path.clone();
         dup.hosts_path = self.hosts_path.clone();
@@ -1419,7 +1645,12 @@ impl AsyncClient {
     /// The optmask cascade from ares_init_options — order preserved bit for
     /// bit, ending with the unconditional server-health reset.
     pub fn apply_options(&mut self, optmask: i32, o: DecodedOptions) {
-        if optmask & ARES_OPT_SERVERS != 0 {
+        // Upstream drops the SERVERS bit when no server was actually supplied.
+        let mut stored_mask = optmask;
+        if stored_mask & ARES_OPT_SERVERS != 0 && o.servers.is_empty() {
+            stored_mask &= !ARES_OPT_SERVERS;
+        }
+        if optmask & ARES_OPT_SERVERS != 0 && !o.servers.is_empty() {
             // Clear sysconfig servers when user explicitly provides servers
             self.config.nameservers.clear();
             self.config.tcp_ports.clear();
@@ -1492,7 +1723,8 @@ impl AsyncClient {
             self.server_failover_retry_chance = o.failover_retry_chance;
             self.server_failover_retry_delay = o.failover_retry_delay;
         }
-        self.health.borrow_mut().reset(self.config.nameservers.len());
+        self.optmask = stored_mask;
+        self.apply_defaults();
     }
 
     /// The pure inverse of the cascade: read the channel back into option fields.
@@ -1572,6 +1804,7 @@ impl AsyncClient {
             self.config.nameservers.push((server.ip, server.udp_port));
             self.config.tcp_ports.push(server.tcp_port);
         }
+        self.optmask |= ARES_OPT_SERVERS;
         self.health.borrow_mut().reset(self.config.nameservers.len());
     }
 
@@ -1579,6 +1812,7 @@ impl AsyncClient {
     pub fn clear_servers(&mut self) {
         self.config.nameservers.clear();
         self.config.tcp_ports.clear();
+        self.optmask |= ARES_OPT_SERVERS;
         self.health.borrow_mut().clear();
     }
 
@@ -1587,6 +1821,7 @@ impl AsyncClient {
         self.config.tcp_ports = vec![None; ns.len()];
         self.health.borrow_mut().reset(ns.len());
         self.config.nameservers = ns;
+        self.optmask |= ARES_OPT_SERVERS;
     }
 
     /// The configured servers with per-entry defaults applied, in order:
@@ -1672,8 +1907,12 @@ impl AsyncClient {
         QueryOpts {
             attempts: self.config.options.attempts,
             timeout: Duration::from_millis(self.config.options.timeout_ms as u64),
+            maxtimeout: (self.maxtimeout > 0)
+                .then(|| Duration::from_millis(self.maxtimeout as u64)),
             failover_chance: self.server_failover_retry_chance,
             failover_delay: self.server_failover_retry_delay,
+            ignore_tc: self.flags & ARES_FLAG_IGNTC != 0,
+            no_check_resp: self.flags & ARES_FLAG_NOCHECKRESP != 0,
         }
     }
 
@@ -1729,18 +1968,25 @@ impl AsyncClient {
 
     // ===== Entry points (one method per ares_* export) =====
 
-    /// ares_query: `no_servers` preflight, then the wire payload for the async
-    /// lifecycle. The `AsyncClient` (built by the shim) supplies the resources.
-    pub(crate) fn query_payload(&self, name: &str, qtype: u16) -> Result<BytesMut, AresError> {
+    /// ares_query / ares_query_dnsrec: `no_servers` preflight, then the wire
+    /// payload for the async lifecycle. The caller-provided class and the
+    /// channel's RD/NORECURSE flag reach the wire.
+    pub(crate) fn query_payload(
+        &self,
+        name: &str,
+        qtype: u16,
+        qclass: u16,
+    ) -> Result<BytesMut, AresError> {
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        Ok(dns_query_payload(name, qtype))
+        Ok(dns_query_payload(name, qtype, qclass, self.recursion_desired()))
     }
 
-    /// ares_send: min-DNS-length + `no_servers` preflight, then the wire payload.
+    /// ares_send / ares_send_dnsrec: length + `no_servers` preflight, then the
+    /// raw wire payload. Caller-provided packets keep their own flags/class.
     pub(crate) fn send_payload(&self, query_buf: &[u8]) -> Result<BytesMut, AresError> {
-        if query_buf.len() < 12 {
+        if query_buf.len() < 12 || query_buf.len() >= (1 << 16) {
             return Err(ARES_EBADQUERY.into());
         }
         if no_servers(self) {
@@ -1784,10 +2030,11 @@ pub(crate) fn rdns_name(ip: IpAddr) -> String {
     }
 }
 
-/// The system resolver config: /etc/resolv.conf + the env overrides
-/// (RES_OPTIONS / LOCALDOMAIN).
-fn build_sysconfig() -> SysConfig {
-    let try_resolv_conf = || std::fs::read_to_string("/etc/resolv.conf").ok()?.parse::<SysConfig>().ok();
+/// The system resolver config: resolv.conf (at `path`, or the system default)
+/// plus the env overrides (RES_OPTIONS / LOCALDOMAIN).
+fn build_sysconfig(path: Option<&str>) -> SysConfig {
+    let path = path.unwrap_or("/etc/resolv.conf");
+    let try_resolv_conf = || std::fs::read_to_string(path).ok()?.parse::<SysConfig>().ok();
     let mut config = try_resolv_conf().unwrap_or_else(SysConfig::default);
     crate::core::sysconfig::apply_env_overrides(&mut config);
     config
@@ -1891,3 +2138,145 @@ fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, health: &RefCell<ServerHealth>, se
 
 /// One query's `(reply-or-status, timeout-count)` outcome.
 type QueryOutcome = (Result<Vec<u8>, c_int>, c_int);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopFactory;
+    impl SocketFactory for NoopFactory {
+        fn create_udp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
+            Err(io::Error::other("no sockets in unit tests"))
+        }
+        fn create_tcp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
+            Err(io::Error::other("no sockets in unit tests"))
+        }
+    }
+
+    pub(super) fn noop_factory() -> Rc<dyn SocketFactory> {
+        Rc::new(NoopFactory)
+    }
+
+    #[test]
+    fn query_payload_writes_class_and_rd_flag() {
+        let p = dns_query_payload("example.com", 1, 3, true);
+        assert_eq!(p[2], 0x01); // RD set
+        assert_eq!(&p[p.len() - 2..], &3u16.to_be_bytes()); // CH reaches the wire
+
+        let p = dns_query_payload("example.com", 1, 1, false);
+        assert_eq!(p[2] & 0x01, 0); // NORECURSE clears RD
+        assert_eq!(&p[p.len() - 2..], &1u16.to_be_bytes());
+    }
+
+    #[test]
+    fn query_timeout_doubles_per_round_and_caps() {
+        let base = Duration::from_millis(100);
+        // First attempt: exactly the base timeout.
+        assert_eq!(calc_query_timeout(base, 0, 2, None), base);
+        // After one full round: 2x, jittered into [1x, 2x].
+        let t = calc_query_timeout(base, 2, 2, None);
+        assert!(t >= Duration::from_millis(100) && t <= Duration::from_millis(200));
+        // Two rounds: 4x, capped at 250ms, jittered into [125, 250].
+        let t = calc_query_timeout(base, 4, 2, Some(Duration::from_millis(250)));
+        assert!(t >= Duration::from_millis(125) && t <= Duration::from_millis(250));
+        // A cap below the base never reduces the base timeout.
+        let t = calc_query_timeout(base, 0, 1, Some(Duration::from_millis(10)));
+        assert_eq!(t, base);
+    }
+
+    #[test]
+    fn defaults_add_loopback_unless_no_dflt_svr() {
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        client.apply_defaults();
+        assert_eq!(
+            client.config.nameservers,
+            vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)]
+        );
+
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        client.flags = ARES_FLAG_NO_DFLT_SVR;
+        client.apply_defaults();
+        assert!(client.config.nameservers.is_empty());
+    }
+
+    #[test]
+    fn template_rewrite_preserves_flags_and_class() {
+        use crate::ffi::dns_record::ARES_FLAG_RD;
+        let mut rec = ares_dns_record_t::new(7, ARES_FLAG_RD, 0, 0);
+        rec.query_add("a.example", 1, 3).expect("query_add");
+        let payload = payload_from_template(&rec, "b.example").expect("template payload");
+        let parsed = parse_record(&payload, 0).expect("parse payload");
+        let (name, qtype, qclass) = parsed.query_at(0).expect("query");
+        assert_eq!(name.to_str().expect("name"), "b.example");
+        assert_eq!(qtype, 1);
+        assert_eq!(qclass, 3);
+        assert_ne!(parsed.flags() & ARES_FLAG_RD, 0);
+    }
+}
+
+#[cfg(test)]
+mod reinit_tests {
+    use super::*;
+
+    fn temp_conf(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cares-rs-reinit-{}-{:?}.conf",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, contents).expect("write temp resolv.conf");
+        path
+    }
+
+    #[test]
+    fn reinit_reloads_sysconfig_and_flushes_cache() {
+        let path = temp_conf(
+            "nameserver 9.9.9.9\nsearch example.test\noptions ndots:3 attempts:2 timeout:1\n",
+        );
+        let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53);
+        client.resolvconf_path = path.to_string_lossy().into_owned();
+        client.cache.borrow_mut().set_max_ttl(3600);
+        let key = ("cached.test".to_string(), 1u16);
+        client.cache.borrow_mut().store_names(
+            vec![key.0.clone()],
+            key.1,
+            60,
+            &[0u8; 12],
+            Instant::now(),
+        );
+        assert!(client.cache.borrow_mut().get(&key.0, key.1, Instant::now()).is_some());
+
+        client.reinit().expect("reinit");
+
+        assert_eq!(
+            client.config.nameservers,
+            vec![(IpAddr::from([9, 9, 9, 9]), None)]
+        );
+        assert_eq!(client.config.search, vec!["example.test".to_string()]);
+        assert_eq!(client.config.options.ndots, 3);
+        assert_eq!(client.config.options.attempts, 2);
+        assert_eq!(client.config.options.timeout_ms, 1000);
+        assert!(client.cache.borrow_mut().get(&key.0, key.1, Instant::now()).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reinit_preserves_explicitly_set_servers() {
+        let path = temp_conf("nameserver 9.9.9.9\n");
+        let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53);
+        client.resolvconf_path = path.to_string_lossy().into_owned();
+        client.set_servers(vec![ServerSpec {
+            ip: IpAddr::from([8, 8, 4, 4]),
+            udp_port: None,
+            tcp_port: None,
+        }]);
+
+        client.reinit().expect("reinit");
+
+        assert_eq!(
+            client.config.nameservers,
+            vec![(IpAddr::from([8, 8, 4, 4]), None)]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+}

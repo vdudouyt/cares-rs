@@ -89,23 +89,30 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
         return;
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
-    let _ = dnsclass;
     let client = channeldata.state.derive();
     let io = client.io.clone();
-    let fut = client.search(name_str.to_string(), dnstype as u16, false);
+    let fut = client.search(
+        name_str.to_string(),
+        dnsclass as u16,
+        dnstype as u16,
+        false,
+    );
     channeldata.spawn(io, fut, move |r| on_raw_reply(callback, arg, r));
 }
 
 /// # Safety
 /// `channel` must be a valid channel and `name` a valid NUL-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, _dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
+pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let name = unsafe { cstr_lossy(name) };
     // Preflight in core, then spawn an fd-owning async query lifecycle that
     // creates the socket, sends, and drives its own failover/TC/timeout.
-    match channeldata.state.query_payload(name, dnstype as u16) {
+    match channeldata
+        .state
+        .query_payload(name, dnstype as u16, dnsclass as u16)
+    {
         Ok(payload) => {
             let client = channeldata.state.derive();
             let io = client.io.clone();
@@ -134,7 +141,6 @@ pub unsafe extern "C" fn ares_query_dnsrec(
         return ARES_EFORMERR;
     }
     let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_EFORMERR; };
-    let _ = dnsclass; // query_dnsrec always emits class IN on the wire
     let name = unsafe { cstr_lossy(name) };
     // Cache probe: if a fresh cached reply parses, deliver synchronously.
     // Hoisted out of the `if let` scrutinee so the cache RefMut drops at the
@@ -150,7 +156,10 @@ pub unsafe extern "C" fn ares_query_dnsrec(
             return ARES_SUCCESS;
         }
     }
-    let payload = match channeldata.state.query_payload(name.as_ref(), dnstype as u16) {
+    let payload = match channeldata
+        .state
+        .query_payload(name.as_ref(), dnstype as u16, dnsclass as u16)
+    {
         Ok(p) => p,
         Err(e) => {
             let status = e.code();
@@ -181,26 +190,47 @@ pub unsafe extern "C" fn ares_search_dnsrec(
 ) -> crate::ffi::ares_status_t {
     let Some(callback) = callback else { return ARES_EFORMERR; };
     if channel.is_null() || dnsrec.is_null() { return ARES_EFORMERR; }
+    // SAFETY: the caller guarantees live channel/record handles.
     let rec = unsafe { &*dnsrec };
-    let mut query_name: Option<&CStr> = None;
-    let mut qtype: c_uint = 0;
-    if rec.query_cnt() > 0 {
-        if let Some((q_name, q_type, _qclass)) = rec.query_at(0) {
-            query_name = Some(q_name);
-            qtype = q_type as c_uint;
-        }
+    let channeldata = unsafe { channel.as_mut() };
+    search_dnsrec_record(channeldata, rec, callback, arg)
+}
+
+/// Safe body of ares_search_dnsrec: validate the template, duplicate it for
+/// the async future, and iterate the search plan.
+fn search_dnsrec_record(
+    channeldata: Option<&mut ChannelData>,
+    rec: &dns_record::ares_dns_record_t,
+    callback: AresCallbackDnsRec,
+    arg: *mut c_void,
+) -> crate::ffi::ares_status_t {
+    // Search only supports a single question (upstream ares_search_int).
+    if rec.query_cnt() != 1 {
+        unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut()) };
+        return ARES_EBADQUERY;
     }
-    let Some(query_name) = query_name else { return ARES_EFORMERR; };
+    let Some((query_name, _qtype, _qclass)) = rec.query_at(0) else {
+        return ARES_EFORMERR;
+    };
     let name_str = query_name.to_str().unwrap_or("");
     if let Some(status) = search_precheck(name_str) {
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut()) };
         return status.code();
     }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_EFORMERR; };
+    // The C record may be destroyed as soon as this call returns; the async
+    // future owns a duplicate that keeps class, flags and all sections.
+    let template = match crate::core::dns_record::duplicate_record(rec) {
+        Some(t) => t,
+        None => {
+            unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut()) };
+            return ARES_EBADQUERY;
+        }
+    };
+    let Some(channeldata) = channeldata else { return ARES_EFORMERR; };
     let client = channeldata.state.derive();
     let cache = client.cache.clone();
     let io = client.io.clone();
-    let fut = client.search(name_str.to_string(), qtype as u16, true);
+    let fut = client.search_dnsrec(template, true);
     channeldata.spawn(io, fut, move |r| on_dnsrec_reply(callback, arg, &cache, r));
     ARES_SUCCESS
 }
@@ -256,6 +286,23 @@ pub(crate) fn on_raw_reply(callback: AresCallback, arg: *mut c_void, r: Result<D
     match res {
         Ok(buf) => unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) },
         Err(err) => unsafe { callback(arg, err, timeouts, std::ptr::null_mut(), 0) },
+    }
+}
+
+/// ares_send → `ares_callback` over the send path shared with
+/// ares_send_dnsrec: store the reply in the query cache and hand the caller the
+/// raw response bytes exactly as received.
+pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, r: Result<Delivery, c_int>) {
+    let (result, timeouts) = match r {
+        Ok(Delivery::Raw { result, timeouts }) => (result, timeouts),
+        Err(status) => (Err(status), 0),
+    };
+    match result {
+        Ok(buf) => {
+            cache.borrow_mut().store_reply(&buf, Instant::now());
+            unsafe { callback(arg, ARES_SUCCESS, timeouts, buf.as_ptr() as *mut u8, buf.len() as c_int) };
+        }
+        Err(status) => unsafe { callback(arg, status, timeouts, std::ptr::null_mut(), 0) },
     }
 }
 
@@ -375,53 +422,141 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    if qbuf.is_null() || qlen < 12 {
+    // Upstream rejects anything shorter than a DNS header or too large for the
+    // 16-bit TCP length prefix.
+    if qbuf.is_null() || !(12..(1 << 16)).contains(&qlen) {
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut(), 0) };
         return;
     }
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return; };
     let query_buf = unsafe { std::slice::from_raw_parts(qbuf, qlen as usize) };
-    // Preflight in core, then spawn an fd-owning async query lifecycle.
-    match channeldata.state.send_payload(query_buf) {
-        Ok(payload) => {
-            let client = channeldata.state.derive();
-            let io = client.io.clone();
-            let fut = client.query_raw(payload);
-            channeldata.spawn(io, fut, move |r| on_raw_reply(callback, arg, r));
+    let channeldata = unsafe { channel.as_mut() };
+    send_raw_packet(channeldata, query_buf, callback, arg);
+}
+
+/// Safe body of ares_send: parse the caller's packet and drive the shared
+/// ares_send_dnsrec path, delivering the raw response bytes.
+fn send_raw_packet(
+    channeldata: Option<&mut ChannelData>,
+    query_buf: &[u8],
+    callback: AresCallback,
+    arg: *mut c_void,
+) {
+    // ares_send is ares_send_dnsrec over a parsed copy of the caller's packet.
+    let rec = match crate::core::dns_record::parse_record(query_buf, 0) {
+        Ok(rec) => rec,
+        Err(e) => {
+            unsafe { callback(arg, e.code(), 0, std::ptr::null_mut(), 0) };
+            return;
         }
-        Err(status) => on_raw_reply(callback, arg, Err(status.code())),
+    };
+    let Some(channeldata) = channeldata else { return; };
+    let cache = channeldata.state.cache.clone();
+    let outcome = send_record(
+        channeldata,
+        &rec,
+        std::ptr::null_mut(),
+        move |r| on_send_raw_reply(callback, arg, &cache, r),
+    );
+    match outcome {
+        Ok(Some(buf)) => unsafe {
+            callback(arg, ARES_SUCCESS, 0, buf.as_ptr() as *mut u8, buf.len() as c_int)
+        },
+        Ok(None) => {},
+        Err(status) => unsafe {
+            callback(arg, status, 0, std::ptr::null_mut(), 0)
+        },
     }
 }
 
-/// Serialize an outgoing DNS record; on failure report the same callback
-/// status upstream's duplicate-based send path uses.
+/// Serialize an outgoing DNS record. Upstream's duplicate-based send path maps
+/// an EBADRESP from the write+parse round-trip to EBADQUERY; other writer
+/// statuses pass through unchanged.
 fn serialize_send_record(
     rec: &dns_record::ares_dns_record_t,
-    callback: ares_callback_dnsrec,
-    arg: *mut c_void,
 ) -> Result<Vec<u8>, crate::ffi::ares_status_t> {
     match crate::core::dns_record::write_record(rec) {
         Ok(buf) => Ok(buf),
-        Err(e) => {
-            // Upstream duplicate() failures surface as EBADQUERY only when
-            // the write+parse round-trip reported EBADRESP; other writer
-            // statuses pass through unchanged.
-            let status = if e.code() == ARES_EBADRESP {
-                ARES_EBADQUERY
-            } else {
-                e.code()
-            };
-            if let Some(cb) = callback {
-                unsafe { cb(arg, status, 0, std::ptr::null_mut()) };
-            }
-            Err(status)
-        }
+        Err(e) => Err(if e.code() == ARES_EBADRESP {
+            ARES_EBADQUERY
+        } else {
+            e.code()
+        }),
     }
 }
 
-/// Serialize an `ares_dns_record_t` and send it through the same async query
-/// lifecycle as `ares_send`. Phase 1 generates a fresh query id (the caller's
-/// record id is not trusted); cache/usevc semantics are refined in Phase 3.
+/// Cache key for a caller-supplied record: its first question's name (without
+/// a trailing dot, matching the cache writer) and type.
+fn record_cache_key(rec: &dns_record::ares_dns_record_t) -> Option<(String, u16)> {
+    let (name, qtype, _) = rec.query_at(0)?;
+    let name = name.to_string_lossy();
+    Some((name.strip_suffix('.').unwrap_or(&name).to_string(), qtype))
+}
+
+/// The shared ares_send / ares_send_dnsrec path: no-server preflight, query
+/// cache probe, a fresh non-zero qid stamped into the wire header, and the
+/// normal async query lifecycle (honoring ARES_FLAG_USEVC via `query_raw`).
+/// Returns `Ok(Some(cached_reply))` on a cache hit (without setting `qid`),
+/// `Ok(None)` after spawning the send, or `Err(status)` on a pre-spawn failure.
+fn send_record<F>(
+    channeldata: &mut ChannelData,
+    rec: &dns_record::ares_dns_record_t,
+    qid: *mut libc::c_ushort,
+    on_reply: F,
+) -> Result<Option<Vec<u8>>, crate::ffi::ares_status_t>
+where
+    F: FnOnce(Result<Delivery, c_int>) + 'static,
+{
+    if channeldata.state.config.nameservers.is_empty() {
+        return Err(ARES_ENOSERVER);
+    }
+    if let Some((name, qtype)) = record_cache_key(rec) {
+        let cached = channeldata
+            .state
+            .cache
+            .borrow_mut()
+            .get(&name, qtype, Instant::now());
+        if let Some(buf) = cached {
+            return Ok(Some(buf));
+        }
+    }
+    let mut buf = serialize_send_record(rec)?;
+    // Upstream duplicates the record through a write+parse round-trip before
+    // sending; a parse failure (EBADRESP) surfaces as EBADQUERY.
+    if let Err(e) = crate::core::dns_record::parse_record(&buf, 0) {
+        return Err(if e.code() == ARES_EBADRESP {
+            ARES_EBADQUERY
+        } else {
+            e.code()
+        });
+    }
+    // DNS messages carry a 16-bit length; upstream rejects larger queries.
+    if buf.len() > u16::MAX as usize || buf.len() < 12 {
+        return Err(ARES_EBADQUERY);
+    }
+    // Upstream generates a unique non-zero id. There is no channel-wide
+    // in-flight-qid registry to probe here, so a random non-zero value is used
+    // (documented approximation; a full registry belongs with the shared
+    // connection work).
+    let new_qid = {
+        let id = rand::random::<u16>();
+        if id == 0 { 1 } else { id }
+    };
+    buf[0..2].copy_from_slice(&new_qid.to_be_bytes());
+    let payload = match channeldata.state.send_payload(&buf) {
+        Ok(p) => p,
+        Err(e) => return Err(e.code()),
+    };
+    if !qid.is_null() {
+        unsafe { *qid = new_qid; }
+    }
+    let client = channeldata.state.derive();
+    let io = client.io.clone();
+    let fut = client.query_raw(payload);
+    channeldata.spawn(io, fut, on_reply);
+    Ok(None)
+}
+
+/// Serialize an `ares_dns_record_t` and send it through the shared send path.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_send_dnsrec(
@@ -433,44 +568,51 @@ pub unsafe extern "C" fn ares_send_dnsrec(
 ) -> crate::ffi::ares_status_t {
     let Some(callback) = callback else { return ARES_EFORMERR; };
     if channel.is_null() || dnsrec.is_null() { return ARES_EFORMERR; }
-    // SAFETY: the caller guarantees a live, initialized record.
+    // SAFETY: the caller guarantees live channel/record handles.
+    let channeldata = unsafe { channel.as_mut() };
     let rec = unsafe { &*dnsrec };
-    let mut buf = match serialize_send_record(rec, Some(callback), arg) {
-        Ok(buf) => buf,
-        Err(status) => return status,
-    };
-    // DNS messages carry a 16-bit length; upstream rejects larger queries.
-    if buf.len() > u16::MAX as usize || buf.len() < 12 {
-        unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut()) };
-        return ARES_EBADQUERY;
-    }
-    // Upstream generates a unique non-zero id; a zero id is reserved as
-    // "unset" by the public send_dnsrec contract. A full in-flight registry
-    // lands with the shared-connection work; a random non-zero id is enough
-    // here and keeps the returned qid equal to the wire truth.
-    let new_qid = {
-        let id = rand::random::<u16>();
-        if id == 0 { 1 } else { id }
-    };
-    buf[0..2].copy_from_slice(&new_qid.to_be_bytes());
-    // SAFETY: the caller guarantees a live channel handle.
-    let Some(channeldata) = (unsafe { channel.as_mut() }) else { return ARES_EFORMERR; };
-    let payload = match channeldata.state.send_payload(&buf) {
-        Ok(p) => p,
-        Err(e) => {
-            let status = e.code();
-            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
-            return status;
-        }
-    };
-    if !qid.is_null() {
-        unsafe { *qid = new_qid; }
-    }
-    let client = channeldata.state.derive();
-    let cache = client.cache.clone();
-    let io = client.io.clone();
-    let fut = client.query_raw(payload);
-    channeldata.spawn(io, fut, move |r| on_dnsrec_reply(callback, arg, &cache, r));
-    ARES_SUCCESS
+    send_dnsrec_record(channeldata, rec, callback, arg, qid)
 }
 
+/// Safe body of ares_send_dnsrec: shared cache/qid/transport path plus the
+/// synchronous cache-hit delivery.
+fn send_dnsrec_record(
+    channeldata: Option<&mut ChannelData>,
+    rec: &dns_record::ares_dns_record_t,
+    callback: AresCallbackDnsRec,
+    arg: *mut c_void,
+    qid: *mut libc::c_ushort,
+) -> crate::ffi::ares_status_t {
+    let Some(channeldata) = channeldata else { return ARES_EFORMERR; };
+    let cache = channeldata.state.cache.clone();
+    let outcome = send_record(
+        channeldata,
+        rec,
+        qid,
+        move |r| on_dnsrec_reply(callback, arg, &cache, r),
+    );
+    match outcome {
+        Ok(Some(buf)) => {
+            // Cache hit (synchronous): parse the stored reply and deliver it;
+            // *qid is deliberately left untouched (upstream behavior).
+            match crate::core::dns_record::parse_record(&buf, 0) {
+                Ok(cached) => {
+                    let dnsrec = Box::into_raw(Box::new(cached));
+                    unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
+                    unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
+                    ARES_SUCCESS
+                }
+                Err(e) => {
+                    let status = e.code();
+                    unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+                    status
+                }
+            }
+        }
+        Ok(None) => ARES_SUCCESS,
+        Err(status) => {
+            unsafe { callback(arg, status, 0, std::ptr::null_mut()) };
+            status
+        }
+    }
+}

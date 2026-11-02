@@ -192,7 +192,12 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         failover_retry_delay: options.server_failover_opts.retry_delay as u64,
     };
 
-    let mut channeldata = ChannelData::new_default();
+    let resolvconf = if optmask & ARES_OPT_RESOLVCONF != 0 {
+        decoded.resolvconf_path.clone()
+    } else {
+        None
+    };
+    let mut channeldata = ChannelData::new_unfinalized(resolvconf.as_deref());
     channeldata.state.apply_options(optmask, decoded);
     let channel = Box::into_raw(Box::new(channeldata));
     unsafe { *out_channel = channel };
