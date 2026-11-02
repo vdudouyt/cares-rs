@@ -146,7 +146,7 @@ fn txt_reply_from_buf(buf: &[u8], ext: bool) -> Result<*mut c_void, c_int> {
             AresData { data_type: AresTxtReply::datatype(), data: reply };
         let aresdata = Box::into_raw(Box::new(aresdata));
         Ok((aresdata as *mut u8)
-            .wrapping_add(std::mem::offset_of!(AresData<AresTxtReplyExt>, data))
+            .wrapping_add(std::mem::offset_of!(AresData<AresTxtReply>, data))
             as *mut c_void)
     }
 }

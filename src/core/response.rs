@@ -115,11 +115,19 @@ impl<'a> ParsedResponse<'a> {
         let min_cname_ttl = self
             .answers
             .iter()
-            .filter(|a| a.record_type == RECORD_TYPE_CNAME)
+            .filter(|a| {
+                a.class == crate::ffi::dns_record::ARES_CLASS_IN
+                    && a.record_type == RECORD_TYPE_CNAME
+            })
             .map(|a| a.ttl)
             .min();
         let mut first_cname: Option<CString> = None;
         for mut answer in self.answers {
+            // Upstream ares_parse_into_addrinfo only considers IN records, so
+            // other classes must not affect CNAME chains, names or TTLs.
+            if answer.class != crate::ffi::dns_record::ARES_CLASS_IN {
+                continue;
+            }
             if answer.record_type == RECORD_TYPE_CNAME {
                 let mut cname_buf = SliceBuf::new(answer.data);
                 let alias_of = DnsLabel::parse(&mut cname_buf).ok_or(AresError::from(ARES_EBADRESP))?;

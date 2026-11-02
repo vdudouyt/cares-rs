@@ -319,10 +319,9 @@ pub unsafe extern "C" fn ares_dns_record_duplicate(
     if dnsrec.is_null() {
         return std::ptr::null_mut();
     }
-    let buf = write_record(unsafe { &*dnsrec });
-    match parse_record(&buf, 0) {
-        Ok(rec) => Box::into_raw(Box::new(rec)),
-        Err(_) => std::ptr::null_mut(),
+    match crate::core::dns_record::duplicate_record(unsafe { &*dnsrec }) {
+        Some(rec) => Box::into_raw(Box::new(rec)),
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -927,8 +926,7 @@ pub unsafe extern "C" fn ares_dns_rr_del_opt_byid(
         return ARES_EFORMERR;
     }
     match unsafe { &mut *rr }.del_opt_byid_checked(key, opt as u16) {
-        Ok(true) => ARES_SUCCESS,
-        Ok(false) => crate::ffi::error::ARES_ENOTFOUND,
+        Ok(()) => ARES_SUCCESS,
         Err(e) => e.code(),
     }
 }
@@ -961,16 +959,20 @@ pub unsafe extern "C" fn ares_dns_parse(
 // Serialization: ares_dns_write
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub unsafe extern "C" fn ares_dns_write(
-    dnsrec: *const ares_dns_record_t,
+fn dns_write_impl(
+    rec: &ares_dns_record_t,
     buf: *mut *mut u8,
     buf_len: *mut libc::size_t,
 ) -> c_int {
-    if dnsrec.is_null() || buf.is_null() || buf_len.is_null() {
-        return ARES_EBADRESP;
+    if buf.is_null() || buf_len.is_null() {
+        return ARES_EFORMERR;
     }
-    let out = write_record(unsafe { &*dnsrec });
+    unsafe { *buf = std::ptr::null_mut(); }
+    unsafe { *buf_len = 0; }
+    let out = match write_record(rec) {
+        Ok(out) => out,
+        Err(e) => return e.code(),
+    };
     let ptr = unsafe { malloc_bytes(&out) };
     if ptr.is_null() {
         return ARES_ENOMEM;
@@ -978,6 +980,18 @@ pub unsafe extern "C" fn ares_dns_write(
     unsafe { *buf = ptr; }
     unsafe { *buf_len = out.len(); }
     ARES_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ares_dns_write(
+    dnsrec: *const ares_dns_record_t,
+    buf: *mut *mut u8,
+    buf_len: *mut libc::size_t,
+) -> c_int {
+    if dnsrec.is_null() {
+        return ARES_EFORMERR;
+    }
+    dns_write_impl(unsafe { &*dnsrec }, buf, buf_len)
 }
 
 // ---------------------------------------------------------------------------

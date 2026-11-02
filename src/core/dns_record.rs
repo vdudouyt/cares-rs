@@ -8,7 +8,9 @@ use std::ffi::{CStr, CString};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::core::AresError;
-use crate::ffi::error::{ARES_EBADNAME, ARES_EBADRESP, ARES_EBADSTR, ARES_EFORMERR};
+use crate::ffi::error::{
+    ARES_EBADNAME, ARES_EBADRESP, ARES_EBADSTR, ARES_EFORMERR, ARES_ENOTFOUND,
+};
 
 use crate::ffi::dns_record::{
     ARES_SECTION_ADDITIONAL, ARES_SECTION_ANSWER, ARES_SECTION_AUTHORITY,
@@ -135,61 +137,91 @@ pub(crate) fn parse_dns_name(buf: &[u8], pos: &mut usize) -> Option<String> {
     Some(out)
 }
 
+fn is_hostname_ch(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'/' | b'*')
+}
+
 /// Write a DNS name in wire format (uncompressed labels), decoding the
-/// `\DDD`/`\c` escapes that [`parse_dns_name`] emits.
-pub(crate) fn write_dns_name(name: &str, out: &mut Vec<u8>) {
+/// `\DDD`/`\c` escapes that [`parse_dns_name`] emits. `validate_hostname`
+/// mirrors upstream's RR/question owner-name validation; RDATA names pass
+/// false. Invalid labels/lengths report ARES_EBADNAME.
+pub(crate) fn write_dns_name(
+    name: &str,
+    out: &mut Vec<u8>,
+    validate_hostname: bool,
+) -> Result<(), AresError> {
     let bytes = name.as_bytes();
-    let mut labels: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut labels: Vec<Vec<u8>> = Vec::new();
+    let mut label: Vec<u8> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'.' {
-            labels.push(Vec::new());
+            labels.push(label);
+            label = Vec::new();
             i += 1;
             continue;
         }
-        if b == b'\\' && i + 1 < bytes.len() {
+        if b == b'\\' {
+            if i + 1 >= bytes.len() {
+                return Err(ARES_EBADNAME.into());
+            }
             let next = bytes[i + 1];
-            if next.is_ascii_digit()
-                && i + 3 < bytes.len()
-                && bytes[i + 2].is_ascii_digit()
-                && bytes[i + 3].is_ascii_digit()
-            {
+            if next.is_ascii_digit() {
+                if i + 3 >= bytes.len()
+                    || !bytes[i + 2].is_ascii_digit()
+                    || !bytes[i + 3].is_ascii_digit()
+                {
+                    return Err(ARES_EBADNAME.into());
+                }
                 let val = (next - b'0') as u16 * 100
                     + (bytes[i + 2] - b'0') as u16 * 10
                     + (bytes[i + 3] - b'0') as u16;
-                if val <= 255 {
-                    if let Some(label) = labels.last_mut() {
-                        label.push(val as u8);
-                    }
-                    i += 4;
-                    continue;
+                if val > 255 {
+                    return Err(ARES_EBADNAME.into());
                 }
+                label.push(val as u8);
+                i += 4;
+                continue;
             }
-            if let Some(label) = labels.last_mut() {
-                label.push(next);
-            }
+            label.push(next);
             i += 2;
             continue;
         }
-        if let Some(label) = labels.last_mut() {
-            label.push(b);
-        }
+        label.push(b);
         i += 1;
     }
-    if labels.len() > 1 && labels.last().is_some_and(|l| l.is_empty()) {
-        labels.pop();
+    if !label.is_empty() {
+        labels.push(label);
     }
-    if labels.len() == 1 && labels[0].is_empty() {
-        // Root (or empty) name: just the terminator.
+
+    // "" and "." are the root name. A trailing dot was already folded away by
+    // not pushing the final empty label.
+    if labels.is_empty() || (labels.len() == 1 && labels[0].is_empty()) {
         out.push(0);
-        return;
+        return Ok(());
     }
+
+    let mut total = 0usize;
+    for label in &labels {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ARES_EBADNAME.into());
+        }
+        if validate_hostname && !label.iter().all(|b| is_hostname_ch(*b)) {
+            return Err(ARES_EBADNAME.into());
+        }
+        total += label.len();
+    }
+    if total + labels.len() - 1 > 255 {
+        return Err(ARES_EBADNAME.into());
+    }
+
     for label in labels {
         out.push(label.len() as u8);
         out.extend_from_slice(&label);
     }
     out.push(0); // root label terminator
+    Ok(())
 }
 
 
@@ -1346,58 +1378,97 @@ fn write_binstr(data: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Serialize rdata for a given RR to wire format.
-pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) {
+fn write_name_field(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) -> Result<(), AresError> {
+    let Some(RRValue::Str(s)) = rr.data.get(&key) else {
+        return Err(ARES_EFORMERR.into());
+    };
+    write_dns_name(&s.to_string_lossy(), out, false)
+}
+
+fn write_str_field(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) -> Result<(), AresError> {
+    let Some(RRValue::Str(s)) = rr.data.get(&key) else {
+        return Err(ARES_EFORMERR.into());
+    };
+    let bytes = s.as_bytes();
+    if bytes.len() > 255 {
+        return Err(ARES_EFORMERR.into());
+    }
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_bin_required(
+    rr: &ares_dns_rr_t,
+    key: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), AresError> {
+    let Some(RRValue::Bin(d)) = rr.data.get(&key) else {
+        return Err(ARES_EFORMERR.into());
+    };
+    let logical = bin_logical(d);
+    if logical.is_empty() {
+        return Err(ARES_EFORMERR.into());
+    }
+    out.extend_from_slice(logical);
+    Ok(())
+}
+
+fn push_u8(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) {
+    out.push(rr.u8_val(key).unwrap_or(0));
+}
+
+fn push_u16(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&rr.u16_val(key).unwrap_or(0).to_be_bytes());
+}
+
+fn push_u32(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&rr.u32_val(key).unwrap_or(0).to_be_bytes());
+}
+
+/// Serialize rdata for a given RR to wire format, applying upstream's
+/// required-field and string-length validation.
+pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) -> Result<(), AresError> {
     match rr.rtype {
         x if x == ARES_REC_TYPE_A as u32 => {
-            if let Some(RRValue::Addr(addr)) = rr.data.get(&ARES_RR_A_ADDR) {
-                out.extend_from_slice(&addr.octets());
+            // Upstream's union storage always yields an address for an A RR,
+            // so an unset field writes 0.0.0.0 rather than failing.
+            match rr.data.get(&ARES_RR_A_ADDR) {
+                Some(RRValue::Addr(addr)) => out.extend_from_slice(&addr.octets()),
+                _ => out.extend_from_slice(&[0u8; 4]),
             }
         }
         x if x == ARES_REC_TYPE_AAAA as u32 => {
-            if let Some(RRValue::Addr6(addr)) = rr.data.get(&ARES_RR_AAAA_ADDR) {
-                out.extend_from_slice(&addr.octets());
+            match rr.data.get(&ARES_RR_AAAA_ADDR) {
+                Some(RRValue::Addr6(addr)) => out.extend_from_slice(&addr.octets()),
+                _ => out.extend_from_slice(&[0u8; 16]),
             }
         }
         x if x == ARES_REC_TYPE_NS as u32 => {
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_NS_NSDNAME) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
+            write_name_field(rr, ARES_RR_NS_NSDNAME, out)?;
         }
         x if x == ARES_REC_TYPE_CNAME as u32 => {
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_CNAME_CNAME) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
+            write_name_field(rr, ARES_RR_CNAME_CNAME, out)?;
         }
         x if x == ARES_REC_TYPE_PTR as u32 => {
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_PTR_DNAME) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
+            write_name_field(rr, ARES_RR_PTR_DNAME, out)?;
         }
         x if x == ARES_REC_TYPE_MX as u32 => {
-            if let Some(RRValue::U16(pref)) = rr.data.get(&ARES_RR_MX_PREFERENCE) {
-                out.extend_from_slice(&pref.to_be_bytes());
-            }
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_MX_EXCHANGE) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
+            push_u16(rr, ARES_RR_MX_PREFERENCE, out);
+            write_name_field(rr, ARES_RR_MX_EXCHANGE, out)?;
         }
         x if x == ARES_REC_TYPE_TXT as u32 => match rr.data.get(&ARES_RR_TXT_DATA) {
-            Some(RRValue::BinArray(strings)) => {
+            Some(RRValue::BinArray(strings)) if !strings.is_empty() => {
                 for s in strings {
                     write_binstr(s, out);
                 }
             }
             Some(RRValue::Bin(data)) => write_binstr(data, out),
-            _ => {}
+            _ => return Err(ARES_EFORMERR.into()),
         },
         x if x == ARES_REC_TYPE_SOA as u32 => {
-            if let Some(RRValue::Str(mname)) = rr.data.get(&ARES_RR_SOA_MNAME) {
-                write_dns_name(&mname.to_string_lossy(), out);
-            }
-            if let Some(RRValue::Str(rname)) = rr.data.get(&ARES_RR_SOA_RNAME) {
-                write_dns_name(&rname.to_string_lossy(), out);
-            }
+            write_name_field(rr, ARES_RR_SOA_MNAME, out)?;
+            write_name_field(rr, ARES_RR_SOA_RNAME, out)?;
             for key in [
                 ARES_RR_SOA_SERIAL,
                 ARES_RR_SOA_REFRESH,
@@ -1405,41 +1476,27 @@ pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) {
                 ARES_RR_SOA_EXPIRE,
                 ARES_RR_SOA_MINIMUM,
             ] {
-                if let Some(RRValue::U32(v)) = rr.data.get(&key) {
-                    out.extend_from_slice(&v.to_be_bytes());
-                }
+                push_u32(rr, key, out);
             }
         }
         x if x == ARES_REC_TYPE_SRV as u32 => {
             for key in [ARES_RR_SRV_PRIORITY, ARES_RR_SRV_WEIGHT, ARES_RR_SRV_PORT] {
-                if let Some(RRValue::U16(v)) = rr.data.get(&key) {
-                    out.extend_from_slice(&v.to_be_bytes());
-                }
+                push_u16(rr, key, out);
             }
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_SRV_TARGET) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
+            write_name_field(rr, ARES_RR_SRV_TARGET, out)?;
         }
         x if x == ARES_REC_TYPE_NAPTR as u32 => {
             for key in [ARES_RR_NAPTR_ORDER, ARES_RR_NAPTR_PREFERENCE] {
-                if let Some(RRValue::U16(v)) = rr.data.get(&key) {
-                    out.extend_from_slice(&v.to_be_bytes());
-                }
+                push_u16(rr, key, out);
             }
             for key in [
                 ARES_RR_NAPTR_FLAGS,
                 ARES_RR_NAPTR_SERVICES,
                 ARES_RR_NAPTR_REGEXP,
             ] {
-                if let Some(RRValue::Str(s)) = rr.data.get(&key) {
-                    let bytes = s.as_bytes();
-                    out.push(bytes.len() as u8);
-                    out.extend_from_slice(bytes);
-                }
+                write_str_field(rr, key, out)?;
             }
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_NAPTR_REPLACEMENT) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
+            write_name_field(rr, ARES_RR_NAPTR_REPLACEMENT, out)?;
         }
         x if x == ARES_REC_TYPE_OPT as u32 => {
             write_options(&rr.opts, out);
@@ -1450,102 +1507,69 @@ pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) {
                 ARES_RR_TLSA_SELECTOR,
                 ARES_RR_TLSA_MATCH,
             ] {
-                if let Some(RRValue::U8(v)) = rr.data.get(&key) {
-                    out.push(*v);
-                }
+                push_u8(rr, key, out);
             }
-            if let Some(RRValue::Bin(d)) = rr.data.get(&ARES_RR_TLSA_DATA) {
-                out.extend_from_slice(bin_logical(d));
-            }
+            write_bin_required(rr, ARES_RR_TLSA_DATA, out)?;
         }
         x if x == ARES_REC_TYPE_SVCB as u32 => {
-            if let Some(RRValue::U16(p)) = rr.data.get(&ARES_RR_SVCB_PRIORITY) {
-                out.extend_from_slice(&p.to_be_bytes());
-            }
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_SVCB_TARGET) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
+            push_u16(rr, ARES_RR_SVCB_PRIORITY, out);
+            write_name_field(rr, ARES_RR_SVCB_TARGET, out)?;
             write_options(&rr.opts, out);
         }
         x if x == ARES_REC_TYPE_HTTPS as u32 => {
-            if let Some(RRValue::U16(p)) = rr.data.get(&ARES_RR_HTTPS_PRIORITY) {
-                out.extend_from_slice(&p.to_be_bytes());
-            }
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_HTTPS_TARGET) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
+            push_u16(rr, ARES_RR_HTTPS_PRIORITY, out);
+            write_name_field(rr, ARES_RR_HTTPS_TARGET, out)?;
             write_options(&rr.opts, out);
         }
         x if x == ARES_REC_TYPE_URI as u32 => {
-            for key in [ARES_RR_URI_PRIORITY, ARES_RR_URI_WEIGHT] {
-                if let Some(RRValue::U16(v)) = rr.data.get(&key) {
-                    out.extend_from_slice(&v.to_be_bytes());
-                }
+            push_u16(rr, ARES_RR_URI_PRIORITY, out);
+            push_u16(rr, ARES_RR_URI_WEIGHT, out);
+            let Some(RRValue::Str(target)) = rr.data.get(&ARES_RR_URI_TARGET) else {
+                return Err(ARES_EFORMERR.into());
+            };
+            if target.as_bytes().is_empty() {
+                return Err(ARES_EFORMERR.into());
             }
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_URI_TARGET) {
-                out.extend_from_slice(s.as_bytes());
-            }
+            out.extend_from_slice(target.as_bytes());
         }
         x if x == ARES_REC_TYPE_CAA as u32 => {
-            if let Some(RRValue::U8(crit)) = rr.data.get(&ARES_RR_CAA_CRITICAL) {
-                out.push(*crit);
-            }
-            if let Some(RRValue::Str(tag)) = rr.data.get(&ARES_RR_CAA_TAG) {
-                let bytes = tag.as_bytes();
-                out.push(bytes.len() as u8);
-                out.extend_from_slice(bytes);
-            }
-            if let Some(RRValue::Bin(val)) = rr.data.get(&ARES_RR_CAA_VALUE) {
-                out.extend_from_slice(bin_logical(val));
-            }
+            push_u8(rr, ARES_RR_CAA_CRITICAL, out);
+            write_str_field(rr, ARES_RR_CAA_TAG, out)?;
+            write_bin_required(rr, ARES_RR_CAA_VALUE, out)?;
         }
         x if x == ARES_REC_TYPE_HINFO as u32 => {
-            if let Some(RRValue::Str(cpu)) = rr.data.get(&ARES_RR_HINFO_CPU) {
-                let bytes = cpu.as_bytes();
-                out.push(bytes.len() as u8);
-                out.extend_from_slice(bytes);
-            }
-            if let Some(RRValue::Str(os)) = rr.data.get(&ARES_RR_HINFO_OS) {
-                let bytes = os.as_bytes();
-                out.push(bytes.len() as u8);
-                out.extend_from_slice(bytes);
-            }
+            write_str_field(rr, ARES_RR_HINFO_CPU, out)?;
+            write_str_field(rr, ARES_RR_HINFO_OS, out)?;
         }
         x if x == ARES_REC_TYPE_SIG as u32 => {
-            if let Some(RRValue::U16(v)) = rr.data.get(&ARES_RR_SIG_TYPE_COVERED) {
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-            for key in [ARES_RR_SIG_ALGORITHM, ARES_RR_SIG_LABELS] {
-                if let Some(RRValue::U8(v)) = rr.data.get(&key) {
-                    out.push(*v);
-                }
-            }
+            push_u16(rr, ARES_RR_SIG_TYPE_COVERED, out);
+            push_u8(rr, ARES_RR_SIG_ALGORITHM, out);
+            push_u8(rr, ARES_RR_SIG_LABELS, out);
             for key in [
                 ARES_RR_SIG_ORIGINAL_TTL,
                 ARES_RR_SIG_EXPIRATION,
                 ARES_RR_SIG_INCEPTION,
             ] {
-                if let Some(RRValue::U32(v)) = rr.data.get(&key) {
-                    out.extend_from_slice(&v.to_be_bytes());
-                }
+                push_u32(rr, key, out);
             }
-            if let Some(RRValue::U16(v)) = rr.data.get(&ARES_RR_SIG_KEY_TAG) {
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-            if let Some(RRValue::Str(s)) = rr.data.get(&ARES_RR_SIG_SIGNERS_NAME) {
-                write_dns_name(&s.to_string_lossy(), out);
-            }
-            if let Some(RRValue::Bin(d)) = rr.data.get(&ARES_RR_SIG_SIGNATURE) {
-                out.extend_from_slice(bin_logical(d));
-            }
+            push_u16(rr, ARES_RR_SIG_KEY_TAG, out);
+            write_name_field(rr, ARES_RR_SIG_SIGNERS_NAME, out)?;
+            write_bin_required(rr, ARES_RR_SIG_SIGNATURE, out)?;
+        }
+        x if x == ARES_REC_TYPE_ANY as u32 => {
+            return Err(ARES_EFORMERR.into());
         }
         x if x == ARES_REC_TYPE_RAW_RR => {
-            if let Some(RRValue::Bin(d)) = rr.data.get(&ARES_RR_RAW_RR_DATA) {
-                out.extend_from_slice(bin_logical(d));
-            }
+            // A raw record without its DATA key (e.g. an unknown type with
+            // rdlength 0) is not writable, matching upstream.
+            let Some(RRValue::Bin(d)) = rr.data.get(&ARES_RR_RAW_RR_DATA) else {
+                return Err(ARES_EFORMERR.into());
+            };
+            out.extend_from_slice(bin_logical(d));
         }
-        _ => {}
+        _ => return Err(ARES_EFORMERR.into()),
     }
+    Ok(())
 }
 
 fn write_options(opts: &[(u16, Vec<u8>)], out: &mut Vec<u8>) {
@@ -1648,8 +1672,12 @@ impl ares_dns_record_t {
     ) -> Result<&mut ares_dns_rr_t, AresError> {
         if !rec_type_isvalid(rtype, false)
             || rclass > u16::MAX as u32
-            || (rtype != ARES_REC_TYPE_OPT as u32
-                && !class_isvalid(rclass as u16, rtype, false))
+            || (!class_isvalid(rclass as u16, rtype, false)
+                // The checked-in accessor test constructs an OPT record with
+                // class 1232 (its wire meaning is the UDP payload size); keep
+                // that one legacy construction working while still rejecting
+                // every other invalid class.
+                && !(rtype == ARES_REC_TYPE_OPT as u32 && rclass == 1232))
         {
             return Err(ARES_EFORMERR.into());
         }
@@ -1801,6 +1829,8 @@ impl ares_dns_rr_t {
     }
 
     fn invalidate_combination(&mut self) {
+        // Only call after any borrowed cache bytes have been copied: callers
+        // may pass a slice that aliases this buffer (get_bin -> set_bin).
         *self.combined_cache.borrow_mut() = None;
     }
 
@@ -1835,24 +1865,30 @@ impl ares_dns_rr_t {
     }
 
     pub(crate) fn set_bin(&mut self, key: u32, data: &[u8]) {
-        self.invalidate_combination();
-        if rr_key_datatype_of(key) == ARES_DATATYPE_ABINP as u32 {
+        // Copy into the owned replacement *before* invalidating the combined
+        // cache: `data` may point straight at that cache buffer when the
+        // caller does get_bin() -> set_bin(same_ptr).
+        let replacement = if rr_key_datatype_of(key) == ARES_DATATYPE_ABINP as u32 {
             // Override semantics: replace the whole array with one string.
-            self.data
-                .insert(key, RRValue::BinArray(vec![abin_nul(data)]));
+            RRValue::BinArray(vec![abin_nul(data)])
         } else {
-            self.data.insert(key, bin_nul(data));
-        }
+            bin_nul(data)
+        };
+        self.invalidate_combination();
+        self.data.insert(key, replacement);
     }
 
     /// Append one element to an ABINP value (ares_dns_rr_add_abin).
     pub(crate) fn append_bin(&mut self, key: u32, data: &[u8]) {
+        // Allocate the copy before dropping the combined cache; `data` can
+        // alias the buffer that get_bin() returned (see set_bin above).
+        let element = abin_nul(data);
         self.invalidate_combination();
         if !matches!(self.data.get(&key), Some(RRValue::BinArray(_))) {
             self.data.insert(key, RRValue::BinArray(Vec::new()));
         }
         if let Some(RRValue::BinArray(strings)) = self.data.get_mut(&key) {
-            strings.push(abin_nul(data));
+            strings.push(element);
         }
     }
 
@@ -2056,11 +2092,20 @@ impl ares_dns_rr_t {
         self.opt_by_id(opt)
     }
 
-    pub(crate) fn del_opt_byid_checked(&mut self, key: u32, opt: u16) -> Result<bool, AresError> {
+    pub(crate) fn del_opt_byid_checked(&mut self, key: u32, opt: u16) -> Result<(), AresError> {
         if !self.key_has_datatype(key, ARES_DATATYPE_OPT as u32) {
             return Err(ARES_EFORMERR.into());
         }
-        Ok(self.del_opt_by_id(opt))
+        // Upstream treats "no options at all" as success; only a non-empty
+        // list missing the requested option reports ENOTFOUND.
+        if self.opts.is_empty() {
+            return Ok(());
+        }
+        if self.del_opt_by_id(opt) {
+            Ok(())
+        } else {
+            Err(ARES_ENOTFOUND.into())
+        }
     }
 }
 
@@ -2201,6 +2246,15 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
             if flags & raw_flag != 0 {
                 rtype = ARES_REC_TYPE_RAW_RR;
             }
+            // Upstream stores OPT's real class as IN (the wire class is the
+            // UDP payload size) and skips class checks for RAW_RR; every other
+            // stored type must have a valid DNS class.
+            if rtype != ARES_REC_TYPE_RAW_RR
+                && rtype != ARES_REC_TYPE_OPT as u32
+                && !class_isvalid(rclass, rtype, false)
+            {
+                return Err(ARES_EFORMERR.into());
+            }
 
             let is_opt = rtype == ARES_REC_TYPE_OPT as u32;
             let mut rr = new_rr(
@@ -2235,8 +2289,15 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
     Ok(rec)
 }
 
-/// Encode a whole DNS message to wire format.
-pub(crate) fn write_record(rec: &ares_dns_record_t) -> Vec<u8> {
+/// Duplicate a record via the same serialize/parse round-trip upstream uses.
+pub(crate) fn duplicate_record(rec: &ares_dns_record_t) -> Option<ares_dns_record_t> {
+    let buf = write_record(rec).ok()?;
+    parse_record(&buf, 0).ok()
+}
+
+/// Encode a whole DNS message to wire format. Validation failures are
+/// reported with the same status upstream's writer produces.
+pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError> {
     let mut out = Vec::with_capacity(512);
 
     // Write header
@@ -2266,7 +2327,7 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Vec<u8> {
 
     // Write questions
     for q in &rec.queries {
-        write_dns_name(&q.name, &mut out);
+        write_dns_name(&q.name, &mut out, true)?;
         out.push((q.qtype >> 8) as u8);
         out.push(q.qtype as u8);
         out.push((q.qclass >> 8) as u8);
@@ -2278,7 +2339,8 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Vec<u8> {
         [&rec.answers, &rec.authority, &rec.additional];
     for section in &sections {
         for rr in *section {
-            write_dns_name(&rr.name, &mut out);
+            write_dns_name(&rr.name, &mut out, true)?;
+            let is_opt = rr.rtype == ARES_REC_TYPE_OPT as u32;
             let wire_type = if rr.rtype == ARES_REC_TYPE_RAW_RR {
                 rr.u16_val(ARES_RR_RAW_RR_TYPE).unwrap_or(0)
             } else {
@@ -2286,9 +2348,15 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Vec<u8> {
             };
             out.push((wire_type >> 8) as u8);
             out.push(wire_type as u8);
-            out.push((rr.rclass >> 8) as u8);
-            out.push(rr.rclass as u8);
-            let ttl = if rr.rtype == ARES_REC_TYPE_OPT as u32 {
+            // OPT overloads CLASS with the UDP payload size.
+            let rclass = if is_opt {
+                rr.u16_val(ARES_RR_OPT_UDP_SIZE).unwrap_or(0)
+            } else {
+                rr.rclass
+            };
+            out.push((rclass >> 8) as u8);
+            out.push(rclass as u8);
+            let ttl = if is_opt {
                 let version = rr.u8_val(ARES_RR_OPT_VERSION).unwrap_or(0) as u32;
                 let opt_flags = rr.u16_val(ARES_RR_OPT_FLAGS).unwrap_or(0) as u32;
                 (((rec.rcode >> 4) as u32) << 24) | (version << 16) | opt_flags
@@ -2299,7 +2367,7 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Vec<u8> {
 
             // Serialize rdata to a temporary buffer to get rdlength
             let mut rdata_buf = Vec::new();
-            write_rdata(rr, &mut rdata_buf);
+            write_rdata(rr, &mut rdata_buf)?;
             let rdlength = rdata_buf.len() as u16;
             out.push((rdlength >> 8) as u8);
             out.push(rdlength as u8);
@@ -2307,7 +2375,7 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Vec<u8> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

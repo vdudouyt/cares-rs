@@ -393,6 +393,32 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     }
 }
 
+/// Serialize an outgoing DNS record; on failure report the same callback
+/// status upstream's duplicate-based send path uses.
+fn serialize_send_record(
+    rec: &dns_record::ares_dns_record_t,
+    callback: ares_callback_dnsrec,
+    arg: *mut c_void,
+) -> Result<Vec<u8>, crate::ffi::ares_status_t> {
+    match crate::core::dns_record::write_record(rec) {
+        Ok(buf) => Ok(buf),
+        Err(e) => {
+            // Upstream duplicate() failures surface as EBADQUERY only when
+            // the write+parse round-trip reported EBADRESP; other writer
+            // statuses pass through unchanged.
+            let status = if e.code() == ARES_EBADRESP {
+                ARES_EBADQUERY
+            } else {
+                e.code()
+            };
+            if let Some(cb) = callback {
+                unsafe { cb(arg, status, 0, std::ptr::null_mut()) };
+            }
+            Err(status)
+        }
+    }
+}
+
 /// Serialize an `ares_dns_record_t` and send it through the same async query
 /// lifecycle as `ares_send`. Phase 1 generates a fresh query id (the caller's
 /// record id is not trusted); cache/usevc semantics are refined in Phase 3.
@@ -409,7 +435,10 @@ pub unsafe extern "C" fn ares_send_dnsrec(
     if channel.is_null() || dnsrec.is_null() { return ARES_EFORMERR; }
     // SAFETY: the caller guarantees a live, initialized record.
     let rec = unsafe { &*dnsrec };
-    let mut buf = crate::core::dns_record::write_record(rec);
+    let mut buf = match serialize_send_record(rec, Some(callback), arg) {
+        Ok(buf) => buf,
+        Err(status) => return status,
+    };
     // DNS messages carry a 16-bit length; upstream rejects larger queries.
     if buf.len() > u16::MAX as usize || buf.len() < 12 {
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut()) };
