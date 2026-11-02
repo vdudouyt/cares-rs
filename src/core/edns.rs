@@ -217,22 +217,24 @@ pub(crate) fn cookie_option(buf: &[u8]) -> Option<&[u8]> {
 
 /// Replace (or remove, when `cookie` is `None`) the COOKIE option in an existing
 /// OPT RR. All other EDNS options are preserved, so a caller-supplied template
-/// (e.g. `ares_search_dnsrec` search options) survives. No-op when there is no
-/// OPT.
-pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) {
-    let Some(opt) = find_opt(buf) else { return };
-    let Some(old_rdata) = opt.rdata(buf) else { return };
+/// (e.g. `ares_search_dnsrec` search options) survives. A missing OPT is a
+/// successful no-op. Returns false (buffer untouched) when the option list is
+/// malformed or the new COOKIE would push the message past the 16-bit DNS
+/// length limit.
+pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) -> bool {
+    let Some(opt) = find_opt(buf) else { return true };
+    let Some(old_rdata) = opt.rdata(buf) else { return false };
 
     let mut new_rdata: Vec<u8> = Vec::with_capacity(old_rdata.len() + cookie.map_or(0, |c| 4 + c.len()));
     let mut rest = old_rdata;
     while !rest.is_empty() {
         if rest.len() < 4 {
-            return; // malformed option list — leave the packet untouched
+            return false; // malformed option list — leave the packet untouched
         }
         let code = u16::from_be_bytes([rest[0], rest[1]]);
         let len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
         if rest.get(4..4 + len).is_none() {
-            return; // malformed option list — leave the packet untouched
+            return false; // malformed option list — leave the packet untouched
         }
         if code != OPT_COOKIE {
             new_rdata.extend_from_slice(&rest[..4 + len]);
@@ -241,20 +243,33 @@ pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) {
     }
     if let Some(cookie) = cookie {
         if cookie.len() > u16::MAX as usize {
-            return;
+            return false;
         }
         new_rdata.extend_from_slice(&OPT_COOKIE.to_be_bytes());
         new_rdata.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
         new_rdata.extend_from_slice(cookie);
     }
     if new_rdata.len() > u16::MAX as usize {
-        return;
+        return false;
+    }
+    // The whole message (normally RDATA growth, but a removal can shrink it)
+    // must stay within the 16-bit DNS/TCP length field.
+    let Some(new_total) = buf
+        .len()
+        .checked_sub(opt.rdata_len)
+        .and_then(|n| n.checked_add(new_rdata.len()))
+    else {
+        return false;
+    };
+    if new_total > u16::MAX as usize {
+        return false;
     }
 
     let rdlen_offset = opt.rdata_offset.wrapping_sub(2);
-    let Some(slot) = buf.get_mut(rdlen_offset..rdlen_offset + 2) else { return };
+    let Some(slot) = buf.get_mut(rdlen_offset..rdlen_offset + 2) else { return false };
     slot.copy_from_slice(&(new_rdata.len() as u16).to_be_bytes());
     buf.splice(opt.rdata_offset..opt.rdata_offset + opt.rdata_len, new_rdata);
+    true
 }
 
 /// Locate question 0's label byte ranges `(start, end)` in the wire message.
@@ -495,6 +510,30 @@ mod tests {
         assert!(!has_opt(&q));
         assert_eq!(header_u16(&q, 10), Some(0));
         assert_eq!(q.len(), 29);
+    }
+
+    #[test]
+    fn cookie_append_checks_total_message_length() {
+        // Valid header with one OPT RR (empty RDATA) at offset 12, then
+        // trailing padding so the message is near the 16-bit limit.
+        let make = |len: usize| {
+            let mut buf = vec![0u8; len];
+            buf[10..12].copy_from_slice(&1u16.to_be_bytes()); // arcount = 1
+            buf[12] = 0; // root name
+            buf[13..15].copy_from_slice(&41u16.to_be_bytes()); // OPT
+            buf[15..17].copy_from_slice(&1280u16.to_be_bytes());
+            buf
+        };
+
+        let mut too_big = make(65530);
+        let original = too_big.clone();
+        assert!(!set_cookie_option(&mut too_big, Some(&[1u8; 8])));
+        assert_eq!(too_big, original, "failed append must not truncate/mutate");
+
+        let mut fits = make(65520);
+        assert!(set_cookie_option(&mut fits, Some(&[1u8; 8])));
+        assert_eq!(fits.len(), 65532);
+        assert_eq!(cookie_option(&fits), Some(&[1u8; 8][..]));
     }
 
     #[test]

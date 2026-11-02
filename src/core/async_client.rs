@@ -243,7 +243,10 @@ impl AsyncClient {
         if synthesize_edns && !edns::has_opt(&payload) {
             match self.edns_udp_size() {
                 Ok(Some(size)) => {
-                    edns::append_opt(&mut payload, size);
+                    if !edns::append_opt(&mut payload, size) {
+                        // Too large for the 16-bit DNS length field.
+                        return (Err(ARES_EFORMERR), timeouts);
+                    }
                 }
                 Ok(None) => {}
                 // EDNSPSZ wider than the 16-bit OPT CLASS: upstream rejects
@@ -261,6 +264,12 @@ impl AsyncClient {
         };
         let mut cookie_try_count: u32 = 0;
         let mut tries: u32 = 0;
+        // A template/record that already exceeds the 16-bit wire length cannot
+        // be framed; upstream's TCP writer reports EBADQUERY rather than
+        // truncating the length prefix.
+        if payload.len() > u16::MAX as usize {
+            return (Err(ARES_EBADQUERY), timeouts);
+        }
         let mut failover_tries: u32 = 0;
         // Upstream's query->try_count: incremented for every retry (timeout,
         // server-error failover, or send failure); the timeout backoff below is
@@ -276,11 +285,13 @@ impl AsyncClient {
             // Cookies ride on the OPT record: re-evaluate them for this server
             // and transport immediately before every send (a BADCOOKIE retry
             // must pick up the newly learned server cookie; a TCP upgrade must
-            // remove it). Raw send never synthesizes/rewrites a cookie.
-            let sent_cookie = if synthesize_edns {
-                self.apply_cookie(&mut payload, server, use_tcp)
-            } else {
-                None
+            // remove it). This matches upstream `ares_cookie_apply`, which acts
+            // whenever the outgoing record has an OPT — including a
+            // caller-supplied OPT on a raw send or search template. A raw send
+            // with no OPT is therefore left completely untouched.
+            let sent_cookie = match self.apply_cookie(&mut payload, server, use_tcp) {
+                Ok(c) => c,
+                Err(e) => return (Err(e.code()), timeouts),
             };
             let framed_tcp = if use_tcp { Some(frame_tcp(&payload)) } else { None };
             let wire: &[u8] = framed_tcp.as_deref().unwrap_or(&payload);
@@ -788,6 +799,7 @@ impl AsyncClient {
             name,
             move |candidate| dns_query_payload(candidate, dnstype, dnsclass, rd),
             retry_server_error,
+            true,
         )
         .await
     }
@@ -808,6 +820,9 @@ impl AsyncClient {
             name,
             move |candidate| payload_from_template(&template, candidate),
             retry_server_error,
+            // Upstream duplicates the caller record unchanged (only query[0]'s
+            // name is replaced): never synthesize an OPT for this path.
+            false,
         )
         .await
     }
@@ -821,6 +836,7 @@ impl AsyncClient {
         name: String,
         make_payload: F,
         retry_server_error: bool,
+        synthesize_edns: bool,
     ) -> Delivery
     where
         F: Fn(&str) -> Result<BytesMut, AresError>,
@@ -857,7 +873,7 @@ impl AsyncClient {
             // of a lookup only; biased probe → primary). The probe folds itself into
             // ServerHealth and terminates; if the primary finishes first the probe
             // is dropped un-settled.
-            let mut primary = pin!(self.clone().request(payload, use_vc, true).fuse());
+            let mut primary = pin!(self.clone().request(payload, use_vc, synthesize_edns).fuse());
             let (result, io_timeouts) = match probe_payload {
                 Some(pp) => {
                     let mut probe = pin!(self.clone().run_probe(pp, use_vc).fuse());
@@ -1533,7 +1549,16 @@ pub(crate) fn build_query(
     rd: bool,
     max_udp_size: i32,
 ) -> Result<Vec<u8>, AresError> {
-    let max_udp_size: u16 = if max_udp_size > 0 { max_udp_size as u16 } else { 0 };
+    // Upstream ares_dns_record_create_query checks that the advertised EDNS
+    // size fits the OPT RR's 16-bit CLASS; zero/negative means "no EDNS".
+    let max_udp_size: u16 = if max_udp_size > 0 {
+        if max_udp_size > u16::MAX as i32 {
+            return Err(ARES_EFORMERR.into());
+        }
+        max_udp_size as u16
+    } else {
+        0
+    };
     // Check if trailing dot is an unescaped separator (not a literal escaped dot)
     let has_unescaped_trailing_dot = if let Some(prefix) = name_str.strip_suffix('.') {
         // Count consecutive backslashes before the trailing dot
@@ -2461,30 +2486,42 @@ impl AsyncClient {
     /// Attach the COOKIE EDNS option for this send (UDP only; removed on TCP).
     /// Returns the 8-byte client cookie actually placed on the wire, which is
     /// what the response's echoed client cookie must match (per-query spoof
-    /// check, independent of later state changes).
-    fn apply_cookie(&self, payload: &mut Vec<u8>, server: usize, use_tcp: bool) -> Option<[u8; 8]> {
+    /// check, independent of later state changes). `ARES_EFORMERR` means the
+    /// message could not be rewritten without exceeding the 16-bit DNS limit.
+    fn apply_cookie(
+        &self,
+        payload: &mut Vec<u8>,
+        server: usize,
+        use_tcp: bool,
+    ) -> Result<Option<[u8; 8]>, AresError> {
         if !edns::has_opt(payload) {
-            return None;
+            return Ok(None);
         }
         if use_tcp {
             // Cookies are deliberately not used over TCP; strip a stale one
             // (e.g. after a BADCOOKIE-driven upgrade).
-            edns::set_cookie_option(payload, None);
-            return None;
+            if !edns::set_cookie_option(payload, None) {
+                return Err(ARES_EFORMERR.into());
+            }
+            return Ok(None);
         }
         let cookie = self.with_cookie(server, ServerCookie::cookie_for_query).flatten();
         let Some(cookie) = cookie else {
             // Server is known to be unsupported right now: no cookie.
-            edns::set_cookie_option(payload, None);
-            return None;
+            if !edns::set_cookie_option(payload, None) {
+                return Err(ARES_EFORMERR.into());
+            }
+            return Ok(None);
         };
         if cookie.len() < 8 {
-            return None;
+            return Ok(None);
         }
         let mut client = [0u8; 8];
         client.copy_from_slice(&cookie[..8]);
-        edns::set_cookie_option(payload, Some(&cookie));
-        Some(client)
+        if !edns::set_cookie_option(payload, Some(&cookie)) {
+            return Err(ARES_EFORMERR.into());
+        }
+        Ok(Some(client))
     }
 
     /// Validate a response's COOKIE option against this server's state.
@@ -2918,6 +2955,30 @@ mod tests {
         );
         assert!(build_query("example.com", 1, 1, 0, true, 0).is_ok());
         assert!(validate_query_class_type(255, 255).is_ok());
+    }
+
+    #[test]
+    fn create_query_rejects_oversized_edns_payload_size() {
+        for oversized in [65536, 70000, i32::MAX] {
+            assert_eq!(
+                build_query("example.com", 1, 1, 0, true, oversized)
+                    .expect_err("oversized EDNS must fail")
+                    .code(),
+                ARES_EFORMERR
+            );
+        }
+        // 1..=65535 is valid EDNS; the OPT CLASS carries the exact size.
+        for size in [1i32, 1280, 65535] {
+            let p = build_query("example.com", 1, 1, 0, true, size).expect("valid EDNS size");
+            assert_eq!(u16::from_be_bytes([p[10], p[11]]), 1, "arcount");
+            let opt_class = u16::from_be_bytes([p[32], p[33]]);
+            assert_eq!(u32::from(opt_class), size as u32);
+        }
+        // Zero and negative mean "no EDNS".
+        for size in [0i32, -1] {
+            let p = build_query("example.com", 1, 1, 0, true, size).expect("no EDNS");
+            assert_eq!(u16::from_be_bytes([p[10], p[11]]), 0, "arcount");
+        }
     }
 
     #[test]
