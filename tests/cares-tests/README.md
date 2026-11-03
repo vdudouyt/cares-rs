@@ -20,14 +20,15 @@ Tests are organized by file:
 - `ares-test-misc.cc` — utility functions (GetServers, ExpandName, CreateQuery, etc.)
 - `ares-test-init.cc` — library/channel initialization and option handling
 
-### Excluded test categories
-- **EDNS / DNS cookies / DNS 0x20** — not implemented in cares-rs
+### Supported test categories
+- **EDNS / DNS cookies / DNS 0x20** — implemented and covered by the restored upstream tests.
+- **Event thread** — `ARES_OPT_EVENT_THREAD` is implemented; `ares_threadsafety()` returns 1.
+  The manual reactor API (`ares_fds`/`ares_process`/`ares_process_fd`/`ares_timeout`) is
+  still supported for channels without the event thread.
+
+### Remaining excluded test categories
 - **Alloc-failure injection** — not applicable to Rust
 - **Container/namespace** — tests access channel struct internals incompatible with our opaque Rust struct
-- **Event thread** — the built-in event thread (`ARES_OPT_EVENT_THREAD`) is not
-  supported; `ares_init_options` returns `ARES_ENOTIMP` and `ares_threadsafety()`
-  returns 0, matching c-ares on a non-threaded build. Drive the channel via the
-  manual reactor API (`ares_fds`/`ares_process`/`ares_process_fd`/`ares_timeout`) instead.
 - **Internal API** — tests c-ares private functions not exposed via FFI
 
 ## Fuzz corpus tests (aresfuzz, aresfuzzname)
