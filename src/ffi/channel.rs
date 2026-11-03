@@ -15,13 +15,13 @@ use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{JoinHandle, ThreadId};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// How long the built-in event thread parks in `poll` when no task publishes
-/// a shorter timeout. 10 ms keeps response latency low while still sleeping
-/// when there is nothing to do.
-const EVENT_POLL_MS: u128 = 10;
+/// Upper bound on the event thread's poll wait. New work wakes the thread
+/// immediately through the wake pipe, so this only bounds idle wakeups (and
+/// gives timers a hard ceiling).
+const EVENT_MAX_WAIT_MS: u128 = 1000;
 
 /// The C-visible channel: the pure core state plus the channel-level C
 /// callbacks. Everything the shims marshal lives behind `.state`; the six
@@ -61,6 +61,9 @@ pub struct ChannelData {
     /// the same channel on the same thread (destroy from a callback remains
     /// unsupported).
     pub(crate) lock: Arc<ReentrantMutex>,
+    /// Event-thread wake pipe (None for non-event channels). Created when the
+    /// event thread starts and closed by `WakePipe::drop` with the channel.
+    pub(crate) event_wake: Option<Arc<WakePipe>>,
 }
 
 impl ChannelData {
@@ -80,6 +83,7 @@ impl ChannelData {
             event_stop: Arc::new(AtomicBool::new(false)),
             event_join: None,
             lock: Arc::new(ReentrantMutex::new()),
+            event_wake: None,
         }
     }
 
@@ -104,7 +108,25 @@ impl ChannelData {
             event_stop: Arc::new(AtomicBool::new(false)),
             event_join: None,
             lock: Arc::new(ReentrantMutex::new()),
+            event_wake: None,
         }
+    }
+
+    /// Wake the event thread (no-op for non-event channels). Safe to call with
+    /// the channel lock held; a full pipe means the thread is already awake.
+    pub(crate) fn wake(&self) {
+        if let Some(wake) = &self.event_wake {
+            wake.wake();
+        }
+    }
+
+    /// True when a shared-socket sibling routed work into a mailbox that has
+    /// not been re-polled yet (the event thread must run another cycle without
+    /// waiting for fd readiness).
+    fn has_routed(&self) -> bool {
+        self.executor
+            .ids()
+            .any(|id| self.executor.io(id).is_some_and(|io| io.borrow().routed))
     }
 
     /// Push the channel's socket settings (buffers, local bind, state
@@ -159,6 +181,9 @@ impl ChannelData {
     ) {
         let id = self.executor.spawn(io, fut, on);
         self.advance(id);
+        // New fds/timers may have been published: wake the event thread now
+        // rather than waiting for its idle poll to expire.
+        self.wake();
     }
 
     /// Advance one task one step: poll it, apply the DNS effects it emitted
@@ -277,6 +302,73 @@ impl ChannelData {
     }
 }
 
+/// The event thread's self-pipe. `wake` is nonblocking (a full pipe simply
+/// means the thread is already runnable); `drain` is called by the thread on
+/// every wakeup.
+pub(crate) struct WakePipe {
+    read_fd: libc::c_int,
+    write_fd: libc::c_int,
+}
+
+impl WakePipe {
+    fn new() -> Option<Self> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds points to two writable slots.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        for fd in fds {
+            // Both ends nonblocking and close-on-exec.
+            // SAFETY: fd is a freshly created valid descriptor.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let fdflags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let ok = flags != -1
+                && fdflags != -1
+                && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != -1
+                && unsafe { libc::fcntl(fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC) } != -1;
+            if !ok {
+                for fd in fds {
+                    unsafe { libc::close(fd) };
+                }
+                return None;
+            }
+        }
+        Some(WakePipe { read_fd: fds[0], write_fd: fds[1] })
+    }
+
+    fn read_fd(&self) -> libc::c_int {
+        self.read_fd
+    }
+
+    fn wake(&self) {
+        let byte = 1u8;
+        // SAFETY: one byte from a valid stack address to a valid descriptor.
+        // EAGAIN (pipe full) and EINTR are benign: the thread is already awake.
+        unsafe { libc::write(self.write_fd, &byte as *const u8 as *const libc::c_void, 1) };
+    }
+
+    fn drain(&self) {
+        let mut buf = [0u8; 64];
+        loop {
+            // SAFETY: buf is writable for its full length and the fd is valid.
+            let n = unsafe { libc::read(self.read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for WakePipe {
+    fn drop(&mut self) {
+        // SAFETY: the fds are owned by this WakePipe and closed exactly once.
+        unsafe {
+            libc::close(self.read_fd);
+            libc::close(self.write_fd);
+        }
+    }
+}
+
 /// A per-channel recursive lock. Completion callbacks fire while the lock is
 /// held, so the same thread must be able to re-enter a channel API (the
 /// historical single-thread behavior). A different thread waits on `available`
@@ -287,8 +379,25 @@ pub(crate) struct ReentrantMutex {
 }
 
 struct LockState {
-    owner: Option<ThreadId>,
+    /// Non-allocating platform thread identity (see `thread_token`).
+    owner: Option<usize>,
     depth: usize,
+}
+
+/// An opaque, allocation-free thread identity for the recursive lock.
+fn thread_token() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: pthread_self has no preconditions and cannot fail.
+        unsafe { libc::pthread_self() as usize }
+    }
+    #[cfg(not(unix))]
+    {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        hasher.finish() as usize
+    }
 }
 
 impl ReentrantMutex {
@@ -300,7 +409,7 @@ impl ReentrantMutex {
     }
 
     fn lock(&self) -> ReentrantGuard<'_> {
-        let me = std::thread::current().id();
+        let me = thread_token();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             match state.owner {
@@ -329,7 +438,7 @@ pub(crate) struct ReentrantGuard<'a> {
 
 impl Drop for ReentrantGuard<'_> {
     fn drop(&mut self) {
-        let me = std::thread::current().id();
+        let me = thread_token();
         let mut state = self.lock.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.owner != Some(me) {
             return;
@@ -348,7 +457,7 @@ impl Drop for ReentrantGuard<'_> {
 /// The built-in event thread: snapshot the fds/timeout under the channel lock,
 /// `poll` without holding it, then lock again and drive the futures whose fds
 /// became ready (or whose timeout expired).
-fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static ReentrantMutex) {
+fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static ReentrantMutex, wake: Arc<WakePipe>) {
     use crate::ffi::ares_socket::{ares_fd_events_t, ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
     loop {
         if stop.load(Ordering::Acquire) {
@@ -370,24 +479,29 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
 
         // Poll rather than select: no FD_SETSIZE ceiling and no fd_set
         // marshalling in the loop. The readiness oracle handed to the executor
-        // is the same one `ares_process_fds` uses.
-        let mut pollfds: Vec<libc::pollfd> = waits
-            .iter()
-            .map(|(fd, wants_write)| libc::pollfd {
-                fd: *fd,
-                events: if *wants_write { libc::POLLOUT } else { libc::POLLIN },
-                revents: 0,
-            })
-            .collect();
+        // is the same one `ares_process_fds` uses. Slot 0 is the wake pipe.
+        let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(waits.len() + 1);
+        pollfds.push(libc::pollfd { fd: wake.read_fd(), events: libc::POLLIN, revents: 0 });
+        pollfds.extend(waits.iter().map(|(fd, wants_write)| libc::pollfd {
+            fd: *fd,
+            events: if *wants_write { libc::POLLOUT } else { libc::POLLIN },
+            revents: 0,
+        }));
         let timeout_ms = match next_timeout {
-            Some(0) => 0,
-            Some(ms) => ms.clamp(1, EVENT_POLL_MS) as libc::c_int,
-            None => EVENT_POLL_MS as libc::c_int,
+            Some(ms) => ms.clamp(1, EVENT_MAX_WAIT_MS) as libc::c_int,
+            None => EVENT_MAX_WAIT_MS as libc::c_int,
         };
-        let count = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
+        // A timeout/error just means no fd is ready; timeouts are still
+        // processed below, so no extra sleep is needed.
+        let _count = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, timeout_ms) };
 
         let mut events: Vec<ares_fd_events_t> = Vec::new();
+        let mut woke = false;
         for p in &pollfds {
+            if p.fd == wake.read_fd() {
+                woke = p.revents != 0;
+                continue;
+            }
             if p.revents == 0 {
                 continue;
             }
@@ -403,6 +517,9 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
             }
             events.push(ares_fd_events_t { fd: p.fd, events: flags });
         }
+        if woke {
+            wake.drain();
+        }
 
         {
             let _guard = lock.lock();
@@ -411,14 +528,18 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
             }
             // SAFETY: as above; the lock excludes all other channel access.
             let data = unsafe { &mut *(channel as *mut ChannelData) };
-            data.process_events(&events, false);
+            let mut batch = events;
+            loop {
+                data.process_events(&batch, false);
+                // A shared UDP socket that died flags every sibling mailbox;
+                // re-poll them now instead of waiting for their timeouts.
+                if !data.has_routed() {
+                    break;
+                }
+                batch.clear();
+            }
         }
 
-        // A zero return means poll timed out; yield briefly so an idle channel
-        // does not spin at 100% CPU.
-        if count == 0 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
 }
 
@@ -443,17 +564,15 @@ pub(crate) unsafe fn channel_access<'a>(channel: *const ChannelData) -> Option<(
 /// Returns false when the OS refused the thread; the caller then treats init
 /// as failed.
 pub(crate) fn start_event_thread(channel: *mut ChannelData) -> bool {
-    // SAFETY: the caller passes a freshly boxed, live channel.
-    let (stop, lock) = unsafe {
-        (
-            (*channel).event_stop.clone(),
-            &*((*channel).lock.as_ref() as *const ReentrantMutex),
-        )
-    };
+    let Some(wake) = WakePipe::new().map(Arc::new) else { return false };
+    // SAFETY: the caller passes a freshly boxed, live channel. The wake pipe is
+    // owned by the channel and mirrored into the thread for its lifetime.
+    let (stop, lock) = unsafe { ((*channel).event_stop.clone(), &*((*channel).lock.as_ref() as *const ReentrantMutex)) };
+    unsafe { (*channel).event_wake = Some(wake.clone()) };
     let raw = channel as usize;
     match std::thread::Builder::new()
         .name("cares-event".to_string())
-        .spawn(move || event_thread_main(raw, stop, lock))
+        .spawn(move || event_thread_main(raw, stop, lock, wake))
     {
         Ok(handle) => {
             // SAFETY: the thread never reads `event_join`.
@@ -506,6 +625,7 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
 fn cancel_impl(channel: *mut ChannelData) {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     channeldata.abort_all(ARES_ECANCELLED);
+    channeldata.wake();
 }
 
 #[no_mangle]
@@ -516,16 +636,19 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
 
 /// Safe body of ares_destroy: stop and join the event thread (without holding
 /// the lock across the join), abort every query, then free the channel. The
-/// stop flag is observed on the thread's next poll wakeup (at most
-/// `EVENT_POLL_MS`); there is no separate wake pipe.
+/// stop flag is followed by a wake-pipe write so the join is prompt.
 fn destroy_impl(channel: *mut ChannelData) {
     if channel.is_null() { return; }
     let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return; };
     let stop = data.event_stop.clone();
     let join = data.event_join.take();
+    let wake = data.event_wake.clone();
     drop(guard);
     if let Some(handle) = join {
         stop.store(true, Ordering::Release);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
         let _ = handle.join();
     }
     let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return; };
@@ -539,16 +662,11 @@ fn destroy_impl(channel: *mut ChannelData) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_fds(channel: *const ChannelData, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return 0; };
-    unsafe { libc::FD_ZERO(write_fds) };
-    unsafe { libc::FD_ZERO(read_fds) };
+    unsafe { libc::FD_ZERO(write_fds); libc::FD_ZERO(read_fds) };
 
     let fds = channeldata.all_poll_fds();
     for (fd, wants_write) in &fds {
-        if *wants_write {
-            unsafe { libc::FD_SET(*fd, write_fds) };
-        } else {
-            unsafe { libc::FD_SET(*fd, read_fds) };
-        }
+        unsafe { if *wants_write { libc::FD_SET(*fd, write_fds) } else { libc::FD_SET(*fd, read_fds) } };
     }
     crate::core::async_client::nfds(&fds)
 }
@@ -598,6 +716,7 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, head: *const ares_ad
         head = unsafe { (*head).next as *const ares_addr_node };
     }
     channeldata.state.set_servers(servers);
+    channeldata.wake();
     ARES_SUCCESS
 }
 
@@ -625,6 +744,7 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, head: *const A
         head = node.next as *const AresAddrPortNode;
     }
     channeldata.state.set_servers(servers);
+    channeldata.wake();
     ARES_SUCCESS
 }
 
@@ -669,7 +789,9 @@ fn get_servers_ports_ptr(channeldata: &ChannelData) -> Option<*mut AresAddrPortN
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *const c_char) -> c_int {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
-    unsafe { set_servers_ports_csv_impl(channeldata, servers) }
+    let status = unsafe { set_servers_ports_csv_impl(channeldata, servers) };
+    channeldata.wake();
+    status
 }
 
 /// Unlocked body of `ares_set_servers[_ports]_csv` (both public wrappers lock).
@@ -698,7 +820,9 @@ unsafe fn set_servers_ports_csv_impl(channeldata: &mut ChannelData, servers: *co
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const c_char) -> c_int {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
-    unsafe { set_servers_ports_csv_impl(channeldata, servers) }
+    let status = unsafe { set_servers_ports_csv_impl(channeldata, servers) };
+    channeldata.wake();
+    status
 }
 
 /// # Safety
@@ -841,7 +965,9 @@ pub unsafe extern "C" fn ares_reinit(channel: Channel) -> c_int {
         return ARES_EFORMERR;
     }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
-    reinit_channel(channeldata)
+    let status = reinit_channel(channeldata);
+    channeldata.wake();
+    status
 }
 
 /// Safe body of ares_reinit (the pointer deref stays in the shim).
@@ -868,6 +994,11 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
     channeldata.server_state_callback_arg = arg;
 }
 
+/// Number of in-flight executor tasks. A single host lookup is one task even
+/// when it races A/AAAA sub-queries internally, so this counts user-visible
+/// lookups rather than upstream's internal per-family query objects (a
+/// documented minor semantic gap).
+///
 /// # Safety
 /// `channel` must be null or a valid channel handle returned by
 /// `ares_init`/`ares_init_options` and not yet destroyed.
@@ -911,7 +1042,6 @@ pub unsafe extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_i
 fn wait_empty_impl(channel: *mut ChannelData, timeout_ms: c_int) -> c_int {
     let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
     if data.executor.active_count() == 0 { return ARES_SUCCESS; }
-    if !data.event_mode { return ARES_ENOTIMP; }
     drop(guard);
     let start = Instant::now();
     loop {

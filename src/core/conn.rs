@@ -122,6 +122,13 @@ impl Conn {
         }
     }
 
+    /// Mark a shared-UDP socket dead (send failure). No-op for other wires.
+    pub fn mark_dead(&self) {
+        if let Some(c) = self.shared_udp_handle() {
+            c.borrow_mut().mark_dead();
+        }
+    }
+
     fn fd(&self) -> i32 {
         match &self.wire {
             Wire::Datagram { sock } | Wire::Stream { sock, .. } => sock.as_raw_fd(),
@@ -187,6 +194,31 @@ impl Conn {
         };
         self.io.borrow_mut().scratch = scratch; // put back (grown on first use)
         r
+    }
+
+    /// A non-blocking read, bypassing wait registration. Used after a timeout
+    /// expired in the same reactor cycle as socket readiness: `Conn::recv` is
+    /// deliberately timeout-biased, but a pending hard error (ICMP
+    /// port-unreachable) must still be consumed before counting a timeout.
+    pub fn try_recv(&mut self) -> Poll<io::Result<Vec<u8>>> {
+        if let Some(msg) = self.take_routed_slot() {
+            return Poll::Ready(Ok(msg));
+        }
+        // Only consume a read when the reactor actually reported this fd
+        // ready. A pure timeout must stay a timeout (custom socket tables can
+        // return zero-length "datagrams" on every read, which must not be
+        // mistaken for readiness).
+        let fd = self.fd();
+        let ready = self
+            .io
+            .borrow()
+            .fired
+            .iter()
+            .any(|w| w.fd == fd && !w.writable);
+        if !ready {
+            return Poll::Pending;
+        }
+        self.read()
     }
 
     /// Await this conn's next message with no timeout bound — usable directly

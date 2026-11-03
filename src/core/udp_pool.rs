@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
 use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use crate::async_runtime::io::{dead, recv_datagram};
 use crate::async_runtime::socket::Socket;
@@ -65,6 +66,15 @@ pub(crate) struct UdpConn {
     /// caps this total (upstream `conn->total_queries`), so an exhausted conn
     /// is retired even if its current waiters later drain.
     total_queries: usize,
+    /// Sticky hard-error flag. Once the shared socket dies, every waiter must
+    /// observe the error rather than waiting for its own timeout.
+    dead: bool,
+    /// When the socket died. Event-driven channels keep a dead conn pooled
+    /// briefly so concurrent retries join it and fail fast instead of each
+    /// opening a fresh socket.
+    dead_since: Option<Instant>,
+    /// Event-thread channels opt into the dead-conn grace behavior.
+    event_driven: bool,
 }
 
 impl UdpConn {
@@ -72,13 +82,16 @@ impl UdpConn {
     /// connected by the caller, outside any pool borrow, so the C socket
     /// callbacks (asocket / create-cb / config-cb / aconnect) fire with no
     /// cell held.
-    pub(crate) fn new(sock: Rc<dyn Socket>) -> Rc<RefCell<Self>> {
+    pub(crate) fn new(sock: Rc<dyn Socket>, event_driven: bool) -> Rc<RefCell<Self>> {
         let fd = sock.as_raw_fd();
         Rc::new(RefCell::new(UdpConn {
             sock,
             fd,
             inbox: HashMap::new(),
             total_queries: 0,
+            dead: false,
+            dead_since: None,
+            event_driven,
         }))
     }
 
@@ -131,10 +144,22 @@ impl UdpConn {
     /// `Ready(Ok)` if a datagram is now in its slot, `Ready(Err(UnexpectedEof))`
     /// if the socket died with nothing buffered, `Pending` otherwise.
     pub(crate) fn poll_read(&mut self, tag: u16, scratch: &mut Vec<u8>) -> Poll<io::Result<Vec<u8>>> {
+        if self.dead {
+            return Poll::Ready(Err(dead()));
+        }
         let alive = self.recv_and_route(scratch);
+        if !alive {
+            // A hard error is sticky: wake every sibling waiter (their replies
+            // can never arrive now) and report the dead socket to each future.
+            self.dead = true;
+            self.dead_since.get_or_insert_with(Instant::now);
+            for slot in self.inbox.values() {
+                slot.notify.borrow_mut().routed = true;
+            }
+        }
         match self.take(tag) {
             Some(msg) => Poll::Ready(Ok(msg)),
-            None if !alive => Poll::Ready(Err(dead())),
+            None if self.dead => Poll::Ready(Err(dead())),
             None => Poll::Pending,
         }
     }
@@ -192,6 +217,36 @@ impl UdpConn {
         self.inbox.is_empty()
     }
 
+    /// The shared socket has hit a hard error. While waiters remain, new
+    /// queries should join it so they fail fast instead of opening a fresh
+    /// socket that needs its own ICMP error.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead
+    }
+
+    /// Mark the shared socket dead from a send failure. Siblings are woken so
+    /// they observe the error immediately; the conn stays pooled for the short
+    /// grace window so retries do not open a new socket per query.
+    pub(crate) fn mark_dead(&mut self) {
+        self.dead = true;
+        self.dead_since.get_or_insert_with(Instant::now);
+        for slot in self.inbox.values() {
+            slot.notify.borrow_mut().routed = true;
+        }
+    }
+
+    /// True while a dead conn is still inside its short grace window. Keeping
+    /// it pooled lets a burst of retries fail fast on the same failed socket
+    /// instead of opening one fresh socket per query (each requiring its own
+    /// ICMP error, which the kernel may rate-limit).
+    fn dead_in_grace(&self) -> bool {
+        self.event_driven
+            && self.dead
+            && self
+                .dead_since
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(100))
+    }
+
     /// The per-conn cap is spent (`max_queries == 0` means unlimited).
     fn exhausted(&self, max_queries: usize) -> bool {
         max_queries != 0 && self.total_queries >= max_queries
@@ -225,6 +280,16 @@ impl UdpPool {
     /// Register a newly created connection for `server`.
     pub fn insert(&mut self, server: usize, conn: Conn) {
         self.conns.entry(server).or_default().push(conn);
+    }
+
+    /// True when any pooled conn for `server` has hit a hard socket error.
+    /// A timeout on a sibling conn is then attributable to the same failure
+    /// (e.g. ICMP rate-limiting on one of several sockets) rather than a
+    /// genuine query timeout.
+    pub fn has_dead(&self, server: usize) -> bool {
+        self.conns
+            .get(&server)
+            .is_some_and(|list| list.iter().any(|c| c.borrow().is_dead()))
     }
 
     /// Remove `conn` from `server`'s list (a dead socket / send failure). The
@@ -264,9 +329,14 @@ impl UdpPool {
         stayopen: bool,
         max_queries: usize,
     ) -> Vec<Conn> {
-        let exhausted = conn.borrow().exhausted(max_queries);
-        let idle = conn.borrow().is_empty();
-        if !exhausted && (stayopen || !idle) {
+        let (exhausted, idle, dead, dead_grace) = {
+            let c = conn.borrow();
+            (c.exhausted(max_queries), c.is_empty(), c.is_dead(), c.dead_in_grace())
+        };
+        let retire = exhausted
+            || (dead && idle && !dead_grace)
+            || (!dead && !stayopen && idle);
+        if !retire {
             return Vec::new();
         }
         self.remove(server, conn)
@@ -291,8 +361,13 @@ impl UdpPool {
         let mut kept = Vec::with_capacity(list.len());
         for conn in list.drain(..) {
             let conn_state = conn.borrow();
-            let retire = conn_state.exhausted(max_queries)
-                || (!stayopen && conn_state.is_empty());
+            let retire = if conn_state.exhausted(max_queries) {
+                true
+            } else if conn_state.is_dead() {
+                conn_state.is_empty() && !conn_state.dead_in_grace()
+            } else {
+                !stayopen && conn_state.is_empty()
+            };
             drop(conn_state);
             if retire {
                 retired.push(conn);
@@ -376,6 +451,9 @@ mod tests {
             fd: 5,
             inbox: HashMap::new(),
             total_queries: 0,
+            dead: false,
+            dead_since: None,
+            event_driven: false,
         };
         let io = mailbox();
 
@@ -394,7 +472,7 @@ mod tests {
     #[test]
     fn pool_respects_total_queries_not_just_waiters() {
         let mut pool = UdpPool::new();
-        let conn = UdpConn::new(Rc::new(DummySock));
+        let conn = UdpConn::new(Rc::new(DummySock), false);
         let io = mailbox();
         pool.insert(0, conn.clone());
 
@@ -423,7 +501,7 @@ mod tests {
     #[test]
     fn release_retires_exhausted_conn_even_when_stayopen() {
         let mut pool = UdpPool::new();
-        let conn = UdpConn::new(Rc::new(DummySock));
+        let conn = UdpConn::new(Rc::new(DummySock), false);
         let io = mailbox();
         pool.insert(0, conn.clone());
         conn.borrow_mut().reserve(3, || panic!("free qid"), io);
@@ -440,7 +518,7 @@ mod tests {
         let sock: Rc<dyn Socket> = Rc::new(QueueSock {
             queued: RefCell::new(VecDeque::from(vec![vec![0x12, 0x34, 0xAA]])),
         });
-        let uc = UdpConn::new(sock);
+        let uc = UdpConn::new(sock, false);
         let a_io = mailbox();
         let b_io = mailbox();
 

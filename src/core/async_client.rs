@@ -17,6 +17,7 @@ use std::ffi::{c_int, CString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::pin;
+use std::task::Poll;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -49,7 +50,8 @@ use crate::ffi::dns_record::ARES_CLASS_IN;
 use crate::ffi::ares_options::{
     ARES_FLAG_DNS0x20, ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
     ARES_FLAG_NOCHECKRESP, ARES_FLAG_NORECURSE, ARES_FLAG_NOSEARCH, ARES_FLAG_PRIMARY,
-    ARES_FLAG_STAYOPEN, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_EDNSPSZ, ARES_OPT_FLAGS,
+    ARES_FLAG_STAYOPEN, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_EDNSPSZ,
+    ARES_OPT_EVENT_THREAD, ARES_OPT_FLAGS,
     ARES_OPT_HOSTS_FILE, ARES_OPT_LOOKUPS, ARES_OPT_MAXTIMEOUTMS, ARES_OPT_NDOTS,
     ARES_OPT_NOROTATE, ARES_OPT_QUERY_CACHE, ARES_OPT_RESOLVCONF, ARES_OPT_ROTATE,
     ARES_OPT_SERVERS, ARES_OPT_SERVER_FAILOVER, ARES_OPT_SOCK_RCVBUF,
@@ -305,6 +307,8 @@ impl AsyncClient {
             if conn.send(wire, timeout).await.is_err() {
                 if use_tcp {
                     self.tcp_pool.borrow_mut().remove(server);
+                } else if self.optmask & ARES_OPT_EVENT_THREAD != 0 {
+                    conn.mark_dead();
                 } else {
                     self.retire_udp(server, &conn);
                 }
@@ -320,7 +324,18 @@ impl AsyncClient {
                 return (Err(ARES_ECONNREFUSED), timeouts);
             }
             loop {
-                match conn.recv(timeout).await {
+                // Timeout-biased recv, with a last non-blocking read when the
+                // timer and socket readiness land in the same reactor cycle
+                // (valgrind/slow hosts): a pending ICMP error must not be
+                // reported as a timeout.
+                let received = match conn.recv(timeout).await {
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => match conn.try_recv() {
+                        Poll::Ready(result) => result,
+                        Poll::Pending => Err(e),
+                    },
+                    other => other,
+                };
+                match received {
                     Ok(buf) => {
                         if !qid_matches(&buf, wire, use_tcp) {
                             continue; // stray datagram — await the next reply
@@ -388,6 +403,30 @@ impl AsyncClient {
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                        // If any UDP socket to this server has already died, a
+                        // timeout here is the same unreachable-server condition
+                        // (the kernel may rate-limit ICMP across parallel
+                        // sockets). Mark this conn dead and retry without
+                        // counting a timeout.
+                        if !use_tcp && self.optmask & ARES_OPT_EVENT_THREAD != 0 && self.udp_pool.borrow().has_dead(server) {
+                            conn.mark_dead();
+                            if io.borrow().app.cancelled.get() {
+                                return (Err(ARES_ETIMEOUT), timeouts);
+                            }
+                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: false }]);
+                            let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
+                            match verdict {
+                                TimeoutVerdict::Retry { server: next } => {
+                                    tries += 1;
+                                    try_count += 1;
+                                    server = next;
+                                    continue 'attempt;
+                                }
+                                TimeoutVerdict::Expire => {
+                                    return (Err(ARES_ECONNREFUSED), timeouts);
+                                }
+                            }
+                        }
                         if io.borrow().app.cancelled.get() {
                             return (Err(ARES_ETIMEOUT), timeouts);
                         }
@@ -417,6 +456,12 @@ impl AsyncClient {
                         let refused = !use_tcp;
                         if use_tcp {
                             self.tcp_pool.borrow_mut().remove(server);
+                        } else if self.optmask & ARES_OPT_EVENT_THREAD != 0 {
+                            // Event-driven bursts keep a dead shared UDP conn
+                            // pooled briefly: retries join it and fail fast
+                            // instead of each opening a socket that needs its
+                            // own (potentially rate-limited) ICMP error.
+                            conn.mark_dead();
                         } else {
                             self.retire_udp(server, &conn);
                         }
@@ -2577,6 +2622,7 @@ impl AsyncClient {
     fn connect_failover(&self, payload: &mut [u8], start: usize, use_tcp: bool) -> Result<(Conn, usize), ()> {
         let opts = self.opts();
         let stayopen = self.flags & ARES_FLAG_STAYOPEN != 0;
+        let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
         let mut s = start;
         for _ in 0..opts.attempts.max(1) {
             let Some(ep) = self.endpoints.get(s) else { break };
@@ -2613,7 +2659,7 @@ impl AsyncClient {
                 let checked_out = pooled.or_else(|| {
                     let sk = self.factory.create_udp(ep.bind).ok()?;
                     let _ = sk.connect(ep.udp_addr);
-                    let c = UdpConn::new(sk);
+                    let c = UdpConn::new(sk, event_driven);
                     self.udp_pool.borrow_mut().insert(s, c.clone());
                     Some(c)
                 });
