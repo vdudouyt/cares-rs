@@ -1,0 +1,450 @@
+{
+  "schema_version": 1,
+  "description": "Approved differences between the cares-rs ported gtest sources and the upstream c-ares 1.34.6 oracle. Anything not listed here is a provenance failure.",
+  "upstream_root": "/home/user/c-ares-1.34.6/test",
+  "ported_root": "tests/cares-tests/src",
+  "harness_files": [
+    {
+      "file": "main.cc",
+      "reason": "cares-rs dlsym loader entry point (upstream ares-test-main.cc not portable)"
+    },
+    {
+      "file": "loader.cc",
+      "reason": "cares-rs dlsym shim layer"
+    },
+    {
+      "file": "loader.h",
+      "reason": "cares-rs dlsym shim declarations"
+    },
+    {
+      "file": "ares-test.h",
+      "reason": "harness fixture adapted: dlsym loader, no alloc hooks/internal headers"
+    },
+    {
+      "file": "ares-test.cc",
+      "reason": "harness implementation adapted: dlsym loader, no alloc hooks/event systems; HostEnt lowercasing restored to upstream"
+    },
+    {
+      "file": "ares-test-ai.h",
+      "reason": "harness fixture adapted to cares-rs test headers"
+    },
+    {
+      "file": "dns-proto.h",
+      "reason": "harness DNS packet builder adapted to public c-ares 1.34.6 headers"
+    },
+    {
+      "file": "dns-proto.cc",
+      "reason": "harness DNS packet builder adapted to public c-ares 1.34.6 headers"
+    },
+    {
+      "file": "ares-fuzz-main.cc",
+      "reason": "cares-rs custom fuzz corpus driver"
+    },
+    {
+      "file": "ares-test-fuzz.c",
+      "reason": "cares-rs custom modern fuzz corpus body"
+    },
+    {
+      "file": "ares-test-fuzz-name.c",
+      "reason": "cares-rs custom legacy fuzz corpus body"
+    },
+    {
+      "file": "include/ares_mem.h",
+      "reason": "minimal public-API declaration shim"
+    },
+    {
+      "file": "include/ares_buf.h",
+      "reason": "minimal string builder shim for fuzz driver"
+    },
+    {
+      "file": "include/cares/ares.h",
+      "reason": "vendored public c-ares 1.34.6 header"
+    },
+    {
+      "file": "include/cares/ares_build.h",
+      "reason": "vendored public c-ares 1.34.6 header"
+    },
+    {
+      "file": "include/cares/ares_dns.h",
+      "reason": "vendored public c-ares 1.34.6 header"
+    },
+    {
+      "file": "include/cares/ares_dns_record.h",
+      "reason": "vendored public c-ares 1.34.6 header"
+    },
+    {
+      "file": "include/cares/ares_nameser.h",
+      "reason": "vendored public c-ares 1.34.6 header"
+    },
+    {
+      "file": "include/cares/ares_version.h",
+      "reason": "vendored public c-ares 1.34.6 header"
+    },
+    {
+      "file": "ares_dns.h",
+      "reason": "compatibility include shim for upstream test sources"
+    }
+  ],
+  "protected_files": [
+    "ares-test-init.cc",
+    "ares-test-live.cc",
+    "ares-test-misc.cc",
+    "ares-test-mock.cc",
+    "ares-test-mock-ai.cc",
+    "ares-test-parse.cc",
+    "ares-test-parse-a.cc",
+    "ares-test-parse-aaaa.cc",
+    "ares-test-parse-caa.cc",
+    "ares-test-parse-mx.cc",
+    "ares-test-parse-naptr.cc",
+    "ares-test-parse-ns.cc",
+    "ares-test-parse-ptr.cc",
+    "ares-test-parse-soa-any.cc",
+    "ares-test-parse-soa.cc",
+    "ares-test-parse-srv.cc",
+    "ares-test-parse-txt.cc",
+    "ares-test-parse-uri.cc",
+    "dns-proto-test.cc",
+    "ares-test-mock-et.cc"
+  ],
+  "verbatim_files": [
+    "ares-test-parse.cc",
+    "dns-proto-test.cc"
+  ],
+  "body_normalizations": {
+    "ares-test-live.cc": [
+      [
+        "SIZE_MAX",
+        "std::string::npos"
+      ]
+    ]
+  },
+  "excluded_upstream_files": [
+    {
+      "file": "ares-test-internal.cc",
+      "reason": "c-ares private/internal API not exposed via FFI",
+      "category": "non-portable",
+      "phase": "3"
+    },
+    {
+      "file": "ares-test-ns.cc",
+      "reason": "container/namespace helpers not portable to cares-rs",
+      "category": "non-portable",
+      "phase": "3"
+    },
+    {
+      "file": "ares-test-main.cc",
+      "reason": "replaced by cares-rs main.cc dlsym entry point",
+      "category": "harness",
+      "phase": "0"
+    },
+    {
+      "file": "ares-test-fuzz.c",
+      "reason": "replaced by cares-rs ares-test-fuzz.c driver body",
+      "category": "harness",
+      "phase": "0"
+    },
+    {
+      "file": "ares-fuzz.c",
+      "reason": "fuzz target not part of gtest oracle",
+      "category": "harness",
+      "phase": "0"
+    },
+    {
+      "file": "ares_queryloop.c",
+      "reason": "fuzz helper not part of gtest oracle",
+      "category": "harness",
+      "phase": "0"
+    },
+    {
+      "file": "dns-dump.cc",
+      "reason": "manual debug utility not part of gtest oracle",
+      "category": "harness",
+      "phase": "0"
+    }
+  ],
+  "excluded_tests": {
+    "ares-test-mock.cc": [
+      {
+        "name": "ContainedMockChannelSysConfig::SysConfigNdots0",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelSysConfig::SysConfigNdotsDefault",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "MockChannelTest::ExplicitIPAllocFail",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      },
+      {
+        "name": "MockChannelTest::SearchAllocFailure",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      },
+      {
+        "name": "MockUDPChannelTest::SearchDomainsAllocFail",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      }
+    ],
+    "ares-test-mock-ai.cc": [
+      {
+        "name": "ContainedMockChannelAISysConfig::NoHostsLocalHostUnspec",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelAISysConfig::NoHostsLocalHostv4",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelAISysConfig::NoHostsLocalHostv6",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelAISysConfig::v4OnlyLocalHostUnspec",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelAISysConfig::v4OnlyLocalHostv4",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelAISysConfig::v4OnlyLocalHostv6",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelAISysConfig::v6OnlyLocalHostUnspec",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelAISysConfig::v6OnlyLocalHostv4",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "ContainedMockChannelAISysConfig::v6OnlyLocalHostv6",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      }
+    ],
+    "ares-test-misc.cc": [
+      {
+        "name": "LibraryTest::CreateEDNSQuery",
+        "reason": "EDNS / DNS cookie feature not implemented (deferred)",
+        "category": "deferred-edns",
+        "phase": "4B"
+      }
+    ],
+    "ares-test-live.cc": [
+      {
+        "name": "DefaultChannelModeTest::LiveGetHostByAddrFailAlloc",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      },
+      {
+        "name": "DefaultChannelTest::LiveGetNameInfoAllocFail",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      }
+    ],
+    "ares-test-init.cc": [
+      {
+        "name": "DefaultChannelTest::SetSortlistAllocFail",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ChannelAllocFail",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerBlacklistedIpv6",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerChannelInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerEmptyInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerFullResolvInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerMalformedResolvConfLookup",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerMultiResolvInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerMyHostsInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerMyResolvConfInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerNoDfltSvrEmptyInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerNoDfltSvrFullInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerNsswitchConfNotReadable",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerResolvConfNotReadable",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerRotateInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerRotateOverride",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerSortlistOptionInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerSvcConfInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerSvcConfNotReadable",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::ContainerSystemdResolvInit",
+        "reason": "container/namespace test relies on Linux chroot and c-ares channel internals",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::EnvInitAllocFail",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::EnvInitModernOptions",
+        "reason": "upstream test accesses ares_channel_t internals (channel->optmask) not exposed by the opaque Rust channel; non-portable",
+        "category": "non-portable",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::FailChannelInit",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      },
+      {
+        "name": "LibraryTest::OptionsChannelAllocFail",
+        "reason": "alloc-failure injection is not supported on the Rust side (deferred)",
+        "category": "deferred-alloc",
+        "phase": "3"
+      }
+    ]
+  },
+  "added_tests": {
+    "ares-test-misc.cc": [
+      {
+        "name": "DefaultChannelTest::GetServersPorts",
+        "reason": "cares-rs local addition: exercises full ares_addr_port_node chain free under Valgrind",
+        "phase": "4A"
+      }
+    ],
+    "ares-test-live.cc": [
+      {
+        "name": "DefaultChannelTest::GetSock",
+        "reason": "cares-rs local addition: ares_getsock bitmask coverage",
+        "phase": "4A"
+      },
+      {
+        "name": "DefaultChannelTest::VerifySocketFunctionCallback",
+        "reason": "cares-rs local addition: socket creation callback coverage",
+        "phase": "4A"
+      },
+      {
+        "name": "LibraryTest::GetTCPSock",
+        "reason": "cares-rs local addition: ares_getsock TCP coverage",
+        "phase": "4A"
+      }
+    ]
+  }
+}

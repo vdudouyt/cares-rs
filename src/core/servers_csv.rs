@@ -2,13 +2,8 @@ use std::io::Read;
 use std::net::IpAddr;
 use crate::core::sysconfig::parse_ns_addr;
 
-/// Parse from any `Read` (e.g., `Cursor<&[u8]>`).
-/// Accepts CSV and/or newline separators.
-/// Rules (std-only):
-/// - `IP`           => port defaults to 53
-/// - `IP:port`      => OK for IPv4
-/// - `[IPv6]:port`  => OK for IPv6 with port
-/// - `IPv6`         => OK (no port) -> defaults to 53
+/// Parse a comma/newline/space-separated server list; `[IPv6]:port` and bare
+/// addresses are accepted, and a missing port defaults to 53.
 pub fn parse_from_reader<R: Read>(mut r: R) -> Option<Vec<(IpAddr, Option<u16>)>> {
     let mut buf = Vec::new();
     r.read_to_end(&mut buf).ok()?;
@@ -19,8 +14,13 @@ pub fn parse_from_reader<R: Read>(mut r: R) -> Option<Vec<(IpAddr, Option<u16>)>
 pub fn parse_servers_str(s: &str) -> Option<Vec<(IpAddr, Option<u16>)>> {
     let mut out = Vec::new();
 
-    for item in s.split([',', '\n']).filter(|t| !t.is_empty()) {
-        out.push(parse_ns_addr(item.trim())?);
+    // c-ares also accepts space-separated entries.
+    for item in s.split([',', '\n', ' ']).map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        // Skip link-local entries with a % interface specifier.
+        if item.contains('%') {
+            continue;
+        }
+        out.push(parse_ns_addr(item)?);
     }
 
     Some(out)

@@ -1,0 +1,48 @@
+name: Miri
+
+# Miri interprets the crate's MIR to detect undefined behaviour (use-after-free,
+# out-of-bounds, invalid/dangling pointers, aliasing violations), memory leaks,
+# and allocator mismatches in the unsafe FFI + DNS-parsing code. Miri cannot run
+# the network core (real sockets/syscalls), so the socket/reactor tests are
+# `#[cfg_attr(miri, ignore)]`'d; everything else (parsing + the alloc/free matrix)
+# runs in-memory. See tests/miri_memory.rs for the comprehensive coverage.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    env:
+      # Tree Borrows: the FFI pointer round-tripping (Box::into_raw callback state,
+      # offset_of recovery, libc::malloc'd buffers) is Tree-Borrows-friendly.
+      # disable-isolation: lets `ares_init` read /etc/resolv.conf and getrandom work.
+      # It does NOT enable sockets, so real-socket tests stay ignored regardless.
+      MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-disable-isolation"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust + Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache Cargo + Miri sysroot
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/miri
+            target/miri
+          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-miri-
+
+      - name: Set up Miri sysroot
+        run: cargo miri setup
+
+      - name: Run Miri tests
+        run: cargo miri test
