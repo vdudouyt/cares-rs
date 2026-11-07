@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::marker::PhantomPinned;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -228,28 +229,34 @@ impl Reactor {
 /// Resolves once `dir` of `source` has an event newer than its registration
 /// (async-io's `Ready`); dropping it removes its waker (so `interests` only
 /// ever lists live waiters).
+///
+/// `!Unpin`, with its mutable state in `Cell`s and `poll` working through
+/// `&Self`: it is pinned inside async state machines that `select_biased!`
+/// reads through shared references, and a `&mut` to an `Unpin` type would be
+/// treated as unique there (Tree Borrows), making the next self-write UB.
 pub(crate) struct Ready {
     reactor: Rc<Reactor>,
     source: Rc<Source>,
     dir: usize,
-    ticks: Option<(usize, usize)>,
-    index: Option<usize>,
+    ticks: Cell<Option<(usize, usize)>>,
+    index: Cell<Option<usize>>,
+    _pin: PhantomPinned,
 }
 
 impl Ready {
     pub(crate) fn new(reactor: Rc<Reactor>, source: Rc<Source>, dir: usize) -> Self {
-        Ready { reactor, source, dir, ticks: None, index: None }
+        Ready { reactor, source, dir, ticks: Cell::new(None), index: Cell::new(None), _pin: PhantomPinned }
     }
 }
 
 impl Future for Ready {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = &mut *self;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.into_ref().get_ref();
         let mut state = this.source.state.borrow_mut();
         let Some(d) = state.get_mut(this.dir) else { return Poll::Ready(()) };
-        match this.ticks {
+        match this.ticks.get() {
             Some((a, b)) if d.tick != a && d.tick != b => {
                 if let Some(i) = this.index.take() {
                     d.wakers.remove(i);
@@ -257,15 +264,15 @@ impl Future for Ready {
                 return Poll::Ready(());
             }
             Some(_) => {}
-            None => this.ticks = Some((this.reactor.ticker(), d.tick)),
+            None => this.ticks.set(Some((this.reactor.ticker(), d.tick))),
         }
-        match this.index.and_then(|i| d.wakers.get_mut(i)) {
+        match this.index.get().and_then(|i| d.wakers.get_mut(i)) {
             Some(slot) => {
                 if !slot.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
                     *slot = Some(cx.waker().clone());
                 }
             }
-            None => this.index = Some(d.wakers.insert(Some(cx.waker().clone()))),
+            None => this.index.set(Some(d.wakers.insert(Some(cx.waker().clone())))),
         }
         Poll::Pending
     }
@@ -282,33 +289,35 @@ impl Drop for Ready {
 
 /// Resolves at `when` (async-io's `Timer::at`). Registered on first `Pending`,
 /// deregistered on completion or drop. Reads the clock on every poll, so a task
-/// polled for another reason still observes its expiry.
+/// polled for another reason still observes its expiry. `!Unpin` with `Cell`
+/// state, for the same reason as [`Ready`].
 pub(crate) struct Timer {
     reactor: Rc<Reactor>,
     when: Instant,
-    id: Option<usize>,
+    id: Cell<Option<usize>>,
+    _pin: PhantomPinned,
 }
 
 impl Timer {
     pub(crate) fn at(reactor: &Rc<Reactor>, when: Instant) -> Self {
-        Timer { reactor: reactor.clone(), when, id: None }
+        Timer { reactor: reactor.clone(), when, id: Cell::new(None), _pin: PhantomPinned }
     }
 }
 
 impl Future for Timer {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = &mut *self;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.into_ref().get_ref();
         if Instant::now() >= this.when {
             if let Some(id) = this.id.take() {
                 this.reactor.remove_timer(this.when, id);
             }
             return Poll::Ready(());
         }
-        match this.id {
+        match this.id.get() {
             Some(id) => this.reactor.update_timer(this.when, id, cx.waker()),
-            None => this.id = Some(this.reactor.insert_timer(this.when, cx.waker())),
+            None => this.id.set(Some(this.reactor.insert_timer(this.when, cx.waker()))),
         }
         Poll::Pending
     }
@@ -379,8 +388,8 @@ mod tests {
         let c = Arc::new(Count(AtomicUsize::new(0)));
         (c.clone(), Waker::from(c))
     }
-    fn poll<F: Future + Unpin>(f: &mut F, w: &Waker) -> Poll<F::Output> {
-        Pin::new(f).poll(&mut Context::from_waker(w))
+    fn poll<F: Future>(f: &mut Pin<Box<F>>, w: &Waker) -> Poll<F::Output> {
+        f.as_mut().poll(&mut Context::from_waker(w))
     }
 
     #[test]
@@ -388,7 +397,7 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(7);
         let (count, w) = counter();
-        let mut rd = Ready::new(r.clone(), src.clone(), READ);
+        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
         assert!(poll(&mut rd, &w).is_pending());
         assert_eq!(r.interests(), vec![(7, false)]);
 
@@ -408,11 +417,11 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(7);
         let (_c, w) = counter();
-        let mut first = Ready::new(r.clone(), src.clone(), READ);
+        let mut first = Box::pin(Ready::new(r.clone(), src.clone(), READ));
         assert!(poll(&mut first, &w).is_pending());
         r.dispatch(Instant::now(), true, |_, wr| !wr);
         // A waiter registered after this turn's event must not see it (C2).
-        let mut late = Ready::new(r.clone(), src.clone(), READ);
+        let mut late = Box::pin(Ready::new(r.clone(), src.clone(), READ));
         assert!(poll(&mut late, &w).is_pending());
         assert!(poll(&mut first, &w).is_ready());
     }
@@ -422,8 +431,8 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(9);
         let (_c, w) = counter();
-        let mut rd = Ready::new(r.clone(), src.clone(), WRITE);
-        let mut t = Timer::at(&r, Instant::now() + Duration::from_secs(60));
+        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), WRITE));
+        let mut t = Box::pin(Timer::at(&r, Instant::now() + Duration::from_secs(60)));
         assert!(poll(&mut rd, &w).is_pending());
         assert!(poll(&mut t, &w).is_pending());
         assert_eq!(r.interests(), vec![(9, true)]);
@@ -438,8 +447,10 @@ mod tests {
     fn skip_timeouts_leaves_due_timer_unwoken() {
         let r = Reactor::new();
         let (count, w) = counter();
-        let when = Instant::now() + Duration::from_millis(1);
-        let mut t = Timer::at(&r, when);
+        // Far enough out that the real clock can't reach it even under Miri;
+        // expiry is then driven by the synthetic `now` handed to `dispatch`.
+        let when = Instant::now() + Duration::from_secs(60);
+        let mut t = Box::pin(Timer::at(&r, when));
         assert!(poll(&mut t, &w).is_pending());
         let later = when + Duration::from_millis(5);
         r.dispatch(later, true, |_, _| false);
@@ -455,8 +466,8 @@ mod tests {
         let src = r.insert_io(4);
         let (ca, wa) = counter();
         let (cb, wb) = counter();
-        let mut a = Ready::new(r.clone(), src.clone(), READ);
-        let mut b = Ready::new(r.clone(), src.clone(), READ);
+        let mut a = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut b = Box::pin(Ready::new(r.clone(), src.clone(), READ));
         assert!(poll(&mut a, &wa).is_pending());
         assert!(poll(&mut b, &wb).is_pending());
         assert_eq!(r.interests(), vec![(4, false)]);
@@ -469,7 +480,7 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(3);
         let (_c, w) = counter();
-        let mut rd = Ready::new(r.clone(), src.clone(), READ);
+        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
         assert!(poll(&mut rd, &w).is_pending());
         r.remove_io(&src);
         assert!(r.interests().is_empty());

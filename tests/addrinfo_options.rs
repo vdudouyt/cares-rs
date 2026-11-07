@@ -699,6 +699,7 @@ fn numericserv_rejects_text_and_socktype_protocol_are_set() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn cname_chain_is_exposed_via_addrinfo() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::CnameA {
@@ -798,6 +799,7 @@ fn channel_with_order(hosts_path: &CString, order: &CString, server_port: u16) -
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn lookups_fb_prefers_hosts_and_bf_prefers_dns() {
     let _serial = serial();
     let hosts = TempFile::new("10.1.1.1 order.example\n");

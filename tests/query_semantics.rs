@@ -642,6 +642,7 @@ impl Drop for EnvGuard {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn query_apis_carry_class_and_norecurse() {
     let _serial = serial();
     let (mut mini, port) = Mini::udp(ReplyKind::A);
@@ -694,6 +695,7 @@ fn query_apis_carry_class_and_norecurse() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn usevc_uses_tcp_for_query_send_and_send_dnsrec() {
     let _serial = serial();
     let (mut mini, port) = Mini::tcp(ReplyKind::A);
@@ -727,6 +729,7 @@ fn usevc_uses_tcp_for_query_send_and_send_dnsrec() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn csv_explicit_port_usevc_connects_to_that_tcp_port() {
     let _serial = serial();
     let (mut mini, port) = Mini::tcp(ReplyKind::A);
@@ -746,6 +749,7 @@ fn csv_explicit_port_usevc_connects_to_that_tcp_port() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn igntc_delivers_truncated_udp_without_tcp_retry() {
     let _serial = serial();
     let (mut mini, port) = Mini::both(ReplyKind::Truncated, ReplyKind::A);
@@ -764,6 +768,7 @@ fn igntc_delivers_truncated_udp_without_tcp_retry() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn nocheckresp_delivers_server_error_rcodes() {
     let _serial = serial();
     let (mut mini, port) = Mini::udp(ReplyKind::Rcode(2));
@@ -812,6 +817,7 @@ unsafe fn search_channel(flags: c_int, domains: &[&str], ndots: c_int) -> Channe
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn nosearch_suppresses_search_suffixes() {
     let _serial = serial();
     let (mut mini, port) = Mini::udp(ReplyKind::A);
@@ -831,6 +837,7 @@ fn nosearch_suppresses_search_suffixes() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn noaliases_suppresses_hostaliases_lookup() {
     let _serial = serial();
     let aliases = TempFile::new("aliasname alias-target.example\n");
@@ -862,6 +869,7 @@ fn noaliases_suppresses_hostaliases_lookup() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn hostaliases_alias_suppresses_search_domains() {
     let _serial = serial();
     let aliases = TempFile::new("aliasname alias-target.example\n");
@@ -1025,6 +1033,7 @@ fn raw_out_of_range_class_is_rejected_synchronously() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn cache_key_isolates_class_and_norecurse() {
     let _serial = serial();
     let (mut mini, port) = Mini::udp(ReplyKind::A);
@@ -1059,6 +1068,7 @@ fn cache_key_isolates_class_and_norecurse() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn search_dnsrec_preserves_template_class_flags_and_additional() {
     let _serial = serial();
     let (mut mini, port) = Mini::udp(ReplyKind::NxThenA);
@@ -1117,6 +1127,7 @@ fn search_dnsrec_preserves_template_class_flags_and_additional() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn reinit_reloads_resolvconf_and_flushes_cache() {
     let _serial = serial();
     let (mut mini, port) = Mini::udp(ReplyKind::A);

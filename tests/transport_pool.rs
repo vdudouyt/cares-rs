@@ -251,6 +251,7 @@ fn last_octet(data: &[u8]) -> u8 {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn parallel_lookups_create_exactly_max_queries_sockets() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::A([2, 3, 4, 5]));
@@ -293,6 +294,7 @@ fn parallel_lookups_create_exactly_max_queries_sockets() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn total_query_cap_retires_socket_even_when_stayopen() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::A([1, 1, 1, 1]));
@@ -322,6 +324,7 @@ fn total_query_cap_retires_socket_even_when_stayopen() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn stayopen_reuses_idle_socket_and_default_retires_it() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::A([4, 4, 4, 4]));
@@ -376,6 +379,7 @@ fn stayopen_reuses_idle_socket_and_default_retires_it() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn shared_udp_demux_routes_each_answer_to_its_query() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::NameA);
@@ -427,6 +431,7 @@ fn shared_udp_demux_routes_each_answer_to_its_query() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn concurrent_batch_completes_without_waiting_for_timeouts() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::NameA);
@@ -468,6 +473,7 @@ fn concurrent_batch_completes_without_waiting_for_timeouts() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn local_ip4_binds_udp_source_address() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::A([6, 6, 6, 6]));
@@ -493,6 +499,7 @@ fn local_ip4_binds_udp_source_address() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn socket_buffer_options_are_accepted_and_saved() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::A([7, 7, 7, 7]));
@@ -528,6 +535,7 @@ fn socket_buffer_options_are_accepted_and_saved() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn socket_state_callback_reports_open_and_close() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::A([8, 8, 8, 8]));
@@ -667,6 +675,7 @@ unsafe extern "C" fn ex_asendto(
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn extended_socket_adapters_are_used_for_udp() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::A([9, 9, 9, 9]));

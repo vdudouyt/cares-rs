@@ -715,12 +715,15 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
     if rr.is_null() || (val.is_null() && len != 0) {
         return ARES_EFORMERR;
     }
-    let data = if len == 0 {
-        &[] as &[u8]
+    // Copied out first: `val` may point into this RR's own ABINP cache
+    // (get_bin -> set_bin), which the setter frees; no borrow of it may be live
+    // across that call.
+    let data: Vec<u8> = if len == 0 {
+        Vec::new()
     } else {
-        unsafe { std::slice::from_raw_parts(val, len) }
+        unsafe { std::slice::from_raw_parts(val, len) }.to_vec()
     };
-    match unsafe { &mut *rr }.set_bin_checked(key, data) {
+    match unsafe { &mut *rr }.set_bin_checked(key, &data) {
         Ok(()) => ARES_SUCCESS,
         Err(e) => e.code(),
     }
@@ -1108,13 +1111,14 @@ pub unsafe extern "C" fn ares_dns_rr_add_abin(
     if rr.is_null() || (val.is_null() && len != 0) {
         return ARES_EFORMERR;
     }
-    let data = if len == 0 {
-        &[] as &[u8]
+    // Copied out first (see ares_dns_rr_set_bin): `val` may alias this RR's cache.
+    let data: Vec<u8> = if len == 0 {
+        Vec::new()
     } else {
         // SAFETY: `val` points to `len` readable bytes per the C contract.
-        unsafe { std::slice::from_raw_parts(val, len) }
+        unsafe { std::slice::from_raw_parts(val, len) }.to_vec()
     };
-    match unsafe { &mut *rr }.add_abin_checked(key, data) {
+    match unsafe { &mut *rr }.add_abin_checked(key, &data) {
         Ok(()) => ARES_SUCCESS,
         Err(e) => e.code(),
     }

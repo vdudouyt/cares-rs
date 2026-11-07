@@ -165,9 +165,9 @@ mod tests {
         let a = Async::new(sock.clone(), &r);
         assert!(!a.readable_this_turn(), "no report yet (C1)");
 
-        let mut rd = a.readable();
+        let mut rd = Box::pin(a.readable());
         let mut cx = Context::from_waker(Waker::noop());
-        assert!(Pin::new(&mut rd).poll(&mut cx).is_pending());
+        assert!(rd.as_mut().poll(&mut cx).is_pending());
         r.dispatch(Instant::now(), true, |fd, w| fd == 11 && !w);
         assert!(a.readable_this_turn());
 
@@ -184,14 +184,13 @@ mod tests {
     fn dropping_async_deregisters_its_fd() {
         let r = Reactor::new();
         let a = Async::new(Rc::new(Counting { reads: Cell::new(0) }), &r);
-        let mut rd = a.writable();
+        let mut rd = Box::pin(a.writable());
         let mut cx = Context::from_waker(Waker::noop());
-        assert!(Pin::new(&mut rd).poll(&mut cx).is_pending());
+        assert!(rd.as_mut().poll(&mut cx).is_pending());
         assert_eq!(r.interests(), vec![(11, true)]);
         drop(rd);
         drop(a);
         assert!(r.interests().is_empty());
     }
 
-    use std::pin::Pin;
 }
