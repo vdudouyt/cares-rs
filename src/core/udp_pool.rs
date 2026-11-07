@@ -5,12 +5,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use crate::async_runtime::io::{dead, recv_datagram};
 use crate::async_runtime::socket::Socket;
-use crate::core::async_client::DnsMailbox;
 use crate::core::tcp_pool::dns_tag;
 
 pub(crate) type Conn = Rc<RefCell<UdpConn>>;
@@ -19,11 +18,24 @@ pub(crate) type Conn = Rc<RefCell<UdpConn>>;
 /// the caller can drop them after its pool borrow ends.
 type Checkout = (Option<Conn>, Vec<Conn>);
 
-/// One tag's inbox slot: the routed reply plus the target mailbox, flagged
-/// `routed` so a sibling drain can wake a future with no fd readiness of its own.
+/// One tag's inbox slot: the routed reply plus the waiting task's waker, so a
+/// sibling drain can wake a future with no fd readiness of its own.
 struct InboxSlot {
     reply: Option<Vec<u8>>,
-    notify: Rc<RefCell<DnsMailbox>>,
+    waker: Option<Waker>,
+}
+
+impl InboxSlot {
+    fn deliver(&mut self, frame: Vec<u8>) {
+        self.reply = Some(frame);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if let Some(w) = &self.waker {
+            w.wake_by_ref();
+        }
+    }
 }
 
 /// A shared datagram connection to one server, driven cooperatively by every
@@ -59,22 +71,29 @@ impl UdpConn {
         }))
     }
 
-    /// Reserve a free inbox tag for a query, registering `io` to be flagged when
-    /// a sibling routes this tag's reply. Rerolls from `qid` on collision (≈
+    /// Reserve a free inbox tag for a query. Rerolls from `qid` on collision (≈
     /// upstream `generate_unique_qid`); the caller must re-stamp its payload on a re-roll.
     pub(crate) fn reserve(
         &mut self,
         qid: u16,
         mut reroll: impl FnMut() -> u16,
-        io: Rc<RefCell<DnsMailbox>>,
     ) -> u16 {
         let mut tag = qid;
         while self.inbox.contains_key(&tag) {
             tag = reroll();
         }
-        self.inbox.insert(tag, InboxSlot { reply: None, notify: io });
+        self.inbox.insert(tag, InboxSlot { reply: None, waker: None });
         self.total_queries += 1;
         tag
+    }
+
+    /// Remember the task waiting on `tag`, to be woken when a sibling routes its reply.
+    pub(crate) fn register(&mut self, tag: u16, waker: &Waker) {
+        if let Some(slot) = self.inbox.get_mut(&tag) {
+            if !slot.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+                slot.waker = Some(waker.clone());
+            }
+        }
     }
 
     /// Release `tag`'s slot (RAII from `Conn`'s Drop; unknown tags are a no-op).
@@ -109,7 +128,7 @@ impl UdpConn {
             self.dead = true;
             self.dead_since.get_or_insert_with(Instant::now);
             for slot in self.inbox.values() {
-                slot.notify.borrow_mut().routed = true;
+                slot.wake();
             }
         }
         match self.take(tag) {
@@ -128,14 +147,12 @@ impl UdpConn {
                 Poll::Ready(Ok(frame)) => {
                     if let Some(tag) = dns_tag(&frame) {
                         if let Some(slot) = self.inbox.get_mut(&tag) {
-                            slot.reply = Some(frame);
-                            slot.notify.borrow_mut().routed = true;
+                            slot.deliver(frame);
                         }
                     } else if let Some(slot) = self.inbox.values_mut().find(|s| s.reply.is_none()) {
                         // Untaggable datagram: hand it to an awaiting waiter so
                         // the application sees (and rejects) it.
-                        slot.reply = Some(frame);
-                        slot.notify.borrow_mut().routed = true;
+                        slot.deliver(frame);
                     }
                     // A caller-supplied socket may be blocking: one datagram per
                     // readiness cycle is safe; the next cycle drains the rest.
@@ -175,7 +192,7 @@ impl UdpConn {
         self.dead = true;
         self.dead_since.get_or_insert_with(Instant::now);
         for slot in self.inbox.values() {
-            slot.notify.borrow_mut().routed = true;
+            slot.wake();
         }
     }
 
@@ -328,8 +345,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::net::SocketAddr;
 
-    fn mailbox() -> Rc<RefCell<DnsMailbox>> {
-        Rc::new(RefCell::new(DnsMailbox::default()))
+    /// A waker that records whether it fired.
+    struct Flag(std::sync::atomic::AtomicBool);
+    impl std::task::Wake for Flag {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl Flag {
+        fn fired(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     /// A socket with no datagrams waiting, for tests that never read it.
@@ -383,11 +409,9 @@ mod tests {
             dead_since: None,
             event_driven: false,
         };
-        let io = mailbox();
-
-        assert_eq!(uc.reserve(7, || panic!("free qid must not reroll"), io.clone()), 7);
+        assert_eq!(uc.reserve(7, || panic!("free qid must not reroll")), 7);
         let rolls = RefCell::new(vec![9u16, 7u16]); // popped back-to-front: 7, then 9
-        assert_eq!(uc.reserve(7, || rolls.borrow_mut().pop().unwrap(), io.clone()), 9);
+        assert_eq!(uc.reserve(7, || rolls.borrow_mut().pop().unwrap()), 9);
         assert!(rolls.borrow().is_empty());
         assert!(uc.has_waiter(7) && uc.has_waiter(9));
         assert_eq!(uc.total_queries(), 2);
@@ -401,18 +425,17 @@ mod tests {
     fn pool_respects_total_queries_not_just_waiters() {
         let mut pool = UdpPool::new();
         let conn = UdpConn::new(Rc::new(DummySock), false);
-        let io = mailbox();
         pool.insert(0, conn.clone());
 
         let (picked, retired) = pool.pick_or_none(0, 2, true);
         assert!(picked.is_some() && retired.is_empty());
-        conn.borrow_mut().reserve(1, || panic!("free qid"), io.clone());
+        conn.borrow_mut().reserve(1, || panic!("free qid"));
         conn.borrow_mut().release(1);
         assert_eq!(conn.borrow().total_queries(), 1);
 
         let (picked, retired) = pool.pick_or_none(0, 2, true);
         assert!(picked.is_some() && retired.is_empty());
-        conn.borrow_mut().reserve(2, || panic!("free qid"), io.clone());
+        conn.borrow_mut().reserve(2, || panic!("free qid"));
         conn.borrow_mut().release(2);
         assert_eq!(conn.borrow().total_queries(), 2);
 
@@ -426,35 +449,34 @@ mod tests {
     fn release_retires_exhausted_conn_even_when_stayopen() {
         let mut pool = UdpPool::new();
         let conn = UdpConn::new(Rc::new(DummySock), false);
-        let io = mailbox();
         pool.insert(0, conn.clone());
-        conn.borrow_mut().reserve(3, || panic!("free qid"), io);
+        conn.borrow_mut().reserve(3, || panic!("free qid"));
         conn.borrow_mut().release(3);
 
         let retired = pool.release_if_done(0, &conn, true, 1);
         assert_eq!(retired.len(), 1);
     }
 
-    /// A sibling that drains the socket must flag the target mailbox even when
+    /// A sibling that drains the socket must wake the target task even when
     /// the target previously suspended Pending with no readiness of its own.
     #[test]
-    fn sibling_routing_flags_target_mailbox() {
+    fn sibling_routing_wakes_target() {
         let sock: Rc<dyn Socket> = Rc::new(QueueSock {
             queued: RefCell::new(VecDeque::from(vec![vec![0x12, 0x34, 0xAA]])),
         });
         let uc = UdpConn::new(sock, false);
-        let a_io = mailbox();
-        let b_io = mailbox();
+        let b = std::sync::Arc::new(Flag(Default::default()));
 
-        uc.borrow_mut().reserve(0x1111, || panic!("free qid"), a_io);
-        uc.borrow_mut().reserve(0x1234, || panic!("free qid"), b_io.clone());
-        assert!(!b_io.borrow().routed);
+        uc.borrow_mut().reserve(0x1111, || panic!("free qid"));
+        uc.borrow_mut().reserve(0x1234, || panic!("free qid"));
+        uc.borrow_mut().register(0x1234, &Waker::from(b.clone()));
+        assert!(!b.fired());
 
         // A drains: the datagram belongs to B, so it goes into B's slot and
-        // flags B's mailbox (A gets Pending for its own tag).
+        // wakes B (A gets Pending for its own tag).
         let mut scratch = Vec::new();
         assert!(matches!(uc.borrow_mut().poll_read(0x1111, &mut scratch), Poll::Pending));
-        assert!(b_io.borrow().routed);
+        assert!(b.fired());
         assert!(uc.borrow_mut().take(0x1234).is_some());
     }
 }

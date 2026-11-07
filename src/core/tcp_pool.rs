@@ -5,11 +5,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Poll, Waker};
 
 use crate::async_runtime::io::{dead, recv_stream};
 use crate::async_runtime::socket::Socket;
-use crate::core::async_client::DnsMailbox;
 
 /// Demux tag of a frame — its transaction id (header bytes 0..2). `None` for a
 /// frame too short to carry one: it is handed to an awaiting waiter, which then
@@ -33,11 +32,24 @@ pub(crate) fn dns_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(msg)
 }
 
-/// One tag's inbox slot: the routed reply plus the target mailbox, flagged
-/// `routed` so a sibling drain can wake a future with no fd readiness of its own.
+/// One tag's inbox slot: the routed reply plus the waiting task's waker, so a
+/// sibling drain can wake a future with no fd readiness of its own.
 struct InboxSlot {
     reply: Option<Vec<u8>>,
-    notify: Rc<RefCell<DnsMailbox>>,
+    waker: Option<Waker>,
+}
+
+impl InboxSlot {
+    fn deliver(&mut self, frame: Vec<u8>) {
+        self.reply = Some(frame);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if let Some(w) = &self.waker {
+            w.wake_by_ref();
+        }
+    }
 }
 
 /// A shared stream connection to one server: a reassembly buffer plus the
@@ -57,22 +69,29 @@ impl TcpConn {
         Rc::new(RefCell::new(TcpConn { sock, fd, rbuf: Vec::new(), inbox: HashMap::new() }))
     }
 
-    /// Reserve a free inbox tag for a query, registering `io` to be flagged when
-    /// a sibling routes this tag's reply. Rerolls from `qid` on collision (≈
+    /// Reserve a free inbox tag for a query. Rerolls from `qid` on collision (≈
     /// upstream `generate_unique_qid`, or two queries would clobber one slot);
     /// the caller must re-stamp its payload on a re-roll.
     pub(crate) fn reserve(
         &mut self,
         qid: u16,
         mut reroll: impl FnMut() -> u16,
-        io: Rc<RefCell<DnsMailbox>>,
     ) -> u16 {
         let mut tag = qid;
         while self.inbox.contains_key(&tag) {
             tag = reroll();
         }
-        self.inbox.insert(tag, InboxSlot { reply: None, notify: io });
+        self.inbox.insert(tag, InboxSlot { reply: None, waker: None });
         tag
+    }
+
+    /// Remember the task waiting on `tag`, to be woken when a sibling routes its reply.
+    pub(crate) fn register(&mut self, tag: u16, waker: &Waker) {
+        if let Some(slot) = self.inbox.get_mut(&tag) {
+            if !slot.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+                slot.waker = Some(waker.clone());
+            }
+        }
     }
 
     /// Release `tag`'s slot (RAII from `Conn`'s Drop; unknown tags are a no-op).
@@ -112,14 +131,12 @@ impl TcpConn {
         while let Some(frame) = dns_frame(&mut self.rbuf) {
             if let Some(tag) = dns_tag(&frame) {
                 if let Some(slot) = self.inbox.get_mut(&tag) {
-                    slot.reply = Some(frame);
-                    slot.notify.borrow_mut().routed = true;
+                    slot.deliver(frame);
                 }
             } else if let Some(slot) = self.inbox.values_mut().find(|s| s.reply.is_none()) {
                 // Untaggable frame: hand it to an awaiting waiter so the
                 // application sees (and rejects) it.
-                slot.reply = Some(frame);
-                slot.notify.borrow_mut().routed = true;
+                slot.deliver(frame);
             }
         }
         alive
@@ -204,13 +221,11 @@ mod tests {
     #[test]
     fn reserve_rerolls_colliding_tag() {
         let mut tc = TcpConn { sock: Rc::new(DummySock), fd: 5, rbuf: Vec::new(), inbox: HashMap::new() };
-        let io = Rc::new(RefCell::new(DnsMailbox::default()));
-
-        assert_eq!(tc.reserve(7, || panic!("free qid must not reroll"), io.clone()), 7);
+        assert_eq!(tc.reserve(7, || panic!("free qid must not reroll")), 7);
 
         // The reroll may collide again (7) before drawing a free id (9).
         let rolls = RefCell::new(vec![9u16, 7u16]); // popped back-to-front: 7, then 9
-        assert_eq!(tc.reserve(7, || rolls.borrow_mut().pop().unwrap(), io.clone()), 9);
+        assert_eq!(tc.reserve(7, || rolls.borrow_mut().pop().unwrap()), 9);
         assert!(rolls.borrow().is_empty());
         assert!(tc.has_waiter(7) && tc.has_waiter(9));
 

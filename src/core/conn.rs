@@ -62,7 +62,7 @@ impl Conn {
         qid: u16,
         reroll: impl FnMut() -> u16,
     ) -> (Self, u16) {
-        let tag = conn.borrow_mut().reserve(qid, reroll, io.clone());
+        let tag = conn.borrow_mut().reserve(qid, reroll);
         (Conn { io, wire: Wire::Shared(conn, tag), udp_lease: None }, tag)
     }
 
@@ -75,7 +75,7 @@ impl Conn {
         qid: u16,
         reroll: impl FnMut() -> u16,
     ) -> (Self, u16) {
-        let tag = conn.borrow_mut().reserve(qid, reroll, io.clone());
+        let tag = conn.borrow_mut().reserve(qid, reroll);
         (Conn { io, wire: Wire::SharedUdp(conn, tag), udp_lease: None }, tag)
     }
 
@@ -141,6 +141,15 @@ impl Conn {
         }
     }
 
+    /// On a shared conn, let a sibling's drain wake this task when it routes our reply.
+    fn register_waker(&self, waker: &std::task::Waker) {
+        match &self.wire {
+            Wire::Shared(c, tag) => c.borrow_mut().register(*tag, waker),
+            Wire::SharedUdp(c, tag) => c.borrow_mut().register(*tag, waker),
+            _ => {}
+        }
+    }
+
     /// One non-blocking read of this conn's next message. `scratch` is taken out
     /// of the mailbox for the read's span so the C recv callback fires with no
     /// mailbox borrow live.
@@ -194,12 +203,13 @@ impl Conn {
     pub async fn recv_msg(&mut self) -> io::Result<Vec<u8>> {
         let fd = self.fd();
         let io = self.io.clone();
-        poll_fn(move |_| {
+        poll_fn(move |cx| {
             // A sibling may have already drained the socket and routed our frame
             // into our slot, consuming the fd's readiness; take it without waiting.
             if let Some(msg) = self.take_routed_slot() {
                 return Poll::Ready(Ok(msg));
             }
+            self.register_waker(cx.waker());
             poll_recv(&io, fd, || self.read())
         })
         .await

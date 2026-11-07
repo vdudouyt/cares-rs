@@ -87,13 +87,6 @@ impl ChannelData {
         }
     }
 
-    /// True when a shared-socket sibling routed work into a mailbox not yet re-polled.
-    fn has_routed(&self) -> bool {
-        self.executor
-            .ids()
-            .any(|id| self.executor.io(id).is_some_and(|io| io.borrow().routed))
-    }
-
     /// Push socket settings into a rebuilt factory after option setters.
     pub(crate) fn refresh_socket_config(&mut self) {
         let socket = SocketConfig {
@@ -173,12 +166,22 @@ impl ChannelData {
         let now = Instant::now();
         let rf: &libc::fd_set = &*read_fds;
         let wf: &libc::fd_set = &*write_fds;
-        let ready = self.executor.drive_ready(now, skip_timeouts, |fd, writable| {
+        self.executor.drive_ready(now, skip_timeouts, |fd, writable| {
             let set = if writable { wf } else { rf };
             unsafe { libc::FD_ISSET(fd, set as *const libc::fd_set as *mut libc::fd_set) }
         });
-        for id in ready {
+        self.run_ready();
+    }
+
+    /// Poll woken tasks until the run queue is empty (siblings woken by a
+    /// shared-conn route run in this same turn). A budget bounds a self-waking
+    /// task; leftovers make `next_timeout_ms` report 0 so the caller comes back.
+    fn run_ready(&mut self) {
+        let mut budget = 4 * self.executor.active_count() + 16;
+        while budget > 0 {
+            let Some(id) = self.executor.pop_ready() else { break };
             self.advance(id);
+            budget -= 1;
         }
     }
 
@@ -196,6 +199,9 @@ impl ChannelData {
     }
 
     fn next_timeout_ms(&self) -> Option<u128> {
+        if self.executor.has_ready() {
+            return Some(0);
+        }
         self.executor.next_timeout_ms(Instant::now())
     }
 
@@ -218,13 +224,11 @@ impl ChannelData {
     ) {
         use crate::ffi::ares_socket::{ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
         let now = Instant::now();
-        let ready = self.executor.drive_ready(now, skip_timeouts, |fd, writable| {
+        self.executor.drive_ready(now, skip_timeouts, |fd, writable| {
             let bit = if writable { ARES_FD_EVENT_WRITE } else { ARES_FD_EVENT_READ };
             events.iter().any(|ev| ev.fd == fd && ev.events & bit != 0)
         });
-        for id in ready {
-            self.advance(id);
-        }
+        self.run_ready();
     }
 
     /// Fire the server-state callback if installed; a stale index is skipped.
@@ -457,16 +461,7 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
             }
             // SAFETY: as above; the lock excludes all other channel access.
             let data = unsafe { &mut *(channel as *mut ChannelData) };
-            let mut batch = events;
-            loop {
-                data.process_events(&batch, false);
-                // A shared UDP socket that died flags every sibling mailbox;
-                // re-poll them now instead of waiting for their timeouts.
-                if !data.has_routed() {
-                    break;
-                }
-                batch.clear();
-            }
+            data.process_events(&events, false);
         }
 
     }

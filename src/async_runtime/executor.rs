@@ -3,10 +3,13 @@
 //! `FuturesUnordered`/`for_each_concurrent` wedge. No DNS/framing knowledge.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 
 /// One fd the future is blocked on, with the interest it awaits.
@@ -25,9 +28,6 @@ pub(crate) struct Mailbox<A> {
     /// Readiness set by the executor. Carries read vs write interest, so a
     /// sibling arm on the same fd with opposite interest doesn't consume it.
     pub fired: Vec<Wait>,
-    /// A sibling sharing this lookup routed a reply into our inbox after we
-    /// last suspended; re-poll us even though no `waits` entry fired.
-    pub routed: bool,
     /// Reusable receive scratch (grown to 64 KB by `conn`), borrowed only for
     /// one synchronous recv — avoids zeroing 64 KB per call.
     pub scratch: Vec<u8>,
@@ -98,14 +98,50 @@ impl<A, T> AbstractTask<A> for Task<A, T> {
     }
 }
 
-/// In-flight tasks in reused slots (`None` = reaped).
+/// The runnable queue: `(slot, generation)` pairs pushed by wakers.
+type RunQueue = Arc<Mutex<VecDeque<(usize, u32)>>>;
+
+/// One task's waker (≈ async-task's header): waking queues the task once until
+/// its next poll. `Send + Sync` only because `Wake` demands it; every wake
+/// happens on the thread holding the channel lock.
+struct TaskWaker {
+    id: usize,
+    gen: u32,
+    scheduled: AtomicBool,
+    queue: RunQueue,
+}
+
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        if !self.scheduled.swap(true, Ordering::AcqRel) {
+            self.queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_back((self.id, self.gen));
+        }
+    }
+}
+
+struct Slot<A> {
+    task: Box<dyn AbstractTask<A>>,
+    flag: Arc<TaskWaker>,
+    waker: Waker,
+}
+
+/// In-flight tasks in reused slots (`None` = reaped) plus the runnable queue
+/// (≈ async-executor's `LocalExecutor`, ticked by the host instead of a thread).
 pub(crate) struct Executor<A> {
-    slots: Vec<Option<Box<dyn AbstractTask<A>>>>,
+    slots: Vec<Option<Slot<A>>>,
+    queue: RunQueue,
+    next_gen: u32,
 }
 
 impl<A> Default for Executor<A> {
     fn default() -> Self {
-        Executor { slots: Vec::new() }
+        Executor { slots: Vec::new(), queue: RunQueue::default(), next_gen: 0 }
     }
 }
 
@@ -122,43 +158,68 @@ impl<A> Executor<A> {
     {
         let task: Box<dyn AbstractTask<A>> =
             Box::new(Task { io, fut: Box::pin(fut), out: None, on: Box::new(on) });
-        match self.slots.iter().position(|s| s.is_none()) {
-            Some(i) => {
-                self.slots[i] = Some(task);
-                i
-            }
-            None => {
-                self.slots.push(Some(task));
-                self.slots.len() - 1
+        let id = self.slots.iter().position(|s| s.is_none()).unwrap_or(self.slots.len());
+        // A generation per spawn: a stale waker for a reaped occupant of this
+        // slot must not poll the new one.
+        self.next_gen = self.next_gen.wrapping_add(1);
+        let flag = Arc::new(TaskWaker {
+            id,
+            gen: self.next_gen,
+            scheduled: AtomicBool::new(false),
+            queue: self.queue.clone(),
+        });
+        let waker = Waker::from(flag.clone());
+        let slot = Some(Slot { task, flag, waker });
+        match self.slots.get_mut(id) {
+            Some(s) => *s = slot,
+            None => self.slots.push(slot),
+        }
+        id
+    }
+
+    /// Pop the next runnable live task, skipping stale or reaped entries. The
+    /// queue lock is released before returning, so the poll that follows may wake.
+    pub(crate) fn pop_ready(&self) -> Option<usize> {
+        loop {
+            let (id, gen) = self.queue.lock().unwrap_or_else(PoisonError::into_inner).pop_front()?;
+            if self.slots.get(id).and_then(|s| s.as_ref()).is_some_and(|s| s.flag.gen == gen) {
+                return Some(id);
             }
         }
+    }
+
+    /// Whether any woken task is waiting to be polled.
+    pub(crate) fn has_ready(&self) -> bool {
+        !self.queue.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
     }
 
     /// `waits`/`timeout` are valid only until the next poll (every pending arm
     /// re-registers), so clear them, then poll once. A reaped id yields `false`.
     pub(crate) fn poll(&mut self, id: usize) -> bool {
-        let Some(task) = self.slots.get_mut(id).and_then(|s| s.as_mut()) else {
+        let Some(slot) = self.slots.get_mut(id).and_then(|s| s.as_mut()) else {
             return false;
         };
         {
-            let mut m = task.io().borrow_mut();
+            let mut m = slot.task.io().borrow_mut();
             m.waits.clear();
             m.timeout = None;
         }
-        let mut cx = Context::from_waker(Waker::noop());
-        task.poll(&mut cx)
+        // Cleared before the poll so a wake during it re-queues the task.
+        slot.flag.scheduled.store(false, Ordering::Release);
+        let mut cx = Context::from_waker(&slot.waker);
+        slot.task.poll(&mut cx)
     }
 
     /// Task `id`'s mailbox, for the host to drain app-specific signals.
     pub(crate) fn io(&self, id: usize) -> Option<&Rc<RefCell<Mailbox<A>>>> {
-        self.slots.get(id).and_then(|s| s.as_ref()).map(|t| t.io())
+        self.slots.get(id).and_then(|s| s.as_ref()).map(|s| s.task.io())
     }
 
     /// Reap `id` and deliver its output or cancel status; an already-reaped id
     /// is a no-op (a re-entrant abort cannot double-deliver).
     pub(crate) fn deliver(&mut self, id: usize, cancel: Option<i32>) {
-        if let Some(task) = self.slots.get_mut(id).and_then(|s| s.take()) {
-            task.deliver(cancel);
+        if let Some(slot) = self.slots.get_mut(id).and_then(|s| s.take()) {
+            slot.task.deliver(cancel);
         }
     }
 
@@ -166,7 +227,7 @@ impl<A> Executor<A> {
     pub(crate) fn poll_fds(&self) -> Vec<(i32, bool)> {
         let mut fds = Vec::new();
         for t in self.slots.iter().flatten() {
-            for w in &t.io().borrow().waits {
+            for w in &t.task.io().borrow().waits {
                 fds.push((w.fd, w.writable));
             }
         }
@@ -177,7 +238,7 @@ impl<A> Executor<A> {
     pub(crate) fn next_timeout_ms(&self, now: Instant) -> Option<u128> {
         let mut best: Option<u128> = None;
         for t in self.slots.iter().flatten() {
-            if let Some(d) = t.io().borrow().timeout {
+            if let Some(d) = t.task.io().borrow().timeout {
                 let ms = d.saturating_duration_since(now).as_millis();
                 best = Some(best.map_or(ms, |b| b.min(ms)));
             }
@@ -185,30 +246,21 @@ impl<A> Executor<A> {
         best
     }
 
-    /// Set each mailbox's `fired` from `ready` and gate on timeout expiry vs
-    /// `now`; returns ids to re-poll. Expiry gates the re-poll but is not stored
-    /// — timeout arms read the clock directly.
-    pub(crate) fn drive_ready(
-        &mut self,
-        now: Instant,
-        skip_timeouts: bool,
-        ready: impl Fn(i32, bool) -> bool,
-    ) -> Vec<usize> {
-        let mut go = Vec::new();
-        for (id, slot) in self.slots.iter_mut().enumerate() {
-            let Some(t) = slot.as_mut() else { continue };
-            let mut m = t.io().borrow_mut();
+    /// Set each mailbox's `fired` from `ready` and schedule tasks whose fds
+    /// fired or whose timeout expired by `now`. Expiry gates the re-poll but is
+    /// not stored — timeout arms read the clock directly.
+    pub(crate) fn drive_ready(&mut self, now: Instant, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
+        for slot in self.slots.iter_mut().flatten() {
+            let mut m = slot.task.io().borrow_mut();
             let fired: Vec<Wait> = m.waits.iter().copied().filter(|w| ready(w.fd, w.writable)).collect();
             let expired = !skip_timeouts && m.timeout.is_some_and(|d| now >= d);
-            let routed = m.routed;
-            if fired.is_empty() && !expired && !routed {
+            if fired.is_empty() && !expired {
                 continue;
             }
             m.fired = fired;
-            m.routed = false;
-            go.push(id);
+            drop(m);
+            slot.waker.wake_by_ref();
         }
-        go
     }
 
     /// The id range spanning every slot, live or reaped.
@@ -250,16 +302,55 @@ mod tests {
         assert!(matches!(poll_timeout(&io, past), Poll::Ready(())));
     }
 
+    /// A future that stores its waker on first poll and completes on the second.
+    fn wake_later(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
+        let mut polled = false;
+        poll_fn(move |cx| {
+            if polled {
+                return Poll::Ready(());
+            }
+            polled = true;
+            *slot.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        })
+    }
+
     #[test]
-    fn drive_ready_wakes_routed_mailbox_without_fd() {
+    fn waker_queues_task_once() {
+        let mut ex = Executor::<()>::default();
+        let w = Rc::new(RefCell::new(None));
+        let id = ex.spawn(mailbox(), wake_later(w.clone()), |_| {});
+        assert!(!ex.poll(id));
+        let waker = w.borrow_mut().take().expect("registered waker");
+        waker.wake_by_ref();
+        waker.wake_by_ref(); // deduplicated until the next poll
+        assert_eq!(ex.pop_ready(), Some(id));
+        assert_eq!(ex.pop_ready(), None);
+        assert!(ex.poll(id));
+    }
+
+    #[test]
+    fn stale_waker_does_not_poll_reused_slot() {
+        let mut ex = Executor::<()>::default();
+        let w = Rc::new(RefCell::new(None));
+        let id = ex.spawn(mailbox(), wake_later(w.clone()), |_| {});
+        assert!(!ex.poll(id));
+        let stale = w.borrow_mut().take().expect("registered waker");
+        ex.deliver(id, Some(1));
+        let id2 = ex.spawn(mailbox(), std::future::pending::<()>(), |_| {});
+        assert_eq!(id, id2, "slot reused");
+        stale.wake();
+        assert_eq!(ex.pop_ready(), None, "stale generation must be skipped");
+    }
+
+    #[test]
+    fn drive_ready_schedules_fired_and_expired() {
         let mut ex = Executor::<()>::default();
         let io = mailbox();
         let id = ex.spawn(io.clone(), std::future::pending::<()>(), |_| {});
-        io.borrow_mut().routed = true;
-
-        let go = ex.drive_ready(Instant::now(), true, |_, _| false);
-
-        assert_eq!(go, vec![id]);
-        assert!(!io.borrow().routed, "routed wake must be consumed");
+        io.borrow_mut().waits.push(Wait { fd: 3, writable: false });
+        ex.drive_ready(Instant::now(), true, |fd, w| fd == 3 && !w);
+        assert_eq!(ex.pop_ready(), Some(id));
+        assert_eq!(io.borrow().fired.len(), 1);
     }
 }
