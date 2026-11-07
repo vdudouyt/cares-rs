@@ -1,6 +1,5 @@
-//! #1: socket-creation failure must deliver ARES_ECONNREFUSED to the callback,
-//! not panic/abort the process. We inject failure via a custom socket layer
-//! whose socket() always returns ARES_SOCKET_BAD.
+//! Socket-creation failure must deliver ARES_ECONNREFUSED to the callback, not
+//! panic/abort; injected via a socket layer whose socket() returns ARES_SOCKET_BAD.
 
 use std::ffi::{c_int, c_void, CString};
 use std::ptr;

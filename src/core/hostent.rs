@@ -1,6 +1,5 @@
-//! The pure shape of a hostent result — which names, aliases and addresses
-//! a reply yields for which family. The ffi layer builds the C graph from a
-//! blueprint mechanically; every inclusion/ordering decision is made here.
+//! The pure shape of a hostent result: which names, aliases and addresses a
+//! reply yields. The ffi layer only builds the C graph mechanically.
 
 use std::ffi::CString;
 use std::net::IpAddr;
@@ -10,8 +9,7 @@ use crate::core::packets::AddrRecord;
 use crate::core::response::ParsedRRs;
 use crate::core::sortlist::{apply_sortlist_ips, SortlistEntry};
 
-/// Everything a `struct hostent` will say, decided: representative family,
-/// per-family address filter, and the NUL-safety alias policy.
+/// A fully decided hostent: family, address filter, and NUL-safe aliases.
 pub(crate) struct Hostent {
     pub name: CString,
     pub aliases: Vec<CString>,
@@ -21,17 +19,14 @@ pub(crate) struct Hostent {
 }
 
 impl Hostent {
-    /// A synthetic result with no aliases (IP literal / localhost): the
-    /// representative family and per-family filter come from `addrs` (which
-    /// must be non-empty), via [`Self::from_lookup`].
+    /// A synthetic result with no aliases (IP literal / localhost); `addrs`
+    /// must be non-empty.
     pub fn new(canonical: String, addrs: Vec<IpAddr>) -> Self {
         Self::from_lookup(HostLookup { canonical, aliases: vec![], addrs })
     }
 
-    /// A synchronous (hosts-file / IP-literal / localhost) result: the
-    /// representative family comes from the first address; aliases that
-    /// cannot become C strings (embedded NUL) are dropped; a NUL-containing
-    /// canonical name degrades to the empty string.
+    /// A hosts-file/IP-literal result: family from the first address; aliases
+    /// with an embedded NUL are dropped and such a canonical name becomes empty.
     pub fn from_lookup(lookup: HostLookup) -> Self {
         let (addrtype, length) = match lookup.addrs[0] {
             IpAddr::V4(_) => (libc::AF_INET, 4),
@@ -52,8 +47,7 @@ impl Hostent {
         }
     }
 
-    /// A DNS result for an explicit family: only addresses whose width
-    /// matches the family are emitted (an unknown family emits none).
+    /// A DNS result for an explicit family; an unknown family emits no addresses.
     pub fn from_parsed(rrs: ParsedRRs<AddrRecord>, family: i32) -> Self {
         let length = match family {
             libc::AF_INET => 4,
@@ -64,8 +58,7 @@ impl Hostent {
         Hostent { name: rrs.name, aliases: rrs.aliases, addrtype: family, length, addrs }
     }
 
-    /// Apply the channel sortlist to the final hostent, regardless of whether
-    /// the addresses came from the hosts file or DNS.
+    /// Apply the channel sortlist, whether the addresses came from hosts or DNS.
     pub fn sort_addrs(&mut self, sortlist: &[SortlistEntry]) {
         if !sortlist.is_empty() {
             apply_sortlist_ips(sortlist, &mut self.addrs);
@@ -80,9 +73,6 @@ fn ip_len(ip: &IpAddr) -> usize {
     }
 }
 
-
-/// The addrttl report: records of the wanted family, in arrival order,
-/// truncated to the caller's array size.
 pub(crate) fn addrttl_fill(items: &[AddrRecord], want_v4: bool, max: usize) -> Vec<(IpAddr, u32)> {
     items
         .iter()

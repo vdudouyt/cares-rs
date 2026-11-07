@@ -1,10 +1,5 @@
-//! Phase 2 DNS record parity regressions.
-//!
-//! These tests exercise the public `ares_dns_*` API against the c-ares 1.34.6
-//! contract for the bugs found during the DNS-record parity work:
-//! ABINP alias safety, OPT wire fields, zero-length raw RRs, class validation,
-//! CNAME class filtering and writer validation. All packets are built in
-//! memory; nothing here touches the network or the filesystem.
+//! DNS-record parity regressions against the c-ares 1.34.6 contract; all
+//! packets are built in memory (no network or filesystem).
 
 use std::ffi::{c_int, c_uint, CStr, CString};
 use std::ptr;
@@ -56,11 +51,11 @@ fn answer(name: &str, rtype: u16, class: u16, ttl: u32, rdata: &[u8]) -> Vec<u8>
 fn response(qname: &str, qtype: u16, answers: &[Vec<u8>]) -> Vec<u8> {
     let mut buf = Vec::new();
     push_u16(&mut buf, 0x1234);
-    push_u16(&mut buf, 0x8180); // QR, RD, RA, NOERROR
-    push_u16(&mut buf, 1); // qdcount
+    push_u16(&mut buf, 0x8180);
+    push_u16(&mut buf, 1);
     push_u16(&mut buf, answers.len() as u16);
-    push_u16(&mut buf, 0); // nscount
-    push_u16(&mut buf, 0); // arcount
+    push_u16(&mut buf, 0);
+    push_u16(&mut buf, 0);
     push_name(&mut buf, qname);
     push_u16(&mut buf, qtype);
     push_u16(&mut buf, ARES_CLASS_IN);
@@ -74,16 +69,16 @@ fn opt_response(qname: &str, udp_size: u16, ext_rcode: u8, version: u8, flags: u
     let mut buf = Vec::new();
     push_u16(&mut buf, 0x1234);
     push_u16(&mut buf, 0x8180);
-    push_u16(&mut buf, 1); // qdcount
-    push_u16(&mut buf, 0); // ancount
-    push_u16(&mut buf, 0); // nscount
-    push_u16(&mut buf, 1); // arcount
+    push_u16(&mut buf, 1);
+    push_u16(&mut buf, 0);
+    push_u16(&mut buf, 0);
+    push_u16(&mut buf, 1);
     push_name(&mut buf, qname);
     push_u16(&mut buf, T_A);
     push_u16(&mut buf, ARES_CLASS_IN);
 
-    // OPT RR: root owner, class holds the UDP payload size, TTL carries the
-    // extended rcode/version/flags, empty rdata.
+    // OPT: root owner, class = UDP payload size, TTL = ext rcode/version/flags,
+    // empty rdata.
     buf.push(0);
     push_u16(&mut buf, T_OPT);
     push_u16(&mut buf, udp_size);
@@ -154,7 +149,7 @@ fn txt_abinp_alias_is_safe_and_empty_string_is_preserved() {
             ares_dns_rr_add_abin(rr, ARES_RR_TXT_DATA, b"alpha".as_ptr(), 5),
             ARES_SUCCESS
         );
-        // An empty character-string is still a real ABINP element.
+        // A zero-length character-string is still a real ABINP element.
         assert_eq!(
             ares_dns_rr_add_abin(rr, ARES_RR_TXT_DATA, b"".as_ptr(), 0),
             ARES_SUCCESS
@@ -240,9 +235,8 @@ fn txt_parse_multi_string_uses_one_abinp_element_per_string() {
 
 #[test]
 fn opt_wire_fields_survive_write_reparse_and_duplicate() {
-    // Extended rcode 1 combines with the low nibble 0 to make BADSIG (16),
-    // which is a valid RCODE value (unlike arbitrary 12-bit experiments,
-    // which upstream normalizes to SERVFAIL).
+    // Extended rcode 1 + low nibble 0 = BADSIG (16); upstream normalizes other
+    // 12-bit values to SERVFAIL.
     let buf = opt_response("example.com", 1232, 0x01, 5, 0x0123);
     unsafe {
         let rec = parse_packet(&buf);
@@ -501,7 +495,7 @@ fn del_opt_byid_empty_and_missing_options() {
             ARES_SUCCESS
         );
 
-        // No options at all: upstream treats the delete as a no-op success.
+        // Upstream treats delete with no options as a no-op success.
         assert_eq!(
             ares_dns_rr_del_opt_byid(rr, ARES_RR_OPT_OPTIONS, 5),
             ARES_SUCCESS

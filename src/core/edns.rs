@@ -1,22 +1,11 @@
-//! EDNS(0), DNS cookie and DNS 0x20 wire helpers.
-//!
-//! Pure, safe wire manipulation over a serialized DNS message. The helpers are
-//! deliberately defensive: every offset is bounds-checked and a malformed OPT
-//! or option list simply yields `None` / leaves the buffer untouched instead of
-//! panicking (the FFI parses untrusted network data).
-//!
-//! Simplifications relative to upstream `ares_cookie.c` (documented here so the
-//! state machine stays reviewable): cookie timestamps (client rotation,
-//! unsupported/regression timers) are not enforced. The restored tests run far
-//! inside every timer window, and the state transitions they do pin
-//! (INITIAL → GENERATED → SUPPORTED / UNSUPPORTED, BADCOOKIE re-sends) are
-//! implemented exactly.
+//! EDNS(0), DNS cookie and DNS 0x20 wire helpers over a serialized message.
+//! Unlike upstream `ares_cookie.c`, cookie rotation/regression timers are not enforced.
 
 use std::time::Instant;
 
 use rand::Rng;
 
-/// Default advertised UDP payload size (`EDNSPACKETSZ`).
+/// Default advertised UDP payload size.
 pub(crate) const EDNS_PACKETSZ: u16 = 1280;
 
 /// OPT pseudo-RR type (RFC 6891).
@@ -26,13 +15,10 @@ const OPT_COOKIE: u16 = 10;
 
 /// Location of the OPT pseudo-RR inside a serialized message.
 struct OptRecord {
-    /// First byte of the OPT RR (its root name).
     rr_start: usize,
-    /// One past the last byte of its RDATA.
     rr_end: usize,
     /// Offset of the TTL field (extended RCODE / version / flags).
     ttl_offset: usize,
-    /// Offset of the RDATA.
     rdata_offset: usize,
     rdata_len: usize,
 }
@@ -53,7 +39,6 @@ fn header_u16(buf: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_be_bytes([b[0], b[1]]))
 }
 
-/// Skip a (possibly compressed) DNS name starting at `*pos`.
 fn skip_name(buf: &[u8], pos: &mut usize) -> Option<()> {
     loop {
         let len = *buf.get(*pos)?;
@@ -77,7 +62,6 @@ fn skip_name(buf: &[u8], pos: &mut usize) -> Option<()> {
     }
 }
 
-/// Skip one RR, returning its TYPE and the offset/length of its RDATA.
 fn skip_rr(buf: &[u8], pos: &mut usize) -> Option<(u16, usize, usize)> {
     skip_name(buf, pos)?;
     let record_type = header_u16(buf, *pos)?;
@@ -92,8 +76,7 @@ fn skip_rr(buf: &[u8], pos: &mut usize) -> Option<(u16, usize, usize)> {
     Some((record_type, rdata_offset, rdata_len))
 }
 
-/// Find the OPT pseudo-RR in the ADDITIONAL section. Malformed messages yield
-/// `None` (never a panic).
+/// Find the OPT pseudo-RR in the ADDITIONAL section.
 fn find_opt(buf: &[u8]) -> Option<OptRecord> {
     if buf.len() < 12 {
         return None;
@@ -139,18 +122,15 @@ fn find_opt(buf: &[u8]) -> Option<OptRecord> {
     None
 }
 
-/// Does the message carry an OPT pseudo-RR?
 pub(crate) fn has_opt(buf: &[u8]) -> bool {
     find_opt(buf).is_some()
 }
 
 /// Append an empty OPT pseudo-RR (root name, CLASS = `udp_size`, TTL 0) as the
-/// last additional record. Returns false when the message is malformed, already
-/// has an OPT, or the ARCOUNT cannot be incremented.
+/// last additional record; false if malformed, already has an OPT, or ARCOUNT is full.
 pub(crate) fn append_opt(buf: &mut Vec<u8>, udp_size: u16) -> bool {
-    // Header + root name + TYPE/CLASS/TTL/RDLENGTH = 11 bytes. Reserve the
-    // whole record first so a near-limit packet is rejected cleanly instead of
-    // being truncated/corrupted (DNS messages are bound by the 16-bit length).
+    // Header + root name + TYPE/CLASS/TTL/RDLENGTH = 11 bytes; reject a
+    // near-limit packet up front so it cannot be truncated by the 16-bit length.
     const OPT_WIRE_LEN: usize = 11;
     if buf.len() < 12
         || buf.len().saturating_add(OPT_WIRE_LEN) > u16::MAX as usize
@@ -161,17 +141,16 @@ pub(crate) fn append_opt(buf: &mut Vec<u8>, udp_size: u16) -> bool {
     let Some(arcount) = header_u16(buf, 10) else { return false };
     let Some(new_arcount) = arcount.checked_add(1) else { return false };
     buf[10..12].copy_from_slice(&new_arcount.to_be_bytes());
-    buf.push(0); // root name
+    buf.push(0);
     buf.extend_from_slice(&OPT_TYPE.to_be_bytes());
     buf.extend_from_slice(&udp_size.to_be_bytes());
     buf.extend_from_slice(&0u32.to_be_bytes()); // extended RCODE / version / flags
-    buf.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH
+    buf.extend_from_slice(&0u16.to_be_bytes());
     true
 }
 
-/// Remove the OPT pseudo-RR (used for the FORMERR-with-EDNS fallback), keeping
-/// every other additional record intact and fixing ARCOUNT. Returns true when
-/// an OPT was removed.
+/// Remove the OPT pseudo-RR (FORMERR-with-EDNS fallback), keeping other
+/// additional records and fixing ARCOUNT.
 pub(crate) fn strip_opt(buf: &mut Vec<u8>) -> bool {
     let Some(opt) = find_opt(buf) else { return false };
     let Some(arcount) = header_u16(buf, 10) else { return false };
@@ -195,7 +174,6 @@ pub(crate) fn extended_rcode(buf: &[u8], base: u8) -> u16 {
     (ext << 4) | u16::from(base & 0x0f)
 }
 
-/// The value of the COOKIE EDNS option in the message, if present.
 pub(crate) fn cookie_option(buf: &[u8]) -> Option<&[u8]> {
     let opt = find_opt(buf)?;
     let mut rdata = opt.rdata(buf)?;
@@ -215,12 +193,9 @@ pub(crate) fn cookie_option(buf: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Replace (or remove, when `cookie` is `None`) the COOKIE option in an existing
-/// OPT RR. All other EDNS options are preserved, so a caller-supplied template
-/// (e.g. `ares_search_dnsrec` search options) survives. A missing OPT is a
-/// successful no-op. Returns false (buffer untouched) when the option list is
-/// malformed or the new COOKIE would push the message past the 16-bit DNS
-/// length limit.
+/// Replace (or remove, when `cookie` is `None`) the COOKIE option in an
+/// existing OPT, preserving all other options. A missing OPT is a no-op;
+/// malformed lists or a message over the 16-bit length limit return false.
 pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) -> bool {
     let Some(opt) = find_opt(buf) else { return true };
     let Some(old_rdata) = opt.rdata(buf) else { return false };
@@ -229,12 +204,12 @@ pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) -> boo
     let mut rest = old_rdata;
     while !rest.is_empty() {
         if rest.len() < 4 {
-            return false; // malformed option list — leave the packet untouched
+            return false;
         }
         let code = u16::from_be_bytes([rest[0], rest[1]]);
         let len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
         if rest.get(4..4 + len).is_none() {
-            return false; // malformed option list — leave the packet untouched
+            return false;
         }
         if code != OPT_COOKIE {
             new_rdata.extend_from_slice(&rest[..4 + len]);
@@ -252,8 +227,8 @@ pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) -> boo
     if new_rdata.len() > u16::MAX as usize {
         return false;
     }
-    // The whole message (normally RDATA growth, but a removal can shrink it)
-    // must stay within the 16-bit DNS/TCP length field.
+    // The whole message (RDATA can grow or shrink) must stay within the 16-bit
+    // DNS/TCP length field.
     let Some(new_total) = buf
         .len()
         .checked_sub(opt.rdata_len)
@@ -272,11 +247,8 @@ pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) -> boo
     true
 }
 
-/// Locate question 0's label byte ranges `(start, end)` in the wire message.
-/// Shared by the case-preserving reader and the DNS 0x20 randomizer so both
-/// accept exactly the same names. Returns `None` for a missing/malformed
-/// question or a compressed name (queries sent by this crate never compress
-/// the question).
+/// Question 0's label byte ranges, shared by the case-preserving reader and
+/// the DNS 0x20 randomizer. A compressed question name returns `None`.
 fn question_label_ranges(buf: &[u8]) -> Option<Vec<(usize, usize)>> {
     if buf.len() < 12 || header_u16(buf, 4)? == 0 {
         return None;
@@ -301,7 +273,6 @@ fn question_label_ranges(buf: &[u8]) -> Option<Vec<(usize, usize)>> {
     }
 }
 
-/// Join label ranges with '.' into a presentation-form name.
 fn join_question_name(buf: &[u8], ranges: &[(usize, usize)]) -> Option<Vec<u8>> {
     let mut name = Vec::new();
     for (i, &(start, end)) in ranges.iter().enumerate() {
@@ -313,11 +284,9 @@ fn join_question_name(buf: &[u8], ranges: &[(usize, usize)]) -> Option<Vec<u8>> 
     Some(name)
 }
 
-/// Randomize the case of every ASCII letter in question 0's name, writing the
-/// mixed-case name back into the wire buffer (draft-vixie-dnsext-dns0x20). One
-/// random bit per letter, exactly like upstream `ares_apply_dns0x20`. Returns
-/// the presentation-form randomized name (labels joined by '.') for response
-/// validation, or `None` when the message has no parseable question name.
+/// Randomize the case of each ASCII letter in question 0 (DNS 0x20,
+/// draft-vixie-dnsext-dns0x20) and return the presentation-form name for
+/// response validation.
 pub(crate) fn randomize_question_name(buf: &mut [u8]) -> Option<Vec<u8>> {
     let ranges = question_label_ranges(buf)?;
     let mut rng = rand::thread_rng();
@@ -335,21 +304,18 @@ pub(crate) fn randomize_question_name(buf: &mut [u8]) -> Option<Vec<u8>> {
     join_question_name(buf, &ranges)
 }
 
-/// Extract question 0's presentation-form name from a wire message, preserving
-/// its case.
+/// Question 0's presentation-form name, preserving case.
 pub(crate) fn question_name(buf: &[u8]) -> Option<Vec<u8>> {
     let ranges = question_label_ranges(buf)?;
     join_question_name(buf, &ranges)
 }
 
-/// DNS 0x20 response validation: the response question 0 must carry the exact
-/// same case as the randomized query name.
+/// DNS 0x20 check: the response question must match the randomized query's case.
 pub(crate) fn question_matches_case(resp: &[u8], expected: &[u8]) -> bool {
     question_name(resp).as_deref() == Some(expected)
 }
 
-/// Cookie support state for one server (upstream `ares_cookie_t`, minus the
-/// timer bookkeeping; see the module docs).
+/// Cookie support state for one server (upstream `ares_cookie_t`, minus timers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CookieState {
     #[default]
@@ -371,7 +337,7 @@ pub(crate) struct ServerCookie {
 /// The verdict of validating one response's COOKIE option.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CookieVerdict {
-    /// Accept the response (and any state was already updated).
+    /// Accept the response (state already updated).
     Accept,
     /// Drop the response silently and keep waiting for a valid reply.
     Drop,
@@ -380,9 +346,9 @@ pub(crate) enum CookieVerdict {
 }
 
 impl ServerCookie {
-    /// Produce the COOKIE option value to send with this query, advancing
-    /// INITIAL → GENERATED and regenerating the client cookie only when the
-    /// state was cleared. `None` means "do not send a cookie" (UNSUPPORTED).
+    /// COOKIE value for this query, advancing INITIAL → GENERATED and regenerating
+    /// the client cookie only from a cleared state. `None` means do not send a
+    /// cookie (UNSUPPORTED).
     pub(crate) fn cookie_for_query(&mut self) -> Option<Vec<u8>> {
         match self.state {
             CookieState::Unsupported => None,
@@ -401,7 +367,6 @@ impl ServerCookie {
         }
     }
 
-    /// Remember a server cookie learned from a validated response.
     fn store_server(&mut self, cookie: &[u8]) {
         self.state = CookieState::Supported;
         self.server.clear();
@@ -417,9 +382,8 @@ impl ServerCookie {
         self.state = CookieState::Initial;
     }
 
-    /// Validate the COOKIE option of a response. `sent_client` is the client
-    /// cookie actually placed on the wire for this query (`None` when no cookie
-    /// was sent). `rcode` is the full extended RCODE.
+    /// Validate a response's COOKIE option. `sent_client` is the client cookie put
+    /// on the wire (`None` if none); `rcode` is the full extended RCODE.
     pub(crate) fn validate_response(
         &mut self,
         resp: &[u8],
@@ -428,16 +392,14 @@ impl ServerCookie {
     ) -> CookieVerdict {
         let resp_cookie = cookie_option(resp);
 
-        // A malformed COOKIE length is always dropped as a likely spoof. An
-        // 8-byte echo is just the client cookie (server does not support
-        // cookies yet); 9..40 carries a server cookie.
+        // Malformed COOKIE lengths are dropped as likely spoofs. An 8-byte echo is
+        // client-only (no server cookie yet); 9..40 bytes carry a server cookie.
         if let Some(cookie) = resp_cookie {
             if !(8..=40).contains(&cookie.len()) {
                 return CookieVerdict::Drop;
             }
         }
 
-        // We did not ask for cookies: nothing to validate.
         let Some(sent) = sent_client else {
             return CookieVerdict::Accept;
         };
@@ -448,10 +410,8 @@ impl ServerCookie {
                 Some(prefix) if prefix == sent => {}
                 _ => return CookieVerdict::Drop,
             }
-            // Only a real server cookie (more than the 8-byte client echo)
-            // confirms support and is remembered. An 8-byte echo leaves the
-            // state untouched so the GENERATED handling below can mark the
-            // server unsupported and accept the reply.
+            // Only a real server cookie (>8 bytes) confirms support and is remembered.
+            // An 8-byte echo leaves state for the GENERATED branch to mark UNSUPPORTED.
             if cookie.len() > 8 {
                 self.store_server(cookie);
             }
@@ -466,17 +426,15 @@ impl ServerCookie {
             };
         }
 
-        // A valid server cookie was returned: done.
         if resp_cookie.is_some_and(|c| c.len() > 8) {
             return CookieVerdict::Accept;
         }
 
         match self.state {
-            // We previously learned this server supports cookies: a reply
-            // without one is dropped so a spoofed/regressed reply cannot win.
+            // SUPPORTED: a reply without a cookie is dropped so a spoofed/regressed
+            // reply cannot win.
             CookieState::Supported => CookieVerdict::Drop,
-            // First learning attempt answered without a cookie: the server
-            // does not support them. Accept this reply.
+            // First attempt without a cookie: mark the server UNSUPPORTED and accept.
             CookieState::Generated => {
                 self.clear();
                 self.state = CookieState::Unsupported;
@@ -491,7 +449,6 @@ impl ServerCookie {
 mod tests {
     use super::*;
 
-    /// Build a minimal query with question "example.com" A IN.
     fn query() -> Vec<u8> {
         let mut q = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -514,13 +471,12 @@ mod tests {
 
     #[test]
     fn cookie_append_checks_total_message_length() {
-        // Valid header with one OPT RR (empty RDATA) at offset 12, then
-        // trailing padding so the message is near the 16-bit limit.
+        // Header with one empty OPT at offset 12 plus padding, near the 16-bit limit.
         let make = |len: usize| {
             let mut buf = vec![0u8; len];
-            buf[10..12].copy_from_slice(&1u16.to_be_bytes()); // arcount = 1
-            buf[12] = 0; // root name
-            buf[13..15].copy_from_slice(&41u16.to_be_bytes()); // OPT
+            buf[10..12].copy_from_slice(&1u16.to_be_bytes());
+            buf[12] = 0;
+            buf[13..15].copy_from_slice(&41u16.to_be_bytes());
             buf[15..17].copy_from_slice(&1280u16.to_be_bytes());
             buf
         };
@@ -538,9 +494,8 @@ mod tests {
 
     #[test]
     fn append_opt_rejects_messages_without_room_for_the_whole_rr() {
-        // Header + 65519 zero bytes = 65531 bytes; the 11-byte OPT would
-        // overflow the 16-bit DNS message length, so it must be rejected
-        // without mutating the buffer.
+        // 65531 bytes + the 11-byte OPT overflows the 16-bit message length, so it
+        // must be rejected without mutating the buffer.
         let mut buf = vec![0u8; 65531];
         assert!(!append_opt(&mut buf, 1280));
         assert_eq!(buf.len(), 65531);
@@ -555,7 +510,7 @@ mod tests {
 
     #[test]
     fn strip_preserves_other_additions() {
-        // Query with one non-OPT additional (a root-named TXT RR) then OPT.
+        // One non-OPT additional (root-named TXT RR) before OPT.
         let mut q = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
             7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
@@ -570,7 +525,6 @@ mod tests {
     #[test]
     fn cookie_option_roundtrip_and_preserves_other_options() {
         let mut q = query();
-        // Add a custom option (code 3) then the cookie.
         let opt = find_opt(&q).expect("opt");
         let custom = [0x00, 0x03, 0x00, 0x02, 0xAA, 0xBB];
         let mut rdata = custom.to_vec();
@@ -582,7 +536,6 @@ mod tests {
         assert_eq!(cookie_option(&q), Some(&[1, 2, 3, 4, 5, 6, 7, 8][..]));
         set_cookie_option(&mut q, Some(&[9, 9, 9, 9, 9, 9, 9, 9, 1, 2]));
         assert_eq!(cookie_option(&q), Some(&[9, 9, 9, 9, 9, 9, 9, 9, 1, 2][..]));
-        // The custom option survived.
         assert_eq!(&find_opt(&q).and_then(|o| o.rdata(&q)).unwrap()[..6], &custom);
         set_cookie_option(&mut q, None);
         assert_eq!(cookie_option(&q), None);
@@ -620,7 +573,6 @@ mod tests {
         let randomized = randomize_question_name(&mut q).unwrap();
         assert_eq!(randomized.len(), 11);
         assert!(question_matches_case(&q, &randomized));
-        // Lowercasing the response question makes the check fail.
         let mut lower = q.clone();
         for b in lower.iter_mut().skip(12).take(13) {
             *b = b.to_ascii_lowercase();
@@ -635,7 +587,7 @@ mod tests {
         assert_eq!(client.len(), 8);
         assert_eq!(c.state, CookieState::Generated);
 
-        // A zero-additional response (no cookie) marks unsupported and accepts.
+        // A response with no cookie marks the server unsupported and accepts.
         let resp = [0, 1, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             c.validate_response(&resp, Some(&client[..8].try_into().unwrap()), 0),
@@ -653,8 +605,8 @@ mod tests {
 
     #[test]
     fn eight_byte_cookie_is_accepted_as_client_only() {
-        // An 8-byte echoed client cookie is valid: no server cookie is stored,
-        // the server is marked UNSUPPORTED, and the reply is accepted.
+        // An 8-byte echoed client cookie is valid: nothing stored, server marked
+        // UNSUPPORTED, reply accepted.
         let mut c = ServerCookie::default();
         let client = c.cookie_for_query().unwrap();
         let sent: [u8; 8] = client[..8].try_into().unwrap();

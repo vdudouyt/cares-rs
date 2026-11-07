@@ -1,11 +1,5 @@
-//! Channel lifecycle and configuration: init/dup/destroy/cancel, server
-//! lists, reactor fd/timeout accessors, and the channel-level callbacks.
-//!
-//! With `ARES_OPT_EVENT_THREAD` a background thread drives the reactor, so
-//! every shim serializes on the channel lock. Completion callbacks fire while
-//! that lock is held. The lock is recursive, so a completion callback may
-//! re-enter the same channel on the same thread; a callback that calls
-//! `ares_destroy` is still unsupported (destroy joins the event thread).
+//! Channel lifecycle/config shims. With `ARES_OPT_EVENT_THREAD` a background thread
+//! drives the reactor; callbacks fire under the recursive lock (destroy inside one is unsupported).
 
 use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
@@ -18,56 +12,31 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Upper bound on the event thread's poll wait. New work wakes the thread
-/// immediately through the wake pipe, so this only bounds idle wakeups (and
-/// gives timers a hard ceiling).
+/// Upper bound on the event thread's poll wait; new work wakes it via the wake pipe.
 const EVENT_MAX_WAIT_MS: u128 = 1000;
 
-/// The C-visible channel: the pure core state plus the channel-level C
-/// callbacks. Everything the shims marshal lives behind `.state`; the six
-/// callback fields are the only C-tainted residents.
+/// The C-visible channel: core state plus the channel-level C callbacks.
 pub struct ChannelData {
     pub(crate) state: AsyncClient,
-    /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>`
-    /// in `state`. The socket-state callbacks (create/configure) live in
-    /// the factory; setters rebuild it copy-on-write. ares_dup deep-clones it
-    /// so no `Rc` is ever shared between channels (each may have its own
-    /// event thread).
+    /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>` in
+    /// `state`; rebuilt copy-on-write. Deep-cloned by ares_dup (`Rc` isn't atomic).
     pub(crate) socket_factory: std::rc::Rc<CSocketFactory>,
     pub(crate) server_state_callback: ares_server_state_callback,
     pub(crate) server_state_callback_arg: *mut libc::c_void,
-    /// Optional notification hook fired when a pending write drains. Our writes
-    /// are awaited directly, so nothing currently invokes it; the fields exist
-    /// for API parity and are copied by ares_dup.
     pub(crate) pending_write_cb: ares_pending_write_cb,
     pub(crate) pending_write_arg: *mut libc::c_void,
-    /// ARES_OPT_SOCK_STATE_CB (stored here for ares_save_options; also copied
-    /// into the socket factory that fires it).
     pub(crate) sock_state_cb: ares_sock_state_cb,
     pub(crate) sock_state_cb_data: *mut libc::c_void,
-    /// The in-flight resolver ops — the executor's task set (each future owns
-    /// its socket(s)).
     executor: Executor<DnsSignals>,
-    /// True when ARES_OPT_EVENT_THREAD was supplied: a background thread owns
-    /// the reactor loop and the channel is serialized by `lock`.
     pub(crate) event_mode: bool,
-    /// Set by `ares_destroy` to ask the event thread to leave its loop.
     pub(crate) event_stop: Arc<AtomicBool>,
-    /// Handle of the built-in event thread (present while `event_mode`).
     pub(crate) event_join: Option<JoinHandle<()>>,
-    /// Per-channel serialization for every shim that touches channel state.
-    /// The event thread also takes it around its process cycle; user callbacks
-    /// fire while it is held. Recursive so a completion callback may re-enter
-    /// the same channel on the same thread (destroy from a callback remains
-    /// unsupported).
+    /// Per-channel recursive lock; user callbacks fire while it is held.
     pub(crate) lock: Arc<ReentrantMutex>,
-    /// Event-thread wake pipe (None for non-event channels). Created when the
-    /// event thread starts and closed by `WakePipe::drop` with the channel.
     pub(crate) event_wake: Option<Arc<WakePipe>>,
 }
 
 impl ChannelData {
-    /// A fresh channel: pure state, no callbacks installed.
     pub(crate) fn new(state: AsyncClient, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
         ChannelData {
             state,
@@ -87,9 +56,8 @@ impl ChannelData {
         }
     }
 
-    /// ares_dup: duplicate the pure state. The socket factory is deep-cloned
-    /// rather than sharing its `Rc`: duplicated event channels each have their
-    /// own thread, and `Rc` refcounts are not atomic.
+    /// ares_dup: deep-clone the factory rather than sharing its `Rc` (duplicated
+    /// event channels each have their own thread; `Rc` refcounts aren't atomic).
     pub(crate) fn dup_from(&self) -> Self {
         let socket_factory = std::rc::Rc::new((*self.socket_factory).clone());
         let mut state = self.state.duplicate();
@@ -112,25 +80,21 @@ impl ChannelData {
         }
     }
 
-    /// Wake the event thread (no-op for non-event channels). Safe to call with
-    /// the channel lock held; a full pipe means the thread is already awake.
+    /// Wake the event thread; a full pipe means it is already awake.
     pub(crate) fn wake(&self) {
         if let Some(wake) = &self.event_wake {
             wake.wake();
         }
     }
 
-    /// True when a shared-socket sibling routed work into a mailbox that has
-    /// not been re-polled yet (the event thread must run another cycle without
-    /// waiting for fd readiness).
+    /// True when a shared-socket sibling routed work into a mailbox not yet re-polled.
     fn has_routed(&self) -> bool {
         self.executor
             .ids()
             .any(|id| self.executor.io(id).is_some_and(|io| io.borrow().routed))
     }
 
-    /// Push the channel's socket settings (buffers, local bind, state
-    /// callback) into a rebuilt factory. Called after option/local setters.
+    /// Push socket settings into a rebuilt factory after option setters.
     pub(crate) fn refresh_socket_config(&mut self) {
         let socket = SocketConfig {
             send_buf: self.state.socket_send_buffer_size,
@@ -145,34 +109,27 @@ impl ChannelData {
         self.apply_socket_factory(factory);
     }
 
-    /// A fresh channel with the default (libc) socket factory, before the
-    /// no-nameserver fallback is applied (ares_init_options applies options
-    /// first so ARES_FLAG_NO_DFLT_SVR and explicit servers win). `resolvconf`
-    /// is the caller's ARES_OPT_RESOLVCONF path, if any.
+    /// Fresh channel before the no-nameserver fallback; options are applied
+    /// first so ARES_FLAG_NO_DFLT_SVR and explicit servers win.
     pub(crate) fn new_unfinalized(resolvconf: Option<&str>) -> Self {
         let factory = std::rc::Rc::new(CSocketFactory::default());
         let state = AsyncClient::from_sysconfig_path(factory.clone(), resolvconf);
         ChannelData::new(state, factory)
     }
 
-    /// A fresh, fully initialized channel with the default (libc) socket factory.
     pub(crate) fn new_default() -> Self {
         let mut channel = ChannelData::new_unfinalized(None);
         channel.state.apply_defaults();
         channel
     }
 
-    /// Install a rebuilt socket factory, keeping the concrete handle and the
-    /// core's `Rc<dyn SocketFactory>` in sync (they are the same object).
+    /// Install a rebuilt factory, keeping the concrete handle and core `Rc` in sync.
     pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<CSocketFactory>) {
         self.state.factory = factory.clone();
         self.socket_factory = factory;
     }
 
-    /// The single spawn path: register a lifecycle `fut` + its mailbox + its C
-    /// delivery closure `on` in a free slot and drive it once (issuing the initial
-    /// send). Every ares_* entry shim calls here. `on` fires when the reactor later
-    /// settles the query (or in place if it completes on this first poll).
+    /// Spawn a task and drive it once; `on` may fire inline on this first poll.
     pub(crate) fn spawn<T: 'static>(
         &mut self,
         io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>,
@@ -181,19 +138,16 @@ impl ChannelData {
     ) {
         let id = self.executor.spawn(io, fut, on);
         self.advance(id);
-        // New fds/timers may have been published: wake the event thread now
-        // rather than waiting for its idle poll to expire.
+        // New fds/timers may have been published: wake now rather than waiting
+        // for the idle poll to expire.
         self.wake();
     }
 
-    /// Advance one task one step: poll it, apply the DNS effects it emitted
-    /// (server-state notify), and on completion deliver its result. On `Pending` the
-    /// future has published the fds it is now blocked on into its mailbox.
+    /// Advance one task; on `Pending` its mailbox holds the fds it now waits on.
     fn advance(&mut self, id: usize) {
         let done = self.executor.poll(id);
-        // Drain + apply the future's app-specific effects between poll and delivery
-        // (server-state callbacks fire before the result). Scoped so the `executor`
-        // borrow releases before the callbacks fire.
+        // Effects are drained before delivery so the callbacks fire first; scoped
+        // so the `executor` borrow releases before the callbacks run.
         let effects = match self.executor.io(id) {
             Some(io) => std::mem::take(&mut io.borrow_mut().app.effects),
             None => Vec::new(),
@@ -210,9 +164,6 @@ impl ChannelData {
         }
     }
 
-    /// Drive every task whose published fd is ready (or whose timeout passed) this
-    /// `ares_process` cycle: set its mailbox readiness via the `FD_ISSET` oracle
-    /// (the sole unsafe here) and re-poll it.
     fn drive_fd_futures(
         &mut self,
         read_fds: &mut libc::fd_set,
@@ -231,33 +182,23 @@ impl ChannelData {
         }
     }
 
-    /// Fire `status` to every in-flight task (fire the terminal status + drop the
-    /// future, which drops its owned sockets). The shared safe teardown for
-    /// `ares_cancel` (ECANCELLED) / `ares_destroy` (EDESTRUCTION).
     pub(crate) fn abort_all(&mut self, status: c_int) {
         for id in self.executor.ids() {
             self.executor.deliver(id, Some(status));
         }
-        // Drop any shared TCP/UDP connections the aborted futures held.
         self.state.tcp_pool.borrow_mut().clear();
         let retired = self.state.udp_pool.borrow_mut().clear();
         drop(retired);
     }
 
-    /// Every (fd, wants_write) the caller should select on.
     fn all_poll_fds(&self) -> Vec<(i32, bool)> {
         self.executor.poll_fds()
     }
 
-    /// The earliest timeout (ms) across in-flight tasks, or `None`.
     fn next_timeout_ms(&self) -> Option<u128> {
         self.executor.next_timeout_ms(Instant::now())
     }
 
-    /// One `ares_process` cycle: drive every in-flight async future whose
-    /// published socket is ready (or whose timeout passed) this cycle. Each
-    /// future owns its socket(s) and applies its own verdicts; the only unsafe
-    /// here is the `FD_ISSET` readiness check and the C-callback invokers.
     pub(crate) fn process_channel(
         &mut self,
         read_fds: &mut libc::fd_set,
@@ -267,10 +208,9 @@ impl ChannelData {
         self.drive_fd_futures(read_fds, write_fds, skip_timeouts);
     }
 
-    /// Drive one batch of explicit fd/event pairs without ever putting them in
-    /// an `fd_set` (upstream `ares_process_fds` semantics). This avoids the
-    /// `FD_SETSIZE` ceiling: a custom socket layer may legally return a high
-    /// fd, and `libc::FD_SET` would index out of bounds and abort the process.
+    /// Drive explicit fd/event pairs without an `fd_set` (upstream
+    /// `ares_process_fds` semantics): `FD_SET` would index out of bounds past
+    /// `FD_SETSIZE` on a high custom-socket fd and abort the process.
     pub(crate) fn process_events(
         &mut self,
         events: &[crate::ffi::ares_socket::ares_fd_events_t],
@@ -287,8 +227,7 @@ impl ChannelData {
         }
     }
 
-    /// Fire the server-state notification callback (if installed) for a server
-    /// index; a stale index is silently skipped.
+    /// Fire the server-state callback if installed; a stale index is skipped.
     pub(crate) fn invoke_server_state_callback(&self, server_index: usize, success: bool, is_tcp: bool) {
         if let Some(cb) = self.server_state_callback {
             let Some(server_str) = self.state.server_state_string(server_index, is_tcp) else {
@@ -302,9 +241,7 @@ impl ChannelData {
     }
 }
 
-/// The event thread's self-pipe. `wake` is nonblocking (a full pipe simply
-/// means the thread is already runnable); `drain` is called by the thread on
-/// every wakeup.
+/// Event-thread self-pipe; `wake` is nonblocking (a full pipe means the thread is already runnable).
 pub(crate) struct WakePipe {
     read_fd: libc::c_int,
     write_fd: libc::c_int,
@@ -318,7 +255,6 @@ impl WakePipe {
             return None;
         }
         for fd in fds {
-            // Both ends nonblocking and close-on-exec.
             // SAFETY: fd is a freshly created valid descriptor.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             let fdflags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -369,10 +305,8 @@ impl Drop for WakePipe {
     }
 }
 
-/// A per-channel recursive lock. Completion callbacks fire while the lock is
-/// held, so the same thread must be able to re-enter a channel API (the
-/// historical single-thread behavior). A different thread waits on `available`
-/// until the owner fully unwinds.
+/// Per-channel recursive lock: completion callbacks fire while it is held, so the
+/// same thread must be able to re-enter a channel API.
 pub(crate) struct ReentrantMutex {
     state: Mutex<LockState>,
     available: Condvar,
@@ -384,7 +318,6 @@ struct LockState {
     depth: usize,
 }
 
-/// An opaque, allocation-free thread identity for the recursive lock.
 fn thread_token() -> usize {
     #[cfg(unix)]
     {
@@ -454,9 +387,8 @@ impl Drop for ReentrantGuard<'_> {
     }
 }
 
-/// The built-in event thread: snapshot the fds/timeout under the channel lock,
-/// `poll` without holding it, then lock again and drive the futures whose fds
-/// became ready (or whose timeout expired).
+/// The event thread: snapshot fds/timeout under the channel lock, `poll` without
+/// holding it, then re-lock to drive ready futures.
 fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static ReentrantMutex, wake: Arc<WakePipe>) {
     use crate::ffi::ares_socket::{ares_fd_events_t, ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
     loop {
@@ -464,7 +396,7 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
             break;
         }
 
-        // Snapshot the reactor interests while serialized. The channel pointer
+        // Snapshot the reactor interests while serialized; the channel pointer
         // stays valid until `ares_destroy` joins this thread.
         let (waits, next_timeout) = {
             let _guard = lock.lock();
@@ -477,9 +409,7 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
             (data.all_poll_fds(), data.next_timeout_ms())
         };
 
-        // Poll rather than select: no FD_SETSIZE ceiling and no fd_set
-        // marshalling in the loop. The readiness oracle handed to the executor
-        // is the same one `ares_process_fds` uses. Slot 0 is the wake pipe.
+        // poll rather than select: no FD_SETSIZE ceiling. Slot 0 is the wake pipe.
         let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(waits.len() + 1);
         pollfds.push(libc::pollfd { fd: wake.read_fd(), events: libc::POLLIN, revents: 0 });
         pollfds.extend(waits.iter().map(|(fd, wants_write)| libc::pollfd {
@@ -506,9 +436,8 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
                 continue;
             }
             let mut flags = 0;
-            // Errors/hangups wake both interests so a failed connect (write)
-            // and a dead read socket are both driven without waiting for the
-            // timeout arm.
+            // Errors/hangups wake both interests so a failed connect and a dead
+            // read socket are driven without waiting for the timeout arm.
             if p.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                 flags |= ARES_FD_EVENT_READ;
             }
@@ -543,11 +472,9 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
     }
 }
 
-/// Lock a channel (recursively on the same thread) and hand back the guard
-/// together with a mutable view of its state. `None` for a NULL handle. The
-/// guard is `'static` because the channel owns its lock for as long as it
-/// lives and `ares_destroy` joins the event thread before dropping the
-/// channel; the caller must not retain the returned reference past its frame.
+/// Lock a channel and return the guard plus a mutable view; `None` for NULL.
+/// The guard is `'static` because the channel can't be freed while locked
+/// (`ares_destroy` joins the event thread first); don't outlive the frame.
 ///
 /// # Safety
 /// `channel` must be NULL or a live channel handle.
@@ -559,10 +486,8 @@ pub(crate) unsafe fn channel_access<'a>(channel: *const ChannelData) -> Option<(
     Some((lock.lock(), unsafe { &mut *(channel as *mut ChannelData) }))
 }
 
-/// Start the built-in event thread for `channel`. The thread only owns a raw
-/// address cast to `usize`, so `ChannelData` itself need not be `Send`.
-/// Returns false when the OS refused the thread; the caller then treats init
-/// as failed.
+/// Start the built-in event thread for `channel`; the thread only holds the raw
+/// address as `usize`, so `ChannelData` need not be `Send`. False if the OS refuses.
 pub(crate) fn start_event_thread(channel: *mut ChannelData) -> bool {
     let Some(wake) = WakePipe::new().map(Arc::new) else { return false };
     // SAFETY: the caller passes a freshly boxed, live channel. The wake pipe is
@@ -597,8 +522,6 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: *const ChannelData
     dup_impl(dest, source)
 }
 
-/// Safe body of ares_dup: copy under the source lock, then start the
-/// duplicate's own event thread.
 fn dup_impl(dest: *mut Channel, source: *const ChannelData) -> c_int {
     if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
     let lock = unsafe { (*source).lock.clone() };
@@ -621,7 +544,6 @@ pub unsafe extern "C" fn ares_cancel(channel: Channel) {
     cancel_impl(channel)
 }
 
-/// Safe body of ares_cancel: abort every in-flight future.
 fn cancel_impl(channel: *mut ChannelData) {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     channeldata.abort_all(ARES_ECANCELLED);
@@ -634,9 +556,8 @@ pub unsafe extern "C" fn ares_destroy(channel: Channel) {
     destroy_impl(channel)
 }
 
-/// Safe body of ares_destroy: stop and join the event thread (without holding
-/// the lock across the join), abort every query, then free the channel. The
-/// stop flag is followed by a wake-pipe write so the join is prompt.
+/// Stop and join the event thread without holding the lock across the join,
+/// abort every query, then free the channel.
 fn destroy_impl(channel: *mut ChannelData) {
     if channel.is_null() { return; }
     let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return; };
@@ -674,7 +595,6 @@ pub unsafe extern "C" fn ares_fds(channel: *const ChannelData, read_fds: &mut li
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeval, tv: *mut libc::timeval) -> *mut libc::timeval {
-    // Upstream: NULL channel or output buffer -> return NULL.
     if tv.is_null() || channel.is_null() { return std::ptr::null_mut(); }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return std::ptr::null_mut(); };
     let maxtv_ms = (!maxtv.is_null())
@@ -757,7 +677,6 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: *const ChannelData, out
     ARES_SUCCESS
 }
 
-/// Build the ares_addr_port_node chain for ares_get_servers_ports.
 fn get_servers_ports_ptr(channeldata: &ChannelData) -> Option<*mut AresAddrPortNode> {
     let mut data: Vec<AresAddrPortNode> = vec![];
     for (ip, udp_port, tcp_port) in channeldata.state.server_list() {
@@ -796,7 +715,6 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
 
 /// Unlocked body of `ares_set_servers[_ports]_csv` (both public wrappers lock).
 unsafe fn set_servers_ports_csv_impl(channeldata: &mut ChannelData, servers: *const c_char) -> c_int {
-    // NULL or empty string clears servers
     if servers.is_null() {
         channeldata.state.clear_servers();
         return ARES_SUCCESS;
@@ -829,7 +747,6 @@ pub unsafe extern "C" fn ares_set_servers_csv(channel: Channel, servers: *const 
 /// `channel` must be a valid channel and `socks` must point to at least `numsocks` writable slots.
 #[no_mangle]
 pub unsafe extern "C" fn ares_getsock(channel: *const ChannelData, socks: *mut ares_socket_t, numsocks: c_int) -> c_int {
-    // Upstream: NULL channel or non-positive numsocks -> return 0 (no sockets).
     if numsocks <= 0 || channel.is_null() { return 0; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return 0; };
     let n = min(ARES_GETSOCK_MAXNUM, numsocks as usize);
@@ -906,7 +823,7 @@ pub unsafe extern "C" fn ares_get_servers(channel: *const ChannelData, out: *mut
     ARES_SUCCESS
 }
 
-/// Build the ares_addr_node chain for ares_get_servers (an AresData wrapper so
+/// Build the ares_addr_node chain for ares_get_servers (wrapped in `AresData` so
 /// the caller can free it with ares_free_data, the c-ares contract).
 fn get_servers_ptr(channeldata: &ChannelData) -> Option<*mut ares_addr_node> {
     let mut data: Vec<ares_addr_node> = vec![];
@@ -942,8 +859,8 @@ pub unsafe extern "C" fn ares_set_sortlist(channel: Channel, sortstr: *const c_c
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
     if sortstr.is_null() {
         channeldata.state.sortlist = Vec::new();
-        // An explicit clear is still an explicit sortlist option, so reinit
-        // must not repopulate it from resolv.conf and save_options reports it.
+        // An explicit clear is still an explicit sortlist option: reinit must not
+        // repopulate it from resolv.conf, and save_options reports it.
         channeldata.state.optmask |= ARES_OPT_SORTLIST;
         return ARES_SUCCESS;
     }
@@ -970,7 +887,6 @@ pub unsafe extern "C" fn ares_reinit(channel: Channel) -> c_int {
     status
 }
 
-/// Safe body of ares_reinit (the pointer deref stays in the shim).
 fn reinit_channel(channeldata: &mut ChannelData) -> c_int {
     match channeldata.state.reinit() {
         Ok(()) => ARES_SUCCESS,
@@ -994,10 +910,8 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
     channeldata.server_state_callback_arg = arg;
 }
 
-/// Number of in-flight executor tasks. A single host lookup is one task even
-/// when it races A/AAAA sub-queries internally, so this counts user-visible
-/// lookups rather than upstream's internal per-family query objects (a
-/// documented minor semantic gap).
+/// In-flight executor tasks. One host lookup is one task even when it races
+/// A/AAAA internally (upstream counts per-family query objects — a minor gap).
 ///
 /// # Safety
 /// `channel` must be null or a valid channel handle returned by
@@ -1008,9 +922,8 @@ pub unsafe extern "C" fn ares_queue_active_queries(channel: *const ChannelData) 
     channeldata.executor.active_count()
 }
 
-/// Install the pending-write notification callback. Our writes are awaited
-/// directly, so the callback is stored (and copied by ares_dup) but never
-/// fired yet; the API surface matches upstream.
+/// Store the pending-write callback (copied by ares_dup) but never fire it:
+/// writes are awaited inline, so this is upstream API parity only.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_pending_write_cb(
@@ -1023,8 +936,8 @@ pub unsafe extern "C" fn ares_set_pending_write_cb(
     channeldata.pending_write_arg = arg;
 }
 
-/// Process queued writes. Everything we write is awaited inline, so there is
-/// nothing to drain; accepting NULL matches the upstream contract.
+/// Everything is written inline, so there is nothing to drain; accepting NULL
+/// matches the upstream contract.
 #[no_mangle]
 pub extern "C" fn ares_process_pending_write(channel: Channel) {
     if channel.is_null() {}
@@ -1037,8 +950,8 @@ pub unsafe extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_i
     wait_empty_impl(channel, timeout_ms)
 }
 
-/// Safe body of ares_queue_wait_empty: poll the executor's active count,
-/// releasing the channel lock while sleeping so the event thread can run.
+/// Poll the executor's active count, releasing the channel lock while sleeping
+/// so the event thread can run.
 fn wait_empty_impl(channel: *mut ChannelData, timeout_ms: c_int) -> c_int {
     let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
     if data.executor.active_count() == 0 { return ARES_SUCCESS; }

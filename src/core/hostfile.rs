@@ -2,22 +2,17 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
 
-/// Address family filter for lookups
+/// Address family filter for lookups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
-    /// IPv4 only (AF_INET)
     Ipv4,
-    /// IPv6 only (AF_INET6)
     Ipv6,
-    /// Both IPv4 and IPv6 (AF_UNSPEC)
     Any,
 }
 
 impl AddressFamily {
-    /// The lookup filter for a POSIX `AF_*` constant, or `None` if it isn't one
-    /// we recognize. Callers map `None` to their own status: `ares_gethostbyname`
-    /// (DNS) → `ENOTIMP`, `ares_gethostbyname_file` (hosts) → `ENOTFOUND`; while
-    /// `ares_getaddrinfo` treats an unknown family leniently (`unwrap_or(Any)`).
+    /// The lookup filter for a POSIX `AF_*` constant; callers map `None` to
+    /// their own status (ENOTIMP, ENOTFOUND, or lenient `Any` for getaddrinfo).
     pub fn from_af(af: libc::c_int) -> Option<Self> {
         match af {
             libc::AF_INET => Some(Self::Ipv4),
@@ -28,8 +23,8 @@ impl AddressFamily {
     }
 }
 
-/// A merged entry from the hosts file: every IP and name that upstream's
-/// parser would fold together because they share an IP or any hostname.
+/// A merged hosts entry: every IP and name upstream folds together across
+/// lines that share an IP or any hostname.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEntry {
     pub ips: Vec<IpAddr>,
@@ -38,18 +33,15 @@ pub struct HostEntry {
 }
 
 impl HostEntry {
-    /// The primary hostname (first name seen in the file).
     fn canonical(&self) -> &str {
         self.names.first().map(String::as_str).unwrap_or("")
     }
 
-    /// Check if this entry contains the given name (case-insensitive)
     pub fn has_name(&self, name: &str) -> bool {
         self.names.iter().any(|n| n.eq_ignore_ascii_case(name))
     }
 }
 
-/// Result of a hostname lookup
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostLookup {
     pub canonical: String,
@@ -57,21 +49,17 @@ pub struct HostLookup {
     pub addrs: Vec<IpAddr>,
 }
 
-/// Upstream caps the CNAME/alias list derived from one hosts entry at 100.
+/// Upstream caps the alias list derived from one hosts entry at 100.
 const MAX_HOST_ALIASES: usize = 100;
 
-/// Parsed hosts file
 #[derive(Debug, Clone, Default)]
 pub struct Hosts {
     entries: Vec<HostEntry>,
 }
 
 impl Hosts {
-    /// Parse hosts file content from a string.
-    ///
-    /// Matching upstream `ares_hosts_file_add`: a new line merges into the
-    /// first existing entry that shares an IP (checked first) or any hostname;
-    /// merged IPs/names append in file order, and duplicate names are skipped.
+    /// Parse hosts content, merging like upstream `ares_hosts_file_add`: an IP
+    /// match is checked first, then any hostname match; names keep file order.
     pub fn parse(content: &str) -> Self {
         let mut hosts = Self::default();
 
@@ -84,29 +72,22 @@ impl Hosts {
         hosts
     }
 
-    /// Load and parse hosts file from a path
     pub fn from_path<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Ok(Self::parse(&content))
     }
 
-    /// Parse a single line, returning None for comments/empty/malformed lines.
-    /// The returned entry is a single-line fragment to be merged by `add_entry`.
     fn parse_line(line: &str) -> Option<HostEntry> {
-        // Strip comments (everything after #)
         let line = match line.find('#') {
             Some(pos) => &line[..pos],
             None => line,
         };
 
-        // Split on whitespace
         let mut parts = line.split_whitespace();
 
-        // First part is the IP address
         let ip_str = parts.next()?;
         let ip = IpAddr::from_str(ip_str).ok()?;
 
-        // Second part is the primary hostname; the rest are aliases.
         let mut names = Vec::new();
         for name in parts {
             if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(name)) {
@@ -120,7 +101,6 @@ impl Hosts {
         Some(HostEntry { ips: vec![ip], names })
     }
 
-    /// Fold one parsed line into the matching entry, or start a new one.
     fn add_entry(&mut self, entry: HostEntry) {
         let Some(ip) = entry.ips.first().copied() else { return; };
         let Some(match_idx) = self.find_merge_target(ip, &entry.names) else {
@@ -153,8 +133,7 @@ impl Hosts {
         target.names.extend(new_names);
     }
 
-    /// Upstream checks an IP match before any hostname match, then takes the
-    /// first hostname match in file order.
+    /// IP matches win over hostname matches; hostnames are checked in file order.
     fn find_merge_target(&self, ip: IpAddr, names: &[String]) -> Option<usize> {
         if let Some(idx) = self.entries.iter().position(|e| e.ips.contains(&ip)) {
             return Some(idx);
@@ -167,7 +146,6 @@ impl Hosts {
         None
     }
 
-    /// Lookup a hostname, returning every address in its merged entry.
     pub fn lookup(&self, name: &str, family: AddressFamily) -> Option<HostLookup> {
         let entry = self.entries.iter().find(|e| e.has_name(name))?;
 
@@ -192,7 +170,6 @@ impl Hosts {
         })
     }
 
-    /// Lookup by IP address, matching any IP in a merged entry.
     pub fn reverse_lookup(&self, ip: IpAddr) -> Option<HostLookup> {
         let entry = self.entries.iter().find(|e| e.ips.contains(&ip))?;
         let addrs: Vec<IpAddr> = entry
@@ -210,8 +187,7 @@ impl Hosts {
     }
 }
 
-/// All names after the primary, preserving file order and capping at the
-/// upstream 100-alias limit.
+/// Names after the primary, capped at the upstream 100-alias limit.
 fn entry_alias_list(entry: &HostEntry) -> Vec<String> {
     entry
         .names

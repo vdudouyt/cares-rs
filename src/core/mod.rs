@@ -1,6 +1,4 @@
-//! Safe pure-Rust core: the resolver (`async_client`), DNS wire codec, and
-//! system config. Compiler-enforced to stay unsafe-free — everything that
-//! talks to raw pointers or the C ABI lives under `src/ffi/`.
+//! Safe pure-Rust core; raw pointers and the C ABI live under `src/ffi/`.
 #![forbid(unsafe_code)]
 
 pub mod cache;

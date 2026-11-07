@@ -1,17 +1,11 @@
 //! C ↔ Rust marshaling helpers shared by the FFI shims.
-//!
-//! Every helper preserves the exact per-site semantics the inlined idioms had:
-//! `cstr_lossy` is the historical `.to_str().unwrap_or("")` (invalid UTF-8 →
-//! empty string, deliberately no NULL check where callers had none), while
-//! `cstr_opt` is for call sites that map invalid UTF-8 to their own error code.
 
 use super::*;
 
 /// C string → `&str`, mapping invalid UTF-8 to `""`.
 ///
 /// # Safety
-/// `p` must be a valid NUL-terminated C string (no NULL check — some public
-/// entry points deliberately accept the crash-on-NULL contract of upstream).
+/// `p` must be a valid NUL-terminated C string; there is deliberately no NULL check.
 pub(crate) unsafe fn cstr_lossy<'a>(p: *const c_char) -> &'a str {
     unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
 }
@@ -24,12 +18,10 @@ pub(crate) unsafe fn cstr_opt<'a>(p: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(p) }.to_str().ok()
 }
 
-/// Copy `bytes` into a fresh `libc::malloc` buffer with a NUL terminator
-/// (callers hand these to C to be released via `ares_free_string`/`ares_free`).
+/// Copy `bytes` into a fresh `libc::malloc` buffer with a NUL terminator.
 ///
 /// # Safety
-/// Only that the returned pointer is either NULL or a heap C string the caller
-/// must free with `libc::free`.
+/// The returned pointer is either NULL or a heap C string to free with `libc::free`.
 pub(crate) unsafe fn malloc_cstr(bytes: &[u8]) -> *mut c_char {
     let len = bytes.len();
     let p = unsafe { libc::malloc(len + 1) as *mut u8 };
@@ -39,13 +31,12 @@ pub(crate) unsafe fn malloc_cstr(bytes: &[u8]) -> *mut c_char {
     p as *mut c_char
 }
 
-/// Copy `bytes` into a fresh `libc::malloc` buffer with no NUL terminator —
-/// the length travels separately (callers hand these to C to be released via
-/// `ares_free`/`ares_free_string`).
+/// Copy `bytes` into a fresh `libc::malloc` buffer with no NUL terminator;
+/// the length travels separately.
 ///
 /// # Safety
-/// Only that the returned pointer is either NULL or a heap buffer of
-/// `bytes.len()` the caller must free with `libc::free`.
+/// The returned pointer is either NULL or a heap buffer of `bytes.len()` to free
+/// with `libc::free`.
 pub(crate) unsafe fn malloc_bytes(bytes: &[u8]) -> *mut u8 {
     let len = bytes.len();
     let p = unsafe { libc::malloc(len) as *mut u8 };

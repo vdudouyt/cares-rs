@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 #[repr(C)]
 pub struct ares_addrinfo_hints {
     pub ai_flags: c_int,
@@ -38,8 +37,8 @@ pub struct ares_addrinfo {
     pub name: *mut c_char,
 }
 
-/// Build the C node list from accumulated (safe) AddrRecords at delivery
-/// time — arrival order preserved, ai_ttl carried from the answer records.
+/// Build the C node list from AddrRecords at delivery time, preserving arrival
+/// order and carrying ai_ttl from the answer records.
 pub(crate) fn nodes_from_addr_records(
     records: &[AddrRecord],
     port: u16,
@@ -92,8 +91,8 @@ pub(crate) fn nodes_from_addr_records(
     head
 }
 
-/// Build the CNAME chain (reply order) from the safe parsed entries. `alias`
-/// is the owner and `name` the target; absent strings stay NULL.
+/// Build the CNAME chain in reply order; `alias` is the owner, `name` the target,
+/// and absent strings stay NULL.
 pub(crate) fn cnames_from_entries(entries: &[crate::core::response::CnameEntry]) -> *mut ares_addrinfo_cname {
     let mut head: *mut ares_addrinfo_cname = std::ptr::null_mut();
     let mut tail: *mut ares_addrinfo_cname = std::ptr::null_mut();
@@ -157,10 +156,8 @@ pub unsafe extern "C" fn ares_freeaddrinfo(ai: *mut ares_addrinfo) {
     if ai.is_null() { return; }
     let ai = unsafe { Box::from_raw(ai) };
 
-    // Free nodes
     unsafe { free_addrinfo_nodes(ai.nodes) };
 
-    // Free cnames
     let mut cname = ai.cnames;
     while !cname.is_null() {
         let next = unsafe { (*cname).next };
@@ -174,7 +171,6 @@ pub unsafe extern "C" fn ares_freeaddrinfo(ai: *mut ares_addrinfo) {
         cname = next;
     }
 
-    // Free name
     if !ai.name.is_null() {
         drop(unsafe { CString::from_raw(ai.name) });
     }

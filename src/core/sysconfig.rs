@@ -3,13 +3,13 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SysConfig {
-    pub nameservers: Vec<(IpAddr, Option<u16>)>, // (ip, udp_port_override)
-    pub tcp_ports: Vec<Option<u16>>, // per-server TCP port overrides
+    pub nameservers: Vec<(IpAddr, Option<u16>)>,
+    // Parallel to `nameservers`.
+    pub tcp_ports: Vec<Option<u16>>,
     pub domain: Option<String>,
     pub search: Vec<String>,
     /// Raw `lookup`/`hostresorder` tokens mapped to c-ares's `b`/`f` order.
     pub lookups: Option<String>,
-    /// Raw `sortlist` value, parsed by the channel when applied.
     pub sortlist: Option<String>,
     pub options: SysConfigOptions,
 }
@@ -48,7 +48,6 @@ impl FromStr for SysConfig {
             if line.is_empty() { continue; }
 
             let mut parts = line.split_whitespace();
-            // A non-empty trimmed line always has a first token.
             let Some(keyword) = parts.next() else { continue };
             let rest = parts.collect::<Vec<_>>();
             let [arg1, ..] = rest[..] else { return Err(ParseError::MissingValue { keyword: keyword.into() })  };
@@ -56,11 +55,11 @@ impl FromStr for SysConfig {
             match keyword {
                 "nameserver" => {
                     for tok in rest {
-                        // Skip invalid nameserver tokens instead of panicking on a
-                        // malformed resolv.conf (matches upstream c-ares).
+                        // Skip invalid tokens rather than failing on a malformed
+                        // resolv.conf (matches upstream).
                         if let Some(ns) = parse_ns_addr(tok) {
                             conf.nameservers.push(ns);
-                            conf.tcp_ports.push(None); // keep the parallel vecs in sync
+                            conf.tcp_ports.push(None);
                         }
                     }
                 }
@@ -132,9 +131,7 @@ fn take_num_arg<T: FromStr>(keyword: &str, val: &str) -> Result<T, ParseError> {
     
 }
 
-/// Apply `RES_OPTIONS` environment variable overrides to a SysConfig.
 pub fn apply_env_overrides(config: &mut SysConfig) {
-    // LOCALDOMAIN overrides search/domain
     if let Ok(val) = std::env::var("LOCALDOMAIN") {
         let val = val.trim();
         if !val.is_empty() {
@@ -143,11 +140,9 @@ pub fn apply_env_overrides(config: &mut SysConfig) {
         }
     }
 
-    // RES_OPTIONS overrides options
     if let Ok(val) = std::env::var("RES_OPTIONS") {
         let val = val.trim();
         if !val.is_empty() {
-            // Strip leading "options" keyword if present
             let opts_str = val.strip_prefix("options").map(|s| s.trim_start()).unwrap_or(val);
             let _ = parse_options_into(&mut config.options, opts_str);
         }
@@ -163,7 +158,7 @@ pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
         return Some((ip, None))
     }
 
-    // Handle bracketed IPv6 without port, e.g. "[::1]"
+    // Bracketed IPv6 without a port, e.g. "[::1]".
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len()-1];
         if let Ok(ip) = IpAddr::from_str(inner) {

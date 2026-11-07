@@ -1,5 +1,3 @@
-//! Module for looking up service names from /etc/services
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -14,7 +12,6 @@ pub enum Protocol {
 
 #[derive(Debug)]
 pub struct Services {
-    // Map from (port, protocol) to service name
     entries: HashMap<(u16, Protocol), String>,
 }
 
@@ -36,19 +33,17 @@ impl Services {
             let line = line?;
             let line = line.trim();
 
-            // Skip comments and empty lines
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
 
-            // Remove inline comments
             let line = if let Some(pos) = line.find('#') {
                 &line[..pos]
             } else {
                 line
             };
 
-            // Parse: service_name port/protocol [aliases...]
+            // Format: service_name port/protocol [aliases...]
             let mut parts = line.split_whitespace();
             let Some(service_name) = parts.next() else {
                 continue;
@@ -57,7 +52,6 @@ impl Services {
                 continue;
             };
 
-            // Parse port/protocol
             let mut port_proto_parts = port_proto.split('/');
             let Some(port_str) = port_proto_parts.next() else {
                 continue;
@@ -84,12 +78,11 @@ impl Services {
         Ok(Services { entries })
     }
 
-    /// Look up a service name by port and protocol
     pub fn lookup(&self, port: u16, protocol: Protocol) -> Option<&str> {
         self.entries.get(&(port, protocol)).map(|s| s.as_str())
     }
 
-    /// Look up a service name, trying TCP first, then UDP
+    /// Look up a service name, preferring UDP or TCP as requested.
     pub fn lookup_any(&self, port: u16, prefer_udp: bool) -> Option<&str> {
         if prefer_udp {
             self.lookup(port, Protocol::Udp)

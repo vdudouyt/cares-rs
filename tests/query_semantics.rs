@@ -1,9 +1,5 @@
-//! Phase 3A query semantics: wire class/flags, transports, reply policy,
-//! search/aliases/default-server behavior, validation, cache keys and reinit.
-//!
-//! All tests use loopback mini DNS servers (UDP and/or TCP) and drive the
-//! public reactor API directly. They share process-global state (HOSTALIASES,
-//! environment) so the whole file is serialized by a mutex.
+//! Query semantics: wire class/flags, transports, reply policy, search/aliases,
+//! validation, cache keys and reinit. Loopback servers; global state serialized.
 
 use std::ffi::{c_int, c_uint, c_void, CStr, CString};
 use std::io::{Read, Write};
@@ -35,10 +31,6 @@ fn serial() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
-
-// ---------------------------------------------------------------------------
-// Mini DNS server (UDP + optional TCP on the same port)
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum ReplyKind {
@@ -203,21 +195,21 @@ fn make_reply(request: &[u8], kind: ReplyKind) -> Vec<u8> {
     };
 
     let mut reply = Vec::new();
-    reply.extend_from_slice(&request[0..2]); // QID
-    let mut flags = 0x8180u16; // QR | RD | RA
+    reply.extend_from_slice(&request[0..2]);
+    let mut flags = 0x8180u16;
     if truncated {
-        flags |= 0x0200; // TC
+        flags |= 0x0200;
     }
     flags |= u16::from(rcode);
     reply.extend_from_slice(&flags.to_be_bytes());
-    reply.extend_from_slice(&[0, 1]); // qdcount
+    reply.extend_from_slice(&[0, 1]);
     reply.extend_from_slice(&(u16::from(answer)).to_be_bytes());
-    reply.extend_from_slice(&[0, 0, 0, 0]); // nscount, arcount
-    reply.extend_from_slice(&request[12..]); // echo the question section
+    reply.extend_from_slice(&[0, 0, 0, 0]);
+    reply.extend_from_slice(&request[12..]);
     if answer {
-        reply.extend_from_slice(&[0xC0, 0x0C]); // owner -> question
-        reply.extend_from_slice(&[0, 1, 0, 1]); // A, IN
-        reply.extend_from_slice(&[0, 0, 2, 0x58]); // TTL 600
+        reply.extend_from_slice(&[0xC0, 0x0C]);
+        reply.extend_from_slice(&[0, 1, 0, 1]);
+        reply.extend_from_slice(&[0, 0, 2, 0x58]);
         reply.extend_from_slice(&[0, 4, 127, 1, 2, 3]);
     }
     reply
@@ -270,7 +262,7 @@ fn additional_opt(request: &[u8]) -> Option<(u16, u8, u16)> {
         }
         pos += len;
     }
-    pos += 4; // qtype, qclass
+    pos += 4;
     loop {
         let len = request[pos] as usize;
         pos += 1;
@@ -297,10 +289,6 @@ fn additional_opt(request: &[u8]) -> Option<(u16, u8, u16)> {
     }
     Some((rclass, (ttl >> 16) as u8, (ttl & 0xffff) as u16))
 }
-
-// ---------------------------------------------------------------------------
-// Channel + reactor helpers
-// ---------------------------------------------------------------------------
 
 fn base_options(flags: c_int) -> ares_options {
     let mut opts: ares_options = unsafe { std::mem::zeroed() };
@@ -598,10 +586,6 @@ unsafe fn get_servers_csv(channel: Channel) -> String {
     text
 }
 
-// ---------------------------------------------------------------------------
-// Temporary files / env guards
-// ---------------------------------------------------------------------------
-
 struct TempFile {
     path: PathBuf,
 }
@@ -657,10 +641,6 @@ impl Drop for EnvGuard {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1. class and RD on the wire
-// ---------------------------------------------------------------------------
-
 #[test]
 fn query_apis_carry_class_and_norecurse() {
     let _serial = serial();
@@ -712,10 +692,6 @@ fn query_apis_carry_class_and_norecurse() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 2/10. USEVC / explicit CSV port use TCP
-// ---------------------------------------------------------------------------
 
 #[test]
 fn usevc_uses_tcp_for_query_send_and_send_dnsrec() {
@@ -769,10 +745,6 @@ fn csv_explicit_port_usevc_connects_to_that_tcp_port() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 3. IGNTC and NOCHECKRESP
-// ---------------------------------------------------------------------------
-
 #[test]
 fn igntc_delivers_truncated_udp_without_tcp_retry() {
     let _serial = serial();
@@ -813,10 +785,6 @@ fn nocheckresp_delivers_server_error_rcodes() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 4. NOSEARCH / NOALIASES
-// ---------------------------------------------------------------------------
 
 unsafe fn search_channel(flags: c_int, domains: &[&str], ndots: c_int) -> Channel {
     let c_domains: Vec<CString> = domains
@@ -870,8 +838,7 @@ fn noaliases_suppresses_hostaliases_lookup() {
     let (mut mini, port) = Mini::udp(ReplyKind::A);
 
     unsafe {
-        // ndots=1 keeps the one-dot alias target as-is, isolating the
-        // HOSTALIASES-vs-NOALIASES behavior from search expansion.
+        // ndots=1 keeps the alias target as-is, isolating HOSTALIASES from search expansion.
         let channel = search_channel(0, &["search.test"], 1);
         use_server(channel, port);
         let name = CString::new("aliasname").unwrap();
@@ -916,10 +883,6 @@ fn hostaliases_alias_suppresses_search_domains() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 5. default server / NO_DFLT_SVR
-// ---------------------------------------------------------------------------
-
 #[test]
 fn no_dflt_svr_leaves_no_servers_but_default_is_loopback() {
     let _serial = serial();
@@ -958,10 +921,6 @@ fn no_dflt_svr_leaves_no_servers_but_default_is_loopback() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 6. synchronous validation
-// ---------------------------------------------------------------------------
 
 #[test]
 fn send_and_query_validation_is_synchronous() {
@@ -1029,8 +988,7 @@ fn raw_out_of_range_class_is_rejected_synchronously() {
         let channel = init_flags(0);
         let name = CString::new("wide-class.example").unwrap();
 
-        // ares_query takes a signed int; both a value above u16 and -1 must
-        // fail before any wire request (no server configured/needed).
+        // ares_query takes signed int; >u16 and -1 must fail before any wire request.
         for class in [0x10001, -1] {
             let mut result = RawResult::default();
             ares_query(
@@ -1045,8 +1003,7 @@ fn raw_out_of_range_class_is_rejected_synchronously() {
             assert_eq!(result.status, ARES_EFORMERR, "class {class}");
         }
 
-        // ares_query_dnsrec takes an unsigned 32-bit class; 0x10001 and the
-        // u32 representation of -1 must both fail via the callback.
+        // ares_query_dnsrec takes unsigned class; 0x10001 and u32::MAX must fail via the callback.
         for class in [0x10001u32, u32::MAX] {
             let mut result = DnsResult::default();
             let rc = ares_query_dnsrec(
@@ -1066,10 +1023,6 @@ fn raw_out_of_range_class_is_rejected_synchronously() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 7. cache key includes class and RD
-// ---------------------------------------------------------------------------
 
 #[test]
 fn cache_key_isolates_class_and_norecurse() {
@@ -1104,10 +1057,6 @@ fn cache_key_isolates_class_and_norecurse() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 8. search_dnsrec preserves class/flags/additional
-// ---------------------------------------------------------------------------
 
 #[test]
 fn search_dnsrec_preserves_template_class_flags_and_additional() {
@@ -1167,10 +1116,6 @@ fn search_dnsrec_preserves_template_class_flags_and_additional() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 9. reinit reloads resolv.conf and flushes the cache
-// ---------------------------------------------------------------------------
-
 #[test]
 fn reinit_reloads_resolvconf_and_flushes_cache() {
     let _serial = serial();
@@ -1201,7 +1146,6 @@ fn reinit_reloads_resolvconf_and_flushes_cache() {
         assert_eq!(reply.status, ARES_SUCCESS);
         assert_eq!(mini.udp_queries.len(), 1);
 
-        // Same query should hit the cache: no new server request.
         let reply = run_query_dnsrec(channel, &name, ARES_CLASS_IN, &mut mini);
         assert_eq!(reply.status, ARES_SUCCESS);
         assert_eq!(
@@ -1210,7 +1154,6 @@ fn reinit_reloads_resolvconf_and_flushes_cache() {
             "second query should be a cache hit"
         );
 
-        // Reload the same server config; reinit must flush the query cache.
         conf.rewrite(&format!("# reloaded\nnameserver 127.0.0.1:{port}\n"));
         assert_eq!(ares_reinit(channel), ARES_SUCCESS);
         let reply = run_query_dnsrec(channel, &name, ARES_CLASS_IN, &mut mini);

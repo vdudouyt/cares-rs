@@ -1,6 +1,4 @@
-//! DNS-record metadata and wire-name helpers: the pure string/key tables of
-//! the ares_dns_* metadata surface and the compression-aware name codec.
-//! (The record model itself joins this module as the codec split completes.)
+//! DNS-record metadata tables and the compression-aware wire-name codec.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -57,8 +55,7 @@ use crate::ffi::dns_record::{
     ARES_SVCB_PARAM_NO_DEFAULT_ALPN, ARES_SVCB_PARAM_PORT,
 };
 
-/// Append one wire label to `out`, rendering non-printable and reserved bytes
-/// as the escapes c-ares accepts (`\DDD` and `\c`).
+/// Append one wire label to `out` using c-ares's `\DDD`/`\c` escapes.
 fn push_escaped_label(label: &[u8], out: &mut String) {
     for &c in label {
         if !(0x20..=0x7e).contains(&c) {
@@ -75,11 +72,9 @@ fn push_escaped_label(label: &[u8], out: &mut String) {
     }
 }
 
-/// Read a DNS name from wire format, handling label compression. Returns the
-/// escaped dotted name (exactly as c-ares renders it) and advances `pos` past
-/// the bytes occupied by the name at its original location. Compression
-/// pointers must point strictly before the earliest label seen so far, which
-/// both enforces RFC 1035 §4.1.4 and guarantees termination.
+/// Read a DNS name from wire format (escaped as c-ares renders it), following
+/// compression and advancing `pos` past its original bytes. Pointers must point
+/// strictly backwards (RFC 1035 §4.1.4), which guarantees termination.
 pub(crate) fn parse_dns_name(buf: &[u8], pos: &mut usize) -> Option<String> {
     let mut out = String::new();
     let mut cur = *pos;
@@ -141,9 +136,8 @@ fn is_hostname_ch(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'/' | b'*')
 }
 
-/// Write a DNS name in wire format (uncompressed labels), decoding the
-/// `\DDD`/`\c` escapes that [`parse_dns_name`] emits. `validate_hostname`
-/// mirrors upstream's RR/question owner-name validation; RDATA names pass
+/// Write an uncompressed DNS name, decoding `\DDD`/`\c` escapes.
+/// `validate_hostname` mirrors upstream's owner-name check; RDATA names pass
 /// false. Invalid labels/lengths report ARES_EBADNAME.
 pub(crate) fn write_dns_name(
     name: &str,
@@ -195,8 +189,7 @@ pub(crate) fn write_dns_name(
         labels.push(label);
     }
 
-    // "" and "." are the root name. A trailing dot was already folded away by
-    // not pushing the final empty label.
+    // "" and "." are the root name; a trailing dot was already folded away.
     if labels.is_empty() || (labels.len() == 1 && labels[0].is_empty()) {
         out.push(0);
         return Ok(());
@@ -220,10 +213,9 @@ pub(crate) fn write_dns_name(
         out.push(label.len() as u8);
         out.extend_from_slice(&label);
     }
-    out.push(0); // root label terminator
+    out.push(0);
     Ok(())
 }
-
 
 pub(crate) static KEYS_A: [u32; 1] = [ARES_RR_A_ADDR];
 pub(crate) static KEYS_NS: [u32; 1] = [ARES_RR_NS_NSDNAME];
@@ -305,12 +297,6 @@ pub(crate) static KEYS_CAA: [u32; 3] = [
 ];
 pub(crate) static KEYS_RAW_RR: [u32; 2] =
     [ARES_RR_RAW_RR_TYPE, ARES_RR_RAW_RR_DATA];
-
-
-// ---------------------------------------------------------------------------
-// Metadata string/table logic (the pure bodies of the ares_dns_* metadata
-// shims — each shim is one call into here)
-// ---------------------------------------------------------------------------
 
 pub(crate) fn rec_type_name(rtype: u32) -> &'static CStr {
     match rtype {
@@ -628,10 +614,6 @@ pub(crate) fn section_name(section: u32) -> &'static CStr {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Address text helpers (pure bodies of ares_dns_pton / ares_dns_addr_to_ptr)
-// ---------------------------------------------------------------------------
-
 pub(crate) enum PtonAddr {
     V4([u8; 4]),
     V6([u8; 16]),
@@ -646,9 +628,8 @@ impl PtonAddr {
     }
 }
 
-/// Parse an IP literal according to the caller-supplied family. Returns the
-/// (possibly updated) family plus the network-order octets. AF_UNSPEC tries
-/// IPv4 first, then IPv6, exactly like upstream ares_dns_pton().
+/// Parse an IP literal for the requested family, returning the resolved family
+/// and network-order octets. AF_UNSPEC tries IPv4 then IPv6 (upstream order).
 pub(crate) fn dns_pton(ipaddr: &str, family: libc::c_int) -> Option<(libc::c_int, PtonAddr)> {
     if family == libc::AF_INET {
         ipaddr
@@ -674,7 +655,7 @@ pub(crate) fn dns_pton(ipaddr: &str, family: libc::c_int) -> Option<(libc::c_int
     }
 }
 
-/// `d.c.b.a.in-addr.arpa` for the network-order IPv4 octets.
+/// Reverse IPv4 octets into `d.c.b.a.in-addr.arpa`.
 pub(crate) fn addr_to_ptr_v4(octets: [u8; 4]) -> String {
     let mut out = String::with_capacity(24);
     for b in octets.iter().rev() {
@@ -685,7 +666,7 @@ pub(crate) fn addr_to_ptr_v4(octets: [u8; 4]) -> String {
     out
 }
 
-/// Reverse nibble form `....ip6.arpa` for the network-order IPv6 octets.
+/// Reverse IPv6 octets into nibble form under `ip6.arpa`.
 pub(crate) fn addr_to_ptr_v6(octets: [u8; 16]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(76);
@@ -698,10 +679,6 @@ pub(crate) fn addr_to_ptr_v6(octets: [u8; 16]) -> String {
     out.push_str("ip6.arpa");
     out
 }
-
-// ---------------------------------------------------------------------------
-// OPT / SVCB option metadata (pure bodies of ares_dns_opt_get_*)
-// ---------------------------------------------------------------------------
 
 fn opt_datatype_opt(opt: u16) -> u32 {
     match opt as u32 {
@@ -785,13 +762,8 @@ pub(crate) fn opt_name(key: u32, opt: u16) -> Option<&'static CStr> {
     }
 }
 
-
-// ---------------------------------------------------------------------------
-// The record model. RRValue is the discriminated union for RR field values;
-// Str keeps a CString and Bin keeps a trailing NUL (not counted in logical
-// length) so the C getters can hand out stable, strlen-safe borrowed
-// pointers straight from the model.
-// ---------------------------------------------------------------------------
+// Bin values and ABINP elements carry a trailing NUL (excluded from the logical
+// length) so C getters can return strlen-safe borrowed pointers.
 
 pub(crate) enum RRValue {
     U8(u8),
@@ -800,24 +772,22 @@ pub(crate) enum RRValue {
     Addr(Ipv4Addr),
     Addr6(Ipv6Addr),
     Str(CString),
-    Bin(Vec<u8>), // Always null-terminated: last byte is \0, not counted in logical length
-    /// One entry per DNS character-string (TXT/ABINP). Each element carries
-    /// its own trailing NUL for the stable C getter, not part of its length.
+    Bin(Vec<u8>), // Trailing \0 for C getters, not counted in logical length
+    /// One entry per DNS character-string; each carries a trailing NUL
+    /// (excluded from its length).
     BinArray(Vec<Vec<u8>>),
 }
 
 pub(crate) struct DnsRecordQuery {
     pub(crate) name: String,
-    pub(crate) name_c: CString, // cached C string for lifetime management
+    pub(crate) name_c: CString,
     pub(crate) qtype: u16,
     pub(crate) qclass: u16,
 }
 
-/// One resource record. The C-facing name is kept because the type IS the
-/// opaque handle the header declares; the struct itself is pure Rust — the
-/// two Cells back the pointer-returning C getters (the ffi shim casts
-/// `Cell<u32>`/`Cell<[u8;16]>` pointers to the layout-identical
-/// `struct in_addr` / `struct ares_in6_addr`).
+/// One resource record; the C name is the opaque handle type. The Cells back
+/// pointer-returning C getters, which cast them to layout-identical
+/// `struct in_addr` / `ares_in6_addr` pointers.
 #[allow(non_camel_case_types)]
 pub struct ares_dns_rr_t {
     pub(crate) name: String,
@@ -829,7 +799,7 @@ pub struct ares_dns_rr_t {
     pub(crate) opts: Vec<(u16, Vec<u8>)>,
     pub(crate) cached_v4: Cell<u32>,
     pub(crate) cached_v6: Cell<[u8; 16]>,
-    /// Cached concatenation of an ABINP value (upstream multistring cache).
+    /// Cached concatenation of ABINP strings (upstream multistring cache).
     pub(crate) combined_cache: RefCell<Option<Vec<u8>>>,
 }
 
@@ -846,9 +816,8 @@ pub struct ares_dns_record_t {
     pub(crate) additional: Vec<ares_dns_rr_t>,
 }
 
-/// Create a null-terminated Bin value. The trailing \0 is part of the Vec
-/// but not part of the logical data length (ares_dns_rr_get_bin reports
-/// len without the null). This ensures C code can safely strlen() the data.
+/// Create a `Bin` value with a trailing NUL (not counted in logical length),
+/// so C code can safely `strlen()` it.
 pub(crate) fn bin_nul(data: &[u8]) -> RRValue {
     let mut v = Vec::with_capacity(data.len() + 1);
     v.extend_from_slice(data);
@@ -856,8 +825,8 @@ pub(crate) fn bin_nul(data: &[u8]) -> RRValue {
     RRValue::Bin(v)
 }
 
-/// One ABINP element: logical bytes plus the trailing NUL that backs the C
-/// pointer contract (zero-length elements are still a non-null 1-byte buffer).
+/// One ABINP element: logical bytes plus a trailing NUL (empty elements are a
+/// 1-byte buffer, never null).
 pub(crate) fn abin_nul(data: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(data.len() + 1);
     v.extend_from_slice(data);
@@ -873,10 +842,6 @@ pub(crate) fn bin_logical(data: &[u8]) -> &[u8] {
         data
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 pub(crate) fn section_vec(rec: &ares_dns_record_t, sect: u32) -> Option<&Vec<ares_dns_rr_t>> {
     match sect {
@@ -910,10 +875,6 @@ pub(crate) fn new_rr(name: &str, rtype: u32, rclass: u16, ttl: u32) -> ares_dns_
         combined_cache: RefCell::new(None),
     }
 }
-
-// ---------------------------------------------------------------------------
-// DNS wire-format helpers (for ares_dns_parse / ares_dns_write)
-// ---------------------------------------------------------------------------
 
 pub(crate) fn opcode_isvalid(opcode: u32) -> bool {
     matches!(opcode, 0 | 1 | 2 | 4 | 5)
@@ -981,8 +942,7 @@ fn flags_to_wire(flags: u16, opcode: u16, rcode: u16) -> u16 {
     wire | (rcode & 0xf)
 }
 
-/// ares_dns_rec_type_isvalid() (the `is_query` variant matters only for
-/// RAW_RR, which is a response-only pseudo type).
+/// RAW_RR is valid only as a response type; unknown types only in queries.
 pub(crate) fn rec_type_isvalid(rtype: u32, is_query: bool) -> bool {
     match rtype {
         1 | 2 | 5 | 6 | 12 | 13 | 15 | 16 | 24 | 28 | 33 | 35 | 41 | 52 | 64
@@ -997,7 +957,7 @@ pub(crate) fn allow_name_comp(rtype: u32) -> bool {
     matches!(rtype, 1 | 2 | 5 | 6 | 12 | 13 | 15 | 16)
 }
 
-/// ares_dns_class_isvalid(): unknown/raw types skip class validation.
+/// RAW_RR skips class validation.
 pub(crate) fn class_isvalid(qclass: u16, rtype: u32, is_query: bool) -> bool {
     if rtype == ARES_REC_TYPE_RAW_RR {
         return true;
@@ -1013,8 +973,7 @@ fn printable(bytes: &[u8]) -> bool {
     bytes.iter().all(|b| (0x20..=0x7e).contains(b))
 }
 
-/// Parse one length-prefixed character-string from `rdata` (upstream
-/// ares_buf_parse_dns_str), advancing `pos` past it.
+/// Parse one length-prefixed character-string, advancing `pos` past it.
 fn parse_dns_str(
     rdata: &[u8],
     pos: &mut usize,
@@ -1053,8 +1012,7 @@ fn parse_options(
         if end > rdata.len() {
             return Err(ARES_EBADRESP.into());
         }
-        // Keep the C getter contract: values carry a trailing NUL while the
-        // logical length excludes it.
+        // Values carry a trailing NUL; logical length excludes it (C getter contract).
         let mut data = rdata[off..end].to_vec();
         data.push(0);
         opts.push((code, data));
@@ -1069,11 +1027,9 @@ fn set_name(rr: &mut ares_dns_rr_t, key: u32, name: String) -> Result<(), AresEr
     Ok(())
 }
 
-/// Parse rdata fields for a given RR type from wire format into key/value
-/// pairs. `rtype` is the *stored* type (RAW_RR for unknown/forced-raw), while
-/// `raw_type` is the original wire type preserved for RAW_RR. Field reads use
-/// the full packet buffer like upstream, then the consumed byte count is
-/// checked against RDLENGTH (trailing slack is ignored).
+/// Parse RR rdata into key/value pairs. `rtype` is the stored type (RAW_RR for
+/// forced-raw) and `raw_type` the original wire type. Field reads use the full
+/// packet; trailing slack past RDLENGTH is ignored (as upstream).
 pub(crate) fn parse_rdata(
     rtype: u32,
     raw_type: u16,
@@ -1426,8 +1382,8 @@ fn push_u32(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&rr.u32_val(key).unwrap_or(0).to_be_bytes());
 }
 
-/// Serialize rdata for a given RR to wire format, applying upstream's
-/// required-field and string-length validation.
+/// Serialize rdata to wire format, applying upstream's required-field and
+/// string-length validation.
 pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) -> Result<(), AresError> {
     match rr.rtype {
         x if x == ARES_REC_TYPE_A as u32 => {
@@ -1560,8 +1516,7 @@ pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) -> Result<(), A
             return Err(ARES_EFORMERR.into());
         }
         x if x == ARES_REC_TYPE_RAW_RR => {
-            // A raw record without its DATA key (e.g. an unknown type with
-            // rdlength 0) is not writable, matching upstream.
+            // A raw record without DATA (e.g. unknown type with rdlength 0) is unwritable.
             let Some(RRValue::Bin(d)) = rr.data.get(&ARES_RR_RAW_RR_DATA) else {
                 return Err(ARES_EFORMERR.into());
             };
@@ -1580,15 +1535,6 @@ fn write_options(opts: &[(u16, Vec<u8>)], out: &mut Vec<u8>) {
         out.extend_from_slice(logical);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Static key arrays for ares_dns_rr_get_keys
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Record/RR accessors — the ffi shims never touch the model
-// fields or RRValue directly; every read and mutation goes through these.
-// ---------------------------------------------------------------------------
 
 impl ares_dns_record_t {
     pub(crate) fn id(&self) -> u16 {
@@ -1637,8 +1583,7 @@ impl ares_dns_record_t {
         self.queries.len()
     }
 
-    /// (name, qtype, qclass) — the name aliases the query's cached CString
-    /// and stays valid until the query's name is rewritten.
+    /// The name aliases the query's cached CString, valid until the name is rewritten.
     pub(crate) fn query_at(&self, idx: usize) -> Option<(&CStr, u16, u16)> {
         let q = self.queries.get(idx)?;
         Some((q.name_c.as_c_str(), q.qtype, q.qclass))
@@ -1678,7 +1623,6 @@ impl ares_dns_record_t {
         }
         let vec = section_vec_mut(self, sect).ok_or(AresError::from(ARES_EFORMERR))?;
         vec.push(new_rr(name, rtype, rclass as u16, ttl));
-        // Just pushed, so never empty; the error arm is unreachable by construction.
         vec.last_mut().ok_or(AresError::from(ARES_EFORMERR))
     }
 
@@ -1708,8 +1652,7 @@ impl ares_dns_record_t {
 }
 
 impl ares_dns_rr_t {
-    /// The RR name as a C string (the shim hands out `.as_ptr()`, valid
-    /// while the RR is alive).
+    /// The RR name as a C string, valid while the RR is alive.
     pub(crate) fn name_cstr(&self) -> &CStr {
         &self.name_c
     }
@@ -1726,10 +1669,8 @@ impl ares_dns_rr_t {
         self.ttl
     }
 
-    /// Refresh the cached v4 backing store for the pointer-returning C
-    /// getter (upstream contract: the pointer stays valid while the RR is
-    /// alive). Cell keeps this a purely safe interior mutation on a shared
-    /// reference; true iff the key holds a v4 address.
+    /// Refresh the cached v4 store backing the pointer-returning C getter; the
+    /// pointer stays valid while the RR is alive. True iff the key holds a v4 address.
     pub(crate) fn refresh_v4(&self, key: u32) -> bool {
         if let Some(RRValue::Addr(addr)) = self.data.get(&key) {
             self.cached_v4.set(u32::from_ne_bytes(addr.octets()));
@@ -1782,8 +1723,7 @@ impl ares_dns_rr_t {
     }
 
     /// Pointer + logical length for a BIN/BINP/ABINP value. ABINP yields the
-    /// concatenation of all strings (upstream multistring_combined), cached so
-    /// the pointer stays valid until the RR is mutated.
+    /// concatenated strings, cached until the RR is mutated.
     pub(crate) fn bin_ptr_len(&self, key: u32) -> Option<(*const u8, usize)> {
         match self.data.get(&key) {
             Some(RRValue::Bin(data)) => Some((data.as_ptr(), bin_logical(data).len())),
@@ -1824,8 +1764,8 @@ impl ares_dns_rr_t {
     }
 
     fn invalidate_combination(&mut self) {
-        // Only call after any borrowed cache bytes have been copied: callers
-        // may pass a slice that aliases this buffer (get_bin -> set_bin).
+        // Call only after copying any borrowed cache bytes: callers may pass a
+        // slice aliasing this buffer (get_bin -> set_bin).
         *self.combined_cache.borrow_mut() = None;
     }
 
@@ -1860,9 +1800,8 @@ impl ares_dns_rr_t {
     }
 
     pub(crate) fn set_bin(&mut self, key: u32, data: &[u8]) {
-        // Copy into the owned replacement *before* invalidating the combined
-        // cache: `data` may point straight at that cache buffer when the
-        // caller does get_bin() -> set_bin(same_ptr).
+        // Copy into the owned replacement *before* invalidating the cache: `data`
+        // may alias that cache buffer (get_bin -> set_bin).
         let replacement = if rr_key_datatype_of(key) == ARES_DATATYPE_ABINP as u32 {
             // Override semantics: replace the whole array with one string.
             RRValue::BinArray(vec![abin_nul(data)])
@@ -1875,8 +1814,8 @@ impl ares_dns_rr_t {
 
     /// Append one element to an ABINP value (ares_dns_rr_add_abin).
     pub(crate) fn append_bin(&mut self, key: u32, data: &[u8]) {
-        // Allocate the copy before dropping the combined cache; `data` can
-        // alias the buffer that get_bin() returned (see set_bin above).
+        // Allocate the copy before dropping the cache: `data` can alias the
+        // buffer get_bin() returned (see set_bin).
         let element = abin_nul(data);
         self.invalidate_combination();
         if !matches!(self.data.get(&key), Some(RRValue::BinArray(_))) {
@@ -1900,10 +1839,8 @@ impl ares_dns_rr_t {
     }
 
     pub(crate) fn set_opt(&mut self, opt: u16, mut data: Vec<u8>) {
-        // The C getter returns a NUL-terminated value; keep that guarantee in
-        // the backing store while opt_at/opt_by_id expose the logical bytes.
+        // Keep the NUL that backs the C getter; opt_at/opt_by_id expose logical bytes.
         data.push(0);
-        // Remove existing opt with same code if present, then add
         self.opts.retain(|(code, _)| *code != opt);
         self.opts.push((opt, data));
     }
@@ -1930,11 +1867,6 @@ impl ares_dns_rr_t {
         self.opts.retain(|(code, _)| *code != opt);
         self.opts.len() < before
     }
-
-    // -----------------------------------------------------------------
-    // Checked C-API entry points: validation lives here (safe core) so the
-    // unsafe FFI shims only dereference their pointers.
-    // -----------------------------------------------------------------
 
     fn key_type_ok(&self, key: u32) -> bool {
         self.rtype == rr_key_rec_type(key)
@@ -2104,10 +2036,6 @@ impl ares_dns_rr_t {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Whole-message codec (the pure bodies of ares_dns_parse/write)
-// ---------------------------------------------------------------------------
-
 impl ares_dns_record_t {
     /// ares_dns_record_create() with upstream validation.
     pub(crate) fn create(
@@ -2146,7 +2074,6 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
         return Err(ARES_EBADRESP.into());
     }
 
-    // Parse header (12 bytes)
     let id = ((data[0] as u16) << 8) | data[1] as u16;
     let wire_flags = ((data[2] as u16) << 8) | data[3] as u16;
     let qdcount = ((data[4] as u16) << 8) | data[5] as u16;
@@ -2178,7 +2105,6 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
 
     let mut pos = 12usize;
 
-    // Parse the question.
     let qname = parse_dns_name(data, &mut pos).ok_or(AresError::from(ARES_EBADNAME))?;
     if pos + 4 > buf_len {
         return Err(ARES_EBADRESP.into());
@@ -2188,7 +2114,6 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
     pos += 4;
     rec.query_add(&qname, qtype as u32, qclass as u32)?;
 
-    // Parse RR sections: answers, authority, additional.
     let section_counts = [
         (ancount, ARES_SECTION_ANSWER),
         (nscount, ARES_SECTION_AUTHORITY),
@@ -2220,8 +2145,8 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
             let rdata = &data[pos..pos + rdlength as usize];
             pos += rdlength as usize;
 
-            // Unknown types become RAW_RR; then the per-section raw flags can
-            // force even a supported type to be preserved verbatim.
+            // Unknown types become RAW_RR; per-section raw flags can force even a
+            // supported type to be preserved verbatim.
             let mut rtype = wire_type as u32;
             if !rec_type_isvalid(rtype, false) {
                 rtype = ARES_REC_TYPE_RAW_RR;
@@ -2241,9 +2166,9 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
             if flags & raw_flag != 0 {
                 rtype = ARES_REC_TYPE_RAW_RR;
             }
-            // Upstream stores OPT's real class as IN (the wire class is the
-            // UDP payload size) and skips class checks for RAW_RR; every other
-            // stored type must have a valid DNS class.
+            // OPT's wire class is the UDP payload size, but upstream stores it as
+            // IN and skips class checks for RAW_RR; other stored types need a valid
+            // DNS class.
             if rtype != ARES_REC_TYPE_RAW_RR
                 && rtype != ARES_REC_TYPE_OPT as u32
                 && !class_isvalid(rclass, rtype, false)
@@ -2295,7 +2220,6 @@ pub(crate) fn duplicate_record(rec: &ares_dns_record_t) -> Option<ares_dns_recor
 pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError> {
     let mut out = Vec::with_capacity(512);
 
-    // Write header
     out.push((rec.id >> 8) as u8);
     out.push(rec.id as u8);
     let has_opt = rec.additional.iter().any(|r| r.rtype == ARES_REC_TYPE_OPT as u32);
@@ -2320,7 +2244,6 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError
     out.push((arcount >> 8) as u8);
     out.push(arcount as u8);
 
-    // Write questions
     for q in &rec.queries {
         write_dns_name(&q.name, &mut out, true)?;
         out.push((q.qtype >> 8) as u8);
@@ -2329,7 +2252,6 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError
         out.push(q.qclass as u8);
     }
 
-    // Write RR sections
     let sections: [&Vec<ares_dns_rr_t>; 3] =
         [&rec.answers, &rec.authority, &rec.additional];
     for section in &sections {
@@ -2360,7 +2282,6 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError
             };
             out.extend_from_slice(&ttl.to_be_bytes());
 
-            // Serialize rdata to a temporary buffer to get rdlength
             let mut rdata_buf = Vec::new();
             write_rdata(rr, &mut rdata_buf)?;
             let rdlength = rdata_buf.len() as u16;
@@ -2379,26 +2300,24 @@ mod tests {
 
     #[test]
     fn parses_simple_name() {
-        // "ab.cd" as uncompressed labels.
         let buf = [2, b'a', b'b', 2, b'c', b'd', 0];
         let mut pos = 0usize;
         assert_eq!(parse_dns_name(&buf, &mut pos), Some("ab.cd".to_string()));
-        assert_eq!(pos, buf.len()); // consumed through the root label
+        assert_eq!(pos, buf.len());
     }
 
     #[test]
     fn follows_backward_compression_pointer() {
-        // "ab" at offset 0, then a pointer at offset 4 -> offset 0.
         let buf = [2, b'a', b'b', 0, 0xC0, 0x00];
         let mut pos = 4usize;
         assert_eq!(parse_dns_name(&buf, &mut pos), Some("ab".to_string()));
-        assert_eq!(pos, 6); // pointer consumes exactly 2 bytes
+        assert_eq!(pos, 6);
     }
 
     #[test]
     fn rejects_self_referential_pointer() {
-        // Pointer at offset 0 that points to offset 0 — would spin forever
-        // without the strictly-backward guard. Must return None and not hang.
+        // Self-referential pointer would spin forever without the strictly-backward
+        // guard; must return None.
         let buf = [0xC0, 0x00];
         let mut pos = 0usize;
         assert_eq!(parse_dns_name(&buf, &mut pos), None);
@@ -2406,7 +2325,6 @@ mod tests {
 
     #[test]
     fn rejects_forward_pointer() {
-        // Pointer at offset 0 -> offset 4 (forward). Rejected.
         let buf = [0xC0, 0x04, 0, 0, 0, 0];
         let mut pos = 0usize;
         assert_eq!(parse_dns_name(&buf, &mut pos), None);
@@ -2414,8 +2332,7 @@ mod tests {
 
     #[test]
     fn rejects_cyclic_pointers() {
-        // A 2-pointer cycle: offset 2 -> offset 0 -> offset 2. The second
-        // (forward) jump is rejected, so the loop terminates with None.
+        // A 2-pointer cycle; the forward jump on the second hop is rejected.
         let buf = [0xC0, 0x02, 0xC0, 0x00];
         let mut pos = 2usize;
         assert_eq!(parse_dns_name(&buf, &mut pos), None);

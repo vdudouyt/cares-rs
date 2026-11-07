@@ -17,8 +17,7 @@ use crate::core::packets::*;
 use crate::core::servers_csv;
 use crate::ffi::ares_hostent::*;
 use crate::ffi::ares_data::*;
-// Re-export the address union (a field type of the public ares_addr_node /
-// ares_addr_port_node structs) so Rust consumers can construct those.
+// Re-export the address union used by the public ares_addr_node structs.
 pub use crate::ffi::ares_data::AresAddrUnion;
 use crate::ffi::clinkedlist::*;
 use crate::ffi::error::*;
@@ -51,12 +50,8 @@ pub const ARES_LIB_INIT_ALL: i32 = 1;
 #[allow(non_camel_case_types)]
 pub type ares_socket_t = c_int;
 
-// Upstream c-ares spells many parameters/returns with named enum/typedef types.
-// We keep `int`-based signatures (C phase) but define the type NAMES so that C
-// consumer source that declares e.g. `ares_status_t s = ares_parse_a_reply(...)`
-// compiles against our header. (Phase 2 promotes these to real `#[repr(C)] enum`s
-// for strict C++ compatibility.) These are force-emitted via cbindgen's
-// `[export] include`.
+// c-ares spells many parameters/returns with named enum/typedef types. Keep
+// `int`-based signatures but define the names so C consumers compile.
 #[allow(non_camel_case_types)] pub type ares_status_t = c_int;
 #[allow(non_camel_case_types)] pub type ares_bool_t = c_int;
 #[allow(non_camel_case_types)] pub type ares_socklen_t = libc::socklen_t;
@@ -90,9 +85,8 @@ pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
     ARES_SUCCESS
 }
 
-/// `ares_library_init_mem`: the allocator hooks are accepted but not yet used.
-/// Full allocator interception is deferred; the library continues to use the
-/// system allocator, matching the pre-hook behavior.
+/// `ares_library_init_mem`: allocator hooks are accepted but not used; the
+/// library keeps using the system allocator.
 #[no_mangle]
 pub extern "C" fn ares_library_init_mem(
     flags: c_int,
@@ -108,8 +102,7 @@ pub extern "C" fn ares_library_init_mem(
 pub extern "C" fn ares_library_cleanup() {
 }
 
-/// The built-in event thread is available, so report ARES_TRUE (1). Channels
-/// are independent; each has its own event thread and lock.
+/// Report ARES_TRUE (1); every channel has its own event thread and lock.
 #[no_mangle]
 pub extern "C" fn ares_threadsafety() -> i32 {
     1
@@ -117,11 +110,8 @@ pub extern "C" fn ares_threadsafety() -> i32 {
 
 pub type Channel = *mut ChannelData;
 
-// Custom 16-byte IPv6 address type matching upstream c-ares
-// (`struct ares_in6_addr { union { unsigned char _S6_u8[16]; } _S6_un; }`), so
-// consumer source using `addr._S6_un._S6_u8` and the `struct ares_in6_addr` type
-// name compiles. A single-member inner struct is layout- and field-path-identical
-// to upstream's single-member union, without Rust union ergonomics.
+// 16-byte IPv6 type matching upstream's `struct ares_in6_addr`, including the
+// `_S6_un._S6_u8` field path consumers rely on.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(non_camel_case_types, non_snake_case)]
@@ -140,8 +130,7 @@ impl ares_in6_addr {
     }
 }
 
-/// Single address + family, as used by `ares_dns_pton()` / `ares_dns_addr_to_ptr()`.
-/// Mirrors upstream `struct ares_addr` (family + anonymous in4/in6 union).
+/// Single address + family for `ares_dns_pton()` / `ares_dns_addr_to_ptr()`.
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct ares_addr {
@@ -149,9 +138,9 @@ pub struct ares_addr {
     pub addr: AresAddrUnion,
 }
 
-// Dual-role: caller-allocatable input to `ares_set_servers`, and cares-rs-allocated
-// output of `ares_get_servers`. Intentionally NO `Drop` — a chain-walking Drop would
-// free caller-owned stack instances. See the ownership taxonomy in `ffi/ares_data.rs`.
+// Dual-role: caller-allocatable input to `ares_set_servers` and cares-rs-allocated
+// output of `ares_get_servers`. Intentionally NO `Drop`, which would free
+// caller-owned stack instances. See the ownership taxonomy in `ffi/ares_data.rs`.
 #[repr(C)]
 pub struct ares_addr_node {
     pub next: *mut ares_addr_node,
@@ -172,9 +161,8 @@ pub const RECORD_TYPE_SRV: u16 = 0x21;
 pub const RECORD_TYPE_NAPTR: u16 = 0x23;
 pub const RECORD_TYPE_URI: u16 = 0x100;
 
-// Internal bare-fn callback aliases (used by the Callback enum, state structs and
-// run_* dispatchers). Excluded from the generated header — see the C-ABI nullable
-// typedefs below, which is what public signatures and cbindgen use.
+// Internal bare-fn callback aliases; excluded from the generated header (use the
+// nullable `Option<...>` typedefs below in public signatures).
 pub type AresHostCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent);
 pub type AresCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int);
 pub type AresCallbackDnsRec = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: usize, dnsrec: *const dns_record::ares_dns_record_t);
@@ -182,10 +170,9 @@ pub type AresSockCreateCallback = unsafe extern "C" fn(socket_fd: c_int, sock_ty
 pub type AresNameinfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, node: *mut c_char, service: *mut c_char);
 pub type AresAddrInfoCallback = unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, res: *mut ares_addrinfo);
 
-// C-ABI nullable callback typedefs used in the public FFI signatures. These wrap
-// an INLINE `extern "C" fn` in `Option<...>` so cbindgen collapses them to proper
-// nullable C function pointers with the upstream c-ares names (it cannot do this
-// for `Option<TypeAlias>`). Signatures must mirror the bare aliases above.
+// C-ABI nullable callback typedefs for public signatures. Wrapping an INLINE
+// `extern "C" fn` in `Option<...>` makes cbindgen emit a proper nullable C
+// function pointer (it cannot do that for `Option<TypeAlias>`).
 #[allow(non_camel_case_types)] pub type ares_host_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, hostent: *mut libc::hostent)>;
 #[allow(non_camel_case_types)] pub type ares_callback = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: c_int, abuf: *mut u8, alen: libc::c_int)>;
 #[allow(non_camel_case_types)] pub type ares_callback_dnsrec = Option<unsafe extern "C" fn(arg: *mut c_void, status: c_int, timeouts: libc::size_t, dnsrec: *const dns_record::ares_dns_record_t)>;
@@ -226,15 +213,12 @@ pub const ARES_NI_IDN: c_int = 1 << 10;
 pub const ARES_NI_IDN_ALLOW_UNASSIGNED: c_int = 1 << 11;
 pub const ARES_NI_IDN_USE_STD3_ASCII_RULES: c_int = 1 << 12;
 
-// c-ares library initialization flag values.
 pub const ARES_LIB_INIT_NONE: c_int = 0;
 pub const ARES_LIB_INIT_WIN32: c_int = 1 << 0;
 
-// Server state callback flag values.
 pub const ARES_SERV_STATE_UDP: c_int = 1 << 0;
 pub const ARES_SERV_STATE_TCP: c_int = 1 << 1;
 
-// Values for ARES_OPT_EVENT_THREAD.
 pub const ARES_EVSYS_DEFAULT: c_int = 0;
 pub const ARES_EVSYS_WIN32: c_int = 1;
 pub const ARES_EVSYS_EPOLL: c_int = 2;
@@ -257,10 +241,9 @@ pub const ARES_SOCKET_BAD: ares_socket_t = -1;
 
 pub type AresSockConfigureCallback = unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int;
 pub type AresServerStateCallback = unsafe extern "C" fn(server_string: *const c_char, success: c_int, flags: c_int, arg: *mut libc::c_void);
-// C-ABI nullable forms (see note by the other ares_*_callback typedefs).
+// C-ABI nullable forms.
 #[allow(non_camel_case_types)] pub type ares_sock_config_callback = Option<unsafe extern "C" fn(socket_fd: c_int, sock_type: c_int, arg: *mut libc::c_void) -> c_int>;
 #[allow(non_camel_case_types)] pub type ares_server_state_callback = Option<unsafe extern "C" fn(server_string: *const c_char, success: c_int, flags: c_int, arg: *mut libc::c_void)>;
-
 
 #[no_mangle]
 pub extern "C" fn ares_library_initialized() -> c_int {

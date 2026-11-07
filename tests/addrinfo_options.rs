@@ -1,10 +1,5 @@
-//! Phase 3B addrinfo/hosts/sortlist semantics.
-//!
-//! Covers hosts-file merging, RFC 6724 vs AI_NOSORT ordering, channel
-//! sortlist behavior, sortlist option round-trips, service/hint handling,
-//! CNAME exposure, CARES_HOSTS (AI_ENVHOSTS), and lookups fb/bf ordering.
-//! All DNS traffic goes to loopback mini servers; process-global environment
-//! and hosts files are serialized.
+//! addrinfo/hosts/sortlist semantics against loopback mini DNS servers;
+//! process-global environment and hosts files are serialized.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
@@ -30,10 +25,6 @@ fn serial() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
-
-// ---------------------------------------------------------------------------
-// Mini UDP DNS server
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum ReplyKind {
@@ -84,8 +75,8 @@ fn encode_name(name: &str, out: &mut Vec<u8>) {
 fn make_reply(request: &[u8], kind: ReplyKind) -> Vec<u8> {
     let mut reply = Vec::new();
     reply.extend_from_slice(&request[0..2]);
-    reply.extend_from_slice(&[0x81, 0x80]); // QR | RD | RA, NOERROR
-    reply.extend_from_slice(&[0, 1]); // qdcount
+    reply.extend_from_slice(&[0x81, 0x80]);
+    reply.extend_from_slice(&[0, 1]);
     let ancount: u16 = match kind {
         ReplyKind::A(_) => 1,
         ReplyKind::CnameA { .. } => 2,
@@ -97,25 +88,23 @@ fn make_reply(request: &[u8], kind: ReplyKind) -> Vec<u8> {
     match kind {
         ReplyKind::A(addr) => {
             reply.extend_from_slice(&[0xC0, 0x0C]);
-            reply.extend_from_slice(&[0, 1, 0, 1]); // A IN
+            reply.extend_from_slice(&[0, 1, 0, 1]);
             reply.extend_from_slice(&[0, 0, 0, 60]);
             reply.push(0);
             reply.push(4);
             reply.extend_from_slice(&addr);
         }
         ReplyKind::CnameA { target, addr } => {
-            // CNAME owner = question name, target = canonical name.
             reply.extend_from_slice(&[0xC0, 0x0C]);
-            reply.extend_from_slice(&[0, 5, 0, 1]); // CNAME IN
+            reply.extend_from_slice(&[0, 5, 0, 1]);
             reply.extend_from_slice(&[0, 0, 0, 60]);
             let mut rdata = Vec::new();
             encode_name(target, &mut rdata);
             reply.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
             reply.extend_from_slice(&rdata);
 
-            // A record owned by the CNAME target.
             encode_name(target, &mut reply);
-            reply.extend_from_slice(&[0, 1, 0, 1]); // A IN
+            reply.extend_from_slice(&[0, 1, 0, 1]);
             reply.extend_from_slice(&[0, 0, 0, 60]);
             reply.push(0);
             reply.push(4);
@@ -124,10 +113,6 @@ fn make_reply(request: &[u8], kind: ReplyKind) -> Vec<u8> {
     }
     reply
 }
-
-// ---------------------------------------------------------------------------
-// Callback captures
-// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct AiNodeView {
@@ -271,10 +256,6 @@ unsafe extern "C" fn host_cb(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Channel/reactor helpers
-// ---------------------------------------------------------------------------
-
 fn base_options() -> ares_options {
     ares_options {
         timeout: 500,
@@ -365,10 +346,6 @@ unsafe fn gethostbyname(channel: Channel, name: &CStr, mini: Option<&mut Mini>) 
     result
 }
 
-// ---------------------------------------------------------------------------
-// Temporary files / environment guards
-// ---------------------------------------------------------------------------
-
 struct TempFile {
     path: PathBuf,
 }
@@ -427,10 +404,6 @@ impl Drop for EnvGuard {
 fn node_addrs(result: &AiResult) -> Vec<IpAddr> {
     result.nodes.iter().filter_map(|node| node.addr).collect()
 }
-
-// ---------------------------------------------------------------------------
-// 1. hosts-file merging + env hosts
-// ---------------------------------------------------------------------------
 
 #[test]
 fn hosts_file_merges_addresses_and_exposes_cnames() {
@@ -523,7 +496,6 @@ fn envhosts_uses_cares_hosts_only() {
             Some("env-alias-cares")
         );
 
-        // Without AI_ENVHOSTS the channel's configured hosts file is used.
         hints.ai_flags = ARES_AI_CANONNAME | ARES_AI_NOSORT;
         let result = getaddrinfo(channel, &name, None, Some(&hints), None);
         assert_eq!(result.status, ARES_SUCCESS);
@@ -534,10 +506,6 @@ fn envhosts_uses_cares_hosts_only() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 2. RFC 6724 ordering vs AI_NOSORT, and sortlist is ignored
-// ---------------------------------------------------------------------------
 
 #[test]
 fn getaddrinfo_sorts_rfc6724_and_ignores_channel_sortlist() {
@@ -551,7 +519,7 @@ fn getaddrinfo_sorts_rfc6724_and_ignores_channel_sortlist() {
             &options,
             ARES_OPT_FLAGS | ARES_OPT_TIMEOUTMS | ARES_OPT_TRIES | ARES_OPT_HOSTS_FILE,
         );
-        // Prefer IPv4 in sortlist: getaddrinfo must not consult it.
+        // Sortlist prefers IPv4, but getaddrinfo must ignore it.
         let sort = CString::new("127.0.0.0/8").unwrap();
         assert_eq!(ares_set_sortlist(channel, sort.as_ptr()), ARES_SUCCESS);
 
@@ -580,10 +548,6 @@ fn getaddrinfo_sorts_rfc6724_and_ignores_channel_sortlist() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 3. gethostbyname applies sortlist to hosts-file results
-// ---------------------------------------------------------------------------
-
 #[test]
 fn gethostbyname_applies_sortlist_to_hosts_results() {
     let _serial = serial();
@@ -611,10 +575,6 @@ fn gethostbyname_applies_sortlist_to_hosts_results() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 4. sortlist option round-trip / explicit empty / /0
-// ---------------------------------------------------------------------------
 
 #[test]
 fn sortlist_option_roundtrip_and_explicit_empty() {
@@ -657,7 +617,7 @@ fn sortlist_option_roundtrip_and_explicit_empty() {
         ares_destroy_options(&mut saved);
         ares_destroy(channel);
 
-        // Explicitly empty sortlist: nsort == 0 with the SORTLIST mask set.
+        // Explicit empty sortlist keeps the SORTLIST mask set with nsort == 0.
         let mut empty = base_options();
         empty.nsort = 0;
         empty.sortlist = ptr::null_mut();
@@ -705,10 +665,6 @@ fn sortlist_zero_prefix_does_not_panic() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 5. service/hint behavior
-// ---------------------------------------------------------------------------
-
 #[test]
 fn numericserv_rejects_text_and_socktype_protocol_are_set() {
     let _serial = serial();
@@ -741,10 +697,6 @@ fn numericserv_rejects_text_and_socktype_protocol_are_set() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 6. CNAME chain and AI_CANONNAME for literals/localhost
-// ---------------------------------------------------------------------------
 
 #[test]
 fn cname_chain_is_exposed_via_addrinfo() {
@@ -826,10 +778,6 @@ fn ai_canonname_for_ip_literal_and_localhost() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 8. lookups fb/bf ordering
-// ---------------------------------------------------------------------------
 
 fn channel_with_order(hosts_path: &CString, order: &CString, server_port: u16) -> Channel {
     unsafe {

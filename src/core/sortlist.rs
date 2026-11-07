@@ -13,8 +13,8 @@ pub struct SortlistEntry {
 }
 
 impl SortlistEntry {
-    /// Validate and build one entry (the same family/mask rules
-    /// `ares_set_sortlist` applies to its textual form).
+    /// Validate and build one entry, applying the same family/mask rules as
+    /// `ares_set_sortlist`.
     pub(crate) fn from_parts(addr: IpAddr, mask_bits: u8) -> Option<Self> {
         let max = if addr.is_ipv4() { 32 } else { 128 };
         if mask_bits > max {
@@ -74,7 +74,6 @@ pub fn apply_sortlist(sortlist: &[SortlistEntry], items: &mut [AddrRecord]) {
     items.sort_by_key(|item| sortlist_index(sortlist, &item.ip));
 }
 
-/// Apply the channel sortlist to a hostent's address list.
 pub(crate) fn apply_sortlist_ips(sortlist: &[SortlistEntry], ips: &mut [IpAddr]) {
     ips.sort_by_key(|ip| sortlist_index(sortlist, ip));
 }
@@ -115,34 +114,30 @@ fn rfc6724_precedence(ip: &IpAddr) -> i32 {
     }
 }
 
-/// RFC 6724 ordering used by getaddrinfo when ARES_AI_NOSORT is not set.
-/// Rules 6 (precedence) and 10 (stable original order) are implemented;
-/// source-address-dependent rules are omitted.
+/// RFC 6724 ordering used by getaddrinfo when ARES_AI_NOSORT is unset; rules 6
+/// (precedence) and 10 (stable order) apply, source-address rules are omitted.
 pub fn sort_addrinfo(items: &mut [AddrRecord]) {
-    // `sort_by_key` is stable, so equal precedences keep their original order.
     items.sort_by_key(|item| std::cmp::Reverse(rfc6724_precedence(&item.ip)));
 }
 
 pub(crate) fn parse_sortlist(s: &str) -> Result<Vec<SortlistEntry>, AresError> {
     let mut entries = Vec::new();
     for token in s.split(|c: char| c.is_whitespace() || c == ';').filter(|t| !t.is_empty()) {
-        // Formats: "ip/mask" or "ip/bits" or just "ip"
+        // Formats: "ip/mask", "ip/bits", or "ip".
         if let Some((addr_s, mask_s)) = token.split_once('/') {
             let addr: IpAddr = addr_s.parse().map_err(|_| ARES_EBADSTR)?;
-            // Try as CIDR bits first
             if let Ok(bits) = mask_s.parse::<u8>() {
                 let max = if addr.is_ipv4() { 32 } else { 128 };
                 if bits > max { return Err(ARES_EBADSTR.into()); }
                 entries.push(SortlistEntry { addr, mask_bits: bits });
             } else {
-                // Try as dotted netmask (IPv4 only)
+                // Dotted netmask, IPv4 only.
                 let mask: std::net::Ipv4Addr = mask_s.parse().map_err(|_| ARES_EBADSTR)?;
                 let mask_u32 = u32::from(mask);
                 let bits = mask_u32.leading_ones() as u8;
                 entries.push(SortlistEntry { addr, mask_bits: bits });
             }
         } else {
-            // Bare address - use /32 or /128 default
             let addr: IpAddr = token.parse().map_err(|_| ARES_EBADSTR)?;
             let bits = if addr.is_ipv4() { 32 } else { 128 };
             entries.push(SortlistEntry { addr, mask_bits: bits });

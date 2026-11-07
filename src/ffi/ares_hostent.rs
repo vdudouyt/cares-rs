@@ -2,7 +2,7 @@ use std::ffi::CString;
 use crate::ffi::cnullterminated;
 
 pub unsafe fn free_hostent(hostent: *mut libc::hostent) {
-    // Upstream ares_free_hostent treats a NULL host as a no-op (`if (!host) return;`).
+    // Upstream treats a NULL host as a no-op.
     if hostent.is_null() { return; }
     unsafe {
         let hostent = Box::from_raw(hostent);

@@ -1,12 +1,9 @@
-//! Legacy ares_parse_*_reply parsers, hostent building, name expansion and
-//! query construction (create_query/mkquery), and small buffer utilities.
+//! Legacy `ares_parse_*_reply` parsers, hostent building, and query construction.
 
 use super::*;
 
 
-/// A caller-array slot for one (address, ttl) pair; the wanted family and
-/// the C field writes per flavor. Filtering/ordering is core's
-/// (hostent::addrttl_fill) — this only transcribes.
+/// A caller-array slot for one (address, ttl) pair; filtering/ordering happens in core.
 pub(crate) trait AddrTTL {
     const WANT_V4: bool;
     fn write(&mut self, ip: &IpAddr, ttl: u32);
@@ -14,7 +11,7 @@ pub(crate) trait AddrTTL {
 
 #[repr(C)]
 pub struct ares_addrttl {
-    pub ipaddr: libc::in_addr, // ipv4 (upstream: struct in_addr)
+    pub ipaddr: libc::in_addr,
     pub ttl: c_int,
 }
 
@@ -30,7 +27,7 @@ impl AddrTTL for ares_addrttl {
 
 #[repr(C)]
 pub struct ares_addr6ttl {
-    pub ip6addr: ares_in6_addr, // ipv6 (upstream: struct ares_in6_addr ip6addr)
+    pub ip6addr: ares_in6_addr,
     pub ttl: c_int,
 }
 
@@ -53,8 +50,7 @@ use crate::core::response::{
 };
 use crate::ffi::convert::malloc_bytes;
 
-/// Build the C hostent graph from a core blueprint — pure transcription:
-/// every inclusion/ordering/family decision was already made in core.
+/// Build the C hostent graph from a core blueprint; all policy decisions were made in core.
 pub(crate) unsafe fn build_hostent(bp: Hostent) -> *mut libc::hostent {
     let addrlist: Vec<*mut i8> = bp
         .addrs
@@ -86,7 +82,6 @@ pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: 
     unsafe { parse_to_clinkedlist::<AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
 }
 
-/// Validate a C (buffer, length) pair; the only unsafe step is the slice view.
 fn checked_slice<'a>(abuf: *const u8, alen: c_int) -> Option<&'a [u8]> {
     if abuf.is_null() || alen < 0 {
         return None;
@@ -94,8 +89,6 @@ fn checked_slice<'a>(abuf: *const u8, alen: c_int) -> Option<&'a [u8]> {
     Some(unsafe { std::slice::from_raw_parts(abuf, alen as usize) })
 }
 
-/// Build the TXT (or TXT-ext) reply chain from a parsed message. Pure safe
-/// code so the FFI shims below stay thin.
 fn txt_reply_from_buf(buf: &[u8], ext: bool) -> Result<*mut c_void, c_int> {
     let rec = crate::ffi::dns_record::parse_record(buf, 0).map_err(|e| e.code())?;
     if rec.answers.is_empty() {
@@ -212,14 +205,12 @@ where T2: DataType, for<'a> T2: FromParsedBuf<'a, T2>
     unsafe { ares_fn_wrapper(out, build) }
 }
 
-/// Trait to bridge lifetime-carrying parsed types to the non-lifetime output type.
-/// This avoids HRTB issues with parse_to_clinkedlist/parse_to_singleptr.
+/// Bridge lifetime-carrying parsed types to the non-lifetime output type (avoids HRTB issues).
 pub(crate) trait FromParsedBuf<'a, T2> {
     fn parse_buf_to_vec(buf: &'a [u8], expected_record_type: u16) -> Result<Vec<T2>, c_int>;
     fn parse_buf_to_clinkedlist_parts(buf: &'a [u8], expected_record_type: u16) -> Result<(Vec<T2>, usize), c_int>;
 }
 
-// Macro to implement FromParsedBuf for each (T1, T2) pair
 macro_rules! impl_from_parsed_buf {
     ($t1:ty, $t2:ty) => {
         impl<'a> FromParsedBuf<'a, $t2> for $t2 {
@@ -382,8 +373,7 @@ pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
 /// `s` must be NULL or a pointer previously returned by this library.
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
-    // All buffers handed to the caller (ares_create_query/mkquery/expand_name/
-    // expand_string/get_servers_csv) are libc::malloc'd, so free with libc::free.
+    // All caller-facing buffers are `libc::malloc`'d, so free with `libc::free`.
     if !s.is_null() {
         unsafe { libc::free(s) };
     }

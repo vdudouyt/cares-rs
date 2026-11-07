@@ -1,5 +1,4 @@
-// Thin c-ares C ABI shims: the safety contract is the documented c-ares API
-// contract, so per-function `# Safety` docs would just be noise.
+// Thin c-ares C ABI shims; the documented c-ares API contract is the safety contract.
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint };
@@ -7,31 +6,13 @@ use crate::core::packets::{ TxtReply, TxtReplyExt, MxReply, CaaReply, NaptrReply
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
 
-// Ownership taxonomy for the `AresData`-managed types below.
-//
-// Freeing is uniform: `ares_free_data` frees every chain explicitly via `free_chain`
-// (walk the boxed tail, then drop the inline-head box). NO type auto-walks its `next`
-// chain in `Drop`; a `Drop` frees only that node's own heap fields. So a chain is freed
-// exactly once, only when `ares_free_data` is called.
-//
-// * Reply types (`AresMxReply`, `AresTxtReply`, `AresSoaReply`, … — the results of
-//   `ares_parse_*_reply`) are allocated ONLY by cares-rs; a consumer never constructs
-//   one. They keep a `Drop` — but only to free their own heap fields (`CString`/`Vec`),
-//   not the chain.
-//
-// * Node types (`ares_addr_node`, `AresAddrPortNode`) are DUAL-ROLE: the caller
-//   constructs them (often on the stack) as INPUT to `ares_set_servers[_ports]`, and
-//   cares-rs also allocates them as the OUTPUT of `ares_get_servers[_ports]`. Because a
-//   Rust `Drop` fires for *every* value of a type, these must have NO `Drop` at all — one
-//   would also free the caller's own stack instances (the `munmap_chunk` benchmark abort
-//   that this arrangement fixes). They own no heap fields, so they need none; only the
-//   cares-rs-allocated (`get_servers`) instances are freed, via `ares_free_data`.
+// Ownership: `ares_free_data` frees every chain explicitly via `free_chain`; no `Drop`
+// walks `next`. Reply types free only their own fields. Node types are caller-constructable
+// too, so they must have NO `Drop` (one would free the caller's stack instances).
 
 pub trait IntoAresData<T> {
-    /// Convert a parsed record into its C reply struct. Returns `None` when a
-    /// field cannot be represented as a C string (e.g. it contains an embedded
-    /// NUL byte from a malformed response); callers map `None` to ARES_EBADRESP
-    /// rather than panicking across the FFI boundary.
+    /// Convert a parsed record into its C reply struct; `None` on an embedded NUL
+    /// (mapped to ARES_EBADRESP rather than panicking across the FFI boundary).
     fn into_ares_data(self, main_buf: &[u8]) -> Option<T>;
 }
 
@@ -39,14 +20,13 @@ impl IntoAresData<AresTxtReply> for TxtReply<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresTxtReply> {
         let mut bytes = self.txt.into_owned().into_bytes();
         let length = bytes.len();
-        bytes.push(0); // NUL terminator (not counted in `length`), matching upstream
+        bytes.push(0); // NUL terminator, not counted in `length`
         let txt = Box::into_raw(bytes.into_boxed_slice());
         Some(AresTxtReply { next: std::ptr::null_mut(), txt: txt as *mut u8, length })
     }
 }
 
-/// Build one TXT reply node from raw character-string bytes (embedded NULs are
-/// preserved; `length` excludes the added terminator).
+/// Build one TXT reply node; `length` excludes the added NUL terminator.
 pub(crate) fn txt_reply_node(data: &[u8]) -> AresTxtReply {
     let mut bytes = data.to_vec();
     let length = bytes.len();
@@ -73,7 +53,7 @@ impl IntoAresData<AresTxtReplyExt> for TxtReplyExt<'_> {
     fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresTxtReplyExt> {
         let mut bytes = self.txt.as_bytes().to_vec();
         let length = bytes.len();
-        bytes.push(0); // NUL terminator (not counted in `length`), matching upstream
+        bytes.push(0); // NUL terminator, not counted in `length`
         let txt = Box::into_raw(bytes.into_boxed_slice());
         Some(AresTxtReplyExt { next: std::ptr::null_mut(), txt: txt as *mut u8, length, record_start: self.record_start as u8 })
     }
@@ -95,9 +75,7 @@ unsafe fn restore_original_ptr(dataptr: *mut c_void) -> *mut c_void {
 pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     if dataptr.is_null() { return; }
     let aresdata = unsafe { restore_original_ptr(dataptr) as *mut AresData<*mut c_void> };
-    // Every chained type is freed the same way: `free_chain` frees the boxed tail and
-    // the inline head, and each node's `Drop` (if any) frees only its own fields. A
-    // chain's `next` is therefore freed only here — never auto-freed by a type's `Drop`.
+    // `free_chain` frees the boxed tail and inline head; a `Drop` frees only its own fields.
     unsafe {
         match (&*aresdata).data_type {
             AresDataType::MxReply => free_chain::<AresMxReply>(aresdata),
@@ -115,10 +93,8 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
     }
 }
 
-/// Free an `AresData`-wrapped node chain. The `chain_nodes`-boxed tail nodes are freed
-/// here, then the box frees the inline head. Each node's `Drop` (if any) frees only its
-/// own fields — never the `next` chain — so a chain is freed exactly once, only from
-/// here, and no `Drop` can walk into caller-owned memory.
+/// Free a node chain: the boxed tail then the inline head; each `Drop` frees only
+/// its own fields, never `next`, so no `Drop` walks into caller-owned memory.
 unsafe fn free_chain<T: CLinkedList>(aresdata: *mut AresData<*mut c_void>) {
     let ad = aresdata as *mut AresData<T>;
     let mut node = unsafe { *(*ad).data.next() };
@@ -189,8 +165,7 @@ impl IntoAresData<AresCaaReply> for CaaReply<'_> {
         let plength = self.property.len();
         let length = self.value.len();
 
-        // Build both CStrings before calling into_raw, so a failure on the
-        // second does not leak the first.
+        // Build both CStrings before `into_raw` so a failure does not leak the first.
         let property = CString::new(self.property).ok()?;
         let value = CString::new(self.value).ok()?;
 
@@ -207,7 +182,6 @@ impl IntoAresData<AresCaaReply> for CaaReply<'_> {
 
 impl Drop for AresCaaReply {
     fn drop(&mut self) {
-        // Own fields only; the `next` chain is freed by ares_free_data's free_chain.
         drop(unsafe { CString::from_raw(self.property as *mut c_char) });
         drop(unsafe { CString::from_raw(self.value as *mut c_char) });
     }
@@ -226,8 +200,7 @@ pub struct AresSoaReply {
 
 impl IntoAresData<AresSoaReply> for SoaReply<'_> {
     fn into_ares_data(self, main_buf: &[u8]) -> Option<AresSoaReply> {
-        // Build both CStrings before into_raw so a failure on the second
-        // does not leak the first.
+        // Build both CStrings before `into_raw` so a failure does not leak the first.
         let nsname = self.nsname.build_cstring(main_buf)?;
         let hostmaster = self.hostmaster.build_cstring(main_buf)?;
 
@@ -243,16 +216,13 @@ impl IntoAresData<AresSoaReply> for SoaReply<'_> {
     }
 }
 
-// ares_addr_port_node
-
 #[repr(C)]
 pub union AresAddrUnion {
     pub addr4: libc::in_addr,
     pub addr6: crate::ffi::ares_in6_addr,
 }
 
-// Dual-role node type (caller-allocatable input + cares-rs-allocated output) — see the
-// ownership taxonomy at the top of this file: intentionally NO `Drop`.
+// Dual-role (caller input + our output), so intentionally no `Drop`.
 #[repr(C)]
 pub struct AresAddrPortNode {
     pub next: *mut AresAddrPortNode,
@@ -270,14 +240,14 @@ impl Drop for AresMxReply {
 
 impl Drop for AresTxtReply {
     fn drop(&mut self) {
-        // txt was allocated with length+1 bytes (data + NUL terminator).
+        // txt is `length + 1` bytes (data + NUL).
         drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length + 1, self.length + 1) });
     }
 }
 
 impl Drop for AresTxtReplyExt {
     fn drop(&mut self) {
-        // txt was allocated with length+1 bytes (data + NUL terminator).
+        // txt is `length + 1` bytes (data + NUL).
         drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length + 1, self.length + 1) });
     }
 }
@@ -320,10 +290,6 @@ impl CLinkedList for AresAddrPortNode {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
 
-// NB: no `Drop` for AresAddrPortNode — it is a caller-constructable input to
-// ares_set_servers_ports (callers build chains on the stack) and owns no heap fields.
-// ares_free_data frees our own boxed chains explicitly via free_chain instead.
-
 pub trait DataType {
     fn datatype() -> AresDataType;
 }
@@ -364,9 +330,7 @@ impl DataType for AresAddrPortNode {
     fn datatype() -> AresDataType { AresDataType::AddrPortNode }
 }
 
-// `ares_addr_node` (returned by `ares_get_servers`, freed with `ares_free_data`)
-// uses the same AresData-chain machinery as AresAddrPortNode. Like it, it has NO
-// `Drop` — it is a caller-constructable input to ares_set_servers.
+// `ares_addr_node` uses the same chain machinery and is also dual-role, so no `Drop`.
 impl CLinkedList for super::ares_addr_node {
     fn next(&mut self) -> &mut *mut Self { &mut self.next }
 }
@@ -410,8 +374,7 @@ impl Drop for AresUriReply {
 
 impl IntoAresData<AresNaptrReply> for NaptrReply<'_> {
     fn into_ares_data(self, _buf: &[u8]) -> Option<AresNaptrReply> {
-        // Build all CStrings before into_raw so a later failure does not leak
-        // the earlier ones.
+        // Build all CStrings before `into_raw` so a failure does not leak the earlier ones.
         let flags = CString::new(self.flags).ok()?;
         let service = CString::new(self.service).ok()?;
         let regexp = CString::new(self.regexp).ok()?;
@@ -485,8 +448,7 @@ mod tests {
 
     impl Default for AresTxtReply {
         fn default() -> Self {
-            // Build through the production path so txt is length+1 bytes (data +
-            // NUL terminator) and the Drop impl frees the matching size.
+            // Production path keeps txt at `length + 1` bytes to match the Drop size.
             TxtReply { txt: std::borrow::Cow::Borrowed("default"), length: 7 }
                 .into_ares_data(&[])
                 .unwrap()
@@ -530,9 +492,8 @@ mod tests {
         assert_eq!(std::ptr::addr_of!(base) as *mut c_void, restoredptr);
     }
 
-    // The `txt` buffer must be NUL-terminated (data + a trailing 0) like upstream
-    // c-ares, with `length` excluding the terminator, so a C consumer's
-    // strlen/printf does not read past the allocation.
+    // `txt` is NUL-terminated with `length` excluding it, so C consumers do not
+    // read past the allocation.
     #[test]
     fn txt_reply_is_nul_terminated() {
         let data = TxtReply { txt: std::borrow::Cow::Borrowed("abc"), length: 3 }

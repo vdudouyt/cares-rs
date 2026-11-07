@@ -31,7 +31,6 @@ fn bad_socket_noop() {
         assert_eq!(ares_init(&mut channel), ARES_SUCCESS);
         assert!(!channel.is_null());
 
-        // Calling with ARES_SOCKET_BAD for both fds should be a no-op
         ares_process_fd(channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD);
 
         ares_destroy(channel);
@@ -55,7 +54,6 @@ fn resolves_localhost() {
             &mut result as *mut _ as *mut c_void,
         );
 
-        // Drive the event loop using ares_getsock + select + ares_process_fd
         let mut iterations = 0;
         while !result.done && iterations < 100 {
             iterations += 1;
@@ -64,12 +62,10 @@ fn resolves_localhost() {
             let bitmask = ares_getsock(channel, socks.as_mut_ptr(), ARES_GETSOCK_MAXNUM as c_int);
 
             if bitmask == 0 {
-                // No sockets — might have resolved from /etc/hosts already
                 ares_process_fd(channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD);
                 continue;
             }
 
-            // Build fd_sets for select
             let mut read_fds: libc::fd_set = std::mem::zeroed();
             let mut write_fds: libc::fd_set = std::mem::zeroed();
             libc::FD_ZERO(&mut read_fds);
@@ -99,7 +95,6 @@ fn resolves_localhost() {
             let n = libc::select(max_fd + 1, &mut read_fds, &mut write_fds, ptr::null_mut(), &mut tv);
             if n < 0 { break; }
 
-            // Call ares_process_fd for each ready socket
             for &sock in &socks {
                 if sock == ARES_SOCKET_BAD {
                     continue;
@@ -126,12 +121,10 @@ fn getsock_reports_writable_for_pending_query() {
         let mut channel: Channel = ptr::null_mut();
         assert_eq!(ares_init(&mut channel), ARES_SUCCESS);
 
-        // Before any query, no sockets should be active
         let mut socks = [ARES_SOCKET_BAD; ARES_GETSOCK_MAXNUM];
         let bitmask = ares_getsock(channel, socks.as_mut_ptr(), ARES_GETSOCK_MAXNUM as c_int);
         assert_eq!(bitmask, 0, "no sockets before query");
 
-        // Issue a query to an external domain (won't resolve from /etc/hosts)
         let mut result = CallbackResult { done: false, status: -1 };
         let name = CString::new("www.example.com.").unwrap();
         ares_gethostbyname(
@@ -142,7 +135,6 @@ fn getsock_reports_writable_for_pending_query() {
             &mut result as *mut _ as *mut c_void,
         );
 
-        // Now getsock should report a socket with the writable bit set
         let mut socks = [ARES_SOCKET_BAD; ARES_GETSOCK_MAXNUM];
         let bitmask = ares_getsock(channel, socks.as_mut_ptr(), ARES_GETSOCK_MAXNUM as c_int);
         assert_ne!(bitmask, 0, "should have active sockets after query");
@@ -157,7 +149,6 @@ fn getsock_reports_writable_for_pending_query() {
 #[test]
 fn null_channel_noop() {
     unsafe {
-        // Should not crash with null channel
         ares_process_fd(ptr::null_mut(), ARES_SOCKET_BAD, ARES_SOCKET_BAD);
         ares_process_fd(ptr::null_mut(), 0, 0);
     }

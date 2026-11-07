@@ -1,14 +1,12 @@
-// Keep MSRV below 1.77 (avoids depending on the stdlib `core::mem::offset_of!`,
-// stabilized in 1.77). This is a subject to be removed in the future.
+// Kept as a macro to stay below MSRV 1.77 (stdlib `core::mem::offset_of!` was
+// stabilized in 1.77); may be removed in the future.
 
 #[macro_export]
 macro_rules! offset_of {
     ($parent:ty, $field:tt) => {{
-        // Base must point into a real allocation with valid provenance: deriving it
-        // from `NonNull::dangling()` (a provenance-free address) makes the field
-        // projection below pointer arithmetic on a dangling pointer, which is UB
-        // (Miri flags it). A never-read `MaybeUninit` gives us a real stack
-        // allocation to compute the field address against.
+        // Base must have valid provenance: deriving it from `NonNull::dangling()`
+        // would make the field projection UB (Miri flags it). A never-read
+        // `MaybeUninit` gives a real stack allocation to compute against.
         let uninit = core::mem::MaybeUninit::<$parent>::uninit();
         let base: *const $parent = uninit.as_ptr();
         // SAFETY: we only take the address of the field, never read it; `base`
@@ -38,7 +36,6 @@ mod tests {
 
     #[test]
     fn offsets_s1() {
-        // Expected offsets per C layout rules.
         let a_off = 0usize;
 
         let b_align = align_of::<u32>();
@@ -54,7 +51,6 @@ mod tests {
 
     #[test]
     fn size_and_alignment_match_c_rules() {
-        // For S2 as an example
         let a_off = 0usize;
         let b_off = align_up(a_off + size_of::<u8>(), align_of::<u32>());
         let c_off = align_up(b_off + size_of::<u32>(), align_of::<u16>());

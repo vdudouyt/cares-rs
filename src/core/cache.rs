@@ -1,8 +1,5 @@
-//! The query cache: a TTL-bounded map of raw DNS reply bytes keyed by the
-//! upstream qcache tuple (`opcode`, RD/CD flags, qname, qtype, qclass). Shared
-//! (via `Rc<RefCell<_>>`) between the async engine (gethostbyname) and the
-//! classic reactor (the dnsrec post-delivery hook), so both read/write one
-//! store. Neutral — no `Client`/`Transport`/FFI.
+//! TTL-bounded cache of raw DNS replies keyed by the upstream qcache tuple
+//! (opcode, RD/CD, qname, qtype, qclass), shared by the async engine and reactor.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -10,8 +7,7 @@ use std::time::{Duration, Instant};
 use crate::core::response::ParsedResponse;
 
 /// Upstream `ares_qcache_calc_key` tuple: opcode + RD/CD + each question's
-/// (type, class, name). Kept as separate fields so a CHAOS, CD or NORECURSE
-/// query can never collide with an ordinary IN/RD entry.
+/// (type, class, name). Separate fields keep CHAOS/CD/NORECURSE entries apart.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub name: String,
@@ -23,8 +19,8 @@ pub struct CacheKey {
 }
 
 impl CacheKey {
-    /// Build a key; the trailing dot is presentation-only (upstream strips it
-    /// before hashing) so `example.com.` and `example.com` share an entry.
+    /// The trailing dot is presentation-only: `example.com.` and `example.com`
+    /// share an entry.
     pub fn new(name: &str, qtype: u16, qclass: u16, opcode: u16, rd: bool, cd: bool) -> Self {
         CacheKey {
             name: name.strip_suffix('.').unwrap_or(name).to_string(),
@@ -36,7 +32,6 @@ impl CacheKey {
         }
     }
 
-    /// The same question/flags with a different (search-candidate) name.
     pub fn with_name(&self, name: &str) -> Self {
         CacheKey::new(name, self.qtype, self.qclass, self.opcode, self.rd, self.cd)
     }
@@ -60,13 +55,10 @@ impl QueryCache {
         self.max_ttl > 0
     }
 
-    /// Drop every cached reply (ares_reinit flushes the query cache).
     pub fn flush(&mut self) {
         self.map.clear();
     }
 
-    /// Read a cached reply for `key`, evicting an expired entry.
-    /// `None` when the cache is disabled, missing the key, or the entry expired.
     pub fn get(&mut self, key: &CacheKey, now: Instant) -> Option<Vec<u8>> {
         if self.max_ttl == 0 {
             return None;
@@ -81,10 +73,8 @@ impl QueryCache {
         }
     }
 
-    /// Store one reply under every name, using `template` for the question
-    /// type/class/opcode/flag parts of the key. TTL is clamped to
-    /// `min_item_ttl` and the channel limit (a no-op when the clamped TTL is 0
-    /// or the cache is disabled).
+    /// Store one reply under every name, clamping TTL to `min_item_ttl` and the
+    /// channel limit (a no-op when the clamped TTL is 0).
     pub fn store_names(
         &mut self,
         names: Vec<String>,
@@ -102,10 +92,8 @@ impl QueryCache {
         }
     }
 
-    /// Store a reply under the request's cache key (upstream keys on the
-    /// outgoing query, not the echoed response header), clamped to the minimum
-    /// answer TTL. `from_buf` only parses a non-empty answer section, so the
-    /// historical `ancount > 0` guard is implied.
+    /// Store under the request's key (not the echoed response header), clamped
+    /// to the minimum answer TTL; a non-empty answer section is implied.
     pub fn store_reply(&mut self, request_key: &CacheKey, buf: &[u8], now: Instant) {
         if let Ok(parsed) = ParsedResponse::from_buf(buf) {
             let min_ttl = parsed.answers.iter().map(|a| a.ttl).min().unwrap_or(0);

@@ -1,12 +1,5 @@
-//! Comprehensive in-memory memory-safety suite, written to run under Miri
-//! (`cargo +nightly miri test`) as well as normal `cargo test`.
-//!
-//! Everything here is hermetic: it builds DNS messages in memory and calls the
-//! public parse / allocate / free entry points directly — no `ares_init`, no
-//! files, no sockets, no syscalls. The goal is to exercise every alloc/free path
-//! (hostent, `ares_data` linked lists, `libc::malloc`'d buffers, `ares_dns_record`)
-//! on both success and error paths, so Miri flags use-after-free, out-of-bounds,
-//! leaks, and allocator mismatches across the whole FFI surface.
+//! Hermetic memory-safety suite (also run under Miri): in-memory DNS messages
+//! only, exercising every alloc/free path without sockets, files, or syscalls.
 
 use std::ffi::{c_char, c_int, c_long, c_uint, c_void, CStr, CString};
 use std::ptr;
@@ -22,7 +15,6 @@ const ARES_SUCCESS: c_int = 0;
 const AF_INET: c_int = libc::AF_INET;
 const AF_INET6: c_int = libc::AF_INET6;
 
-// DNS record types.
 const T_A: u16 = 1;
 const T_NS: u16 = 2;
 const T_SOA: u16 = 6;
@@ -32,54 +24,47 @@ const T_TXT: u16 = 16;
 const T_AAAA: u16 = 28;
 const T_SRV: u16 = 33;
 
-// ---- in-memory DNS response builder ----
-
 fn encode_name(buf: &mut Vec<u8>, name: &str) {
     for label in name.split('.').filter(|l| !l.is_empty()) {
         buf.push(label.len() as u8);
         buf.extend_from_slice(label.as_bytes());
     }
-    buf.push(0); // root terminator
+    buf.push(0);
 }
 
-/// uncompressed name, as an rdata fragment.
 fn name_bytes(name: &str) -> Vec<u8> {
     let mut v = Vec::new();
     encode_name(&mut v, name);
     v
 }
 
-/// One answer RR whose owner name is a compression pointer to the question
-/// (always at offset 12, immediately after the fixed 12-byte header).
+/// Answer RR whose owner name points to the question at offset 12.
 fn rr(rtype: u16, rdata: &[u8]) -> Vec<u8> {
-    let mut v = vec![0xC0, 0x0C]; // owner name -> question at offset 12
+    let mut v = vec![0xC0, 0x0C];
     v.extend_from_slice(&rtype.to_be_bytes());
-    v.extend_from_slice(&1u16.to_be_bytes()); // class IN
-    v.extend_from_slice(&60u32.to_be_bytes()); // ttl
+    v.extend_from_slice(&1u16.to_be_bytes());
+    v.extend_from_slice(&60u32.to_be_bytes());
     v.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
     v.extend_from_slice(rdata);
     v
 }
 
-/// A complete DNS response message: header + one question + the answer RRs.
 fn response(qname: &str, qtype: u16, answers: &[Vec<u8>]) -> Vec<u8> {
     let mut b = Vec::new();
-    b.extend_from_slice(&0x1234u16.to_be_bytes()); // id
-    b.extend_from_slice(&0x8180u16.to_be_bytes()); // flags: QR RD RA, rcode 0
-    b.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-    b.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ancount
-    b.extend_from_slice(&0u16.to_be_bytes()); // nscount
-    b.extend_from_slice(&0u16.to_be_bytes()); // arcount
+    b.extend_from_slice(&0x1234u16.to_be_bytes());
+    b.extend_from_slice(&0x8180u16.to_be_bytes());
+    b.extend_from_slice(&1u16.to_be_bytes());
+    b.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+    b.extend_from_slice(&0u16.to_be_bytes());
+    b.extend_from_slice(&0u16.to_be_bytes());
     encode_name(&mut b, qname);
     b.extend_from_slice(&qtype.to_be_bytes());
-    b.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
+    b.extend_from_slice(&1u16.to_be_bytes());
     for a in answers {
         b.extend_from_slice(a);
     }
     b
 }
-
-// ---------- A / AAAA / NS / PTR -> hostent -> ares_free_hostent ----------
 
 #[test]
 fn parse_a_reply_single_and_free() {
@@ -111,7 +96,7 @@ fn parse_a_reply_multi_with_addrttls_and_free() {
 
 #[test]
 fn parse_aaaa_reply_and_free() {
-    let v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]; // 2001:db8::1
+    let v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     let buf = response("example.com", T_AAAA, &[rr(T_AAAA, &v6)]);
     unsafe {
         let mut he: *mut libc::hostent = ptr::null_mut();
@@ -160,11 +145,9 @@ fn parse_ptr_reply_and_free() {
     }
 }
 
-// ---------- ares_data linked lists -> ares_free_data ----------
-
 #[test]
 fn parse_txt_reply_and_free() {
-    let rdata = [0x05u8, b'h', b'e', b'l', b'l', b'o']; // one char-string "hello"
+    let rdata = [0x05u8, b'h', b'e', b'l', b'l', b'o'];
     let buf = response("example.com", T_TXT, &[rr(T_TXT, &rdata)]);
     unsafe {
         let mut out: *mut c_void = ptr::null_mut();
@@ -177,7 +160,7 @@ fn parse_txt_reply_and_free() {
 
 #[test]
 fn parse_mx_reply_and_free() {
-    let mut rdata = vec![0x00u8, 0x0A]; // preference 10
+    let mut rdata = vec![0x00u8, 0x0A];
     rdata.extend(name_bytes("mail.example.com"));
     let buf = response("example.com", T_MX, &[rr(T_MX, &rdata)]);
     unsafe {
@@ -191,7 +174,7 @@ fn parse_mx_reply_and_free() {
 
 #[test]
 fn parse_srv_reply_and_free() {
-    let mut rdata = vec![0x00u8, 0x0A, 0x00, 0x05, 0x00, 0x50]; // prio 10, weight 5, port 80
+    let mut rdata = vec![0x00u8, 0x0A, 0x00, 0x05, 0x00, 0x50];
     rdata.extend(name_bytes("srv.example.com"));
     let buf = response("example.com", T_SRV, &[rr(T_SRV, &rdata)]);
     unsafe {
@@ -206,13 +189,13 @@ fn parse_srv_reply_and_free() {
 #[test]
 fn parse_soa_reply_and_free() {
     let mut rdata = Vec::new();
-    rdata.extend(name_bytes("ns1.example.com")); // mname
-    rdata.extend(name_bytes("hostmaster.example.com")); // rname
-    rdata.extend_from_slice(&1u32.to_be_bytes()); // serial
-    rdata.extend_from_slice(&3600u32.to_be_bytes()); // refresh
-    rdata.extend_from_slice(&600u32.to_be_bytes()); // retry
-    rdata.extend_from_slice(&86400u32.to_be_bytes()); // expire
-    rdata.extend_from_slice(&60u32.to_be_bytes()); // minimum
+    rdata.extend(name_bytes("ns1.example.com"));
+    rdata.extend(name_bytes("hostmaster.example.com"));
+    rdata.extend_from_slice(&1u32.to_be_bytes());
+    rdata.extend_from_slice(&3600u32.to_be_bytes());
+    rdata.extend_from_slice(&600u32.to_be_bytes());
+    rdata.extend_from_slice(&86400u32.to_be_bytes());
+    rdata.extend_from_slice(&60u32.to_be_bytes());
     let buf = response("example.com", T_SOA, &[rr(T_SOA, &rdata)]);
     unsafe {
         let mut out: *mut c_void = ptr::null_mut();
@@ -222,8 +205,6 @@ fn parse_soa_reply_and_free() {
         ares_free_data(out);
     }
 }
-
-// ---------- ares_dns_record create -> write(malloc) -> parse -> duplicate -> free ----------
 
 #[test]
 fn dns_record_create_write_parse_duplicate_free() {
@@ -243,33 +224,28 @@ fn dns_record_create_write_parse_duplicate_free() {
         let addr = libc::in_addr { s_addr: u32::from_ne_bytes([93, 184, 216, 34]) };
         assert_eq!(ares_dns_rr_set_addr(rr_ptr, ARES_RR_A_ADDR, &addr), ARES_SUCCESS);
 
-        // write -> libc::malloc'd wire buffer
         let mut buf: *mut u8 = ptr::null_mut();
         let mut buflen: libc::size_t = 0;
         assert_eq!(ares_dns_write(rec, &mut buf, &mut buflen), ARES_SUCCESS);
         assert!(!buf.is_null() && buflen > 12);
 
-        // parse it back into a fresh record
         let mut rec2 = ptr::null_mut();
         assert_eq!(ares_dns_parse(buf, buflen, 0, &mut rec2), ARES_SUCCESS);
         assert!(!rec2.is_null());
 
-        // deep duplicate
         let rec3 = ares_dns_record_duplicate(rec);
         assert!(!rec3.is_null());
 
         ares_dns_record_destroy(rec3);
         ares_dns_record_destroy(rec2);
         ares_dns_record_destroy(rec);
-        ares_free_string(buf as *mut c_void); // libc::free of the libc::malloc'd buffer
+        ares_free_string(buf as *mut c_void);
     }
 }
 
-// ---------- expand_name / inet helpers ----------
-
 #[test]
 fn expand_name_and_free() {
-    let mut msg = vec![0u8; 12]; // 12-byte header padding, name starts at offset 12
+    let mut msg = vec![0u8; 12];
     encode_name(&mut msg, "ab.cd");
     unsafe {
         let mut s: *mut c_char = ptr::null_mut();
@@ -286,7 +262,6 @@ fn expand_name_and_free() {
 #[test]
 fn inet_pton_ntop_roundtrip() {
     unsafe {
-        // IPv4
         let src = CString::new("127.0.0.1").unwrap();
         let mut v4 = [0u8; 4];
         assert_eq!(ares_inet_pton(AF_INET, src.as_ptr(), v4.as_mut_ptr() as *mut c_void), 1);
@@ -301,7 +276,6 @@ fn inet_pton_ntop_roundtrip() {
         assert!(!p.is_null());
         assert_eq!(CStr::from_ptr(out.as_ptr()).to_str().unwrap(), "127.0.0.1");
 
-        // IPv6
         let src6 = CString::new("2001:db8::1").unwrap();
         let mut v6 = [0u8; 16];
         assert_eq!(ares_inet_pton(AF_INET6, src6.as_ptr(), v6.as_mut_ptr() as *mut c_void), 1);
@@ -317,12 +291,9 @@ fn inet_pton_ntop_roundtrip() {
     }
 }
 
-// ---------- adversarial: every parser must error cleanly with no allocation ----------
-
 #[test]
 fn truncated_replies_error_cleanly_no_leak() {
-    // Header claims qdcount=1/ancount=1 but the message is truncated right after.
-    // Every parser must return an error and allocate nothing (Miri: no leak/UB).
+    // Truncated right after the header; every parser must error and allocate nothing.
     let short = [0x12u8, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 0x00];
     unsafe {
         let mut he: *mut libc::hostent = ptr::null_mut();
@@ -357,8 +328,6 @@ fn truncated_replies_error_cleanly_no_leak() {
     }
 }
 
-// ---------- dns_record get/set accessor matrix (all datatypes) ----------
-
 #[test]
 fn dns_record_accessors_roundtrip() {
     const T_CAA: u16 = 257;
@@ -370,7 +339,6 @@ fn dns_record_accessors_roundtrip() {
         let apex = CString::new("example.com").unwrap();
         assert_eq!(ares_dns_record_query_add(rec, apex.as_ptr(), T_A as u32, 1), ARES_SUCCESS);
 
-        // Add one RR per datatype family and set its fields.
         let mut rr_a = ptr::null_mut();
         assert_eq!(ares_dns_record_rr_add(&mut rr_a, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_A as u32, 1, 300), ARES_SUCCESS);
         let a4 = libc::in_addr { s_addr: u32::from_ne_bytes([10, 0, 0, 7]) };
@@ -407,16 +375,13 @@ fn dns_record_accessors_roundtrip() {
         assert_eq!(ares_dns_rr_set_bin(rr_txt, ARES_RR_TXT_DATA, txt.as_ptr(), txt.len()), ARES_SUCCESS);
 
         let mut rr_opt = ptr::null_mut();
-        // OPT's public class is IN; the UDP payload size is a separate field
-        // (the wire class is overloaded with ARES_RR_OPT_UDP_SIZE).
+        // OPT's public class is IN; the wire class carries ARES_RR_OPT_UDP_SIZE.
         assert_eq!(ares_dns_record_rr_add(&mut rr_opt, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_OPT as u32, ARES_CLASS_IN as u32, 0), ARES_SUCCESS);
         assert_eq!(ares_dns_rr_set_u16(rr_opt, ARES_RR_OPT_UDP_SIZE, 1232), ARES_SUCCESS);
         let optval = b"optdata";
         assert_eq!(ares_dns_rr_set_opt(rr_opt, ARES_RR_OPT_OPTIONS, 5, optval.as_ptr(), optval.len()), ARES_SUCCESS);
 
-        // rr_add grows the record's internal RR array, which can reallocate and
-        // invalidate earlier rr pointers (same as upstream c-ares's ares_array), so
-        // re-fetch each RR by index before reading.
+        // rr_add can reallocate the RR array and invalidate earlier pointers; re-fetch by index.
         let rr_a = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 0);
         let rr_aaaa = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 1);
         let rr_mx = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 2);
@@ -446,7 +411,6 @@ fn dns_record_accessors_roundtrip() {
         let _ = ares_dns_rr_get_opt_byid(rr_opt, ARES_RR_OPT_OPTIONS, 5, &mut oval, &mut olen);
         let _ = ares_dns_rr_del_opt_byid(rr_opt, ARES_RR_OPT_OPTIONS, 5);
 
-        // Common per-RR getters.
         for &rr in &[rr_a, rr_aaaa, rr_mx, rr_soa, rr_caa, rr_txt, rr_opt] {
             assert!(!ares_dns_rr_get_name(rr).is_null());
             let _ = ares_dns_rr_get_type(rr);
@@ -457,7 +421,6 @@ fn dns_record_accessors_roundtrip() {
         assert!(!ares_dns_rr_get_keys(T_A as u32, &mut kcnt).is_null());
         assert!(kcnt >= 1);
 
-        // Record-level getters/setters.
         assert_eq!(ares_dns_record_get_id(rec), 0x1234);
         ares_dns_record_set_id(rec, 0x5678);
         assert_eq!(ares_dns_record_get_id(rec), 0x5678);
@@ -482,8 +445,6 @@ fn dns_record_accessors_roundtrip() {
     }
 }
 
-// ---------- pure enum/string converters ----------
-
 #[test]
 fn dns_record_converters() {
     unsafe {
@@ -507,8 +468,6 @@ fn dns_record_converters() {
     }
 }
 
-// ---------- globals / library / strerror / mkquery ----------
-
 #[test]
 fn library_globals_and_strerror() {
     unsafe {
@@ -522,9 +481,9 @@ fn library_globals_and_strerror() {
         for code in 0..25 {
             assert!(!ares_strerror(code).is_null());
         }
-        ares_free(ptr::null_mut()); // no-op
+        ares_free(ptr::null_mut());
         let p = libc::malloc(16);
-        ares_free(p); // libc::free of a libc::malloc'd block
+        ares_free(p);
     }
 }
 
@@ -534,7 +493,6 @@ fn mkquery_roundtrip() {
     unsafe {
         let mut buf: *mut u8 = ptr::null_mut();
         let mut buflen: c_int = 0;
-        // dnsclass=IN(1), qtype=A(1), id=0x1234, rd=1
         let rc = ares_mkquery(name.as_ptr(), 1, 1, 0x1234, 1, &mut buf, &mut buflen);
         assert_eq!(rc, ARES_SUCCESS);
         assert!(!buf.is_null() && buflen > 12);
@@ -542,10 +500,8 @@ fn mkquery_roundtrip() {
     }
 }
 
-// ---------- channel-level config (needs ares_init: a file read, no sockets) ----------
-
 unsafe extern "C" fn ai_capture(arg: *mut c_void, _status: c_int, _t: c_int, res: *mut ares_addrinfo) {
-    (*(arg as *mut *mut ares_addrinfo)) = res; // stash the addrinfo for the caller to free
+    (*(arg as *mut *mut ares_addrinfo)) = res;
 }
 
 #[test]
@@ -554,7 +510,6 @@ fn channel_config_smoke() {
         let mut ch: Channel = ptr::null_mut();
         assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
 
-        // server setters: CSV + node-list forms
         let csv = CString::new("8.8.8.8,1.1.1.1").unwrap();
         assert_eq!(ares_set_servers_csv(ch, csv.as_ptr()), ARES_SUCCESS);
         assert_eq!(ares_set_servers_ports_csv(ch, csv.as_ptr()), ARES_SUCCESS);
@@ -575,7 +530,6 @@ fn channel_config_smoke() {
         };
         assert_eq!(ares_set_servers_ports(ch, &pnode), ARES_SUCCESS);
 
-        // server getters (allocate -> free)
         let mut servers: *mut ares_addr_node = ptr::null_mut();
         if ares_get_servers(ch, &mut servers) == ARES_SUCCESS && !servers.is_null() {
             ares_free_data(servers as *mut c_void);
@@ -589,7 +543,7 @@ fn channel_config_smoke() {
             ares_free_data(sp as *mut c_void);
         }
 
-        // misc channel config (all no-op or store-only, no sockets)
+        // Store-only config; no sockets.
         let sortlist = CString::new("130.155.160.0/255.255.240.0").unwrap();
         let _ = ares_set_sortlist(ch, sortlist.as_ptr());
         ares_set_local_ip4(ch, 0x7f000001);
@@ -602,13 +556,11 @@ fn channel_config_smoke() {
         // NULL funcs is misuse: upstream returns ARES_EFORMERR (2).
         assert_eq!(ares_set_socket_functions_ex(ch, ptr::null(), ptr::null_mut()), 2);
 
-        // save/restore options round-trip (malloc'd arrays -> ares_destroy_options)
         let mut opts: ares_options = std::mem::zeroed();
         let mut optmask: c_int = 0;
         assert_eq!(ares_save_options(ch, &mut opts, &mut optmask), ARES_SUCCESS);
         ares_destroy_options(&mut opts);
 
-        // dup -> destroy
         let mut ch2: Channel = ptr::null_mut();
         assert_eq!(ares_dup(&mut ch2, ch), ARES_SUCCESS);
         assert!(!ch2.is_null());
@@ -629,7 +581,6 @@ fn gethostbyname_file_and_free() {
         assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
         let name = CString::new("localhost").unwrap();
         let mut he: *mut libc::hostent = ptr::null_mut();
-        // reads /etc/hosts; tolerate not-found, but free on success (no UB/leak either way)
         let _ = ares_gethostbyname_file(ch, name.as_ptr(), AF_INET, &mut he);
         if !he.is_null() {
             ares_free_hostent(he);
@@ -643,7 +594,6 @@ fn getaddrinfo_ip_literal_freeaddrinfo() {
     unsafe {
         let mut ch: Channel = ptr::null_mut();
         assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
-        // An IP literal resolves synchronously (no socket); the caller owns the result.
         let mut got: *mut ares_addrinfo = ptr::null_mut();
         let name = CString::new("127.0.0.1").unwrap();
         ares_getaddrinfo(
@@ -657,18 +607,15 @@ fn getaddrinfo_ip_literal_freeaddrinfo() {
         if !got.is_null() {
             ares_freeaddrinfo(got);
         }
-        ares_freeaddrinfo(ptr::null_mut()); // null no-op
+        ares_freeaddrinfo(ptr::null_mut());
         ares_destroy(ch);
     }
 }
 
 #[test]
 fn set_servers_stack_chain_no_bad_free() {
-    // The USER-ALLOCATED role of these dual-role node types: the caller builds a
-    // chain (here on the stack, as benches/req100k.rs does) for ares_set_servers
-    // [_ports] and owns/frees it itself — it is NEVER passed to ares_free_data. So
-    // the types must have no chain-walking Drop, else dropping the stack head would
-    // Box::free a stack `next` (munmap_chunk: invalid pointer / Miri: invalid free).
+    // USER-ALLOCATED role: stack-built chains passed to ares_set_servers[_ports]
+    // are never freed via ares_free_data, so Drop must not walk the chain.
     unsafe {
         let mut ch: Channel = ptr::null_mut();
         assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
@@ -702,25 +649,19 @@ fn set_servers_stack_chain_no_bad_free() {
         assert_eq!(ares_set_servers_ports(ch, &p1), ARES_SUCCESS);
 
         ares_destroy(ch);
-        // n1/n2/p1/p2 drop here as plain stack values — must free nothing.
     }
 }
 
 #[test]
 fn get_servers_result_is_freed_with_ares_free_data() {
-    // The c-ares-ALLOCATED role of the same dual-role node types: ares_get_servers
-    // [_ports] allocate and return the list, and the caller frees it with
-    // ares_free_data (the documented c-ares contract). Set two servers so the
-    // returned chain is genuinely multi-node — this exercises free_boxed_tail's
-    // tail-walk in ares_free_data (the path the old ares_get_servers heap-corruption
-    // bug lived on); Miri checks it for leak / use-after-free / double-free.
+    // c-ares-ALLOCATED role: returned chains are freed with ares_free_data; a
+    // two-node chain exercises the tail walk that once corrupted the heap.
     unsafe {
         let mut ch: Channel = ptr::null_mut();
         assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
         let csv = CString::new("8.8.8.8,1.1.1.1").unwrap();
         assert_eq!(ares_set_servers_csv(ch, csv.as_ptr()), ARES_SUCCESS);
 
-        // ares_addr_node chain
         let mut nodes: *mut ares_addr_node = ptr::null_mut();
         assert_eq!(ares_get_servers(ch, &mut nodes), ARES_SUCCESS);
         assert!(!nodes.is_null());
@@ -733,7 +674,6 @@ fn get_servers_result_is_freed_with_ares_free_data() {
         assert!(n >= 2, "multi-node chain so the tail-walk actually runs (got {n})");
         ares_free_data(nodes as *mut c_void);
 
-        // ares_addr_port_node chain
         let mut pnodes: *mut AresAddrPortNode = ptr::null_mut();
         assert_eq!(ares_get_servers_ports(ch, &mut pnodes), ARES_SUCCESS);
         assert!(!pnodes.is_null());
@@ -752,13 +692,11 @@ fn get_servers_result_is_freed_with_ares_free_data() {
 
 #[test]
 fn parse_multi_record_reply_freed_via_free_chain() {
-    // Two MX records -> a 2-node AresMxReply chain, each node owning a `host` CString.
-    // ares_free_data -> free_chain must walk the tail AND each node's fields-only Drop must
-    // free its own field exactly once (Miri: no leak / no double-free) — the multi-node
-    // reply path that single-record parse tests never exercised.
-    let mut mx1 = vec![0x00u8, 0x0A]; // preference 10
+    // Two MX records -> a 2-node chain; free_chain must walk the tail and free
+    // each node's field exactly once (Miri: no leak / no double-free).
+    let mut mx1 = vec![0x00u8, 0x0A];
     mx1.extend(name_bytes("mail1.example.com"));
-    let mut mx2 = vec![0x00u8, 0x14]; // preference 20
+    let mut mx2 = vec![0x00u8, 0x14];
     mx2.extend(name_bytes("mail2.example.com"));
     let buf = response("example.com", T_MX, &[rr(T_MX, &mx1), rr(T_MX, &mx2)]);
     unsafe {
@@ -770,9 +708,8 @@ fn parse_multi_record_reply_freed_via_free_chain() {
     }
 }
 
-/// The cached in_addr/in6_addr getters must hand out a stable pointer whose
-/// pointee stays readable across consecutive calls (upstream contract: valid
-/// while the RR is alive). Guards the Cell-backed refresh in dns_record/safe.rs.
+/// Cached in_addr/in6_addr getters must return a stable pointer valid while the
+/// RR is alive (guards the Cell-backed refresh in dns_record/safe.rs).
 #[test]
 fn dns_record_cached_addr_pointer_stability() {
     const T_AAAA: u16 = 28;
@@ -812,8 +749,7 @@ fn dns_record_cached_addr_pointer_stability() {
 }
 
 /// rr_add -> rr_get -> rr_del over a growing/shrinking section: counts stay
-/// consistent, survivors shift down (Vec::remove semantics), out-of-range
-/// accesses fail cleanly instead of dangling.
+/// consistent, survivors shift down, out-of-range accesses fail cleanly.
 #[test]
 fn dns_record_rr_add_get_del_sequence() {
     unsafe {

@@ -16,9 +16,6 @@ pub type ares_socket_t = c_int;
 #[allow(non_camel_case_types)]
 pub type ares_ssize_t = libc::ssize_t;
 
-// ---------------------------------------------------------------------------
-// ares_process_fds() event/flag constants
-// ---------------------------------------------------------------------------
 pub const ARES_FD_EVENT_NONE: c_uint = 0;
 pub const ARES_FD_EVENT_READ: c_uint = 1 << 0;
 pub const ARES_FD_EVENT_WRITE: c_uint = 1 << 1;
@@ -35,9 +32,6 @@ pub struct ares_fd_events_t {
     pub events: c_uint,
 }
 
-// ---------------------------------------------------------------------------
-// Socket-option / connect / bind / sockfunc flags
-// ---------------------------------------------------------------------------
 pub const ARES_SOCKET_OPT_SENDBUF_SIZE: c_uint = 0;
 pub const ARES_SOCKET_OPT_RECVBUF_SIZE: c_uint = 1;
 pub const ARES_SOCKET_OPT_BIND_DEVICE: c_uint = 2;
@@ -60,7 +54,6 @@ pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *con
     install_socket_functions(channeldata, funcs, user_data);
 }
 
-/// Safe body of the legacy socket-function install.
 fn install_socket_functions(
     channeldata: &mut ChannelData,
     funcs: &AresSocketFunctions,
@@ -70,8 +63,7 @@ fn install_socket_functions(
     channeldata.apply_socket_factory(factory);
 }
 
-/// Extended socket functions (c-ares 1.34.6 API).
-/// Maps to the basic AresSocketFunctions internally.
+/// Extended socket functions (c-ares 1.34.6), mapped onto `AresSocketFunctions` internally.
 #[repr(C)]
 pub struct AresSocketFunctionsEx {
     pub version: c_uint,
@@ -101,15 +93,13 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
     install_socket_functions_ex(channeldata, ex, user_data)
 }
 
-/// Safe body of the extended-socket-function install: validate the ABI, then
-/// rebuild the channel's factory with both the legacy and extended callbacks.
+/// Validate the extended ABI, then rebuild the channel's factory with both callback sets.
 fn install_socket_functions_ex(
     channeldata: &mut ChannelData,
     ex: &AresSocketFunctionsEx,
     user_data: *mut c_void,
 ) -> crate::ffi::ares_status_t {
-    // Version 1 is the only ABI we implement; every required callback must be
-    // present (optional ones are the getname/bind/ifname trio).
+    // Version 1 is the only supported ABI; optional callbacks are getname/bind/ifname.
     if ex.version != 1
         || ex.asocket.is_none()
         || ex.aclose.is_none()
@@ -147,9 +137,8 @@ pub struct AresSocketFunctions {
     pub asendv: Option<unsafe extern "C" fn(fd: ares_socket_t, *const iovec, c_int, user_data: *mut c_void) -> ares_ssize_t>,
 }
 
-/// The extra callbacks only the extended (`ares_set_socket_functions_ex`)
-/// table carries. Kept out of the C-visible `AresSocketFunctions` so the
-/// legacy struct's ABI does not change.
+/// Callbacks only the extended table carries; kept out of the C-visible
+/// `AresSocketFunctions` so the legacy struct's ABI is unchanged.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ExFuncs {
     pub asetsockopt: Option<unsafe extern "C" fn(ares_socket_t, crate::ffi::ares_socket_opt_t, *const c_void, socklen_t, *mut c_void) -> c_int>,
@@ -290,30 +279,24 @@ fn default_setsockopt(fd: ares_socket_t, opt: c_uint, value: &[u8]) -> c_int {
     unsafe { setsockopt(fd, level, name, ptr, len) }
 }
 
-/// The channel's socket source: the (user-replaceable) C function table.
-/// Implements the core `SocketFactory` trait, so the engine never sees
-/// the table or the user_data pointer.
+/// The channel's socket source: the user-replaceable C function table, implementing
+/// `SocketFactory` so the engine never sees the table or `user_data`.
 #[derive(Clone)]
 pub struct CSocketFactory {
     funcs: AresSocketFunctions,
     user_data: *mut c_void,
-    // Socket-state callbacks (ares_set_socket_callback / _configure_callback),
-    // consulted on every freshly created fd. A nonzero return refuses the
-    // socket: `create` returns Err and core turns it into ARES_ECONNREFUSED,
-    // exactly as for an asocket() failure (matches upstream ares_conn.c).
-    // Immutable — a setter rebuilds the factory rather than mutating it, so
-    // channels that share an Rc (ares_dup) stay independent.
+    // Socket-state callbacks, consulted per fresh fd: nonzero refuses the socket
+    // (Err -> ARES_ECONNREFUSED). Immutable, so each setter rebuilds the factory
+    // and channels sharing an Rc (ares_dup) stay independent.
     create_cb: ares_sock_create_callback,
     create_arg: *mut c_void,
     config_cb: ares_sock_config_callback,
     config_arg: *mut c_void,
-    /// Extended-table callbacks, present only after
-    /// `ares_set_socket_functions_ex`.
+    /// Extended-table callbacks, present only after `ares_set_socket_functions_ex`.
     ex: Option<ExFuncs>,
     /// True once the caller installed a custom socket table (legacy or ex).
     custom: bool,
-    /// Socket-option / local-bind / state-callback settings (`ARES_OPT_*` and
-    /// `ares_set_local_*`), copied by every rebuild of the factory.
+    /// Socket-option / local-bind / state-callback settings, copied by every rebuild.
     socket: SocketConfig,
 }
 
@@ -333,10 +316,8 @@ impl Default for CSocketFactory {
     }
 }
 
-/// One socket created from a snapshot of the factory's function table. The
-/// snapshot (instead of a factory back-reference) keeps a replaced table
-/// alive for sockets that outlive an ares_set_socket_functions() swap —
-/// the same semantics the old per-socket Rc<CSocketFactory> provided.
+/// One socket with a snapshot of the factory's function table, so a replaced
+/// table stays alive for sockets that outlive an `ares_set_socket_functions()` swap.
 struct CSocket {
     fd: ares_socket_t,
     funcs: AresSocketFunctions,
@@ -344,11 +325,9 @@ struct CSocket {
     user_data: *mut c_void,
     sock_state_cb: ares_sock_state_cb,
     sock_state_cb_data: *mut c_void,
-    /// Caller-supplied sockets may be blocking (legacy tables are not required
-    /// to install O_NONBLOCK), so the shared-UDP drain must not loop on them.
+    /// Caller-supplied sockets may be blocking, so the UDP drain must not loop on them.
     drain_safe: bool,
-    /// Set once the open notification has fired, so a refused/failed creation
-    /// does not emit a spurious close notification.
+    /// Set once the open notification fired, avoiding a spurious close on failed creation.
     notified_open: Cell<bool>,
 }
 
@@ -395,8 +374,7 @@ impl crate::async_runtime::socket::Socket for CSocket {
 
     fn send(&self, data: &[u8]) -> io::Result<usize> {
         let result = if let Some(asendto) = self.ex.and_then(|ex| ex.asendto) {
-            // The socket is connected; a NULL destination means "use the
-            // connected peer", matching upstream's UDP write path.
+            // Connected socket: NULL destination means "use the connected peer".
             let ptr = data.as_ptr() as *const c_void;
             let user = self.user_data;
             unsafe { asendto(self.fd, ptr, data.len(), 0, std::ptr::null(), 0, user) }
@@ -425,8 +403,7 @@ impl Drop for CSocket {
 }
 
 impl CSocketFactory {
-    /// ares_set_socket_functions[_ex]: a new function table, but the
-    /// socket-state callbacks are an independent setting — carry them over.
+    /// New function table; socket-state callbacks are an independent setting, so carry them over.
     pub(crate) fn with_funcs(funcs: AresSocketFunctions, user_data: *mut c_void, prev: &CSocketFactory) -> Rc<Self> {
         Rc::new(Self {
             funcs,
@@ -441,9 +418,7 @@ impl CSocketFactory {
         })
     }
 
-    /// ares_set_socket_functions_ex: keep the extended callbacks the legacy
-    /// table cannot express (asetsockopt / aconnect / asendto) alongside the
-    /// basic ones.
+    /// Keep the extended callbacks the legacy table cannot express, alongside the basic ones.
     pub(crate) fn with_ex_funcs(
         funcs: AresSocketFunctions,
         ex: ExFuncs,
@@ -463,9 +438,7 @@ impl CSocketFactory {
         })
     }
 
-    /// Copy the current socket-option / local-bind / state-callback settings
-    /// into a rebuilt factory (configuration exports mutate a channel's own
-    /// factory copy-on-write; ares_dup keeps its own handle).
+    /// Copy socket-option / local-bind / state-callback settings into a rebuilt factory.
     pub(crate) fn with_config(&self, socket: SocketConfig) -> Rc<Self> {
         Rc::new(Self {
             funcs: self.funcs.clone(),
@@ -480,7 +453,6 @@ impl CSocketFactory {
         })
     }
 
-    /// ares_set_socket_callback: keep everything, set the create callback.
     pub fn with_create_cb(&self, cb: ares_sock_create_callback, arg: *mut c_void) -> Rc<Self> {
         Rc::new(Self {
             funcs: self.funcs.clone(),
@@ -495,7 +467,6 @@ impl CSocketFactory {
         })
     }
 
-    /// ares_set_socket_configure_callback: keep everything, set the config callback.
     pub fn with_config_cb(&self, cb: ares_sock_config_callback, arg: *mut c_void) -> Rc<Self> {
         Rc::new(Self {
             funcs: self.funcs.clone(),
@@ -527,18 +498,14 @@ impl CSocketFactory {
             drain_safe: !self.custom,
             notified_open: Cell::new(false),
         });
-        // Apply buffer/device/local-address settings first, then the
-        // create/configure callbacks. Any failure drops `sock`, closing the fd
-        // (CSocket::drop -> aclose) and surfacing ECONNREFUSED.
+        // Apply settings then callbacks; any failure drops `sock`, closing the fd
+        // via CSocket::drop -> aclose and surfacing ECONNREFUSED.
         self.configure(fd, addr.is_ipv4())?;
-        // A socket-state callback may refuse the fresh fd; dropping `sock`
-        // closes it and the Err becomes ECONNREFUSED.
         if !self.run_sock_callbacks(fd, socket_type == SOCK_STREAM) {
             return Err(Error::from_raw_os_error(libc::ECONNREFUSED));
         }
-        // Approximation of upstream's state machine: report the fd readable
-        // once it is live, and (0,0) when it closes. Write-interest transitions
-        // while a datagram is pending are not modeled by this reactor.
+        // Approximation of upstream's state machine: report readable when live and
+        // (0,0) on close; write-interest transitions are not modeled by this reactor.
         if let Some(cb) = self.socket.sock_state_cb {
             sock.notified_open.set(true);
             cb(self.socket.sock_state_cb_data, fd, 1, 0);
@@ -546,9 +513,7 @@ impl CSocketFactory {
         Ok(sock)
     }
 
-    /// Apply `ARES_OPT_SOCK_SNDBUF`/`RCVBUF`, `SO_BINDTODEVICE`, and the
-    /// configured local source address (the default path only; a custom socket
-    /// table owns its own addressing).
+    /// Apply buffer/device/local-address settings; a custom table owns its own addressing.
     fn configure(&self, fd: ares_socket_t, is_ipv4: bool) -> io::Result<()> {
         if self.socket.send_buf > 0 {
             self.setsockopt(fd, ARES_SOCKET_OPT_SENDBUF_SIZE, &self.socket.send_buf.to_ne_bytes())?;
@@ -557,7 +522,7 @@ impl CSocketFactory {
             self.setsockopt(fd, ARES_SOCKET_OPT_RECVBUF_SIZE, &self.socket.recv_buf.to_ne_bytes())?;
         }
         if !self.socket.local_dev.is_empty() {
-            // Prior c-ares versions silently ignore device-bind failure.
+            // Device-bind failure is ignored, matching prior c-ares behavior.
             let _ = self.setsockopt(
                 fd,
                 ARES_SOCKET_OPT_BIND_DEVICE,
@@ -590,9 +555,8 @@ impl CSocketFactory {
         Ok(())
     }
 
-    /// One `setsockopt` through the extended callback when present, else the
-    /// platform default (the legacy table reports ENOSYS, which upstream
-    /// treats as success).
+    /// `setsockopt` via the extended callback, else the platform default
+    /// (ENOSYS is treated as success, as upstream does).
     fn setsockopt(&self, fd: ares_socket_t, opt: c_uint, value: &[u8]) -> io::Result<()> {
         let rv = if let Some(ex) = self.ex {
             match ex.asetsockopt {
@@ -619,7 +583,7 @@ impl CSocketFactory {
         Ok(())
     }
 
-    /// Run the create then configure callbacks on a fresh fd; false = refused.
+    /// Run create then configure callbacks; false means refused.
     fn run_sock_callbacks(&self, fd: c_int, is_tcp: bool) -> bool {
         let sock_type = if is_tcp { SOCK_STREAM } else { SOCK_DGRAM };
         if let Some(cb) = self.create_cb {

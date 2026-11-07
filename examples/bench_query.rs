@@ -1,12 +1,6 @@
-//! Perf gate for the async-executor spike: measure the per-query cost of the
-//! `ares_query` lifecycle (which the spike routes through the custom executor)
-//! end-to-end against an in-process mock DNS server. Reports wall-time and
-//! allocation count per query via a counting global allocator.
-//!
-//! Run the SAME binary on `spike-async` and on the prev commit and compare:
-//!   cargo run --release --example bench_query
-//! (`ares_query`/`ares_fds`/`ares_timeout`/`ares_process` are stable exports, so
-//! this builds unchanged on both branches.)
+//! Per-query cost of the `ares_query` lifecycle against an in-process mock DNS
+//! server; reports wall-time and allocation count. Run the same binary on both
+//! commits and compare.
 
 use cares_rs::*;
 use libc::*;
@@ -18,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
-// ---- counting allocator -----------------------------------------------------
 struct Counting;
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
@@ -36,7 +29,6 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
-// ---- in-process mock DNS server ---------------------------------------------
 // Echoes the query's QID + question and appends a single A record (1.2.3.4).
 fn spawn_mock() -> u16 {
     let sock = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
@@ -52,10 +44,9 @@ fn spawn_mock() -> u16 {
                 continue;
             }
             let mut resp = buf[..n].to_vec();
-            resp[2] |= 0x80; // QR = 1 (response)
-            resp[6] = 0; // ANCOUNT hi
-            resp[7] = 1; // ANCOUNT lo = 1
-            // answer: name ptr -> offset 12, type A, class IN, ttl 60, rdlen 4, 1.2.3.4
+            resp[2] |= 0x80;
+            resp[6] = 0;
+            resp[7] = 1;
             resp.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0x00, 0x04, 1, 2, 3, 4]);
             let _ = sock.send_to(&resp, from);
         }
@@ -63,10 +54,8 @@ fn spawn_mock() -> u16 {
     port
 }
 
-// ---- callbacks --------------------------------------------------------------
-// Count every completion; track non-success separately (under heavy load a few
-// queries can hit ephemeral-port/fd pressure → ECONNREFUSED). Never abort from
-// an extern-C callback — a panic across the FFI boundary would core-dump.
+// Count every completion and any non-success (ephemeral-port/fd pressure under
+// load); never panic across the FFI boundary.
 static DONE: AtomicU64 = AtomicU64::new(0);
 static FAILED: AtomicU64 = AtomicU64::new(0);
 unsafe extern "C" fn cb(_arg: *mut c_void, status: c_int, _t: c_int, _abuf: *mut u8, _alen: c_int) {
@@ -83,7 +72,6 @@ unsafe extern "C" fn host_cb(_arg: *mut c_void, status: c_int, _t: c_int, _h: *m
 }
 
 fn set_server(channel: Channel, port: u16) {
-    // point the channel at 127.0.0.1:<mock port>
     let s = CString::new(format!("127.0.0.1:{port}")).unwrap();
     unsafe { ares_set_servers_csv(channel, s.as_ptr()) };
 }
@@ -104,7 +92,7 @@ fn drive(channel: Channel) {
 }
 
 const BATCH: usize = 20;
-const EPOCHS: usize = 1500; // 20 * 1500 = 30_000 queries (modest concurrency)
+const EPOCHS: usize = 1500;
 
 fn run_epochs(port: u16) {
     let name = CString::new("mydomain.local").unwrap();
@@ -113,7 +101,6 @@ fn run_epochs(port: u16) {
         assert_eq!(unsafe { ares_init(&mut channel) }, ARES_SUCCESS);
         set_server(channel, port);
         for _ in 0..BATCH {
-            // T_A = 1
             unsafe { ares_query(channel, name.as_ptr(), 1, 1, Some(cb), ptr::null_mut()) };
         }
         drive(channel);
@@ -158,7 +145,7 @@ fn main() {
     assert_eq!(ares_library_init(ARES_LIB_INIT_ALL), ARES_SUCCESS);
     let port = spawn_mock();
 
-    // warm-up (both paths) so lazy inits don't skew the measured windows.
+    // Warm-up so lazy inits don't skew the measured windows.
     let name = CString::new("mydomain.local").unwrap();
     let mut ch: Channel = ptr::null_mut();
     assert_eq!(unsafe { ares_init(&mut ch) }, ARES_SUCCESS);

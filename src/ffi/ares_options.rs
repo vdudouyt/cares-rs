@@ -11,9 +11,8 @@ use crate::ffi::channel::ChannelData;
 use crate::ffi::channel::channel_access;
 use crate::ares_socket_t;
 
-/// Upstream's private sortlist pattern: an address + prefix length. The public
-/// header only forward-declares it, but `ares_options.sortlist` / `nsort` make
-/// the layout observable through `ares_save_options`, so mirror it exactly.
+/// Upstream's private sortlist pattern (address + prefix length), mirrored
+/// exactly because `ares_save_options` exposes its layout.
 #[repr(C)]
 pub struct apattern {
     pub addr: crate::ffi::ares_addr,
@@ -31,8 +30,6 @@ pub struct ares_server_failover_options {
     pub retry_chance: c_ushort, // probability (1/N); 0 disables retries
     pub retry_delay:  libc::size_t,    // minimum delay in milliseconds
 }
-
-// ------- The ares_options struct itself -------
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -96,8 +93,7 @@ impl Default for ares_options {
     }
 }
 
-/// Decode `ARES_OPT_SORTLIST` patterns. Invalid families/masks are rejected
-/// like `ares_set_sortlist`.
+/// Decode `ARES_OPT_SORTLIST` patterns; invalid families/masks are rejected.
 fn decode_sortlist(patterns: &[apattern]) -> Result<Vec<(IpAddr, u8)>, c_int> {
     let mut out = Vec::with_capacity(patterns.len());
     for pattern in patterns {
@@ -162,13 +158,11 @@ pub const ARES_FLAG_DNS0x20: c_int = 1 << 10;
 /// `out_channel` must be non-null; `options` must be NULL or a valid `ares_options` consistent with `optmask`.
 #[no_mangle]
 pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *const ares_options, optmask: c_int) -> c_int {
-    // Upstream allows a NULL options pointer only when optmask == 0 (equivalent
-    // to ares_init); a non-zero optmask with NULL options is ARES_ENODATA.
+    // Upstream allows NULL options only when optmask == 0; otherwise ARES_ENODATA.
     if options.is_null() && optmask != 0 {
         return ARES_ENODATA;
     }
-    // options may be NULL here only when optmask == 0 (checked above); bind a
-    // zeroed default in that case so no field is ever read through a NULL pointer.
+    // Bind a zeroed default so no field is read through a NULL pointer.
     let default_opts;
     let options = if options.is_null() {
         default_opts = ares_options::default();
@@ -191,15 +185,13 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     }
 }
 
-/// Safe body of ares_init_options: decode the C option struct, apply the core
-/// cascade, and build the unfinalized channel.
+/// Decode the C option struct and build the unfinalized channel.
 fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelData, c_int> {
-    // The built-in event thread owns the socket-state notifications itself, so
-    // upstream rejects combining it with a caller state callback.
+    // Upstream rejects the event thread combined with a caller state callback,
+    // since the event thread issues those notifications itself.
     if optmask & ARES_OPT_EVENT_THREAD != 0 && optmask & ARES_OPT_SOCK_STATE_CB != 0 {
         return Err(crate::ffi::error::ARES_EFORMERR);
     }
-    // Marshal every C field into an owned mirror before any logic runs.
     let decoded_sortlist = match (optmask & ARES_OPT_SORTLIST != 0)
         .then(|| decode_sortlist_options(options))
     {
@@ -262,9 +254,7 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
     Ok(channeldata)
 }
 
-/// Apply the socket-related options (state callback + buffer sizes / local
-/// bind settings) after the core option cascade, then install them in a
-/// rebuilt socket factory. Safe body so the unsafe init shim stays thin.
+/// Apply the socket state callback and refresh the socket configuration.
 fn install_socket_options(channeldata: &mut ChannelData, optmask: c_int, options: &ares_options) {
     if optmask & ARES_OPT_SOCK_STATE_CB != 0 {
         channeldata.sock_state_cb = options.sock_state_cb;
@@ -273,7 +263,7 @@ fn install_socket_options(channeldata: &mut ChannelData, optmask: c_int, options
     channeldata.refresh_socket_config();
 }
 
-/// Report the stored socket state callback in ares_save_options.
+/// Report the stored socket state callback.
 fn save_socket_options(channeldata: &ChannelData, out: &mut ares_options, mask: &mut c_int) {
     if channeldata.state.optmask & ARES_OPT_SOCK_STATE_CB != 0 {
         out.sock_state_cb = channeldata.sock_state_cb;
@@ -282,8 +272,7 @@ fn save_socket_options(channeldata: &ChannelData, out: &mut ares_options, mask: 
     }
 }
 
-/// Decode `ARES_OPT_SORTLIST` from the caller's option struct. `Some(empty)`
-/// means an explicit `nsort == 0` (clears the list).
+/// Decode `ARES_OPT_SORTLIST`; `Some(empty)` means explicit `nsort == 0` (clears).
 fn decode_sortlist_options(options: &ares_options) -> Result<Option<Vec<(IpAddr, u8)>>, c_int> {
     if options.nsort <= 0 {
         return Ok(Some(Vec::new()));
@@ -297,7 +286,7 @@ fn decode_sortlist_options(options: &ares_options) -> Result<Option<Vec<(IpAddr,
     decode_sortlist(patterns).map(Some)
 }
 
-/// Copy the safe sortlist entries into a caller-owned libc array.
+/// Copy sortlist entries into a caller-owned libc array.
 fn save_sortlist(entries: &[crate::core::sortlist::SortlistEntry]) -> Option<(*mut apattern, c_int)> {
     let count = entries.len();
     let arr = unsafe { libc::malloc(count * std::mem::size_of::<apattern>()) as *mut apattern };
@@ -356,8 +345,8 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
         out.socket_receive_buffer_size = saved.socket_receive_buffer_size;
     }
 
-    // servers / domains transfer through libc::malloc; their mask bits are
-    // reported only when the allocation lands (matches the historical shape).
+    // Servers/domains are malloc'd for the caller; their mask bits are only
+    // set when the allocation succeeds.
     if !saved.v4_servers.is_empty() {
         let count = saved.v4_servers.len();
         let ptr = unsafe { libc::malloc(count * std::mem::size_of::<in_addr>()) as *mut in_addr };
@@ -408,8 +397,7 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
     ARES_SUCCESS
 }
 
-/// Copy the flags word and the (optional) EDNS payload size into a saved
-/// options struct. Safe helper so the `unsafe extern` shim stays thin.
+/// Copy the flags word and optional EDNS payload size into a saved options struct.
 fn save_flags_and_ednspsz(out: &mut ares_options, flags: c_int, ednspsz: c_int, mask: c_int) {
     out.flags = flags;
     if mask & ARES_OPT_EDNSPSZ != 0 {
@@ -455,17 +443,14 @@ pub unsafe extern "C" fn ares_destroy_options(options: *mut ares_options) {
     if options.is_null() { return; }
     let opts = unsafe { &mut *options };
 
-    // Free servers array
     if !opts.servers.is_null() {
         unsafe { libc::free(opts.servers as *mut c_void) };
         opts.servers = std::ptr::null_mut();
     }
 
-    // Free domains array
     if !opts.domains.is_null() {
-        // Iterate the signed range so a negative ndomains yields no iterations
-        // (`0..negative` is empty), exactly like upstream's signed
-        // `for (i = 0; i < ndomains; i++)`. Avoids the negative-to-huge-usize trap.
+        // Signed range: a negative ndomains yields no iterations, matching
+        // upstream's `for (i = 0; i < ndomains; i++)` and avoiding a huge usize.
         for i in 0..opts.ndomains {
             let ptr = unsafe { *opts.domains.add(i as usize) };
             if !ptr.is_null() {
@@ -476,22 +461,18 @@ pub unsafe extern "C" fn ares_destroy_options(options: *mut ares_options) {
         opts.domains = std::ptr::null_mut();
     }
 
-    // Free sortlist array
     take_sortlist(opts);
 
-    // Free lookups string
     if !opts.lookups.is_null() {
         drop(unsafe { std::ffi::CString::from_raw(opts.lookups) });
         opts.lookups = std::ptr::null_mut();
     }
 
-    // Free resolvconf_path
     if !opts.resolvconf_path.is_null() {
         drop(unsafe { std::ffi::CString::from_raw(opts.resolvconf_path) });
         opts.resolvconf_path = std::ptr::null_mut();
     }
 
-    // Free hosts_path
     if !opts.hosts_path.is_null() {
         drop(unsafe { std::ffi::CString::from_raw(opts.hosts_path) });
         opts.hosts_path = std::ptr::null_mut();

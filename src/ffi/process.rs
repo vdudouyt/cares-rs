@@ -1,7 +1,4 @@
-//! The reactor driver entry shims (ares_process / ares_process_fd /
-//! ares_process_fds): they marshal C fd/event inputs and drive every in-flight
-//! async future whose socket is ready (or whose timeout passed) via
-//! `ChannelData`.
+//! Reactor driver shims (ares_process / ares_process_fd / ares_process_fds).
 
 use super::*;
 use crate::ffi::ares_socket::{
@@ -36,9 +33,8 @@ pub unsafe extern "C" fn ares_process(channel: Channel, read_fds: &mut libc::fd_
     channeldata.process_channel(read_fds, write_fds, false);
 }
 
-/// Process a batch of fd events in one pass (upstream ares_process_fds()).
-/// `events` may be NULL when `nevents == 0`, which still runs timeout
-/// processing unless ARES_PROCESS_FLAG_SKIP_NON_FD is set.
+/// Process a batch of fd events in one pass. `events` may be NULL when
+/// `nevents == 0`; timeouts still run unless ARES_PROCESS_FLAG_SKIP_NON_FD is set.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process_fds(

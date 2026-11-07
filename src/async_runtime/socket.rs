@@ -1,28 +1,24 @@
-//! Socket abstraction — the engine does socket I/O only through these
-//! object-safe traits. The FFI layer implements them (delegating to the
-//! user-replaceable C socket-function table), so nothing under `src/core`
-//! names an fd table, a C callback, or a sockaddr struct.
+//! Socket abstraction: the engine does socket I/O only through these
+//! object-safe traits, implemented by the FFI layer over the C socket table.
 
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-/// One non-blocking socket, already created for the right address family;
-/// the verbs mirror the BSD socket calls the reactor needs.
+/// One non-blocking socket for a fixed address family.
 pub trait Socket {
     fn as_raw_fd(&self) -> i32;
     fn connect(&self, addr: SocketAddr) -> io::Result<()>;
     fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)>;
     fn send(&self, data: &[u8]) -> io::Result<usize>;
-    /// Whether repeated non-blocking `recv` calls are guaranteed to stop with
-    /// `WouldBlock` rather than block. Draining loops (UDP connection sharing)
-    /// must not re-read when a caller-supplied socket may be blocking.
+    /// Whether repeated `recv` calls cannot block; draining loops must not
+    /// re-read a caller-supplied socket that may be blocking.
     fn drain_safe(&self) -> bool {
         true
     }
 }
 
-/// Creates fresh non-blocking sockets appropriate for a bind address.
+/// Creates fresh non-blocking sockets for a bind address.
 pub trait SocketFactory {
     fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<dyn Socket>>;
     fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<dyn Socket>>;

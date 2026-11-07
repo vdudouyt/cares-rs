@@ -1,5 +1,5 @@
-//! Lookup entry points (gethostbyname/getaddrinfo/search/query/send/...)
-//! and their per-query state + callback dispatch.
+//! Lookup entry points (gethostbyname/getaddrinfo/search/query/send/...) and
+//! their per-query state + callback dispatch.
 
 use super::*;
 use crate::core::async_client::search_precheck;
@@ -21,8 +21,6 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let hostname = unsafe { cstr_lossy(hostname) };
-    // Build the resource bundle + the self-contained future and register it. A
-    // synchronous preflight hit fires re-entrantly on this first `advance`.
     let client = channeldata.state.derive();
     let io = client.io.clone();
     let io_cb = io.clone();
@@ -59,7 +57,6 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *const c_voi
         return;
     }
     let addrbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
-    // Family validation done here (reads raw C args; stays in the shim).
     if family != libc::AF_INET && family != libc::AF_INET6 {
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
         return;
@@ -68,7 +65,6 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *const c_voi
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
         return;
     };
-    // Build the resource bundle and spawn the self-contained async future.
     let client = channeldata.state.derive();
     let io = client.io.clone();
     let io_cb = io.clone();
@@ -81,13 +77,11 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *const c_voi
 #[no_mangle]
 pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsclass: c_int, dnstype: c_int, callback: ares_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
-    // Upstream ares_search returns silently on a NULL channel/name — no
-    // callback may fire before the EFORMERR/void error return.
+    // Upstream returns silently on a NULL channel/name; no callback fires.
     if channel.is_null() || name.is_null() {
         return;
     }
     let name_str = unsafe { cstr_lossy(name) };
-    // Name sanity precedes the channel deref.
     if let Some(status) = search_precheck(name_str) {
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
         return;
@@ -111,8 +105,6 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     let Some(callback) = callback else { return; };
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let name = unsafe { cstr_lossy(name) };
-    // Preflight in core, then spawn an fd-owning async query lifecycle that
-    // creates the socket, sends, and drives its own failover/TC/timeout.
     match channeldata
         .state
         .query_payload(name, dnstype as u32, dnsclass as u32)
@@ -154,8 +146,6 @@ pub unsafe extern "C" fn ares_query_dnsrec(
     query_dnsrec_record(channeldata, name, dnsclass, dnstype, callback, arg, qid)
 }
 
-/// Safe body of ares_query_dnsrec: synchronous validation, cache probe, qid
-/// reporting and the async query lifecycle.
 fn query_dnsrec_record(
     channeldata: &mut ChannelData,
     name: &str,
@@ -175,11 +165,9 @@ fn query_dnsrec_record(
             return status;
         }
     };
-    // Cache probe: if a fresh cached reply parses, deliver synchronously.
-    // Hoisted out of the `if let` scrutinee so the cache RefMut drops at the
-    // `;` — a scrutinee guard would be held across the C callback below, and
-    // a callback re-entering any cache path would then panic (regression
-    // test: tests/reentrant_callback.rs).
+    // Cache probe: hoisted so the cache RefMut drops before the C callback;
+    // holding it across a re-entrant cache access would panic
+    // (tests/reentrant_callback.rs).
     let cache_key = CacheKey::new(
         name,
         dnstype as u16,
@@ -197,7 +185,6 @@ fn query_dnsrec_record(
             return ARES_SUCCESS;
         }
     }
-    // The query id is the first two bytes of the generated wire payload.
     if !qid.is_null() && payload.len() >= 2 {
         unsafe { *qid = u16::from_be_bytes([payload[0], payload[1]]); }
     }
@@ -234,8 +221,6 @@ pub unsafe extern "C" fn ares_search_dnsrec(
     search_dnsrec_record(Some(channeldata), rec, callback, arg)
 }
 
-/// Safe body of ares_search_dnsrec: validate the template, duplicate it for
-/// the async future, and iterate the search plan.
 fn search_dnsrec_record(
     channeldata: Option<&mut ChannelData>,
     rec: &dns_record::ares_dns_record_t,
@@ -273,25 +258,14 @@ fn search_dnsrec_record(
     ARES_SUCCESS
 }
 
-/// Looks up the node name and service name for a socket address.
-///
-/// This is the async equivalent of getnameinfo(3). It performs a reverse DNS lookup
-/// (PTR record) to get the hostname, and looks up the service name from /etc/services.
-///
-/// # Arguments
-/// * `channel` - The c-ares channel
-/// * `sa` - Pointer to a sockaddr structure (sockaddr_in or sockaddr_in6)
-/// * `salen` - Size of the sockaddr structure
-/// * `flags` - Flags controlling the lookup behavior (ARES_NI_*)
-/// * `callback` - Function to call with results
-/// * `arg` - User data passed to callback
+/// Async getnameinfo(3): reverse (PTR) lookup for the node plus a service-name
+/// lookup.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::sockaddr, salen: libc::socklen_t, flags: c_int, callback: ares_nameinfo_callback, arg: *mut c_void) {
     let Some(callback) = callback else { return; };
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
 
-    // Sockaddr unmarshal stays in the shim (reads raw C `*const sockaddr`).
     let addr_info = match extract_addr_port(sa, salen) {
         Ok(result) => result,
         Err(status) => {
@@ -300,22 +274,15 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
         }
     };
 
-    // Build the resource bundle and spawn the self-contained async future. The
-    // three synchronous short-circuits (service-only / NUMERICHOST / no-servers)
-    // fire re-entrantly on the first advance.
+    // Synchronous short-circuits (service-only / NUMERICHOST / no-servers) fire
+    // re-entrantly on the first advance.
     let client = channeldata.state.derive();
     let io = client.io.clone();
     let fut = client.getnameinfo(addr_info, flags);
     channeldata.spawn(io, fut, move |r| on_nameinfo_reply(callback, arg, r));
 }
 
-
-// ===== delivery handlers: a completed query's result (`Ok`) or a cancel status
-// (`Err`) → the C callback. One per callback signature; the shim closures forward
-// their `Result<T, c_int>` here. The only sites that call a C callback.
-
-/// ares_query / ares_send / ares_search → `ares_callback`: reply bytes on success,
-/// else the error/cancel status with a null buffer.
+/// ares_query / ares_send / ares_search → `ares_callback`.
 pub(crate) fn on_raw_reply(callback: AresCallback, arg: *mut c_void, r: Result<Delivery, c_int>) {
     let (res, timeouts): (Result<&[u8], c_int>, c_int) = match &r {
         Ok(Delivery::Raw { result, timeouts }) => (result.as_deref().map_err(|&e| e), *timeouts),
@@ -327,9 +294,7 @@ pub(crate) fn on_raw_reply(callback: AresCallback, arg: *mut c_void, r: Result<D
     }
 }
 
-/// ares_send → `ares_callback` over the send path shared with
-/// ares_send_dnsrec: store the reply in the query cache and hand the caller the
-/// raw response bytes exactly as received.
+/// ares_send → `ares_callback`; stores the reply in the cache first.
 pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, key: Option<CacheKey>, r: Result<Delivery, c_int>) {
     let (result, timeouts) = match r {
         Ok(Delivery::Raw { result, timeouts }) => (result, timeouts),
@@ -346,8 +311,7 @@ pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache:
     }
 }
 
-/// ares_query_dnsrec / ares_search_dnsrec → `ares_callback_dnsrec`: cache-store +
-/// parse the reply into an `ares_dns_record_t` on success, else the status.
+/// ares_query_dnsrec / ares_search_dnsrec → `ares_callback_dnsrec`.
 pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, key: Option<CacheKey>, r: Result<Delivery, c_int>) {
     let (result, timeouts) = match r {
         Ok(Delivery::Raw { result, timeouts }) => (result, timeouts),
@@ -371,9 +335,8 @@ pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, ca
     }
 }
 
-/// ares_gethostbyname / ares_gethostbyaddr → `ares_host_callback`: build + fire +
-/// free a C hostent on success, else the status. The timeout count (no room in the
-/// `Result<Hostent, _>` output) is read from the mailbox on completion.
+/// ares_gethostbyname/addr → `ares_host_callback`; timeouts come from the mailbox
+/// (there is no room for them in the `Result<Hostent, _>`).
 pub(crate) fn on_hostent_reply(callback: AresHostCallback, arg: *mut c_void, io: &Rc<RefCell<DnsMailbox>>, r: Result<Result<Hostent, AresError>, c_int>) {
     match r {
         Ok(inner) => {
@@ -391,8 +354,7 @@ pub(crate) fn on_hostent_reply(callback: AresHostCallback, arg: *mut c_void, io:
     }
 }
 
-/// ares_getnameinfo → `ares_nameinfo_callback`: the node / service strings on
-/// success, else the status with null strings.
+/// ares_getnameinfo → `ares_nameinfo_callback`.
 pub(crate) fn on_nameinfo_reply(callback: AresNameinfoCallback, arg: *mut c_void, r: Result<NameinfoReply, c_int>) {
     match r {
         Ok(reply) => {
@@ -404,8 +366,7 @@ pub(crate) fn on_nameinfo_reply(callback: AresNameinfoCallback, arg: *mut c_void
     }
 }
 
-/// ares_getaddrinfo → `ares_addrinfo_callback`: build the `ares_addrinfo` (nodes at
-/// `port`) on success, else the status with a null result.
+/// ares_getaddrinfo → `ares_addrinfo_callback`.
 pub(crate) fn on_addrinfo_reply(callback: AresAddrInfoCallback, arg: *mut c_void, port: u16, r: Result<AddrInfoOut, c_int>) {
     match r {
         Ok(out) if out.status.code() == ARES_SUCCESS => {
@@ -424,9 +385,7 @@ pub(crate) fn on_addrinfo_reply(callback: AresAddrInfoCallback, arg: *mut c_void
     }
 }
 
-/// Resolve a getaddrinfo service string. `numeric_only` implements
-/// ARES_AI_NUMERICSERV. Unknown services return ARES_ESERVICE; the
-/// libc::getservbyname fallback is inherently a C call.
+/// Resolve a getaddrinfo service string; `numeric_only` implements ARES_AI_NUMERICSERV.
 fn resolve_service_port(service: *const c_char, numeric_only: bool) -> Result<u16, c_int> {
     let svc = unsafe { cstr_lossy(service) };
     if numeric_only {
@@ -446,8 +405,6 @@ fn resolve_service_port(service: *const c_char, numeric_only: bool) -> Result<u1
     }
 }
 
-/// Decode the caller's hints, defaulting to AF_UNSPEC with zeroed
-/// socktype/protocol when the pointer is NULL.
 fn decode_addrinfo_hints(hints: *const ares_addrinfo_hints) -> (c_int, c_int, c_int, c_int) {
     if hints.is_null() {
         return (libc::AF_UNSPEC, 0, 0, 0);
@@ -456,8 +413,7 @@ fn decode_addrinfo_hints(hints: *const ares_addrinfo_hints) -> (c_int, c_int, c_
     (hints.ai_family, hints.ai_flags, hints.ai_socktype, hints.ai_protocol)
 }
 
-/// Resolve the service port, firing the callback with ARES_ESERVICE on an
-/// unknown/non-numeric service. `None` means the callback already fired.
+/// Resolve the service port, firing the callback; `None` means it already fired.
 fn service_port_or_callback(
     service: *const c_char,
     ai_flags: c_int,
@@ -492,15 +448,11 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 
     let (ai_family, ai_flags, ai_socktype, ai_protocol) = decode_addrinfo_hints(hints);
 
-    // Resolve the service name to a port. ARES_AI_NUMERICSERV rejects
-    // non-numeric services synchronously, before any DNS work; an unknown text
-    // service is ARES_ESERVICE either way.
     let Some(port) = service_port_or_callback(service, ai_flags, callback, arg) else {
         return;
     };
 
-    // Build the resource bundle and spawn the self-contained async future. A
-    // synchronous preflight hit (IP literal / hosts file) fires re-entrantly.
+    // A synchronous preflight hit (IP literal / hosts file) fires re-entrantly.
     let hostname_raw = unsafe { cstr_lossy(name) };
     let client = channeldata.state.derive();
     let io = client.io.clone();
@@ -521,7 +473,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     if channel.is_null() {
         return;
     }
-    // Upstream rejects anything shorter than a DNS header or too large for the
+    // Upstream rejects packets shorter than a DNS header or too large for the
     // 16-bit TCP length prefix.
     if qbuf.is_null() || !(12..(1 << 16)).contains(&qlen) {
         unsafe { callback(arg, ARES_EBADQUERY, 0, std::ptr::null_mut(), 0) };
@@ -533,15 +485,12 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
     send_raw_packet(channeldata, query_buf, callback, arg);
 }
 
-/// Safe body of ares_send: parse the caller's packet and drive the shared
-/// ares_send_dnsrec path, delivering the raw response bytes.
 fn send_raw_packet(
     channeldata: &mut ChannelData,
     query_buf: &[u8],
     callback: AresCallback,
     arg: *mut c_void,
 ) {
-    // ares_send is ares_send_dnsrec over a parsed copy of the caller's packet.
     let rec = match crate::core::dns_record::parse_record(query_buf, 0) {
         Ok(rec) => rec,
         Err(e) => {
@@ -567,9 +516,8 @@ fn send_raw_packet(
     }
 }
 
-/// Serialize an outgoing DNS record. Upstream's duplicate-based send path maps
-/// an EBADRESP from the write+parse round-trip to EBADQUERY; other writer
-/// statuses pass through unchanged.
+/// Serialize a record; upstream maps EBADRESP from the write+parse round-trip to
+/// EBADQUERY.
 fn serialize_send_record(
     rec: &dns_record::ares_dns_record_t,
 ) -> Result<Vec<u8>, crate::ffi::ares_status_t> {
@@ -583,8 +531,7 @@ fn serialize_send_record(
     }
 }
 
-/// Cache key for a caller-supplied record: its first question's name (without
-/// a trailing dot, matching the cache writer) and type.
+/// Cache key from the first question; the name has no trailing dot (matches the cache writer).
 fn record_cache_key(rec: &dns_record::ares_dns_record_t) -> Option<CacheKey> {
     let (name, qtype, qclass) = rec.query_at(0)?;
     let name = name.to_string_lossy();
@@ -599,11 +546,8 @@ fn record_cache_key(rec: &dns_record::ares_dns_record_t) -> Option<CacheKey> {
     ))
 }
 
-/// The shared ares_send / ares_send_dnsrec path: no-server preflight, query
-/// cache probe, a fresh non-zero qid stamped into the wire header, and the
-/// normal async query lifecycle (honoring ARES_FLAG_USEVC via `query_raw`).
-/// Returns `Ok(Some(cached_reply))` on a cache hit (without setting `qid`),
-/// `Ok(None)` after spawning the send, or `Err(status)` on a pre-spawn failure.
+/// Shared ares_send/ares_send_dnsrec path: preflight, cache probe, non-zero qid
+/// stamp, async lifecycle. `Ok(Some)` is a cache hit (qid untouched).
 fn send_record<F>(
     channeldata: &mut ChannelData,
     rec: &dns_record::ares_dns_record_t,
@@ -641,10 +585,8 @@ where
     if buf.len() > u16::MAX as usize || buf.len() < 12 {
         return Err(ARES_EBADQUERY);
     }
-    // Upstream generates a unique non-zero id. There is no channel-wide
-    // in-flight-qid registry to probe here, so a random non-zero value is used
-    // (documented approximation; a full registry belongs with the shared
-    // connection work).
+    // No channel-wide in-flight-qid registry exists, so a random non-zero id is
+    // used (documented approximation).
     let new_qid = {
         let id = rand::random::<u16>();
         if id == 0 { 1 } else { id }
@@ -673,7 +615,6 @@ where
     Ok(None)
 }
 
-/// Serialize an `ares_dns_record_t` and send it through the shared send path.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_send_dnsrec(
@@ -691,8 +632,6 @@ pub unsafe extern "C" fn ares_send_dnsrec(
     send_dnsrec_record(Some(channeldata), rec, callback, arg, qid)
 }
 
-/// Safe body of ares_send_dnsrec: shared cache/qid/transport path plus the
-/// synchronous cache-hit delivery.
 fn send_dnsrec_record(
     channeldata: Option<&mut ChannelData>,
     rec: &dns_record::ares_dns_record_t,

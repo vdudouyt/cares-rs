@@ -8,8 +8,6 @@ use std::time::Instant;
 use std::sync::atomic::{AtomicU32, Ordering};
 use libloading::Library;
 
-// Some non-Rusty C API invocations for benchmarking purposes
-
 #[derive(Debug)]
 #[allow(dead_code)]
 struct CAresVariant {

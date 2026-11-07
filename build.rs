@@ -1,22 +1,18 @@
 use std::env;
 use std::path::PathBuf;
 
-// Generate the public C header (`include/cares.h`) from the Rust FFI surface
-// with cbindgen on every build, so the header can never drift from the `.so`
-// (both derive from this crate's source). The header is a generated build
-// artifact — it is git-ignored, not committed.
+// Generate include/cares.h with cbindgen on every build so it can't drift from
+// the .so; the header is a git-ignored build artifact.
 fn main() {
     let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     println!("cargo:rerun-if-changed=src/ffi");
-    // cbindgen parses the whole crate, and core defines types/logic the ffi
-    // signatures reference — regenerate on core edits too.
+    // cbindgen parses the whole crate; core defines types the ffi signatures reference.
     println!("cargo:rerun-if-changed=src/core");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     println!("cargo:rerun-if-changed=build.rs");
-    // Watch the output too, so deleting/tampering with the header re-triggers
-    // generation (cbindgen's write_to_file is content-conditional, so an
-    // unchanged regen doesn't bump the mtime → no rebuild loop).
+    // Watch the output so deletion/tampering re-triggers generation; cbindgen only
+    // rewrites on content change, so an unchanged regen doesn't cause a rebuild loop.
     println!("cargo:rerun-if-changed=include/cares.h");
 
     let config = cbindgen::Config::from_file(crate_dir.join("cbindgen.toml"))
@@ -28,16 +24,15 @@ fn main() {
         .generate()
     {
         Ok(b) => b,
-        // Don't fail the whole build if header generation hiccups; surface a warning.
+        // Warn instead of failing the build if header generation hiccups.
         Err(e) => {
             println!("cargo:warning=cbindgen header generation failed: {e}");
             return;
         }
     };
 
-    // The header lives in `include/`, which is git-ignored — create it (a fresh
-    // checkout has no empty dirs) before writing. cbindgen's write_to_file only
-    // rewrites when the contents change, so this won't needlessly touch mtimes.
+    // include/ is git-ignored; create it for fresh checkouts (write_to_file only
+    // rewrites when contents change, so mtimes stay untouched).
     let include_dir = crate_dir.join("include");
     let _ = std::fs::create_dir_all(&include_dir);
     bindings.write_to_file(include_dir.join("cares.h"));

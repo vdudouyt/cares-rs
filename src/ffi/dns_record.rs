@@ -1,6 +1,5 @@
 #![allow(non_camel_case_types)]
-// Thin c-ares C ABI shims: the safety contract is the documented c-ares API
-// contract, so per-function `# Safety` docs would just be noise.
+// Thin c-ares C ABI shims; the documented c-ares API contract is the safety contract.
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr, CString};
@@ -13,15 +12,9 @@ pub use crate::core::dns_record::{ares_dns_record_t, ares_dns_rr_t};
 pub(crate) use crate::core::dns_record::parse_record;
 use crate::core::dns_record::write_record;
 
-// ---------------------------------------------------------------------------
-// ARES_TRUE / ARES_FALSE
-// ---------------------------------------------------------------------------
 pub const ARES_TRUE: c_int = 1;
 pub const ARES_FALSE: c_int = 0;
 
-// ---------------------------------------------------------------------------
-// ares_dns_rec_type_t
-// ---------------------------------------------------------------------------
 pub const ARES_REC_TYPE_A: u16 = 1;
 pub const ARES_REC_TYPE_NS: u16 = 2;
 pub const ARES_REC_TYPE_CNAME: u16 = 5;
@@ -43,34 +36,22 @@ pub const ARES_REC_TYPE_URI: u16 = 256;
 pub const ARES_REC_TYPE_CAA: u16 = 257;
 pub const ARES_REC_TYPE_RAW_RR: u32 = 65536;
 
-// ---------------------------------------------------------------------------
-// ares_dns_class_t
-// ---------------------------------------------------------------------------
 pub const ARES_CLASS_IN: u16 = 1;
 pub const ARES_CLASS_CHAOS: u16 = 3;
 pub const ARES_CLASS_HESOID: u16 = 4;
 pub const ARES_CLASS_NONE: u16 = 254;
 pub const ARES_CLASS_ANY: u16 = 255;
 
-// ---------------------------------------------------------------------------
-// ares_dns_section_t
-// ---------------------------------------------------------------------------
 pub const ARES_SECTION_ANSWER: u32 = 1;
 pub const ARES_SECTION_AUTHORITY: u32 = 2;
 pub const ARES_SECTION_ADDITIONAL: u32 = 3;
 
-// ---------------------------------------------------------------------------
-// ares_dns_opcode_t
-// ---------------------------------------------------------------------------
 pub const ARES_OPCODE_QUERY: u16 = 0;
 pub const ARES_OPCODE_IQUERY: u16 = 1;
 pub const ARES_OPCODE_STATUS: u16 = 2;
 pub const ARES_OPCODE_NOTIFY: u16 = 4;
 pub const ARES_OPCODE_UPDATE: u16 = 5;
 
-// ---------------------------------------------------------------------------
-// ares_dns_rcode_t
-// ---------------------------------------------------------------------------
 pub const ARES_RCODE_NOERROR: u16 = 0;
 pub const ARES_RCODE_FORMERR: u16 = 1;
 pub const ARES_RCODE_SERVFAIL: u16 = 2;
@@ -92,18 +73,14 @@ pub const ARES_RCODE_BADALG: u16 = 21;
 pub const ARES_RCODE_BADTRUNC: u16 = 22;
 pub const ARES_RCODE_BADCOOKIE: u16 = 23;
 
-// ---------------------------------------------------------------------------
-// ares_dns_flags_t (bitflags in u16)
-// ---------------------------------------------------------------------------
 pub const ARES_DNS_FLAGS_QR: u16 = 1 << 15;
 pub const ARES_DNS_FLAGS_AA: u16 = 1 << 10;
 pub const ARES_DNS_FLAGS_TC: u16 = 1 << 9;
 pub const ARES_DNS_FLAGS_RD: u16 = 1 << 8;
 pub const ARES_DNS_FLAGS_RA: u16 = 1 << 7;
 
-// Upstream spells the DNS header flag bits `ARES_FLAG_*` in
-// ares_dns_record.h (same wire bits, but distinct names from the
-// channel-level ARES_FLAG_USEVC family). Keep both spellings source-compatible.
+// Header flag bits, also spelled `ARES_FLAG_*` upstream (distinct from the
+// channel-level `ARES_FLAG_USEVC` family); keep both spellings source-compatible.
 pub const ARES_FLAG_QR: u16 = 1 << 0;
 pub const ARES_FLAG_AA: u16 = 1 << 1;
 pub const ARES_FLAG_TC: u16 = 1 << 2;
@@ -112,9 +89,6 @@ pub const ARES_FLAG_RA: u16 = 1 << 4;
 pub const ARES_FLAG_AD: u16 = 1 << 5;
 pub const ARES_FLAG_CD: u16 = 1 << 6;
 
-// ---------------------------------------------------------------------------
-// ares_dns_datatype_t
-// ---------------------------------------------------------------------------
 pub const ARES_DATATYPE_INADDR: u16 = 1;
 pub const ARES_DATATYPE_INADDR6: u16 = 2;
 pub const ARES_DATATYPE_U8: u16 = 3;
@@ -127,9 +101,6 @@ pub const ARES_DATATYPE_BINP: u16 = 9;
 pub const ARES_DATATYPE_OPT: u16 = 10;
 pub const ARES_DATATYPE_ABINP: u16 = 11;
 
-// ---------------------------------------------------------------------------
-// ares_dns_parse_flags_t
-// ---------------------------------------------------------------------------
 pub const ARES_DNS_PARSE_AN_BASE_RAW: u32 = 1 << 0;
 pub const ARES_DNS_PARSE_NS_BASE_RAW: u32 = 1 << 1;
 pub const ARES_DNS_PARSE_AR_BASE_RAW: u32 = 1 << 2;
@@ -137,9 +108,6 @@ pub const ARES_DNS_PARSE_AN_EXT_RAW: u32 = 1 << 3;
 pub const ARES_DNS_PARSE_NS_EXT_RAW: u32 = 1 << 4;
 pub const ARES_DNS_PARSE_AR_EXT_RAW: u32 = 1 << 5;
 
-// ---------------------------------------------------------------------------
-// ares_dns_opt_datatype_t
-// ---------------------------------------------------------------------------
 pub const ARES_OPT_DATATYPE_NONE: u32 = 1;
 pub const ARES_OPT_DATATYPE_STR_LIST: u32 = 2;
 pub const ARES_OPT_DATATYPE_U8_LIST: u32 = 3;
@@ -152,9 +120,6 @@ pub const ARES_OPT_DATATYPE_INADDR6_LIST: u32 = 9;
 pub const ARES_OPT_DATATYPE_BIN: u32 = 10;
 pub const ARES_OPT_DATATYPE_NAME: u32 = 11;
 
-// ---------------------------------------------------------------------------
-// ares_opt_param_t
-// ---------------------------------------------------------------------------
 pub const ARES_OPT_PARAM_LLQ: u32 = 1;
 pub const ARES_OPT_PARAM_UL: u32 = 2;
 pub const ARES_OPT_PARAM_NSID: u32 = 3;
@@ -170,9 +135,6 @@ pub const ARES_OPT_PARAM_CHAIN: u32 = 13;
 pub const ARES_OPT_PARAM_EDNS_KEY_TAG: u32 = 14;
 pub const ARES_OPT_PARAM_EXTENDED_DNS_ERROR: u32 = 15;
 
-// ---------------------------------------------------------------------------
-// ares_svcb_param_t
-// ---------------------------------------------------------------------------
 pub const ARES_SVCB_PARAM_MANDATORY: u32 = 0;
 pub const ARES_SVCB_PARAM_ALPN: u32 = 1;
 pub const ARES_SVCB_PARAM_NO_DEFAULT_ALPN: u32 = 2;
@@ -181,9 +143,6 @@ pub const ARES_SVCB_PARAM_IPV4HINT: u32 = 4;
 pub const ARES_SVCB_PARAM_ECH: u32 = 5;
 pub const ARES_SVCB_PARAM_IPV6HINT: u32 = 6;
 
-// ---------------------------------------------------------------------------
-// ares_tlsa_usage_t / ares_tlsa_selector_t / ares_tlsa_match_t
-// ---------------------------------------------------------------------------
 pub const ARES_TLSA_USAGE_CA: u32 = 0;
 pub const ARES_TLSA_USAGE_SERVICE: u32 = 1;
 pub const ARES_TLSA_USAGE_TRUSTANCHOR: u32 = 2;
@@ -194,17 +153,10 @@ pub const ARES_TLSA_MATCH_EXACT: u32 = 0;
 pub const ARES_TLSA_MATCH_SHA256: u32 = 1;
 pub const ARES_TLSA_MATCH_SHA512: u32 = 2;
 
-// ---------------------------------------------------------------------------
-// ares_dns_rr_key_t
-// ---------------------------------------------------------------------------
-// RR keys — formula: RECORD_TYPE * 100 + index (matches c-ares ares_dns_rr_key_t)
-// A record keys (type=1)
+// RR keys: RECORD_TYPE * 100 + index (matches c-ares ares_dns_rr_key_t).
 pub const ARES_RR_A_ADDR: u32 = 100 + 1;
-// NS record keys (type=2)
 pub const ARES_RR_NS_NSDNAME: u32 = 2 * 100 + 1;
-// CNAME record keys (type=5)
 pub const ARES_RR_CNAME_CNAME: u32 = 5 * 100 + 1;
-// SOA record keys (type=6)
 pub const ARES_RR_SOA_MNAME: u32 = 6 * 100 + 1;
 pub const ARES_RR_SOA_RNAME: u32 = 6 * 100 + 2;
 pub const ARES_RR_SOA_SERIAL: u32 = 6 * 100 + 3;
@@ -212,17 +164,12 @@ pub const ARES_RR_SOA_REFRESH: u32 = 6 * 100 + 4;
 pub const ARES_RR_SOA_RETRY: u32 = 6 * 100 + 5;
 pub const ARES_RR_SOA_EXPIRE: u32 = 6 * 100 + 6;
 pub const ARES_RR_SOA_MINIMUM: u32 = 6 * 100 + 7;
-// PTR record keys (type=12)
 pub const ARES_RR_PTR_DNAME: u32 = 12 * 100 + 1;
-// HINFO record keys (type=13)
 pub const ARES_RR_HINFO_CPU: u32 = 13 * 100 + 1;
 pub const ARES_RR_HINFO_OS: u32 = 13 * 100 + 2;
-// MX record keys (type=15)
 pub const ARES_RR_MX_PREFERENCE: u32 = 15 * 100 + 1;
 pub const ARES_RR_MX_EXCHANGE: u32 = 15 * 100 + 2;
-// TXT record keys (type=16)
 pub const ARES_RR_TXT_DATA: u32 = 16 * 100 + 1;
-// SIG record keys (type=24)
 pub const ARES_RR_SIG_TYPE_COVERED: u32 = 24 * 100 + 1;
 pub const ARES_RR_SIG_ALGORITHM: u32 = 24 * 100 + 2;
 pub const ARES_RR_SIG_LABELS: u32 = 24 * 100 + 3;
@@ -232,57 +179,39 @@ pub const ARES_RR_SIG_INCEPTION: u32 = 24 * 100 + 6;
 pub const ARES_RR_SIG_KEY_TAG: u32 = 24 * 100 + 7;
 pub const ARES_RR_SIG_SIGNERS_NAME: u32 = 24 * 100 + 8;
 pub const ARES_RR_SIG_SIGNATURE: u32 = 24 * 100 + 9;
-// AAAA record keys (type=28)
 pub const ARES_RR_AAAA_ADDR: u32 = 28 * 100 + 1;
-// SRV record keys (type=33)
 pub const ARES_RR_SRV_PRIORITY: u32 = 33 * 100 + 2;
 pub const ARES_RR_SRV_WEIGHT: u32 = 33 * 100 + 3;
 pub const ARES_RR_SRV_PORT: u32 = 33 * 100 + 4;
 pub const ARES_RR_SRV_TARGET: u32 = 33 * 100 + 5;
-// NAPTR record keys (type=35)
 pub const ARES_RR_NAPTR_ORDER: u32 = 35 * 100 + 1;
 pub const ARES_RR_NAPTR_PREFERENCE: u32 = 35 * 100 + 2;
 pub const ARES_RR_NAPTR_FLAGS: u32 = 35 * 100 + 3;
 pub const ARES_RR_NAPTR_SERVICES: u32 = 35 * 100 + 4;
 pub const ARES_RR_NAPTR_REGEXP: u32 = 35 * 100 + 5;
 pub const ARES_RR_NAPTR_REPLACEMENT: u32 = 35 * 100 + 6;
-// OPT record keys (type=41)
 pub const ARES_RR_OPT_UDP_SIZE: u32 = 41 * 100 + 1;
 pub const ARES_RR_OPT_VERSION: u32 = 41 * 100 + 3;
 pub const ARES_RR_OPT_FLAGS: u32 = 41 * 100 + 4;
 pub const ARES_RR_OPT_OPTIONS: u32 = 41 * 100 + 5;
-// TLSA record keys (type=52)
 pub const ARES_RR_TLSA_CERT_USAGE: u32 = 52 * 100 + 1;
 pub const ARES_RR_TLSA_SELECTOR: u32 = 52 * 100 + 2;
 pub const ARES_RR_TLSA_MATCH: u32 = 52 * 100 + 3;
 pub const ARES_RR_TLSA_DATA: u32 = 52 * 100 + 4;
-// SVCB record keys (type=64)
 pub const ARES_RR_SVCB_PRIORITY: u32 = 64 * 100 + 1;
 pub const ARES_RR_SVCB_TARGET: u32 = 64 * 100 + 2;
 pub const ARES_RR_SVCB_PARAMS: u32 = 64 * 100 + 3;
-// HTTPS record keys (type=65)
 pub const ARES_RR_HTTPS_PRIORITY: u32 = 65 * 100 + 1;
 pub const ARES_RR_HTTPS_TARGET: u32 = 65 * 100 + 2;
 pub const ARES_RR_HTTPS_PARAMS: u32 = 65 * 100 + 3;
-// URI record keys (type=256)
 pub const ARES_RR_URI_PRIORITY: u32 = 256 * 100 + 1;
 pub const ARES_RR_URI_WEIGHT: u32 = 256 * 100 + 2;
 pub const ARES_RR_URI_TARGET: u32 = 256 * 100 + 3;
-// CAA record keys (type=257)
 pub const ARES_RR_CAA_CRITICAL: u32 = 257 * 100 + 1;
 pub const ARES_RR_CAA_TAG: u32 = 257 * 100 + 2;
 pub const ARES_RR_CAA_VALUE: u32 = 257 * 100 + 3;
-// RAW RR keys (type=65536)
 pub const ARES_RR_RAW_RR_TYPE: u32 = 65536 * 100 + 1;
 pub const ARES_RR_RAW_RR_DATA: u32 = 65536 * 100 + 2;
-
-// =========================================================================
-// FFI functions
-// =========================================================================
-
-// ---------------------------------------------------------------------------
-// Record lifecycle
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_create(
@@ -324,10 +253,6 @@ pub unsafe extern "C" fn ares_dns_record_duplicate(
         None => std::ptr::null_mut(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Record header
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_get_id(
@@ -380,10 +305,6 @@ pub unsafe extern "C" fn ares_dns_record_set_id(
     unsafe { &mut *dnsrec }.set_id(id);
     ARES_TRUE
 }
-
-// ---------------------------------------------------------------------------
-// Query section
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_query_add(
@@ -475,10 +396,6 @@ pub unsafe extern "C" fn ares_dns_record_query_set_type(
     }
 }
 
-// ---------------------------------------------------------------------------
-// RR management
-// ---------------------------------------------------------------------------
-
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_rr_add(
     rr: *mut *mut ares_dns_rr_t,
@@ -560,10 +477,6 @@ pub unsafe extern "C" fn ares_dns_record_rr_del(
         Err(e) => e.code(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// RR getters
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_get_name(
@@ -698,10 +611,6 @@ pub unsafe extern "C" fn ares_dns_rr_get_bin(
     ptr
 }
 
-// ---------------------------------------------------------------------------
-// RR setters
-// ---------------------------------------------------------------------------
-
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_set_addr(
     rr: *mut ares_dns_rr_t,
@@ -817,10 +726,6 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
     }
 }
 
-// ---------------------------------------------------------------------------
-// OPT handling
-// ---------------------------------------------------------------------------
-
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rr_set_opt(
     rr: *mut ares_dns_rr_t,
@@ -864,8 +769,7 @@ pub unsafe extern "C" fn ares_dns_rr_get_opt(
 ) -> c_ushort {
     // ABI-mandated sentinel: 65535 means "misuse / not found".
     const NO_OPT: c_ushort = u16::MAX;
-    // Upstream clears the optional outputs on every path, so a caller that
-    // reuses them never sees stale pointer/length data after a miss.
+    // Clear optional outputs on every path so callers never see stale data after a miss.
     if !val.is_null() {
         unsafe { *val = std::ptr::null(); }
     }
@@ -931,10 +835,6 @@ pub unsafe extern "C" fn ares_dns_rr_del_opt_byid(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Serialization: ares_dns_parse
-// ---------------------------------------------------------------------------
-
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_parse(
     buf: *const u8,
@@ -954,10 +854,6 @@ pub unsafe extern "C" fn ares_dns_parse(
         Err(e) => e.code(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Serialization: ares_dns_write
-// ---------------------------------------------------------------------------
 
 fn dns_write_impl(
     rec: &ares_dns_record_t,
@@ -993,10 +889,6 @@ pub unsafe extern "C" fn ares_dns_write(
     }
     dns_write_impl(unsafe { &*dnsrec }, buf, buf_len)
 }
-
-// ---------------------------------------------------------------------------
-// Metadata / string functions (the tables live in safe.rs)
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_rec_type_tostr(rtype: c_uint) -> *const c_char {
@@ -1049,10 +941,6 @@ pub unsafe extern "C" fn ares_dns_class_fromstr(
         None => ARES_FALSE,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Address helpers (ares_dns_pton / ares_dns_addr_to_ptr)
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_pton(
@@ -1110,10 +998,6 @@ pub unsafe extern "C" fn ares_dns_addr_to_ptr(
     // The PTR string never contains an interior NUL; NULL signals OOM.
     unsafe { malloc_cstr(ptr.as_bytes()) }
 }
-
-// ---------------------------------------------------------------------------
-// OPT / SVCB option metadata
-// ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn ares_dns_opt_get_datatype(

@@ -4,8 +4,8 @@ use std::net::IpAddr;
 #[cfg(test)]
 use bytes::BufMut;
 
-/// Max DNS label segments (e.g. "www.example.com" = 3 segments).
-/// IPv6 reverse DNS (ip6.arpa) needs up to 34 segments.
+/// DNS label segments per name ("www.example.com" = 3). IPv6 reverse DNS
+/// (ip6.arpa) needs up to 34.
 const MAX_LABEL_PARTS: usize = 40;
 
 pub type LabelVec<'a> = ArrayVec<&'a str, MAX_LABEL_PARTS>;
@@ -149,18 +149,17 @@ impl<'a> DnsLabel<'a> {
                 break;
             }
             if len & 0xc0 == 0xc0 {
-                // Compression pointer: top 2 bits are 11
+                // Compression pointer: top two bits are 11.
                 let high_byte = len & 0x3f;
                 let Some(low_byte) = buf.get_u8() else { buf.pos = saved_pos; return None; };
                 offset = Some(((high_byte as u16) << 8) | (low_byte as u16));
                 break;
             }
             if len & 0xc0 != 0 {
-                // Invalid top 2 bits (01 or 10) — not a valid label or compression pointer
+                // Top bits 01/10 are neither a label nor a pointer.
                 buf.pos = saved_pos;
                 return None;
             }
-            // Label length must be <= 63
             if len > 63 {
                 buf.pos = saved_pos;
                 return None;
@@ -176,7 +175,6 @@ impl<'a> DnsLabel<'a> {
         if self.offset.is_none() {
             return Some(join_escaped_labels(self.name.iter()));
         }
-        // Need to follow compression pointer chain — resolve fully
         let mut result = String::new();
         let mut idx = 0;
         for &s in self.name.iter() {
@@ -188,14 +186,13 @@ impl<'a> DnsLabel<'a> {
             idx += 1;
         }
 
-        // Follow compression pointer chain with loop detection
+        // Follow the chain, rejecting offsets that loop.
         let mut current_offset = self.offset;
         let mut visited = std::collections::HashSet::new();
         while let Some(off) = current_offset {
             if !visited.insert(off) {
-                return None; // Loop detected
+                return None;
             }
-            // Manually parse labels at offset, don't borrow from sub_buf
             let mut pos = off as usize;
             loop {
                 let &len = main_buf.get(pos)?;
@@ -233,7 +230,6 @@ impl<'a> DnsLabel<'a> {
     }
 }
 
-/// Names-as-records (PTR/NS targets) parse into C strings directly.
 impl RRParser<'_> for std::ffi::CString {
     fn parse_rr(answer: &DnsAnswer<'_>) -> Option<std::ffi::CString> {
         let mut buf = SliceBuf::new(answer.data);
@@ -280,8 +276,7 @@ impl<'a> DnsAnswer<'a> {
     }
 }
 
-/// Test-only helper for building/parsing a whole DNS frame; the hot parse path
-/// in ParsedResponse bypasses this.
+/// Test-only whole-frame helper; the hot path parses sections directly.
 #[cfg(test)]
 #[derive(Debug, PartialEq)]
 pub struct DnsFrame<'a> {
@@ -380,13 +375,12 @@ pub struct TxtReply<'a> {
 
 impl<'a> Parser<'a> for TxtReply<'a> {
     fn parse(buf: &mut SliceBuf<'a>) -> Option<TxtReply<'a>> {
-        // Fast path: single TXT segment (most common)
+        // Fast path: a single TXT segment (most common).
         let first = parse_prefixed_str(buf)?;
         if buf.remaining() == 0 {
             let length = first.len();
             return Some(TxtReply { txt: Cow::Borrowed(first), length });
         }
-        // Multi-segment: must join
         let mut joined = String::from(first);
         while buf.remaining() > 0 {
             joined.push_str(parse_prefixed_str(buf)?);
@@ -551,10 +545,7 @@ impl<'a> RRParser<'a> for UriReply<'a> {
     }
 }
 
-
-
-/// A single A/AAAA answer: address + TTL. The RR payload every address lookup
-/// flow accumulates and sorts.
+/// A single A/AAAA answer; the payload address lookups accumulate and sort.
 #[derive(Debug)]
 pub struct AddrRecord {
     pub ip: IpAddr,

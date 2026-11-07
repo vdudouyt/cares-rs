@@ -1,7 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 // Panic-safety wall: a panic in a C-ABI library aborts the host process, so
-// production code must not contain any panic path — no exceptions. Unit tests
-// (`cfg(test)`) are exempt: panicking is how they assert.
+// production code must stay panic-free. Tests are exempt.
 #![cfg_attr(
     not(test),
     deny(

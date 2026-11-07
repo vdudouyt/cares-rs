@@ -1,10 +1,5 @@
-//! Byte-level, readiness-driven IO arms over a [`Socket`] + [`Mailbox`] — the
-//! plumbing between a non-blocking socket and the executor. One non-blocking
-//! attempt is a `Poll<io::Result<…>>`: `Pending` registers interest in the
-//! mailbox and suspends; the executor re-polls when the fd fires. Everything
-//! here knows **bytes, not messages** — no framing, no demux, no protocol
-//! (message delimiting and multiplexing are the application's business,
-//! layered on top of these arms).
+//! Byte-level, readiness-driven IO arms over [`Socket`] + [`Mailbox`]: knows
+//! bytes, not messages — framing and demux are the application's business.
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -24,18 +19,15 @@ pub(crate) fn dead() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")
 }
 
-/// Grow the mailbox's receive scratch to its 64 KB working size on first use
-/// (kept allocated for the lookup's lifetime; see `Mailbox::scratch`).
+/// Grow the mailbox's receive scratch to 64 KB on first use (see `Mailbox::scratch`).
 fn ensure_scratch(scratch: &mut Vec<u8>) {
     if scratch.is_empty() {
         scratch.resize(65_535, 0);
     }
 }
 
-/// Await writability on `sock`, then send `bytes` once. Re-awaits on `WouldBlock`;
-/// `Err(TimedOut)` on timeout before writable, the socket's own error on a hard
-/// send failure. The writable arm is polled first — a fd that fired in the same
-/// cycle the timeout passed still sends (writable preempts expiry).
+/// Await writability, then send once. Writability is checked before expiry, so
+/// a fd that fired in the same cycle the timeout passed still sends.
 pub(crate) async fn send_when_writable<A>(
     io: &Rc<RefCell<Mailbox<A>>>,
     sock: &dyn Socket,
@@ -60,9 +52,8 @@ pub(crate) async fn send_when_writable<A>(
     }
 }
 
-/// One non-blocking receive of a self-delimiting datagram (UDP) into the
-/// lookup's `scratch`: `Ready(Ok)` on any read (incl. a zero-length datagram),
-/// `Pending` on `WouldBlock`, `Ready(Err)` on a hard error.
+/// One non-blocking datagram receive (UDP) into `scratch`: `Ready` on any read
+/// including zero-length, `Pending` on `WouldBlock`, `Ready(Err)` on hard error.
 pub(crate) fn recv_datagram(sock: &dyn Socket, scratch: &mut Vec<u8>) -> Poll<io::Result<Vec<u8>>> {
     ensure_scratch(scratch);
     match sock.recv(scratch) {
@@ -72,9 +63,7 @@ pub(crate) fn recv_datagram(sock: &dyn Socket, scratch: &mut Vec<u8>) -> Poll<io
     }
 }
 
-/// Drain a stream socket (TCP) once via the lookup's `scratch`, appending
-/// whatever bytes are available to `buf`. Returns `false` if the connection
-/// died (EOF / hard error). Hands back raw bytes — the caller owns any framing.
+/// Drain available stream bytes (TCP) into `buf`; `false` if the connection died.
 pub(crate) fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>, scratch: &mut Vec<u8>) -> bool {
     ensure_scratch(scratch);
     match sock.recv(scratch) {
@@ -88,14 +77,9 @@ pub(crate) fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>, scratch: &mut Ve
     }
 }
 
-/// The poll body of a recv arm (raced with `select_biased!`). If `fd`'s
-/// **read** readiness fired this cycle, consume that entry (`swap_remove`) and
-/// run `read` once; a `WouldBlock` (`Poll::Pending` from `read`) re-registers
-/// read-interest and suspends (so a sibling arm can still progress). Otherwise
-/// registers read-interest and suspends. Matches only read-readiness, so a
-/// sibling send-arm's write-readiness on the same fd is left alone. Resolves
-/// tokio-style: `Ok(bytes)` for a message, `Err(UnexpectedEof)` for a dead
-/// socket. `read` yields opaque bytes — this arm names nothing of the app.
+/// Recv arm body. Consumes only read readiness for `fd` (leaving a sibling
+/// send-arm's write readiness intact) and runs `read` once; a `WouldBlock`
+/// re-registers read interest. `Ok(bytes)` for a message, `UnexpectedEof` when dead.
 pub(crate) fn poll_recv<A>(
     io: &Rc<RefCell<Mailbox<A>>>,
     fd: i32,
@@ -126,8 +110,7 @@ pub(crate) fn poll_recv<A>(
     }
 }
 
-/// A writability arm: if `fd` fired this cycle, consume **that fd's**
-/// readiness; otherwise register write-interest and suspend.
+/// Writability arm: consume `fd`'s write readiness or register interest.
 fn poll_writable<A>(io: &Rc<RefCell<Mailbox<A>>>, fd: i32) -> Poll<()> {
     let mut m = io.borrow_mut();
     match m.fired.iter().position(|w| w.fd == fd && w.writable) {

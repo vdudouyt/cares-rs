@@ -1,9 +1,5 @@
-//! Phase 4A transport pooling / socket-option semantics.
-//!
-//! Exercises the UDP connection pool (per-socket and total-query caps,
-//! STAYOPEN, shared demux and sibling wakeups), local source binding, socket
-//! buffers, the socket-state callback, and the extended socket-function
-//! adapters. DNS traffic stays on loopback; process-global state is serialized.
+//! Transport pooling / socket-option semantics: UDP pool caps, STAYOPEN, shared
+//! demux, local binding, socket buffers, state callback, extended socket adapters.
 
 use std::ffi::{c_int, c_uint, c_void, CStr, CString};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -32,10 +28,6 @@ fn serial() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
-
-// ---------------------------------------------------------------------------
-// Mini UDP DNS server
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum ReplyKind {
@@ -112,21 +104,17 @@ fn make_reply(request: &[u8], kind: ReplyKind) -> Vec<u8> {
 
     let mut reply = Vec::new();
     reply.extend_from_slice(&request[0..2]);
-    reply.extend_from_slice(&[0x81, 0x80]); // QR | RD | RA, NOERROR
+    reply.extend_from_slice(&[0x81, 0x80]);
     reply.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0]);
     reply.extend_from_slice(&request[12..]);
     reply.extend_from_slice(&[0xC0, 0x0C]);
-    reply.extend_from_slice(&[0, 1, 0, 1]); // A IN
+    reply.extend_from_slice(&[0, 1, 0, 1]);
     reply.extend_from_slice(&[0, 0, 0, 60]);
     reply.push(0);
     reply.push(4);
     reply.extend_from_slice(&addr);
     reply
 }
-
-// ---------------------------------------------------------------------------
-// Callback captures
-// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct RawResult {
@@ -192,10 +180,6 @@ extern "C" fn state_cb(data: *mut c_void, fd: c_int, readable: c_int, writable: 
     let events = unsafe { &mut *(data as *mut StateEvents) };
     events.events.push((fd, readable, writable));
 }
-
-// ---------------------------------------------------------------------------
-// Channel / reactor helpers
-// ---------------------------------------------------------------------------
 
 fn base_options() -> ares_options {
     ares_options {
@@ -266,10 +250,6 @@ fn last_octet(data: &[u8]) -> u8 {
     data[data.len() - 1]
 }
 
-// ---------------------------------------------------------------------------
-// 1. parallel lookups obey udp_max_queries
-// ---------------------------------------------------------------------------
-
 #[test]
 fn parallel_lookups_create_exactly_max_queries_sockets() {
     let _serial = serial();
@@ -312,10 +292,6 @@ fn parallel_lookups_create_exactly_max_queries_sockets() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 2. total-query cap retires a socket even with STAYOPEN
-// ---------------------------------------------------------------------------
-
 #[test]
 fn total_query_cap_retires_socket_even_when_stayopen() {
     let _serial = serial();
@@ -344,10 +320,6 @@ fn total_query_cap_retires_socket_even_when_stayopen() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 3. STAYOPEN controls idle-socket reuse
-// ---------------------------------------------------------------------------
 
 #[test]
 fn stayopen_reuses_idle_socket_and_default_retires_it() {
@@ -403,10 +375,6 @@ fn stayopen_reuses_idle_socket_and_default_retires_it() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 4. shared UDP demux: no cross-talk between concurrent names
-// ---------------------------------------------------------------------------
-
 #[test]
 fn shared_udp_demux_routes_each_answer_to_its_query() {
     let _serial = serial();
@@ -458,10 +426,6 @@ fn shared_udp_demux_routes_each_answer_to_its_query() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 5. sibling routed wakeup: batch finishes quickly with no timeouts
-// ---------------------------------------------------------------------------
-
 #[test]
 fn concurrent_batch_completes_without_waiting_for_timeouts() {
     let _serial = serial();
@@ -503,10 +467,6 @@ fn concurrent_batch_completes_without_waiting_for_timeouts() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 6. local IP binding
-// ---------------------------------------------------------------------------
-
 #[test]
 fn local_ip4_binds_udp_source_address() {
     let _serial = serial();
@@ -531,10 +491,6 @@ fn local_ip4_binds_udp_source_address() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 7. socket buffer options round-trip
-// ---------------------------------------------------------------------------
 
 #[test]
 fn socket_buffer_options_are_accepted_and_saved() {
@@ -570,10 +526,6 @@ fn socket_buffer_options_are_accepted_and_saved() {
         ares_destroy(channel);
     }
 }
-
-// ---------------------------------------------------------------------------
-// 8. socket state callback open/close notifications
-// ---------------------------------------------------------------------------
 
 #[test]
 fn socket_state_callback_reports_open_and_close() {
@@ -616,10 +568,6 @@ fn socket_state_callback_reports_open_and_close() {
         assert_eq!(open.unwrap().0, close.unwrap().0, "same fd for open/close");
     }
 }
-
-// ---------------------------------------------------------------------------
-// 9. extended socket function adapters
-// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct ExCalls {
@@ -769,10 +717,6 @@ fn extended_socket_adapters_are_used_for_udp() {
         assert!(calls.aclose >= 1, "aclose not used");
     }
 }
-
-// ---------------------------------------------------------------------------
-// 10. setters are unsafe-only and tolerate NULL channels
-// ---------------------------------------------------------------------------
 
 #[test]
 fn unsafe_transport_setters_accept_null_channel() {

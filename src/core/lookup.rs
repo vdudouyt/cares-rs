@@ -1,19 +1,5 @@
-//! The neutral DNS-reply/reactor truth tables the async engine reuses: pure,
-//! safe Rust with no I/O. The executor (`async_runtime::executor`) drives one query's
-//! socket lifecycle and consults these for its verdicts.
-//!
-//! # Map
-//! - [`summarize`] / [`qid_matches`] — DNS reply header classification and
-//!   transaction-ID matching
-//! - [`is_localhost`] / [`is_onion_domain`] — special-name classification
-//! - [`SearchPlan`] — the search-domain iteration for ares_search / getaddrinfo
-//!   (ndots threshold, bare-name fallback), via [`SearchPlan::for_search`]
-//!   (gethostbyname inlines its own simpler walk in `core::hostbyname`)
-//! - [`ServerHealth`] — per-server failure accounting and the
-//!   lowest-failures-first server selection for failover and probing
-//! - [`on_datagram`] → [`TaskVerdict`] (failover / TC retry / deliver) and
-//!   [`on_timeout`] → [`TimeoutVerdict`] (retry / expire): the per-query
-//!   reactor policy `resolve_query` applies.
+//! Pure, safe DNS reply/reactor truth tables reused by the async engine, with
+//! no I/O: reply classification, search plans, server health, and verdicts.
 
 use std::time::{Duration, Instant};
 
@@ -24,10 +10,8 @@ pub struct ReplySummary {
     pub truncated: bool,
 }
 
-/// Classify a reply buffer by its DNS header fields alone.
-/// `default_rcode` is used when the buffer is too short to carry an rcode
-/// (regular flows pass 0; the failover probe passes 0xff so a garbage reply
-/// is not mistaken for success).
+/// Classify a reply by its header fields alone. `default_rcode` applies when the
+/// buffer is too short; the failover probe passes 0xff so garbage is not success.
 pub fn summarize(buf: &[u8], default_rcode: u8) -> ReplySummary {
     ReplySummary {
         rcode: if buf.len() >= 4 { buf[3] & 0x0f } else { default_rcode },
@@ -36,15 +20,12 @@ pub fn summarize(buf: &[u8], default_rcode: u8) -> ReplySummary {
     }
 }
 
-/// TC (truncation) flag from the DNS header.
 pub fn is_truncated(buf: &[u8]) -> bool {
     buf.len() >= 4 && (buf[2] & 0x02) != 0
 }
 
-/// Does the response transaction ID match the query's? Responses too short to
-/// carry a QID (or queries too short to compare against) are accepted, matching
-/// the historical behavior. `is_tcp` skips the 2-byte TCP length prefix on the
-/// query buffer.
+/// Responses and queries too short to compare QIDs are accepted (historical
+/// behavior); `is_tcp` skips the 2-byte TCP length prefix on the query.
 pub fn qid_matches(resp: &[u8], writebuf: &[u8], is_tcp: bool) -> bool {
     if resp.len() < 2 {
         return true;
@@ -58,24 +39,21 @@ pub fn qid_matches(resp: &[u8], writebuf: &[u8], is_tcp: bool) -> bool {
     resp_qid == query_qid
 }
 
-/// RFC 6761 section 6.3: "localhost" or any name under ".localhost"
+/// RFC 6761: "localhost" or any name under ".localhost".
 pub fn is_localhost(name: &str) -> bool {
     name.eq_ignore_ascii_case("localhost")
         || (name.len() >= 10 && name[name.len()-10..].eq_ignore_ascii_case(".localhost"))
 }
 
-/// RFC 7686: does `name` name a `.onion` domain? Case-insensitive ASCII suffix
-/// match on bytes (no alloc, no UTF-8 validation, never panics on non-ASCII).
-/// Tolerates a trailing-dot FQDN and a bare "onion". Mirrors upstream c-ares.
+/// RFC 7686: case-insensitive byte suffix match (no alloc/UTF-8 validation,
+/// never panics on non-ASCII); tolerates a trailing dot and bare "onion".
 pub fn is_onion_domain(name: &str) -> bool {
     let b = name.strip_suffix('.').unwrap_or(name).as_bytes();
     b.len() >= 6 && b[b.len() - 6..].eq_ignore_ascii_case(b".onion") || b.eq_ignore_ascii_case(b"onion")
 }
 
-/// The sequence of names a lookup tries: the current query name, the search
-/// domains still to append, and a final bare-name fallback. This is the one
-/// implementation of the domain-iteration logic that used to be duplicated
-/// across the search/gethostbyname/getaddrinfo callbacks.
+/// Ordered names a lookup tries: current name, pending search domains, then a
+/// bare-name fallback.
 #[derive(Debug, Clone)]
 pub struct SearchPlan {
     pub base_name: String,
@@ -84,11 +62,8 @@ pub struct SearchPlan {
 }
 
 impl SearchPlan {
-    /// ares_search / ares_search_dnsrec style plan: a trailing dot (or
-    /// `no_search`, the channel's ARES_FLAG_NOSEARCH) suppresses search
-    /// entirely; at or above `ndots` the bare name is tried first with the
-    /// search domains as fallback; below `ndots` the first search domain is
-    /// appended up front and the bare name becomes the last resort.
+    /// Trailing dot (or `no_search`) suppresses search; at or above `ndots` the
+    /// bare name is tried first, below it the first search domain is appended.
     pub fn for_search(name_str: &str, ndots: u32, search: &[String], no_search: bool) -> Self {
         let has_trailing_dot = name_str.ends_with('.');
         let name_clean = name_str.strip_suffix('.').unwrap_or(name_str);
@@ -99,10 +74,8 @@ impl SearchPlan {
 
         if !has_trailing_dot && !no_search && !search.is_empty() {
             if dot_count >= ndots {
-                // High dots: try bare name first, then search domains as fallback
                 domains = search.to_vec();
             } else {
-                // Low dots: try search domains first, then bare name as fallback
                 domains = search.to_vec();
                 let first_domain = domains.remove(0);
                 current = format!("{}.{}", name_clean, first_domain);
@@ -112,8 +85,7 @@ impl SearchPlan {
         SearchPlan { base_name: name_clean.to_string(), current, domains }
     }
 
-    /// Move to the next name to try: the next search domain appended to the
-    /// base name, then — exactly once — the bare base name, then exhaustion.
+    /// Move to the next name; the bare base name is tried exactly once.
     pub fn advance(&mut self) -> Option<String> {
         if !self.domains.is_empty() {
             let next_domain = self.domains.remove(0);
@@ -121,7 +93,6 @@ impl SearchPlan {
             self.current = new_hostname.clone();
             Some(new_hostname)
         } else if self.current != self.base_name && !self.base_name.is_empty() {
-            // Try bare name as fallback
             let bare_name = self.base_name.clone();
             self.current = bare_name.clone();
             self.base_name = String::new(); // Prevent infinite recursion
@@ -131,11 +102,7 @@ impl SearchPlan {
         }
     }
 
-    /// The full ordered candidate list (`current`, then each `advance`) — for the
-    /// address lifecycles that iterate names via [`AsyncClient::resolve_addrinfo`]
-    /// over a materialized `Vec` rather than lazily.
-    ///
-    /// [`AsyncClient::resolve_addrinfo`]: crate::core::async_client::AsyncClient
+    /// The full ordered candidate list (`current`, then each `advance`).
     pub fn into_names(mut self) -> Vec<String> {
         let mut names = vec![self.current.clone()];
         while let Some(n) = self.advance() {
@@ -147,7 +114,7 @@ impl SearchPlan {
 
 pub use libc::{AF_INET, AF_INET6};
 
-/// A / AAAA DNS record types (the query rtypes the async lifecycles build).
+/// A / AAAA query rtypes.
 pub(crate) const RTYPE_A: u16 = 0x01;
 pub(crate) const RTYPE_AAAA: u16 = 0x1c;
 
@@ -160,30 +127,25 @@ pub enum ReactorAction {
 /// Reactor-level verdict for a datagram that already passed QID matching.
 #[derive(Debug, PartialEq)]
 pub enum TaskVerdict {
-    /// SERVFAIL/NOTIMP/REFUSED failover: resend the same payload to this
-    /// server; `tries` is the failover count to carry onto the retry task.
+    /// Server-error failover: resend to `server`, carrying `tries` onto the retry.
     RetryNextServer { server: usize, tries: u32 },
-    /// Truncated UDP reply: resend the same payload over TCP to the same server.
+    /// Truncated UDP reply: resend over TCP to the same server.
     RetryTcp,
-    /// Hand the reply to the task's callback.
     Deliver,
 }
 
-/// The channel flags that change datagram handling (snapshotted per query).
+/// Channel flags that change datagram handling (snapshotted per query).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplyPolicy {
-    /// ARES_FLAG_IGNTC: accept a truncated UDP reply instead of retrying TCP.
+    /// ARES_FLAG_IGNTC: accept a truncated UDP reply instead of retrying over TCP.
     pub ignore_tc: bool,
     /// ARES_FLAG_NOCHECKRESP: deliver SERVFAIL/NOTIMP/REFUSED responses.
     pub no_check_resp: bool,
 }
 
-/// The process-level decisions for one received datagram, in upstream order:
-/// the TC check first (a truncated UDP reply retries over TCP without touching
-/// server health), then rcode-based failover/server-health bookkeeping, then
-/// delivery. `tries` is the task's failover count so far — the budget is
-/// monotonic (`nservers * attempts` total sends), so a single server is
-/// retried in place rather than skipped.
+/// Datagram policy, in upstream order: TC check (TCP retry, no health update),
+/// then rcode failover/health, then delivery. The send budget is monotonic
+/// (`nservers * attempts`), so a single server is retried in place.
 pub fn on_datagram(
     summary: &ReplySummary,
     server: usize,
@@ -195,15 +157,13 @@ pub fn on_datagram(
 ) -> (Vec<ReactorAction>, TaskVerdict) {
     let mut actions = Vec::new();
 
-    // ARES_FLAG_IGNTC: accept a truncated UDP reply as-is instead of retrying
-    // the query over TCP. Upstream checks TC before the rcode, so an error
-    // rcode on a truncated UDP reply still triggers the TCP retry.
+    // IGNTC: accept a truncated UDP reply as-is. TC is checked before rcode, so
+    // an error rcode on a truncated UDP reply still triggers the TCP retry.
     if summary.truncated && !is_tcp && !policy.ignore_tc {
         return (actions, TaskVerdict::RetryTcp);
     }
 
-    // ARES_FLAG_NOCHECKRESP: pass server-error rcodes through to the caller
-    // instead of treating them as failover errors (upstream still marks the
+    // NOCHECKRESP: pass server-error rcodes through (upstream still marks the
     // server good and delivers).
     let is_server_error =
         !policy.no_check_resp && matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
@@ -217,7 +177,6 @@ pub fn on_datagram(
             return (actions, TaskVerdict::RetryNextServer { server: health.pick_next(), tries });
         }
     } else {
-        // Accepted non-truncated response — notify + reset failure counters.
         actions.push(ReactorAction::NotifyServerState { server, ok: true, tcp: is_tcp });
         health.record_success(server);
     }
@@ -228,14 +187,13 @@ pub fn on_datagram(
 /// Verdict for an expired (timed-out) task.
 #[derive(Debug, PartialEq)]
 pub enum TimeoutVerdict {
-    /// Resend the same payload to this server (tries_done already counted).
     Retry { server: usize },
     /// Out of attempts: deliver ARES_ETIMEOUT.
     Expire,
 }
 
-/// Timeout policy: retry until `attempts` tries are used up, moving to the
-/// next server (and counting a failure) only when there is more than one.
+/// Retry until `attempts` are used up; a timeout counts as a failure and moves
+/// to the next server only when there is more than one.
 pub fn on_timeout(tries_done: u32, attempts: u32, server: usize, health: &mut ServerHealth) -> TimeoutVerdict {
     if tries_done < attempts {
         let server = if health.len() > 1 {
@@ -250,9 +208,9 @@ pub fn on_timeout(tries_done: u32, attempts: u32, server: usize, health: &mut Se
     }
 }
 
-/// Per-server failure bookkeeping and server selection for failover/probing.
-/// Indices track `config.nameservers`; every mutator is bounds-checked so a
-/// server list shrinking under an in-flight query cannot cause a panic.
+/// Per-server failure bookkeeping and selection for failover/probing. Indices
+/// track `config.nameservers`; mutators are bounds-checked so a shrinking server
+/// list under an in-flight query cannot panic.
 #[derive(Default)]
 pub struct ServerHealth {
     pub failures: Vec<u32>,
@@ -260,7 +218,6 @@ pub struct ServerHealth {
 }
 
 impl ServerHealth {
-    /// Number of tracked servers.
     pub fn len(&self) -> usize {
         self.failures.len()
     }
@@ -281,8 +238,7 @@ impl ServerHealth {
         self.last_failure.clear();
     }
 
-    /// Pick the best server to try next based on failure counts.
-    /// Returns the server index with lowest (failure_count, original_index).
+    /// Lowest failure count, tie broken by index; 0 when empty.
     pub fn pick_next(&self) -> usize {
         let mut best: Option<(u32, usize)> = None;
         for (i, &failures) in self.failures.iter().enumerate() {
@@ -298,8 +254,8 @@ impl ServerHealth {
         best.map(|(_, i)| i).unwrap_or(0)
     }
 
-    /// Pick a server eligible for probing: has failures, failure timestamp expired past retry_delay.
-    /// Returns the server with lowest (failure_count, index) among eligible, excluding `exclude_server`.
+    /// Lowest-failure server whose failure timestamp expired past `retry_delay`,
+    /// excluding `exclude_server`.
     pub fn pick_probe(&self, retry_delay_ms: u64, exclude_server: usize) -> Option<usize> {
         let now = Instant::now();
         let retry_delay = Duration::from_millis(retry_delay_ms);
@@ -324,8 +280,8 @@ impl ServerHealth {
         best.map(|(_, i)| i)
     }
 
-    /// Count a failed exchange against `idx`. Returns false when `idx` is out
-    /// of bounds (server list changed under the query).
+    /// Count a failure against `idx`; `false` when out of bounds (server list
+    /// changed under the query).
     pub fn record_failure(&mut self, idx: usize) -> bool {
         if idx >= self.failures.len() {
             return false;
@@ -337,15 +293,15 @@ impl ServerHealth {
         true
     }
 
-    /// Refresh only the failure timestamp (probe error path: the probe itself
-    /// failing is not counted as an additional server failure).
+    /// Refresh only the timestamp: a failing probe is not an additional server
+    /// failure.
     pub fn record_failure_time(&mut self, idx: usize) {
         if idx < self.last_failure.len() {
             self.last_failure[idx] = Some(Instant::now());
         }
     }
 
-    /// Mark `idx` healthy again. Returns false when `idx` is out of bounds.
+    /// Mark `idx` healthy; `false` when out of bounds.
     pub fn record_success(&mut self, idx: usize) -> bool {
         if idx >= self.failures.len() {
             return false;
@@ -428,7 +384,6 @@ mod tests {
         assert_eq!(p.current, "www");
         assert_eq!(p.advance(), None);
     }
-
 
     #[test]
     fn pick_next_lowest_failures_then_index() {

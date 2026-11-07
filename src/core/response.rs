@@ -1,7 +1,5 @@
-//! Parsed-reply engine shared by the legacy ares_parse_* API and the lookup
-//! callbacks: classify a raw DNS reply by header rcode, walk the answer
-//! section, follow CNAME chains, and collect typed records. Pure safe code —
-//! the C-facing hostent/linked-list emission stays in src/ffi.
+//! Parsed-reply engine for the legacy `ares_parse_*` API and lookup callbacks:
+//! classify replies by rcode, follow CNAME chains, and collect typed records.
 
 use std::ffi::CString;
 
@@ -17,9 +15,8 @@ use crate::ffi::{
     RECORD_TYPE_A, RECORD_TYPE_AAAA, RECORD_TYPE_CNAME, RECORD_TYPE_NS, RECORD_TYPE_PTR,
 };
 
-/// Expand a compressed DNS name that starts at `start` within `full_buf`.
-/// Returns the dotted name and the number of bytes the encoding occupies at
-/// `start` (the pure body of ares_expand_name).
+/// Expand a compressed DNS name at `start`; returns the dotted name and the
+/// number of bytes the encoding occupies there.
 pub fn expand_name_at(full_buf: &[u8], start: usize) -> Option<(CString, usize)> {
     let local_buf = &full_buf[start..];
     let mut sbuf = SliceBuf::new(local_buf);
@@ -29,10 +26,8 @@ pub fn expand_name_at(full_buf: &[u8], start: usize) -> Option<(CString, usize)>
     CString::new(name_str).ok().map(|c| (c, consumed))
 }
 
-/// Expand a length-prefixed DNS character-string at `start` within `full_buf`.
-/// Returns the string bytes and the encoded length (length byte + body); a
-/// body with an embedded NUL is rejected, since a strlen-based C consumer
-/// would silently truncate it (the pure body of ares_expand_string).
+/// Expand a length-prefixed character-string; a body with an embedded NUL is
+/// rejected because a strlen-based C consumer would silently truncate it.
 pub fn expand_string_at(full_buf: &[u8], start: usize) -> Option<(&[u8], usize)> {
     let remaining = &full_buf[start..];
     if remaining.is_empty() {
@@ -55,9 +50,8 @@ pub struct ParsedResponse<'a> {
     pub answers: Vec<DnsAnswer<'a>>,
 }
 
-/// One entry of the CNAME chain in a reply, in answer order. `alias` is the
-/// owner name and `name` the target; both are absent only for synthetic
-/// (hosts-file) canonical-name entries.
+/// One CNAME hop in answer order: `alias` is the owner and `name` the target.
+/// Both are absent only for synthetic hosts-file canonical entries.
 #[derive(Debug, Clone)]
 pub struct CnameEntry {
     pub ttl: u32,
@@ -70,7 +64,6 @@ pub struct ParsedRRs<T> {
     pub items: Vec<T>,
     pub name: CString,
     pub aliases: Vec<CString>,
-    /// Every IN-class CNAME answer, in reply order (owner/target/TTL).
     pub cnames: Vec<CnameEntry>,
     pub _limit_ttl: Option<u32>,
     pub success: usize,
@@ -97,19 +90,14 @@ impl<'a> ParsedResponse<'a> {
         if answer_count == 0 {
             return Err(ARES_ENODATA.into());
         }
-        // Grow on demand rather than pre-allocating `answer_count` (ancount is
-        // attacker-controlled, up to 65535, and DnsAnswer is large, so a tiny
-        // response could otherwise reserve tens of MB). The loop is self-bounding:
-        // each DnsAnswer::parse consumes >= 11 bytes, so it stops when the buffer
-        // is exhausted regardless of the claimed ancount.
+        // Not preallocated: ancount is attacker-controlled (up to 65535) and a
+        // tiny response could otherwise reserve tens of MB. Each parse consumes
+        // >= 11 bytes, so the loop is self-bounding.
         let mut answers = Vec::new();
-        // Only parse answer section (ancount); authority and additional sections are skipped
         for _ in 0..answer_count {
             let answer = DnsAnswer::parse(&mut sbuf).ok_or(ARES_EBADRESP)?;
-            // Mirror ares_dns_parse's class validation: unknown/raw types skip
-            // it, OPT is stored with class IN, and anything else must be a
-            // valid class (ANY only for SIG). This is the same check the
-            // ares_dns_record path applies, now enforced for the legacy parsers.
+            // Mirror ares_dns_parse: raw/unknown types skip class validation,
+            // OPT is allowed with class IN, everything else must be valid.
             if rec_type_isvalid(answer.record_type as u32, false)
                 && answer.record_type != ARES_REC_TYPE_OPT
                 && !class_isvalid(
@@ -132,8 +120,7 @@ impl<'a> ParsedResponse<'a> {
     }
 
     pub(crate) fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, AresError> {
-        // The echoed question name comes from the (untrusted) response and may
-        // contain an embedded NUL byte; fail gracefully instead of panicking.
+        // The echoed question name is untrusted and may contain a NUL.
         let mut name = CString::new(self.query.name.join(".")).map_err(|_| AresError::from(ARES_EBADRESP))?;
         let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
         let mut success = 0;
@@ -152,8 +139,7 @@ impl<'a> ParsedResponse<'a> {
             .min();
         let mut first_cname: Option<CString> = None;
         for mut answer in self.answers {
-            // Upstream ares_parse_into_addrinfo only considers IN records, so
-            // other classes must not affect CNAME chains, names or TTLs.
+            // Only IN records affect CNAME chains, names and TTL clamps.
             if answer.class != crate::ffi::dns_record::ARES_CLASS_IN {
                 continue;
             }
@@ -161,8 +147,6 @@ impl<'a> ParsedResponse<'a> {
                 let mut cname_buf = SliceBuf::new(answer.data);
                 let alias_of = DnsLabel::parse(&mut cname_buf).ok_or(AresError::from(ARES_EBADRESP))?;
                 let alias_of = alias_of.build_cstring(buf).ok_or(AresError::from(ARES_EBADRESP))?;
-                // `answer.name` is the CNAME owner (the previous name in the
-                // chain); `alias_of` is the target. Keep the raw RR TTL.
                 let owner = answer.name.build_cstring(buf).ok_or(AresError::from(ARES_EBADRESP))?;
                 cnames.push(CnameEntry {
                     ttl: answer.ttl,
@@ -216,19 +200,14 @@ impl<'a> ParsedResponse<'a> {
     }
 }
 
-/// What an address-record reply must contain to count as an answer — the
-/// three historical acceptance rules of the hostent-producing paths.
+/// What an address-record reply must contain to count as an answer.
 pub enum ReplyRequire {
-    /// gethostbyname's forward path: at least one address record.
     Items,
-    /// The legacy a/aaaa/ns parsers: records or aliases.
     ItemsOrAliases,
-    /// PTR replies: at least one name.
     Aliases,
 }
 
-/// Parse an address-record reply and apply the acceptance rule (ENODATA
-/// when it fails) — the shared front half of every hostent producer.
+/// Parse an address-record reply, returning ENODATA when the acceptance rule fails.
 pub fn addr_reply(buf: &[u8], expected_rtype: u16, require: ReplyRequire) -> Result<ParsedRRs<crate::core::packets::AddrRecord>, AresError> {
     let res = ParsedResponse::from_buf(buf)?;
     let rrs = res.process_answers::<crate::core::packets::AddrRecord>(buf, expected_rtype)?;
@@ -243,19 +222,16 @@ pub fn addr_reply(buf: &[u8], expected_rtype: u16, require: ReplyRequire) -> Res
     Ok(rrs)
 }
 
-/// PTR flows report the queried address itself as a zero-TTL record
-/// alongside the resolved names (both the async and the legacy parser path).
+/// PTR flows also report the queried address itself as a zero-TTL record.
 pub fn push_synthetic_ptr(rrs: &mut ParsedRRs<crate::core::packets::AddrRecord>, ip: std::net::IpAddr) {
     rrs.items.push(crate::core::packets::AddrRecord { ip, ttl: 0 });
 }
 
-/// A reply whose typed chain came out empty still parsed: report success if
-/// at least one RR of the type was seen, EBADRESP otherwise (the linked-list
-/// parsers' shared tail rule).
+/// An empty typed chain succeeds if at least one RR of the type was seen;
+/// otherwise EBADRESP.
 pub(crate) fn empty_chain_status(success: usize) -> AresError {
     if success > 0 { crate::ffi::error::ARES_SUCCESS.into() } else { ARES_EBADRESP.into() }
 }
-
 
 /// ares_parse_soa_reply reports a missing SOA as EBADRESP where the generic
 /// machinery says ENODATA.
@@ -354,9 +330,7 @@ mod tests {
         assert_eq!(rrs.cnames[1].ttl, 60);
         assert_eq!(rrs.cnames[1].alias.as_ref().map(|s| s.to_str().unwrap()), Some("first.example"));
         assert_eq!(rrs.cnames[1].name.as_ref().map(|s| s.to_str().unwrap()), Some("second.example"));
-        // Legacy hostent semantics use the first CNAME target.
         assert_eq!(rrs.name.to_str().unwrap(), "first.example");
-        // The A TTL is clamped to the smallest CNAME TTL.
         assert_eq!(rrs.items[0].ttl, 60);
     }
 }

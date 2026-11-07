@@ -1,14 +1,6 @@
-//! The per-query DNS connection facade (`Conn`) over `async_runtime`'s
-//! byte-level IO arms. A `Conn` owns its mailbox handle, so IO reads
-//! tokio-style: `conn.send(bytes, timeout).await` / `conn.recv(timeout).await`.
-//!
-//! The wire behind a `Conn` is one of four transports — an owned datagram
-//! socket, an owned one-shot stream (framed by [`dns_frame`]), a checkout of a
-//! shared, multiplexed TCP connection ([`TcpConn`]), or a checkout of a shared
-//! datagram connection ([`UdpConn`]) — and the datagram-vs-demuxed asymmetry
-//! is hidden behind the methods. Connection pooling and QID multiplexing live
-//! in [`crate::core::tcp_pool`] / [`crate::core::udp_pool`]; this module only
-//! routes a `Conn` to the right transport and drives it.
+//! The per-query DNS connection facade (`Conn`) over `async_runtime`'s byte-level
+//! IO arms. Pooling and QID multiplexing live in `tcp_pool`/`udp_pool`; this
+//! module routes a `Conn` to the right transport and drives it.
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -27,15 +19,12 @@ use crate::core::async_client::DnsMailbox;
 use crate::core::tcp_pool::{dns_frame, TcpConn};
 use crate::core::udp_pool::{UdpConn, UdpPool};
 
-/// A query's connection — the socket object the lifecycle drives, tokio-style.
-/// It **owns its mailbox** (`io`), so `send`/`recv` take no reactor handle:
-/// `conn.send(bytes, timeout).await` / `conn.recv(timeout).await`, just
-/// like `socket.recv(..).await`.
+/// A query's connection; it owns its mailbox (`io`) so `send`/`recv` take no
+/// reactor handle.
 pub(crate) struct Conn {
     io: Rc<RefCell<DnsMailbox>>,
     wire: Wire,
-    /// Set only on a shared-UDP checkout: the pool + server + stay-open policy,
-    /// so dropping the last query on a non-stay-open conn can retire it.
+    /// Set only on shared-UDP checkouts, so dropping the last query can retire the conn.
     udp_lease: Option<UdpLease>,
 }
 
@@ -46,11 +35,6 @@ struct UdpLease {
     max_queries: usize,
 }
 
-/// The transport behind a [`Conn`]: an exclusively owned datagram socket, an
-/// exclusively owned one-shot stream, this query's tag on a shared stream
-/// connection from the [`tcp_pool`](crate::core::tcp_pool), or this query's tag
-/// on a shared datagram connection from the
-/// [`udp_pool`](crate::core::udp_pool).
 enum Wire {
     Datagram { sock: Rc<dyn Socket> },
     Stream { sock: Rc<dyn Socket>, rbuf: Vec<u8> },
@@ -59,22 +43,19 @@ enum Wire {
 }
 
 impl Conn {
-    /// An owned datagram socket, already connected. One recv = one message.
+    /// An owned datagram socket, already connected (one recv = one message).
     pub fn datagram(io: Rc<RefCell<DnsMailbox>>, sock: Rc<dyn Socket>) -> Self {
         Conn { io, wire: Wire::Datagram { sock }, udp_lease: None }
     }
 
-    /// An owned one-shot stream socket, already connected; [`dns_frame`] cuts
-    /// its bytes into messages.
+    /// An owned one-shot stream socket; [`dns_frame`] cuts its bytes into messages.
     pub fn stream(io: Rc<RefCell<DnsMailbox>>, sock: Rc<dyn Socket>) -> Self {
         Conn { io, wire: Wire::Stream { sock, rbuf: Vec::new() }, udp_lease: None }
     }
 
-    /// A query's handle on a shared stream conn. Reserves an inbox tag on the
-    /// `TcpConn` (rerolling `qid` on collision — see [`TcpConn::reserve`]) so a
-    /// sibling future's read routes this query's reply here; the slot is
-    /// released when this handle drops. Returns the handle plus the tag
-    /// actually reserved — on a re-roll the caller must re-stamp its payload.
+    /// A query's handle on a shared stream conn: reserves a tag (rerolling `qid`
+    /// on collision — see [`TcpConn::reserve`]) and releases it on drop. Returns
+    /// the handle and the tag actually reserved; the caller must re-stamp on a re-roll.
     pub fn shared(
         io: Rc<RefCell<DnsMailbox>>,
         conn: Rc<RefCell<TcpConn>>,
@@ -85,11 +66,9 @@ impl Conn {
         (Conn { io, wire: Wire::Shared(conn, tag), udp_lease: None }, tag)
     }
 
-    /// A query's handle on a shared datagram conn. Reserves an inbox tag on the
-    /// `UdpConn` (rerolling `qid` on collision — see [`UdpConn::reserve`]) so a
-    /// sibling future's read routes this query's reply here; the slot is
-    /// released when this handle drops. Returns the handle plus the tag
-    /// actually reserved — on a re-roll the caller must re-stamp its payload.
+    /// A query's handle on a shared datagram conn: reserves a tag (rerolling `qid`
+    /// on collision — see [`UdpConn::reserve`]) and releases it on drop. Returns
+    /// the handle and the tag actually reserved; the caller must re-stamp on a re-roll.
     pub fn shared_udp(
         io: Rc<RefCell<DnsMailbox>>,
         conn: Rc<RefCell<UdpConn>>,
@@ -100,8 +79,8 @@ impl Conn {
         (Conn { io, wire: Wire::SharedUdp(conn, tag), udp_lease: None }, tag)
     }
 
-    /// Attach the pool lease for a shared-UDP checkout (used by the query
-    /// engine so an exhausted/idle conn can retire when its queries finish).
+    /// Attach the pool lease for a shared-UDP checkout so the conn can retire
+    /// when its queries finish.
     pub fn with_udp_lease(
         mut self,
         pool: Rc<RefCell<UdpPool>>,
@@ -113,8 +92,7 @@ impl Conn {
         self
     }
 
-    /// The shared datagram handle behind this conn, if it is a shared-UDP
-    /// checkout (for removing a dead conn from the pool).
+    /// The shared datagram handle behind this conn, if it is a shared-UDP checkout.
     pub fn shared_udp_handle(&self) -> Option<Rc<RefCell<UdpConn>>> {
         match &self.wire {
             Wire::SharedUdp(c, _) => Some(c.clone()),
@@ -122,7 +100,7 @@ impl Conn {
         }
     }
 
-    /// Mark a shared-UDP socket dead (send failure). No-op for other wires.
+    /// Mark a shared-UDP socket dead on a send failure; no-op for other wires.
     pub fn mark_dead(&self) {
         if let Some(c) = self.shared_udp_handle() {
             c.borrow_mut().mark_dead();
@@ -141,9 +119,8 @@ impl Conn {
         matches!(&self.wire, Wire::Stream { .. } | Wire::Shared(..))
     }
 
-    /// Await writability, then send `bytes` once (WouldBlock re-awaits). The
-    /// socket was connected at creation. Errors: the socket's own error on a
-    /// hard send failure, `ErrorKind::TimedOut` on timeout before writable.
+    /// Await writability, then send `bytes` once (WouldBlock re-awaits);
+    /// `TimedOut` if not writable before `timeout`.
     pub async fn send(&self, bytes: &[u8], timeout: Instant) -> io::Result<()> {
         let sock: Rc<dyn Socket> = match &self.wire {
             Wire::Datagram { sock } | Wire::Stream { sock, .. } => sock.clone(),
@@ -153,12 +130,9 @@ impl Conn {
         send_when_writable(&self.io, &*sock, bytes, timeout).await
     }
 
-    /// Take a message a **sibling** already routed into this tag's inbox slot
-    /// (only possible on a shared conn: when two futures share one socket, the
-    /// one that drains it routes the other's frames into their slots). Returns
-    /// it without needing this conn's fd to fire — the draining sibling
-    /// consumed the fd's readiness. `None` for owned conns (no sibling) or an
-    /// empty slot.
+    /// Take a message a **sibling** already routed into this tag's slot — only
+    /// possible on a shared conn, and without this conn's fd firing again (the
+    /// draining sibling consumed its readiness).
     fn take_routed_slot(&mut self) -> Option<Vec<u8>> {
         match &self.wire {
             Wire::Shared(c, tag) => c.borrow_mut().take(*tag),
@@ -167,20 +141,16 @@ impl Conn {
         }
     }
 
-    /// One non-blocking read of this conn's next message: a datagram, a framed
-    /// one-shot stream message, or this tag's routed message off the shared
-    /// conn. `Poll::Pending` = nothing yet (WouldBlock / incomplete). The recv
-    /// goes through this lookup's mailbox `scratch`, taken OUT of the mailbox
-    /// for the read's span (each `borrow_mut` ends at its `;`) so the C recv
-    /// callback under `Socket::recv` fires with no mailbox borrow live.
+    /// One non-blocking read of this conn's next message. `scratch` is taken out
+    /// of the mailbox for the read's span so the C recv callback fires with no
+    /// mailbox borrow live.
     fn read(&mut self) -> Poll<io::Result<Vec<u8>>> {
         let mut scratch = std::mem::take(&mut self.io.borrow_mut().scratch);
         let r = match &mut self.wire {
             Wire::Datagram { sock } => recv_datagram(&**sock, &mut scratch),
             Wire::Stream { sock, rbuf } => {
-                // One-shot stream: drain bytes, then try to pop one frame. A
-                // buffered frame delivers even on a dead socket; else a dead
-                // socket errors, a live-but-incomplete is `Pending`.
+                // One-shot stream: a buffered frame delivers even on a dead
+                // socket; else a dead socket errors and an incomplete read is `Pending`.
                 let alive = recv_stream(&**sock, rbuf, &mut scratch);
                 match dns_frame(rbuf) {
                     Some(frame) => Poll::Ready(Ok(frame)),
@@ -188,26 +158,24 @@ impl Conn {
                     None => Poll::Pending,
                 }
             }
-            // The shared conn owns the drain+route+demux (per-tag inbox).
+            // The shared conn owns the drain, route, and per-tag demux.
             Wire::Shared(c, tag) => c.borrow_mut().poll_read(*tag, &mut scratch),
             Wire::SharedUdp(c, tag) => c.borrow_mut().poll_read(*tag, &mut scratch),
         };
-        self.io.borrow_mut().scratch = scratch; // put back (grown on first use)
+        self.io.borrow_mut().scratch = scratch;
         r
     }
 
-    /// A non-blocking read, bypassing wait registration. Used after a timeout
-    /// expired in the same reactor cycle as socket readiness: `Conn::recv` is
-    /// deliberately timeout-biased, but a pending hard error (ICMP
+    /// A read bypassing wait registration, for the cycle where `Conn::recv`'s
+    /// timeout expired alongside socket readiness: a pending hard error (ICMP
     /// port-unreachable) must still be consumed before counting a timeout.
     pub fn try_recv(&mut self) -> Poll<io::Result<Vec<u8>>> {
         if let Some(msg) = self.take_routed_slot() {
             return Poll::Ready(Ok(msg));
         }
-        // Only consume a read when the reactor actually reported this fd
-        // ready. A pure timeout must stay a timeout (custom socket tables can
-        // return zero-length "datagrams" on every read, which must not be
-        // mistaken for readiness).
+        // Consume only when the reactor reported this fd ready: a pure timeout
+        // must stay a timeout (custom socket tables can return zero-length
+        // "datagrams" that must not be mistaken for readiness).
         let fd = self.fd();
         let ready = self
             .io
@@ -221,17 +189,14 @@ impl Conn {
         self.read()
     }
 
-    /// Await this conn's next message with no timeout bound — usable directly
-    /// as a `select_biased!` arm. On this conn's fd firing, does one
-    /// non-blocking [`read`](Self::read) (a `WouldBlock` re-registers and
-    /// suspends). Resolves `Ok(bytes)` or `Err(UnexpectedEof)` (dead socket).
+    /// Await this conn's next message with no timeout bound. On this conn's fd
+    /// firing, does one non-blocking [`read`](Self::read); `Err(UnexpectedEof)` on a dead socket.
     pub async fn recv_msg(&mut self) -> io::Result<Vec<u8>> {
         let fd = self.fd();
         let io = self.io.clone();
         poll_fn(move |_| {
-            // A sibling sharing this socket may have already drained it and
-            // routed our frame into our slot (consuming the fd's readiness in
-            // the process); take it without waiting for our fd to fire again.
+            // A sibling may have already drained the socket and routed our frame
+            // into our slot, consuming the fd's readiness; take it without waiting.
             if let Some(msg) = self.take_routed_slot() {
                 return Poll::Ready(Ok(msg));
             }
@@ -240,10 +205,8 @@ impl Conn {
         .await
     }
 
-    /// tokio-style `conn.recv(timeout).await`: await this conn's next message,
-    /// bounded by `timeout` (timeout arm first — the classic
-    /// expiry-preempts-read order). Errors: `ErrorKind::TimedOut` on expiry,
-    /// `ErrorKind::UnexpectedEof` on a dead socket (EOF / hard recv error).
+    /// `conn.recv(timeout).await`; the timeout arm is polled first so expiry
+    /// preempts a read ready in the same poll. `TimedOut` on expiry.
     pub async fn recv(&mut self, timeout: Instant) -> io::Result<Vec<u8>> {
         let io = self.io.clone();
         let mut t = pin!(sleep_until(&io, timeout).fuse());
@@ -255,8 +218,7 @@ impl Conn {
     }
 }
 
-/// Dropping a query's conn releases its shared-stream inbox slot (RAII — no
-/// manual register/clear), so retries, delivery, and abandonment can't leak slots.
+/// Dropping a conn releases its shared inbox slot (RAII).
 impl Drop for Conn {
     fn drop(&mut self) {
         let retired = match (&self.wire, &self.udp_lease) {
@@ -280,8 +242,8 @@ impl Drop for Conn {
             }
             _ => Vec::new(),
         };
-        // Drop retired handles only after the pool borrow above has ended, so
-        // any socket close callback fires with no pool cell held.
+        // Drop retired handles after the pool borrow ends so socket close
+        // callbacks fire with no pool cell held.
         drop(retired);
     }
 }
@@ -295,8 +257,7 @@ mod tests {
     use std::task::{Context, Waker};
     use std::time::Duration;
 
-    /// A socket that always has a datagram waiting — so a recv arm that is
-    /// polled goes `Ready(Ok(..))` immediately.
+    /// A socket that always has a datagram waiting, so a recv arm is immediately ready.
     struct AlwaysReadable {
         fd: i32,
     }
@@ -317,8 +278,7 @@ mod tests {
     }
 
     /// `Conn::shared` propagates the reserved tag, and dropping a `Conn` frees
-    /// exactly its own shared-conn slot (RAII). The reroll *loop* itself is
-    /// covered in `tcp_pool`; here we check the `Conn` wiring around it.
+    /// exactly its own shared-conn slot (RAII).
     #[test]
     fn shared_conn_releases_slot_on_drop() {
         let tc = TcpConn::new(Rc::new(AlwaysReadable { fd: 5 }));
@@ -326,7 +286,6 @@ mod tests {
 
         let (a, ta) = Conn::shared(io.clone(), tc.clone(), 7, || panic!("free qid must not reroll"));
         assert_eq!(ta, 7);
-        // Second checkout collides on 7 → rerolls to 9.
         let (b, tb) = Conn::shared(io.clone(), tc.clone(), 7, || 9);
         assert_eq!(tb, 9);
         assert!(tc.borrow().has_waiter(7) && tc.borrow().has_waiter(9));
@@ -338,19 +297,13 @@ mod tests {
     }
 
     /// `Conn::recv` must be **timeout-biased**: when a reply and the timeout are
-    /// both ready in the same poll, expiry preempts the read. This guards the
-    /// `select_biased!` in `recv` against being weakened to an unbiased
-    /// `futures::select!` (which, given a datagram already waiting *and* an
-    /// expired timeout, would pick the reply arm ~half the time). 100 trials
-    /// make an accidental `select!` fail with probability `1 - 0.5^100` — i.e.
-    /// deterministically for any real run — while `select_biased!` passes every
-    /// trial. The scenario is constructed, not timing-raced, so this is stable.
+    /// both ready in one poll, expiry preempts the read. Guards against weakening
+    /// `select_biased!` to an unbiased `select!` (which would pick either arm).
     #[test]
     fn recv_is_timeout_biased_under_simultaneous_readiness() {
         for trial in 0..100 {
             let io: Rc<RefCell<DnsMailbox>> = Rc::new(RefCell::new(DnsMailbox::default()));
-            // Both arms ready on the first poll: the read fd is fired (a datagram
-            // is waiting) AND the deadline is already in the past.
+            // Both arms ready on the first poll: a datagram waits and the deadline is past.
             io.borrow_mut().fired = vec![Wait { fd: 42, writable: false }];
             let sock: Rc<dyn Socket> = Rc::new(AlwaysReadable { fd: 42 });
             let mut conn = Conn::datagram(io.clone(), sock);

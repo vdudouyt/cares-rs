@@ -1,28 +1,5 @@
-//! DNS-over-UDP connection pooling: one datagram socket per server (or a
-//! small set of them when `ARES_OPT_UDP_MAX_QUERIES` caps how many queries may
-//! be sent on a socket), shared by every concurrent query and demuxed by
-//! transaction id — the upstream c-ares behavior the gtest suite pins (32
-//! parallel UDP lookups with a max of 8 must create exactly 4 sockets).
-//!
-//! - [`UdpConn`] — a shared connected datagram socket: the tag-demuxed inbox
-//!   the querying futures share. Whoever drains the socket (`recv_and_route`)
-//!   routes each datagram to the waiter its transaction id (`dns_tag`) belongs
-//!   to. A query reserves a free inbox tag (`reserve`, rerolling on collision
-//!   ≈ upstream `generate_unique_qid`) and releases it when its `Conn` drops.
-//!   `total_queries` counts every query ever sent on the conn (upstream's
-//!   per-connection cap, not just the currently outstanding waiters).
-//! - [`UdpPool`] — the per-server list of live `UdpConn`s a lookup consults
-//!   (`pick_or_none`) before opening a datagram socket. Unlike TCP a server can
-//!   have several UDP conns once the per-socket query cap is reached.
-//!
-//! Message framing is not needed for UDP (one datagram = one message); the
-//! transaction tag is the first two header bytes, shared with the TCP demux
-//! via [`crate::core::tcp_pool::dns_tag`]. The connection *facade* (`Conn`)
-//! that drives one of these is in `core::conn`; this module owns only the
-//! shared/pooled machinery. It stays separate from `tcp_pool` because the
-//! transports differ in framing, buffering, and lifecycle: TCP has one conn
-//! per server with a reassembly buffer, while UDP has a list capped by
-//! `total_queries` and retires sockets as they become exhausted.
+//! DNS-over-UDP pooling: server-shared datagram sockets demuxed by transaction
+//! tag; a server gets a new conn once the per-socket query cap is spent.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,52 +13,39 @@ use crate::async_runtime::socket::Socket;
 use crate::core::async_client::DnsMailbox;
 use crate::core::tcp_pool::dns_tag;
 
-/// A pooled datagram-connection handle.
 pub(crate) type Conn = Rc<RefCell<UdpConn>>;
 
-/// A checkout result: the selected conn (if any) plus conns retired during the
-/// lookup, both returned by value so the caller can drop retired sockets after
-/// its pool borrow ends.
+/// Selected conn plus handles retired during the lookup, returned by value so
+/// the caller can drop them after its pool borrow ends.
 type Checkout = (Option<Conn>, Vec<Conn>);
 
-/// One tag's inbox slot: the routed reply (once it arrives) plus the target
-/// lookup's mailbox, flagged `routed` so a sibling drain wakes a future that
-/// had already suspended with no fd readiness of its own.
+/// One tag's inbox slot: the routed reply plus the target mailbox, flagged
+/// `routed` so a sibling drain can wake a future with no fd readiness of its own.
 struct InboxSlot {
     reply: Option<Vec<u8>>,
     notify: Rc<RefCell<DnsMailbox>>,
 }
 
-/// A shared datagram connection to one server, cooperatively driven by every
-/// future that has an outstanding query on it: the tag-demuxed inbox the
-/// futures share. `core::conn::Conn` drives this through the crate API below
-/// (`reserve`/`sock`/`fd`/`take`/`poll_read`/`release`); the fields stay
-/// private to the pool.
+/// A shared datagram connection to one server, driven cooperatively by every
+/// future with an outstanding query on it (tag-demuxed inbox).
 pub(crate) struct UdpConn {
     sock: Rc<dyn Socket>,
     fd: i32,
-    /// tag -> reply slot (reply + target mailbox).
     inbox: HashMap<u16, InboxSlot>,
-    /// Every query ever reserved on this conn. `ARES_OPT_UDP_MAX_QUERIES`
-    /// caps this total (upstream `conn->total_queries`), so an exhausted conn
-    /// is retired even if its current waiters later drain.
+    /// Every query ever reserved, not just current waiters; `ARES_OPT_UDP_MAX_QUERIES`
+    /// caps this total, so an exhausted conn retires even if its waiters later drain.
     total_queries: usize,
-    /// Sticky hard-error flag. Once the shared socket dies, every waiter must
-    /// observe the error rather than waiting for its own timeout.
+    /// Sticky hard-error flag: once the shared socket dies every waiter must see the error.
     dead: bool,
-    /// When the socket died. Event-driven channels keep a dead conn pooled
-    /// briefly so concurrent retries join it and fail fast instead of each
-    /// opening a fresh socket.
+    /// When the socket died; event-driven channels keep a dead conn pooled briefly
+    /// so concurrent retries join it and fail fast instead of opening fresh sockets.
     dead_since: Option<Instant>,
-    /// Event-thread channels opt into the dead-conn grace behavior.
     event_driven: bool,
 }
 
 impl UdpConn {
-    /// A fresh shared connection over `sock` — already created **and**
-    /// connected by the caller, outside any pool borrow, so the C socket
-    /// callbacks (asocket / create-cb / config-cb / aconnect) fire with no
-    /// cell held.
+    /// A fresh shared connection over `sock`, already created and connected by
+    /// the caller outside any pool borrow so socket callbacks fire with no cell held.
     pub(crate) fn new(sock: Rc<dyn Socket>, event_driven: bool) -> Rc<RefCell<Self>> {
         let fd = sock.as_raw_fd();
         Rc::new(RefCell::new(UdpConn {
@@ -95,13 +59,9 @@ impl UdpConn {
         }))
     }
 
-    /// Reserve a free inbox tag for a query, registering `io` as the mailbox to
-    /// flag when a sibling routes this tag's reply, and count the query against
-    /// the per-conn total. Starts from the query's current transaction id
-    /// `qid`; if an in-flight sibling on this conn already owns it, fresh ids
-    /// are drawn from `reroll` until one is free (≈ upstream
-    /// `generate_unique_qid` in `ares_send.c`). Returns the tag actually
-    /// reserved; on a re-roll the caller must re-stamp its payload.
+    /// Reserve a free inbox tag for a query, registering `io` to be flagged when
+    /// a sibling routes this tag's reply. Rerolls from `qid` on collision (≈
+    /// upstream `generate_unique_qid`); the caller must re-stamp its payload on a re-roll.
     pub(crate) fn reserve(
         &mut self,
         qid: u16,
@@ -117,40 +77,35 @@ impl UdpConn {
         tag
     }
 
-    /// Release `tag`'s inbox slot (called from `Conn`'s Drop — RAII, no manual
-    /// clear). An unknown tag is a no-op.
+    /// Release `tag`'s slot (RAII from `Conn`'s Drop; unknown tags are a no-op).
     pub(crate) fn release(&mut self, tag: u16) {
         self.inbox.remove(&tag);
     }
 
-    /// This connection's socket (for sending) — cheaply cloned.
     pub(crate) fn sock(&self) -> Rc<dyn Socket> {
         self.sock.clone()
     }
 
-    /// This connection's fd (for readiness registration).
     pub(crate) fn fd(&self) -> i32 {
         self.fd
     }
 
-    /// Take a reply a **sibling** already routed into `tag`'s slot, if any —
-    /// without reading the socket (the draining sibling consumed the fd's
-    /// readiness). `None` for an empty or unknown slot.
+    /// Take a reply a **sibling** already routed into `tag`'s slot (it consumed
+    /// the fd's readiness, so this must not read the socket).
     pub(crate) fn take(&mut self, tag: u16) -> Option<Vec<u8>> {
         self.inbox.get_mut(&tag).and_then(|slot| slot.reply.take())
     }
 
-    /// Drain + route every waiting datagram, then resolve `tag`'s next message:
-    /// `Ready(Ok)` if a datagram is now in its slot, `Ready(Err(UnexpectedEof))`
-    /// if the socket died with nothing buffered, `Pending` otherwise.
+    /// Drain + route waiting datagrams, then resolve `tag`: `Ready(Ok)` if a
+    /// message is now in its slot, `Ready(Err(UnexpectedEof))` if the socket died, else `Pending`.
     pub(crate) fn poll_read(&mut self, tag: u16, scratch: &mut Vec<u8>) -> Poll<io::Result<Vec<u8>>> {
         if self.dead {
             return Poll::Ready(Err(dead()));
         }
         let alive = self.recv_and_route(scratch);
         if !alive {
-            // A hard error is sticky: wake every sibling waiter (their replies
-            // can never arrive now) and report the dead socket to each future.
+            // A hard error is sticky: wake every sibling waiter, since their
+            // replies can never arrive now.
             self.dead = true;
             self.dead_since.get_or_insert_with(Instant::now);
             for slot in self.inbox.values() {
@@ -164,10 +119,8 @@ impl UdpConn {
         }
     }
 
-    /// Drain the socket until `WouldBlock`, routing each datagram by its tag
-    /// into `inbox` (datagrams with no registered waiter are dropped). Returns
-    /// `false` if the socket died (hard error). Idempotent: a sibling future
-    /// calling this after the socket is drained just no-ops.
+    /// Drain the socket until `WouldBlock`, routing each datagram by tag into
+    /// `inbox` (unknown tags dropped); returns `false` if the socket died.
     fn recv_and_route(&mut self, scratch: &mut Vec<u8>) -> bool {
         let drain = self.sock.drain_safe();
         loop {
@@ -178,16 +131,14 @@ impl UdpConn {
                             slot.reply = Some(frame);
                             slot.notify.borrow_mut().routed = true;
                         }
-                        // Unknown tag → drop (a stray/late datagram).
                     } else if let Some(slot) = self.inbox.values_mut().find(|s| s.reply.is_none()) {
-                        // An untaggable datagram: hand it to one awaiting waiter
-                        // so the application sees (and rejects) it.
+                        // Untaggable datagram: hand it to an awaiting waiter so
+                        // the application sees (and rejects) it.
                         slot.reply = Some(frame);
                         slot.notify.borrow_mut().routed = true;
                     }
-                    // A caller-supplied socket may be blocking; one datagram
-                    // per readiness cycle is safe, and the next cycle picks up
-                    // anything still queued.
+                    // A caller-supplied socket may be blocking: one datagram per
+                    // readiness cycle is safe; the next cycle drains the rest.
                     if !drain {
                         return true;
                     }
@@ -198,35 +149,28 @@ impl UdpConn {
         }
     }
 
-    /// How many queries currently own an inbox slot on this conn.
     #[cfg(test)]
     pub(crate) fn waiter_count(&self) -> usize {
         self.inbox.len()
     }
 
-    /// Every query ever sent on this conn (the `ARES_OPT_UDP_MAX_QUERIES`
-    /// counter).
     #[cfg(test)]
     pub(crate) fn total_queries(&self) -> usize {
         self.total_queries
     }
 
-    /// No query currently owns this conn; an idle conn may be closed when
-    /// `ARES_FLAG_STAYOPEN` is clear.
+    /// No query owns this conn (idle conns may be retired unless stay-open).
     pub(crate) fn is_empty(&self) -> bool {
         self.inbox.is_empty()
     }
 
-    /// The shared socket has hit a hard error. While waiters remain, new
-    /// queries should join it so they fail fast instead of opening a fresh
-    /// socket that needs its own ICMP error.
+    /// The shared socket hit a hard error; new queries should join it so they
+    /// fail fast instead of opening a fresh socket that needs its own ICMP error.
     pub(crate) fn is_dead(&self) -> bool {
         self.dead
     }
 
-    /// Mark the shared socket dead from a send failure. Siblings are woken so
-    /// they observe the error immediately; the conn stays pooled for the short
-    /// grace window so retries do not open a new socket per query.
+    /// Mark the socket dead from a send failure, waking siblings immediately.
     pub(crate) fn mark_dead(&mut self) {
         self.dead = true;
         self.dead_since.get_or_insert_with(Instant::now);
@@ -235,10 +179,8 @@ impl UdpConn {
         }
     }
 
-    /// True while a dead conn is still inside its short grace window. Keeping
-    /// it pooled lets a burst of retries fail fast on the same failed socket
-    /// instead of opening one fresh socket per query (each requiring its own
-    /// ICMP error, which the kernel may rate-limit).
+    /// A dead conn stays pooled for a short grace window so a burst of retries
+    /// fails fast on the same socket instead of opening one fresh socket per query.
     fn dead_in_grace(&self) -> bool {
         self.event_driven
             && self.dead
@@ -253,10 +195,8 @@ impl UdpConn {
     }
 }
 
-/// Shared datagram connections keyed by server index. A future consults this
-/// before opening a datagram socket so parallel queries to one server share a
-/// connection (upstream: `server->connections`, capped by
-/// `channel->udp_max_queries`).
+/// Shared datagram connections per server, capped by `channel->udp_max_queries`
+/// (upstream `server->connections`).
 pub(crate) struct UdpPool {
     conns: HashMap<usize, Vec<Conn>>,
 }
@@ -266,9 +206,8 @@ impl UdpPool {
         UdpPool { conns: HashMap::new() }
     }
 
-    /// Drop every pooled connection, returning them so the caller can release
-    /// the `Rc`s **after** its pool borrow ends (a socket close callback fires
-    /// on the last drop).
+    /// Return every pooled conn for dropping after the pool borrow ends (a socket
+    /// close callback fires on the last drop).
     pub fn clear(&mut self) -> Vec<Conn> {
         let mut retired = Vec::new();
         for (_, mut list) in self.conns.drain() {
@@ -277,24 +216,19 @@ impl UdpPool {
         retired
     }
 
-    /// Register a newly created connection for `server`.
     pub fn insert(&mut self, server: usize, conn: Conn) {
         self.conns.entry(server).or_default().push(conn);
     }
 
-    /// True when any pooled conn for `server` has hit a hard socket error.
-    /// A timeout on a sibling conn is then attributable to the same failure
-    /// (e.g. ICMP rate-limiting on one of several sockets) rather than a
-    /// genuine query timeout.
+    /// Any pooled conn for `server` hit a hard socket error, so a sibling's
+    /// timeout is attributable to that failure rather than a genuine query timeout.
     pub fn has_dead(&self, server: usize) -> bool {
         self.conns
             .get(&server)
             .is_some_and(|list| list.iter().any(|c| c.borrow().is_dead()))
     }
 
-    /// Remove `conn` from `server`'s list (a dead socket / send failure). The
-    /// removed handle is returned so the caller can drop it outside the pool
-    /// borrow.
+    /// Remove `conn` from `server`'s list, returning it for dropping outside the borrow.
     pub fn remove(
         &mut self,
         server: usize,
@@ -318,10 +252,9 @@ impl UdpPool {
         removed
     }
 
-    /// Retire a conn when its total-query cap is spent (regardless of open
-    /// waiters, which keep it alive through their own handles) or when it is
-    /// idle and `ARES_FLAG_STAYOPEN` is clear. Returns the removed handle for
-    /// dropping after the pool borrow.
+    /// Retire a conn when its query cap is spent (regardless of open waiters,
+    /// which keep it alive through their handles) or it is idle and not stay-open;
+    /// returns the handle for dropping after the pool borrow.
     pub fn release_if_done(
         &mut self,
         server: usize,
@@ -342,12 +275,9 @@ impl UdpPool {
         self.remove(server, conn)
     }
 
-    /// Check out a connection for a new query on `server`, or `None` when every
-    /// existing conn is exhausted (`total_queries >= max_queries`; `0` =
-    /// unlimited) and the caller must create another socket. Idle conns are
-    /// pruned when `stayopen` is clear; exhausted conns are pruned regardless.
-    /// The returned second vector holds retired handles, to be dropped after
-    /// the pool borrow.
+    /// Check out a conn for a new query on `server`, or `None` when every conn is
+    /// exhausted (`max_queries == 0` = unlimited) and the caller must open another.
+    /// Idle conns are pruned unless stay-open; exhausted ones always are.
     pub fn pick_or_none(
         &mut self,
         server: usize,
@@ -386,8 +316,7 @@ impl UdpPool {
 
 #[cfg(test)]
 impl UdpConn {
-    /// Whether `tag` currently has a reserved inbox slot (for checkout/RAII
-    /// tests here and in `core::conn`; fields are private to this module).
+    /// Whether `tag` has a reserved slot (fields are private to this module).
     pub(crate) fn has_waiter(&self, tag: u16) -> bool {
         self.inbox.contains_key(&tag)
     }
@@ -403,8 +332,7 @@ mod tests {
         Rc::new(RefCell::new(DnsMailbox::default()))
     }
 
-    /// A socket with no datagrams waiting — enough to stand up a `UdpConn` for
-    /// the reservation/pool tests (which never read it).
+    /// A socket with no datagrams waiting, for tests that never read it.
     struct DummySock;
     impl Socket for DummySock {
         fn as_raw_fd(&self) -> i32 {
@@ -476,23 +404,19 @@ mod tests {
         let io = mailbox();
         pool.insert(0, conn.clone());
 
-        // Sequential reuse: max 2, first query reserves and releases. Use
-        // STAYOPEN so the idle conn is eligible for reuse between queries.
         let (picked, retired) = pool.pick_or_none(0, 2, true);
         assert!(picked.is_some() && retired.is_empty());
         conn.borrow_mut().reserve(1, || panic!("free qid"), io.clone());
         conn.borrow_mut().release(1);
         assert_eq!(conn.borrow().total_queries(), 1);
 
-        // Second query still reuses the same conn even though it is idle.
         let (picked, retired) = pool.pick_or_none(0, 2, true);
         assert!(picked.is_some() && retired.is_empty());
         conn.borrow_mut().reserve(2, || panic!("free qid"), io.clone());
         conn.borrow_mut().release(2);
         assert_eq!(conn.borrow().total_queries(), 2);
 
-        // Third checkout: exhausted (total == max) -> pruned even with
-        // STAYOPEN, and the caller must create a new conn.
+        // Exhausted even with STAYOPEN: pruned; caller must create a new conn.
         let (picked, retired) = pool.pick_or_none(0, 2, true);
         assert!(picked.is_none());
         assert_eq!(retired.len(), 1);
