@@ -111,9 +111,9 @@ impl AsyncClient {
     /// Mint the per-lookup copy every entry shim runs on: clone config and
     /// shared `Rc`s, snapshot endpoints, and mint a **fresh** mailbox (cloning
     /// `self.io` would alias every concurrent lookup on the channel).
-    pub(crate) fn derive(&mut self) -> Rc<Self> {
+    pub(crate) fn derive(&mut self) -> Self {
         let hosts = self.hosts();
-        Rc::new(AsyncClient {
+        AsyncClient {
             config: self.config.clone(),
             factory: self.factory.clone(),
             hosts: Some(hosts),
@@ -142,7 +142,7 @@ impl AsyncClient {
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
             io: Rc::new(RefCell::new(DnsMailbox::default())),
-        })
+        }
     }
 
     /// The hosts table; empty only on the channel-owned instance before first use.
@@ -175,7 +175,7 @@ impl AsyncClient {
     /// failover, send, then loop until a verdict. `use_tcp` is the starting transport;
     /// `cancelled` stops retries but still delivers an in-flight reply.
     async fn request(
-        self: Rc<Self>,
+        &self,
         payload: BytesMut,
         mut use_tcp: bool,
         synthesize_edns: bool,
@@ -419,7 +419,7 @@ impl AsyncClient {
     /// ares_query / ares_send: the raw single query, wrapped into `Delivery::Raw`.
     /// The starting transport honors ARES_FLAG_USEVC; `synthesize_edns` is false
     /// for raw send APIs, whose bytes must go on the wire unchanged.
-    pub(crate) async fn query_raw(self: Rc<Self>, payload: BytesMut, synthesize_edns: bool) -> Delivery {
+    pub(crate) async fn query_raw(self, payload: BytesMut, synthesize_edns: bool) -> Delivery {
         let use_vc = self.config.options.use_vc;
         let (result, timeouts) = self.request(payload, use_vc, synthesize_edns).await;
         Delivery::Raw { result, timeouts }
@@ -428,7 +428,7 @@ impl AsyncClient {
     /// One-shot failover probe to a stale server, raced against the primary; reply-
     /// biased, looping past stray (non-QID) datagrams, and folding its outcome into
     /// `ServerHealth`.
-    async fn run_probe(self: Rc<Self>, probe_payload: BytesMut, use_tcp: bool) {
+    async fn run_probe(&self, probe_payload: BytesMut, use_tcp: bool) {
         let io = self.io.clone();
         let opts = self.opts();
         if opts.failover_chance == 0 {
@@ -484,7 +484,7 @@ impl AsyncClient {
     /// hosts/localhost/HOSTALIASES/no-servers/query-cache) then search-domain DNS.
     /// Preflight has no `.await`, so a sync hit fires re-entrantly on first poll.
     pub(crate) async fn gethostbyname(
-        self: Rc<Self>,
+        self,
         hostname: String,
         family: c_int,
     ) -> Result<Hostent, AresError> {
@@ -588,7 +588,7 @@ impl AsyncClient {
                         AF_INET6 => vec![RTYPE_AAAA],
                         _ => vec![RTYPE_A, RTYPE_AAAA],
                     };
-                    let lookup = self.clone().resolve_addrinfo(&names, &rtypes, true).await;
+                    let lookup = self.resolve_addrinfo(&names, &rtypes, true).await;
                     self.io.borrow_mut().app.timeouts = lookup.timeouts;
                     if lookup.replies.is_empty() {
                         last_error = lookup.status;
@@ -628,7 +628,7 @@ impl AsyncClient {
 
     /// ares_gethostbyaddr: hosts-file reverse lookup, then a single PTR query.
     pub(crate) async fn gethostbyaddr(
-        self: Rc<Self>,
+        self,
         ip: IpAddr,
         family: c_int,
     ) -> Result<Hostent, AresError> {
@@ -647,7 +647,7 @@ impl AsyncClient {
             self.recursion_desired(),
         )?;
         let use_vc = self.config.options.use_vc;
-        let (result, io_timeouts) = self.clone().request(payload, use_vc, true).await;
+        let (result, io_timeouts) = self.request(payload, use_vc, true).await;
 
         match result {
             Ok(buf) => {
@@ -665,7 +665,7 @@ impl AsyncClient {
     /// ares_getnameinfo: three synchronous short-circuits (service-only /
     /// NUMERICHOST / no-servers), else a single PTR query + `assemble_nameinfo`.
     pub(crate) async fn getnameinfo(
-        self: Rc<Self>,
+        self,
         addr: AddrInfo,
         flags: c_int,
     ) -> NameinfoReply {
@@ -718,7 +718,7 @@ impl AsyncClient {
             }
         };
         let use_vc = self.config.options.use_vc;
-        let (result, io_timeouts) = self.clone().request(payload, use_vc, true).await;
+        let (result, io_timeouts) = self.request(payload, use_vc, true).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -732,7 +732,7 @@ impl AsyncClient {
     /// ares_search (legacy): iterate the search plan with freshly built payloads
     /// carrying the caller's class/type.
     pub(crate) async fn search(
-        self: Rc<Self>,
+        self,
         name: String,
         dnsclass: u32,
         dnstype: u32,
@@ -754,7 +754,7 @@ impl AsyncClient {
     /// ares_search_dnsrec: iterate the search plan over a duplicate of the
     /// caller's record, replacing only query[0]'s name.
     pub(crate) async fn search_dnsrec(
-        self: Rc<Self>,
+        self,
         template: ares_dns_record_t,
         retry_server_error: bool,
     ) -> Delivery {
@@ -775,7 +775,7 @@ impl AsyncClient {
     /// Shared search-domain driver: retry NXDOMAIN/NODATA/timeout, plus (for the
     /// dnsrec flavor) SERVFAIL/REFUSED/NOTIMP when `retry_server_error`.
     async fn search_plan<F>(
-        self: Rc<Self>,
+        &self,
         name: String,
         make_payload: F,
         retry_server_error: bool,
@@ -812,10 +812,10 @@ impl AsyncClient {
             let probe_payload = if first { make_payload(&plan.current).ok() } else { None };
             first = false;
             let use_vc = self.config.options.use_vc;
-            let mut primary = pin!(self.clone().request(payload, use_vc, synthesize_edns).fuse());
+            let mut primary = pin!(self.request(payload, use_vc, synthesize_edns).fuse());
             let (result, io_timeouts) = match probe_payload {
                 Some(pp) => {
-                    let mut probe = pin!(self.clone().run_probe(pp, use_vc).fuse());
+                    let mut probe = pin!(self.run_probe(pp, use_vc).fuse());
                     // Probe-biased race, but still drive an in-flight probe to
                     // completion: upstream's probe is independent, and dropping it
                     // would leave a recovered server marked failed.
@@ -878,7 +878,7 @@ impl AsyncClient {
     /// Query `name` for each family concurrently on the shared mailbox (replies
     /// self-demux by fd). An A answer with real records sets `cancelled` so the AAAA
     /// sibling stops retrying; IPv6 success does NOT cancel A.
-    async fn query_families(self: Rc<Self>, name: &str, rtypes: &[u16]) -> Vec<QueryOutcome> {
+    async fn query_families(&self, name: &str, rtypes: &[u16]) -> Vec<QueryOutcome> {
         let use_vc = self.config.options.use_vc;
         let rd = self.recursion_desired();
         let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
@@ -886,11 +886,10 @@ impl AsyncClient {
         let mut results: Vec<Option<QueryOutcome>> = (0..rtypes.len()).map(|_| None).collect();
 
         let sub = |i: usize| {
-            let this = self.clone();
             let payload = dns_query_payload(name, u32::from(rtypes[i]), u32::from(ARES_CLASS_IN), rd);
             async move {
                 match payload {
-                    Ok(p) => this.request(p, use_vc, true).await,
+                    Ok(p) => self.request(p, use_vc, true).await,
                     Err(e) => (Err(e.code()), 0),
                 }
             }
@@ -918,13 +917,13 @@ impl AsyncClient {
                 }
             }
         }
-        results.into_iter().map(Option::unwrap).collect()
+        results.into_iter().flatten().collect()
     }
 
     /// Shared address-resolution DNS phase for `gethostbyname`/`getaddrinfo`: try
     /// each candidate name, querying its families with an optional one-shot probe.
     /// A name succeeds if any family yields records.
-    async fn resolve_addrinfo(self: Rc<Self>, names: &[String], rtypes: &[u16], probe: bool) -> AddrLookup {
+    async fn resolve_addrinfo(&self, names: &[String], rtypes: &[u16], probe: bool) -> AddrLookup {
         let use_vc = self.config.options.use_vc;
         let rd = self.recursion_desired();
         let mut timeouts: c_int = 0;
@@ -932,7 +931,7 @@ impl AsyncClient {
         let mut had_nodata = false;
 
         for (i, name) in names.iter().enumerate() {
-            let batch = self.clone().query_families(name, rtypes);
+            let batch = self.query_families(name, rtypes);
             let probe_payload = if probe && i == 0 {
                 dns_query_payload(name, u32::from(rtypes[0]), u32::from(ARES_CLASS_IN), rd).ok()
             } else {
@@ -941,7 +940,7 @@ impl AsyncClient {
             let results = match probe_payload {
                 Some(probe_payload) => {
                     let mut b = pin!(batch.fuse());
-                    let mut p = pin!(self.clone().run_probe(probe_payload, use_vc).fuse());
+                    let mut p = pin!(self.run_probe(probe_payload, use_vc).fuse());
                     // Probe-biased race; still drive an in-flight probe to
                     // completion so a recovered server is not left marked failed.
                     match select_biased! {
@@ -1009,7 +1008,7 @@ impl AsyncClient {
     /// DNS `b`), merging family records, RFC 6724 sorting unless ARES_AI_NOSORT,
     /// and carrying the CNAME chain + canonical name.
     pub(crate) async fn getaddrinfo(
-        self: Rc<Self>,
+        self,
         hostname_raw: String,
         ai_family: c_int,
         ai_flags: c_int,
@@ -1143,7 +1142,7 @@ impl AsyncClient {
                         no_search,
                     )
                     .into_names();
-                    let lookup = self.clone().resolve_addrinfo(&names, &rtypes, false).await;
+                    let lookup = self.resolve_addrinfo(&names, &rtypes, false).await;
                     self.io.borrow_mut().app.timeouts = lookup.timeouts;
                     if lookup.replies.is_empty() {
                         last_error = lookup.status;
