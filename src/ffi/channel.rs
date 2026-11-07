@@ -61,7 +61,7 @@ impl ChannelData {
     pub(crate) fn dup_from(&self) -> Self {
         let socket_factory = std::rc::Rc::new((*self.socket_factory).clone());
         let mut state = self.state.duplicate();
-        state.factory = socket_factory.clone();
+        state.rt.set_factory(socket_factory.clone());
         ChannelData {
             state,
             socket_factory,
@@ -118,7 +118,7 @@ impl ChannelData {
 
     /// Install a rebuilt factory, keeping the concrete handle and core `Rc` in sync.
     pub(crate) fn apply_socket_factory(&mut self, factory: std::rc::Rc<CSocketFactory>) {
-        self.state.factory = factory.clone();
+        self.state.rt.set_factory(factory.clone());
         self.socket_factory = factory;
     }
 
@@ -166,10 +166,17 @@ impl ChannelData {
         let now = Instant::now();
         let rf: &libc::fd_set = &*read_fds;
         let wf: &libc::fd_set = &*write_fds;
-        self.executor.drive_ready(now, skip_timeouts, |fd, writable| {
+        self.turn(now, skip_timeouts, |fd, writable| {
             let set = if writable { wf } else { rf };
             unsafe { libc::FD_ISSET(fd, set as *const libc::fd_set as *mut libc::fd_set) }
         });
+    }
+
+    /// One `ares_process*` turn: hand the caller's readiness to the reactor
+    /// (waking io waiters and, unless skipped, due timers), then run every woken task.
+    fn turn(&mut self, now: Instant, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
+        let reactor = self.state.rt.reactor().clone();
+        reactor.dispatch(now, skip_timeouts, ready);
         self.run_ready();
     }
 
@@ -195,14 +202,19 @@ impl ChannelData {
     }
 
     fn all_poll_fds(&self) -> Vec<(i32, bool)> {
-        self.executor.poll_fds()
+        self.state.rt.reactor().interests()
     }
 
     fn next_timeout_ms(&self) -> Option<u128> {
         if self.executor.has_ready() {
             return Some(0);
         }
-        self.executor.next_timeout_ms(Instant::now())
+        let now = Instant::now();
+        self.state
+            .rt
+            .reactor()
+            .next_deadline()
+            .map(|d| d.saturating_duration_since(now).as_millis())
     }
 
     pub(crate) fn process_channel(
@@ -224,11 +236,10 @@ impl ChannelData {
     ) {
         use crate::ffi::ares_socket::{ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
         let now = Instant::now();
-        self.executor.drive_ready(now, skip_timeouts, |fd, writable| {
+        self.turn(now, skip_timeouts, |fd, writable| {
             let bit = if writable { ARES_FD_EVENT_WRITE } else { ARES_FD_EVENT_READ };
             events.iter().any(|ev| ev.fd == fd && ev.events & bit != 0)
         });
-        self.run_ready();
     }
 
     /// Fire the server-state callback if installed; a stale index is skipped.

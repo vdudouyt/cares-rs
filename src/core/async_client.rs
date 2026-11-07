@@ -18,7 +18,8 @@ use crate::core::cache::{CacheKey, QueryCache};
 use crate::core::conn::Conn;
 use crate::core::tcp_pool::{TcpConn, TcpPool};
 use crate::core::udp_pool::{UdpConn, UdpPool};
-use crate::async_runtime::executor::{sleep_until, Mailbox};
+use crate::async_runtime::executor::Mailbox;
+use crate::async_runtime::reactor::Runtime;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
@@ -63,7 +64,9 @@ use crate::ffi::{
 /// fresh `Mailbox`); the channel-owned instance's `io` is inert.
 pub(crate) struct AsyncClient {
     pub config: SysConfig,
-    pub factory: Rc<dyn SocketFactory>,
+    /// The channel's runtime handle (reactor + socket factory); every lookup
+    /// copy shares it.
+    pub rt: Runtime,
     /// Lazily loaded `/etc/hosts`; always `Some` on a lookup copy.
     hosts: Option<Rc<Hosts>>,
     pub default_udp_port: u16,
@@ -115,7 +118,7 @@ impl AsyncClient {
         let hosts = self.hosts();
         AsyncClient {
             config: self.config.clone(),
-            factory: self.factory.clone(),
+            rt: self.rt.clone(),
             hosts: Some(hosts),
             default_udp_port: self.default_udp_port,
             default_tcp_port: self.default_tcp_port,
@@ -442,26 +445,22 @@ impl AsyncClient {
             return;
         };
         let sk = if use_tcp {
-            let Ok(sk) = self.factory.create_tcp(ep.bind) else { return };
-            let _ = sk.connect(ep.tcp_addr);
+            let Ok(sk) = self.rt.tcp(ep.bind) else { return };
+            let _ = sk.get_ref().connect(ep.tcp_addr);
             sk
         } else {
-            let Ok(sk) = self.factory.create_udp(ep.bind) else { return };
-            let _ = sk.connect(ep.udp_addr);
+            let Ok(sk) = self.rt.udp(ep.bind) else { return };
+            let _ = sk.get_ref().connect(ep.udp_addr);
             sk
         };
         let framed = if use_tcp { frame_tcp(&probe_payload) } else { probe_payload.clone() };
-        let _ = sk.send(&framed);
-        let mut conn = if use_tcp {
-            Conn::stream(io.clone(), sk)
-        } else {
-            Conn::datagram(io.clone(), sk)
-        };
+        let _ = sk.get_ref().send(&framed);
+        let mut conn = if use_tcp { Conn::stream(sk) } else { Conn::datagram(sk) };
         let is_tcp = conn.is_tcp();
         let timeout = Instant::now() + opts.timeout;
         loop {
             let mut reply = pin!(conn.recv_msg().fuse());
-            let mut t = pin!(sleep_until(&io, timeout).fuse());
+            let mut t = pin!(self.rt.timer_at(timeout).fuse());
             select_biased! {
                 r = reply => match r {
                     Ok(buf) => {
@@ -1883,7 +1882,7 @@ impl AsyncClient {
     ) -> Self {
         AsyncClient {
             config,
-            factory,
+            rt: Runtime::new(factory),
             hosts: None,
             default_udp_port,
             default_tcp_port,
@@ -1931,7 +1930,7 @@ impl AsyncClient {
     pub fn duplicate(&self) -> AsyncClient {
         let mut dup = AsyncClient::build(
             self.config.clone(),
-            self.factory.clone(),
+            self.rt.factory(),
             self.default_udp_port,
             self.default_tcp_port,
         );
@@ -2386,15 +2385,15 @@ impl AsyncClient {
                 // callbacks fire during creation, nor while `Conn::shared` borrows.
                 let pooled = self.tcp_pool.borrow().get(s);
                 let checked_out = pooled.or_else(|| {
-                    let sock = self.factory.create_tcp(ep.bind).ok()?;
-                    let _ = sock.connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
+                    let sock = self.rt.tcp(ep.bind).ok()?;
+                    let _ = sock.get_ref().connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
                     let c = TcpConn::new(sock);
                     self.tcp_pool.borrow_mut().insert(s, c.clone());
                     Some(c)
                 });
                 checked_out.map(|c| {
                     let (conn, tag) =
-                        Conn::shared(self.io.clone(), c, qid_of(payload), || rand::thread_rng().r#gen());
+                        Conn::shared(c, qid_of(payload), || rand::thread_rng().r#gen());
                     if payload.len() >= 2 {
                         payload[0..2].copy_from_slice(&tag.to_be_bytes());
                     }
@@ -2410,15 +2409,14 @@ impl AsyncClient {
                 };
                 drop(retired);
                 let checked_out = pooled.or_else(|| {
-                    let sk = self.factory.create_udp(ep.bind).ok()?;
-                    let _ = sk.connect(ep.udp_addr);
+                    let sk = self.rt.udp(ep.bind).ok()?;
+                    let _ = sk.get_ref().connect(ep.udp_addr);
                     let c = UdpConn::new(sk, event_driven);
                     self.udp_pool.borrow_mut().insert(s, c.clone());
                     Some(c)
                 });
                 checked_out.map(|c| {
                     let (conn, tag) = Conn::shared_udp(
-                        self.io.clone(),
                         c,
                         qid_of(payload),
                         || rand::thread_rng().r#gen(),

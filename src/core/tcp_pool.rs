@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use crate::async_runtime::io::{dead, recv_stream};
-use crate::async_runtime::socket::Socket;
+use crate::async_runtime::io::Async;
 
 /// Demux tag of a frame — its transaction id (header bytes 0..2). `None` for a
 /// frame too short to carry one: it is handed to an awaiting waiter, which then
@@ -55,8 +55,7 @@ impl InboxSlot {
 /// A shared stream connection to one server: a reassembly buffer plus the
 /// tag-demuxed inbox every querying future shares.
 pub(crate) struct TcpConn {
-    sock: Rc<dyn Socket>,
-    fd: i32,
+    sock: Rc<Async>,
     rbuf: Vec<u8>,
     inbox: HashMap<u16, InboxSlot>,
 }
@@ -64,9 +63,8 @@ pub(crate) struct TcpConn {
 impl TcpConn {
     /// A fresh shared connection over `sock`, already created and connected by
     /// the caller outside any pool borrow so socket callbacks fire with no cell held.
-    pub(crate) fn new(sock: Rc<dyn Socket>) -> Rc<RefCell<Self>> {
-        let fd = sock.as_raw_fd();
-        Rc::new(RefCell::new(TcpConn { sock, fd, rbuf: Vec::new(), inbox: HashMap::new() }))
+    pub(crate) fn new(sock: Rc<Async>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(TcpConn { sock, rbuf: Vec::new(), inbox: HashMap::new() }))
     }
 
     /// Reserve a free inbox tag for a query. Rerolls from `qid` on collision (≈
@@ -99,12 +97,13 @@ impl TcpConn {
         self.inbox.remove(&tag);
     }
 
-    pub(crate) fn sock(&self) -> Rc<dyn Socket> {
+    pub(crate) fn sock(&self) -> Rc<Async> {
         self.sock.clone()
     }
 
-    pub(crate) fn fd(&self) -> i32 {
-        self.fd
+    /// Whether a sibling has routed a reply into `tag`'s slot.
+    pub(crate) fn has_reply(&self, tag: u16) -> bool {
+        self.inbox.get(&tag).is_some_and(|slot| slot.reply.is_some())
     }
 
     /// Take a reply a **sibling** already routed into `tag`'s slot (it consumed
@@ -115,8 +114,8 @@ impl TcpConn {
 
     /// Drain + route this cycle, then resolve `tag`: `Ready(Ok)` if a frame is now
     /// in its slot, `Ready(Err(UnexpectedEof))` if the connection died, else `Pending`.
-    pub(crate) fn poll_read(&mut self, tag: u16, scratch: &mut Vec<u8>) -> Poll<io::Result<Vec<u8>>> {
-        let alive = self.recv_and_route(scratch);
+    pub(crate) fn poll_read(&mut self, tag: u16) -> Poll<io::Result<Vec<u8>>> {
+        let alive = self.recv_and_route();
         match self.take(tag) {
             Some(msg) => Poll::Ready(Ok(msg)),
             None if !alive => Poll::Ready(Err(dead())),
@@ -126,8 +125,10 @@ impl TcpConn {
 
     /// Drain the socket, reassemble frames, and route each by tag into `inbox`
     /// (unknown tags dropped); returns `false` if the connection died.
-    fn recv_and_route(&mut self, scratch: &mut Vec<u8>) -> bool {
-        let alive = recv_stream(&*self.sock, &mut self.rbuf, scratch);
+    fn recv_and_route(&mut self) -> bool {
+        let sock = self.sock.clone();
+        let rbuf = &mut self.rbuf;
+        let alive = sock.read(|s, scratch| recv_stream(s, rbuf, scratch));
         while let Some(frame) = dns_frame(&mut self.rbuf) {
             if let Some(tag) = dns_tag(&frame) {
                 if let Some(slot) = self.inbox.get_mut(&tag) {
@@ -184,6 +185,8 @@ impl TcpConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_runtime::reactor::Reactor;
+    use crate::async_runtime::socket::Socket;
     use std::net::SocketAddr;
 
     /// A socket with no bytes waiting, for tests that never read it.
@@ -220,7 +223,7 @@ mod tests {
     /// `generate_unique_qid`), and `release` frees only that tag.
     #[test]
     fn reserve_rerolls_colliding_tag() {
-        let mut tc = TcpConn { sock: Rc::new(DummySock), fd: 5, rbuf: Vec::new(), inbox: HashMap::new() };
+        let mut tc = TcpConn { sock: Async::new(Rc::new(DummySock), &Reactor::new()), rbuf: Vec::new(), inbox: HashMap::new() };
         assert_eq!(tc.reserve(7, || panic!("free qid must not reroll")), 7);
 
         // The reroll may collide again (7) before drawing a free id (9).

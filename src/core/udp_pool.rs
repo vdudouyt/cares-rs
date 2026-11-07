@@ -9,7 +9,7 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use crate::async_runtime::io::{dead, recv_datagram};
-use crate::async_runtime::socket::Socket;
+use crate::async_runtime::io::Async;
 use crate::core::tcp_pool::dns_tag;
 
 pub(crate) type Conn = Rc<RefCell<UdpConn>>;
@@ -41,8 +41,7 @@ impl InboxSlot {
 /// A shared datagram connection to one server, driven cooperatively by every
 /// future with an outstanding query on it (tag-demuxed inbox).
 pub(crate) struct UdpConn {
-    sock: Rc<dyn Socket>,
-    fd: i32,
+    sock: Rc<Async>,
     inbox: HashMap<u16, InboxSlot>,
     /// Every query ever reserved, not just current waiters; `ARES_OPT_UDP_MAX_QUERIES`
     /// caps this total, so an exhausted conn retires even if its waiters later drain.
@@ -58,11 +57,9 @@ pub(crate) struct UdpConn {
 impl UdpConn {
     /// A fresh shared connection over `sock`, already created and connected by
     /// the caller outside any pool borrow so socket callbacks fire with no cell held.
-    pub(crate) fn new(sock: Rc<dyn Socket>, event_driven: bool) -> Rc<RefCell<Self>> {
-        let fd = sock.as_raw_fd();
+    pub(crate) fn new(sock: Rc<Async>, event_driven: bool) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(UdpConn {
             sock,
-            fd,
             inbox: HashMap::new(),
             total_queries: 0,
             dead: false,
@@ -101,12 +98,13 @@ impl UdpConn {
         self.inbox.remove(&tag);
     }
 
-    pub(crate) fn sock(&self) -> Rc<dyn Socket> {
+    pub(crate) fn sock(&self) -> Rc<Async> {
         self.sock.clone()
     }
 
-    pub(crate) fn fd(&self) -> i32 {
-        self.fd
+    /// Whether a sibling has routed a reply into `tag`'s slot.
+    pub(crate) fn has_reply(&self, tag: u16) -> bool {
+        self.inbox.get(&tag).is_some_and(|slot| slot.reply.is_some())
     }
 
     /// Take a reply a **sibling** already routed into `tag`'s slot (it consumed
@@ -117,11 +115,11 @@ impl UdpConn {
 
     /// Drain + route waiting datagrams, then resolve `tag`: `Ready(Ok)` if a
     /// message is now in its slot, `Ready(Err(UnexpectedEof))` if the socket died, else `Pending`.
-    pub(crate) fn poll_read(&mut self, tag: u16, scratch: &mut Vec<u8>) -> Poll<io::Result<Vec<u8>>> {
+    pub(crate) fn poll_read(&mut self, tag: u16) -> Poll<io::Result<Vec<u8>>> {
         if self.dead {
             return Poll::Ready(Err(dead()));
         }
-        let alive = self.recv_and_route(scratch);
+        let alive = self.recv_and_route();
         if !alive {
             // A hard error is sticky: wake every sibling waiter, since their
             // replies can never arrive now.
@@ -140,10 +138,11 @@ impl UdpConn {
 
     /// Drain the socket until `WouldBlock`, routing each datagram by tag into
     /// `inbox` (unknown tags dropped); returns `false` if the socket died.
-    fn recv_and_route(&mut self, scratch: &mut Vec<u8>) -> bool {
-        let drain = self.sock.drain_safe();
+    fn recv_and_route(&mut self) -> bool {
+        let sock = self.sock.clone();
+        let drain = sock.get_ref().drain_safe();
         loop {
-            match recv_datagram(&*self.sock, scratch) {
+            match sock.read(|s, scratch| recv_datagram(s, scratch)) {
                 Poll::Ready(Ok(frame)) => {
                     if let Some(tag) = dns_tag(&frame) {
                         if let Some(slot) = self.inbox.get_mut(&tag) {
@@ -342,8 +341,14 @@ impl UdpConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_runtime::reactor::Reactor;
+    use crate::async_runtime::socket::Socket;
     use std::collections::VecDeque;
     use std::net::SocketAddr;
+
+    fn sock(s: impl Socket + 'static) -> Rc<Async> {
+        Async::new(Rc::new(s), &Reactor::new())
+    }
 
     /// A waker that records whether it fired.
     struct Flag(std::sync::atomic::AtomicBool);
@@ -401,8 +406,7 @@ mod tests {
     #[test]
     fn reserve_rerolls_colliding_tag() {
         let mut uc = UdpConn {
-            sock: Rc::new(DummySock),
-            fd: 5,
+            sock: sock(DummySock),
             inbox: HashMap::new(),
             total_queries: 0,
             dead: false,
@@ -424,7 +428,7 @@ mod tests {
     #[test]
     fn pool_respects_total_queries_not_just_waiters() {
         let mut pool = UdpPool::new();
-        let conn = UdpConn::new(Rc::new(DummySock), false);
+        let conn = UdpConn::new(sock(DummySock), false);
         pool.insert(0, conn.clone());
 
         let (picked, retired) = pool.pick_or_none(0, 2, true);
@@ -448,7 +452,7 @@ mod tests {
     #[test]
     fn release_retires_exhausted_conn_even_when_stayopen() {
         let mut pool = UdpPool::new();
-        let conn = UdpConn::new(Rc::new(DummySock), false);
+        let conn = UdpConn::new(sock(DummySock), false);
         pool.insert(0, conn.clone());
         conn.borrow_mut().reserve(3, || panic!("free qid"));
         conn.borrow_mut().release(3);
@@ -461,10 +465,10 @@ mod tests {
     /// the target previously suspended Pending with no readiness of its own.
     #[test]
     fn sibling_routing_wakes_target() {
-        let sock: Rc<dyn Socket> = Rc::new(QueueSock {
-            queued: RefCell::new(VecDeque::from(vec![vec![0x12, 0x34, 0xAA]])),
-        });
-        let uc = UdpConn::new(sock, false);
+        let uc = UdpConn::new(
+            sock(QueueSock { queued: RefCell::new(VecDeque::from(vec![vec![0x12, 0x34, 0xAA]])) }),
+            false,
+        );
         let b = std::sync::Arc::new(Flag(Default::default()));
 
         uc.borrow_mut().reserve(0x1111, || panic!("free qid"));
@@ -474,8 +478,7 @@ mod tests {
 
         // A drains: the datagram belongs to B, so it goes into B's slot and
         // wakes B (A gets Pending for its own tag).
-        let mut scratch = Vec::new();
-        assert!(matches!(uc.borrow_mut().poll_read(0x1111, &mut scratch), Poll::Pending));
+        assert!(matches!(uc.borrow_mut().poll_read(0x1111), Poll::Pending));
         assert!(b.fired());
         assert!(uc.borrow_mut().take(0x1234).is_some());
     }

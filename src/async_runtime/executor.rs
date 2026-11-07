@@ -1,56 +1,21 @@
-//! Readiness-driven, no-op-waker executor: arms re-register waits each poll, so
-//! use only re-polling combinators (`select_biased!`, `.await`);
-//! `FuturesUnordered`/`for_each_concurrent` wedge. No DNS/framing knowledge.
+//! Single-threaded task executor (≈ async-executor's `LocalExecutor`, ticked
+//! by the host once per `ares_process*` turn instead of by a thread). Tasks get
+//! real wakers, so any `std` future combinator works. No DNS/framing knowledge.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::future::{poll_fn, Future};
+use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::Instant;
-
-/// One fd the future is blocked on, with the interest it awaits.
-#[derive(Clone, Copy)]
-pub(crate) struct Wait {
-    pub fd: i32,
-    pub writable: bool,
-}
 
 /// Mailbox shared (`Rc<RefCell<_>>`) between one lifecycle future and the
-/// executor; `app` is opaque host state the reactor never inspects.
+/// host; `app` is opaque host state the executor never inspects.
 #[derive(Default)]
 pub(crate) struct Mailbox<A> {
-    pub waits: Vec<Wait>,
-    pub timeout: Option<Instant>,
-    /// Readiness set by the executor. Carries read vs write interest, so a
-    /// sibling arm on the same fd with opposite interest doesn't consume it.
-    pub fired: Vec<Wait>,
-    /// Reusable receive scratch (grown to 64 KB by `conn`), borrowed only for
-    /// one synchronous recv — avoids zeroing 64 KB per call.
-    pub scratch: Vec<u8>,
     pub app: A,
-}
-
-/// Resolves once `timeout` passes; otherwise mins it into the mailbox and
-/// suspends. Reads `Instant::now()` directly so arms on one mailbox self-demux.
-fn poll_timeout<A>(io: &Rc<RefCell<Mailbox<A>>>, timeout: Instant) -> Poll<()> {
-    if Instant::now() >= timeout {
-        return Poll::Ready(());
-    }
-    let mut m = io.borrow_mut();
-    m.timeout = Some(m.timeout.map_or(timeout, |d| d.min(timeout)));
-    Poll::Pending
-}
-
-/// Sleep until `timeout`, usable as a `select_biased!` arm.
-pub(crate) fn sleep_until<A>(
-    io: &Rc<RefCell<Mailbox<A>>>,
-    timeout: Instant,
-) -> impl Future<Output = ()> + '_ {
-    poll_fn(move |_| poll_timeout(io, timeout))
 }
 
 /// One in-flight task with its output type erased, so one `Executor` drives
@@ -193,17 +158,12 @@ impl<A> Executor<A> {
         !self.queue.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
     }
 
-    /// `waits`/`timeout` are valid only until the next poll (every pending arm
-    /// re-registers), so clear them, then poll once. A reaped id yields `false`.
+    /// Poll `id` once with its own waker; `true` when it completed. A reaped id
+    /// yields `false`.
     pub(crate) fn poll(&mut self, id: usize) -> bool {
         let Some(slot) = self.slots.get_mut(id).and_then(|s| s.as_mut()) else {
             return false;
         };
-        {
-            let mut m = slot.task.io().borrow_mut();
-            m.waits.clear();
-            m.timeout = None;
-        }
         // Cleared before the poll so a wake during it re-queues the task.
         slot.flag.scheduled.store(false, Ordering::Release);
         let mut cx = Context::from_waker(&slot.waker);
@@ -223,46 +183,6 @@ impl<A> Executor<A> {
         }
     }
 
-    /// Every `(fd, wants_write)` an in-flight future is blocked on.
-    pub(crate) fn poll_fds(&self) -> Vec<(i32, bool)> {
-        let mut fds = Vec::new();
-        for t in self.slots.iter().flatten() {
-            for w in &t.task.io().borrow().waits {
-                fds.push((w.fd, w.writable));
-            }
-        }
-        fds
-    }
-
-    /// The earliest timeout across in-flight futures, in ms from `now`.
-    pub(crate) fn next_timeout_ms(&self, now: Instant) -> Option<u128> {
-        let mut best: Option<u128> = None;
-        for t in self.slots.iter().flatten() {
-            if let Some(d) = t.task.io().borrow().timeout {
-                let ms = d.saturating_duration_since(now).as_millis();
-                best = Some(best.map_or(ms, |b| b.min(ms)));
-            }
-        }
-        best
-    }
-
-    /// Set each mailbox's `fired` from `ready` and schedule tasks whose fds
-    /// fired or whose timeout expired by `now`. Expiry gates the re-poll but is
-    /// not stored — timeout arms read the clock directly.
-    pub(crate) fn drive_ready(&mut self, now: Instant, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
-        for slot in self.slots.iter_mut().flatten() {
-            let mut m = slot.task.io().borrow_mut();
-            let fired: Vec<Wait> = m.waits.iter().copied().filter(|w| ready(w.fd, w.writable)).collect();
-            let expired = !skip_timeouts && m.timeout.is_some_and(|d| now >= d);
-            if fired.is_empty() && !expired {
-                continue;
-            }
-            m.fired = fired;
-            drop(m);
-            slot.waker.wake_by_ref();
-        }
-    }
-
     /// The id range spanning every slot, live or reaped.
     pub(crate) fn ids(&self) -> std::ops::Range<usize> {
         0..self.slots.len()
@@ -277,29 +197,10 @@ impl<A> Executor<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::future::poll_fn;
 
     fn mailbox() -> Rc<RefCell<Mailbox<()>>> {
         Rc::new(RefCell::new(Mailbox::default()))
-    }
-
-    #[test]
-    fn poll_timeout_future_mins_and_pends() {
-        let io = mailbox();
-        let far = Instant::now() + Duration::from_secs(60);
-        assert!(matches!(poll_timeout(&io, far), Poll::Pending));
-        assert_eq!(io.borrow().timeout, Some(far));
-        // A nearer timeout mins in.
-        let near = Instant::now() + Duration::from_secs(1);
-        assert!(matches!(poll_timeout(&io, near), Poll::Pending));
-        assert_eq!(io.borrow().timeout, Some(near));
-    }
-
-    #[test]
-    fn poll_timeout_past_ready() {
-        let io = mailbox();
-        let past = Instant::now() - Duration::from_secs(1);
-        assert!(matches!(poll_timeout(&io, past), Poll::Ready(())));
     }
 
     /// A future that stores its waker on first poll and completes on the second.
@@ -341,16 +242,5 @@ mod tests {
         assert_eq!(id, id2, "slot reused");
         stale.wake();
         assert_eq!(ex.pop_ready(), None, "stale generation must be skipped");
-    }
-
-    #[test]
-    fn drive_ready_schedules_fired_and_expired() {
-        let mut ex = Executor::<()>::default();
-        let io = mailbox();
-        let id = ex.spawn(io.clone(), std::future::pending::<()>(), |_| {});
-        io.borrow_mut().waits.push(Wait { fd: 3, writable: false });
-        ex.drive_ready(Instant::now(), true, |fd, w| fd == 3 && !w);
-        assert_eq!(ex.pop_ready(), Some(id));
-        assert_eq!(io.borrow().fired.len(), 1);
     }
 }
