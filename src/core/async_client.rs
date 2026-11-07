@@ -18,7 +18,6 @@ use crate::core::cache::{CacheKey, QueryCache};
 use crate::core::conn::Conn;
 use crate::core::tcp_pool::{TcpConn, TcpPool};
 use crate::core::udp_pool::{UdpConn, UdpPool};
-use crate::async_runtime::executor::Mailbox;
 use crate::async_runtime::reactor::Runtime;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
@@ -60,8 +59,8 @@ use crate::ffi::{
 };
 
 /// THE channel: the state the ffi `ChannelData` wraps, and the resolver client
-/// the async lifecycles run on. Each lookup uses a `derive`d copy (shared `Rc`s,
-/// fresh `Mailbox`); the channel-owned instance's `io` is inert.
+/// the async lifecycles run on. Each lookup uses a `derive`d copy (shared `Rc`s
+/// and the same runtime handle).
 pub(crate) struct AsyncClient {
     pub config: SysConfig,
     /// The channel's runtime handle (reactor + socket factory); every lookup
@@ -106,14 +105,14 @@ pub(crate) struct AsyncClient {
     pub endpoints: Rc<Vec<ServerEndpoint>>,
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
-    /// This lookup's mailbox (inert on the channel-owned instance).
-    pub io: Rc<RefCell<DnsMailbox>>,
+    /// Server-state notifications raised by in-flight lookups, drained by the
+    /// host after each task poll (shared by every lookup copy).
+    pub effects: Rc<RefCell<Vec<Effect>>>,
 }
 
 impl AsyncClient {
     /// Mint the per-lookup copy every entry shim runs on: clone config and
-    /// shared `Rc`s, snapshot endpoints, and mint a **fresh** mailbox (cloning
-    /// `self.io` would alias every concurrent lookup on the channel).
+    /// shared `Rc`s, and snapshot endpoints.
     pub(crate) fn derive(&mut self) -> Self {
         let hosts = self.hosts();
         AsyncClient {
@@ -144,7 +143,7 @@ impl AsyncClient {
             endpoints: Rc::new(self.endpoint_snapshot()),
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
-            io: Rc::new(RefCell::new(DnsMailbox::default())),
+            effects: self.effects.clone(),
         }
     }
 
@@ -182,8 +181,8 @@ impl AsyncClient {
         payload: BytesMut,
         mut use_tcp: bool,
         synthesize_edns: bool,
+        sig: &QuerySignals,
     ) -> QueryOutcome {
-        let io = self.io.clone();
         let opts = self.opts();
         let mut timeouts: c_int = 0;
         // Per-query EDNS/0x20/cookie state lives in locals, not the mailbox:
@@ -226,6 +225,7 @@ impl AsyncClient {
                 Ok(v) => v,
                 Err(()) => return (Err(ARES_ECONNREFUSED), timeouts),
             };
+            sig.qid.set(qid_of(&payload));
             server = si;
             // Cookies are re-evaluated per server/transport before every send: a
             // BADCOOKIE retry must pick up the learned server cookie, a TCP
@@ -320,7 +320,7 @@ impl AsyncClient {
                             },
                             &mut self.health.borrow_mut(),
                         );
-                        notify(&io, actions);
+                        self.notify(actions);
                         match verdict {
                             TaskVerdict::RetryNextServer { server: next, tries: ft } => {
                                 server = next;
@@ -343,10 +343,10 @@ impl AsyncClient {
                         // ICMP across parallel sockets); mark dead and retry uncounted.
                         if !use_tcp && self.optmask & ARES_OPT_EVENT_THREAD != 0 && self.udp_pool.borrow().has_dead(server) {
                             conn.mark_dead();
-                            if io.borrow().app.cancelled.get() {
+                            if sig.cancelled.get() {
                                 return (Err(ARES_ETIMEOUT), timeouts);
                             }
-                            notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: false }]);
+                            self.notify(vec![ReactorAction::NotifyServerState { server, ok: false, tcp: false }]);
                             let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                             match verdict {
                                 TimeoutVerdict::Retry { server: next } => {
@@ -360,10 +360,10 @@ impl AsyncClient {
                                 }
                             }
                         }
-                        if io.borrow().app.cancelled.get() {
+                        if sig.cancelled.get() {
                             return (Err(ARES_ETIMEOUT), timeouts);
                         }
-                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                        self.notify(vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                         let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                         match verdict {
                             TimeoutVerdict::Retry { server: next } => {
@@ -394,10 +394,10 @@ impl AsyncClient {
                         } else {
                             self.retire_udp(server, &conn);
                         }
-                        if io.borrow().app.cancelled.get() {
+                        if sig.cancelled.get() {
                             return (Err(ARES_ETIMEOUT), timeouts);
                         }
-                        notify(&io, vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
+                        self.notify(vec![ReactorAction::NotifyServerState { server, ok: false, tcp: use_tcp }]);
                         let verdict = on_timeout(tries, opts.attempts, server, &mut self.health.borrow_mut());
                         match verdict {
                             TimeoutVerdict::Retry { server: next } => {
@@ -422,9 +422,10 @@ impl AsyncClient {
     /// ares_query / ares_send: the raw single query, wrapped into `Delivery::Raw`.
     /// The starting transport honors ARES_FLAG_USEVC; `synthesize_edns` is false
     /// for raw send APIs, whose bytes must go on the wire unchanged.
-    pub(crate) async fn query_raw(self, payload: BytesMut, synthesize_edns: bool) -> Delivery {
+    /// `sig.qid` reports the transaction id actually reserved on the wire.
+    pub(crate) async fn query_raw(self, payload: BytesMut, synthesize_edns: bool, sig: Rc<QuerySignals>) -> Delivery {
         let use_vc = self.config.options.use_vc;
-        let (result, timeouts) = self.request(payload, use_vc, synthesize_edns).await;
+        let (result, timeouts) = self.request(payload, use_vc, synthesize_edns, &sig).await;
         Delivery::Raw { result, timeouts }
     }
 
@@ -432,7 +433,6 @@ impl AsyncClient {
     /// biased, looping past stray (non-QID) datagrams, and folding its outcome into
     /// `ServerHealth`.
     async fn run_probe(&self, probe_payload: BytesMut, use_tcp: bool) {
-        let io = self.io.clone();
         let opts = self.opts();
         if opts.failover_chance == 0 {
             return;
@@ -465,14 +465,14 @@ impl AsyncClient {
                 r = reply => match r {
                     Ok(buf) => {
                         if qid_matches(&buf, &framed, use_tcp) {
-                            settle_probe(&io, &self.health, pserver, is_tcp, Some(&buf));
+                            settle_probe(&self.effects, &self.health, pserver, is_tcp, Some(&buf));
                             return;
                         }
                     }
                     Err(_) => return,
                 },
                 _ = t => {
-                    settle_probe(&io, &self.health, pserver, is_tcp, None);
+                    settle_probe(&self.effects, &self.health, pserver, is_tcp, None);
                     return;
                 }
             }
@@ -482,10 +482,17 @@ impl AsyncClient {
     /// ares_gethostbyname: the pre-DNS cascade (ASCII/onion/family/IP-literal/
     /// hosts/localhost/HOSTALIASES/no-servers/query-cache) then search-domain DNS.
     /// Preflight has no `.await`, so a sync hit fires re-entrantly on first poll.
-    pub(crate) async fn gethostbyname(
-        self,
+    pub(crate) async fn gethostbyname(self, hostname: String, family: c_int) -> HostReply {
+        let timeouts = Cell::new(0);
+        let result = self.gethostbyname_inner(hostname, family, &timeouts).await;
+        (result, timeouts.get())
+    }
+
+    async fn gethostbyname_inner(
+        &self,
         hostname: String,
         family: c_int,
+        timeouts: &Cell<c_int>,
     ) -> Result<Hostent, AresError> {
         if !hostname.is_ascii() {
             return Err(ARES_EBADNAME.into());
@@ -588,7 +595,7 @@ impl AsyncClient {
                         _ => vec![RTYPE_A, RTYPE_AAAA],
                     };
                     let lookup = self.resolve_addrinfo(&names, &rtypes, true).await;
-                    self.io.borrow_mut().app.timeouts = lookup.timeouts;
+                    timeouts.set(lookup.timeouts);
                     if lookup.replies.is_empty() {
                         last_error = lookup.status;
                         continue;
@@ -626,39 +633,31 @@ impl AsyncClient {
     }
 
     /// ares_gethostbyaddr: hosts-file reverse lookup, then a single PTR query.
-    pub(crate) async fn gethostbyaddr(
-        self,
-        ip: IpAddr,
-        family: c_int,
-    ) -> Result<Hostent, AresError> {
+    pub(crate) async fn gethostbyaddr(self, ip: IpAddr, family: c_int) -> HostReply {
         if let Some(lookup) = self.hostsfile().reverse_lookup(ip) {
-            return Ok(Hostent::from_lookup(lookup));
+            return (Ok(Hostent::from_lookup(lookup)), 0);
         }
 
         if self.endpoints.is_empty() {
-            return Err(ARES_ENOSERVER.into());
+            return (Err(ARES_ENOSERVER.into()), 0);
         }
 
-        let payload = dns_query_payload(
+        let payload = match dns_query_payload(
             &rdns_name(ip),
             u32::from(RECORD_TYPE_PTR),
             u32::from(ARES_CLASS_IN),
             self.recursion_desired(),
-        )?;
+        ) {
+            Ok(p) => p,
+            Err(e) => return (Err(e), 0),
+        };
         let use_vc = self.config.options.use_vc;
-        let (result, io_timeouts) = self.request(payload, use_vc, true).await;
-
-        match result {
-            Ok(buf) => {
-                let hostent = on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip))?;
-                self.io.borrow_mut().app.timeouts = io_timeouts;
-                Ok(hostent)
-            }
-            Err(status) => {
-                self.io.borrow_mut().app.timeouts = io_timeouts;
-                Err(AresError::from(status))
-            }
-        }
+        let (result, timeouts) = self.request(payload, use_vc, true, &QuerySignals::default()).await;
+        let result = match result {
+            Ok(buf) => on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip)),
+            Err(status) => Err(AresError::from(status)),
+        };
+        (result, timeouts)
     }
 
     /// ares_getnameinfo: three synchronous short-circuits (service-only /
@@ -717,15 +716,13 @@ impl AsyncClient {
             }
         };
         let use_vc = self.config.options.use_vc;
-        let (result, io_timeouts) = self.request(payload, use_vc, true).await;
+        let (result, io_timeouts) = self.request(payload, use_vc, true, &QuerySignals::default()).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
             Err(status) => Err(AresError::from(status)),
         };
-        let reply = assemble_nameinfo(dns_result, addr.ip, addr.scope_id, addr.port, flags, io_timeouts);
-        self.io.borrow_mut().app.timeouts = reply.timeouts;
-        reply
+        assemble_nameinfo(dns_result, addr.ip, addr.scope_id, addr.port, flags, io_timeouts)
     }
 
     /// ares_search (legacy): iterate the search plan with freshly built payloads
@@ -801,6 +798,7 @@ impl AsyncClient {
         let mut had_nodata = false;
         let mut timeouts: c_int = 0;
         let mut first = true;
+        let sig = QuerySignals::default();
 
         loop {
             let payload = match make_payload(&plan.current) {
@@ -811,7 +809,7 @@ impl AsyncClient {
             let probe_payload = if first { make_payload(&plan.current).ok() } else { None };
             first = false;
             let use_vc = self.config.options.use_vc;
-            let mut primary = pin!(self.request(payload, use_vc, synthesize_edns).fuse());
+            let mut primary = pin!(self.request(payload, use_vc, synthesize_edns, &sig).fuse());
             let (result, io_timeouts) = match probe_payload {
                 Some(pp) => {
                     let mut probe = pin!(self.run_probe(pp, use_vc).fuse());
@@ -842,7 +840,6 @@ impl AsyncClient {
                         4 => ARES_ENOTIMP.into(),    // NOTIMP
                         5 => ARES_EREFUSED.into(),   // REFUSED
                         0 if summary.ancount > 0 => {
-                            self.io.borrow_mut().app.timeouts = timeouts;
                             return Delivery::Raw { result: Ok(buf), timeouts };
                         }
                         // NOERROR-with-no-answers, or any other rcode → NODATA.
@@ -869,7 +866,6 @@ impl AsyncClient {
             if had_nodata && status.code() == ARES_ENOTFOUND {
                 status = ARES_ENODATA.into();
             }
-            self.io.borrow_mut().app.timeouts = timeouts;
             return Delivery::Raw { result: Err(status.code()), timeouts };
         }
     }
@@ -881,14 +877,16 @@ impl AsyncClient {
         let use_vc = self.config.options.use_vc;
         let rd = self.recursion_desired();
         let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
-        self.io.borrow().app.cancelled.set(false);
+        // Shared by both families: an A answer cancels the AAAA sibling's retries.
+        let sig = QuerySignals::default();
         let mut results: Vec<Option<QueryOutcome>> = (0..rtypes.len()).map(|_| None).collect();
 
+        let sig = &sig;
         let sub = |i: usize| {
             let payload = dns_query_payload(name, u32::from(rtypes[i]), u32::from(ARES_CLASS_IN), rd);
             async move {
                 match payload {
-                    Ok(p) => self.request(p, use_vc, true).await,
+                    Ok(p) => self.request(p, use_vc, true, sig).await,
                     Err(e) => (Err(e.code()), 0),
                 }
             }
@@ -906,7 +904,7 @@ impl AsyncClient {
                             if let (Ok(buf), _) = &r {
                                 let s = summarize(buf, 0);
                                 if s.rcode == 0 && s.ancount > 0 {
-                                    self.io.borrow().app.cancelled.set(true);
+                                    sig.cancelled.set(true);
                                 }
                             }
                         }
@@ -1142,7 +1140,6 @@ impl AsyncClient {
                     )
                     .into_names();
                     let lookup = self.resolve_addrinfo(&names, &rtypes, false).await;
-                    self.io.borrow_mut().app.timeouts = lookup.timeouts;
                     if lookup.replies.is_empty() {
                         last_error = lookup.status;
                         continue;
@@ -1289,33 +1286,29 @@ pub(crate) enum Effect {
     NotifyServerState { server: usize, ok: bool, tcp: bool },
 }
 
-/// The application-owned half of the mailbox: fields the reactor never touches.
+/// Signals shared between the `request`s of one lookup and their host.
 #[derive(Default)]
-pub(crate) struct DnsSignals {
-    pub effects: Vec<Effect>,
-    /// Accumulated timeout count, written before completion for the C callback.
-    pub timeouts: c_int,
-    /// Intra-lookup coordination: `getaddrinfo` sets this once its A answer has
-    /// real records so the sibling AAAA `request` stops retrying (an in-flight
-    /// reply still delivers). Fresh per lookup, so it starts `false`.
+pub(crate) struct QuerySignals {
+    /// Intra-lookup coordination: `query_families` sets this once its A answer
+    /// has real records so the sibling AAAA `request` stops retrying (an
+    /// in-flight reply still delivers).
     pub cancelled: Cell<bool>,
     /// The transaction id actually reserved on the wire for the current query
     /// (after any shared-socket reroll); `0` means none was reserved.
-    pub qid: u16,
+    pub qid: Cell<u16>,
 }
 
-/// The DNS-application instantiation of the reactor mailbox.
-pub(crate) type DnsMailbox = Mailbox<DnsSignals>;
+/// A hostent lifecycle's result plus its timeout count, for `ares_host_callback`.
+pub(crate) type HostReply = (Result<Hostent, AresError>, c_int);
 
-fn push_effect(io: &Rc<RefCell<DnsMailbox>>, e: Effect) {
-    io.borrow_mut().app.effects.push(e);
-}
-
-fn notify(io: &Rc<RefCell<DnsMailbox>>, actions: Vec<ReactorAction>) {
-    for a in actions {
-        match a {
-            ReactorAction::NotifyServerState { server, ok, tcp } => {
-                push_effect(io, Effect::NotifyServerState { server, ok, tcp })
+impl AsyncClient {
+    fn notify(&self, actions: Vec<ReactorAction>) {
+        let mut effects = self.effects.borrow_mut();
+        for a in actions {
+            match a {
+                ReactorAction::NotifyServerState { server, ok, tcp } => {
+                    effects.push(Effect::NotifyServerState { server, ok, tcp })
+                }
             }
         }
     }
@@ -1908,7 +1901,7 @@ impl AsyncClient {
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
-            io: Rc::new(RefCell::new(DnsMailbox::default())),
+            effects: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -2433,7 +2426,6 @@ impl AsyncClient {
                 })
             };
             if let Some(conn) = conn {
-                self.io.borrow_mut().app.qid = qid_of(payload);
                 return Ok((conn, s));
             }
             if self.health.borrow().len() > 1 {
@@ -2595,7 +2587,7 @@ fn qid_of(payload: &[u8]) -> u16 {
 
 /// Fold a probe reply into server health. `None` = the probe timed out (failure
 /// timestamp only).
-fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, health: &RefCell<ServerHealth>, server: usize, is_tcp: bool, reply: Option<&[u8]>) {
+fn settle_probe(effects: &RefCell<Vec<Effect>>, health: &RefCell<ServerHealth>, server: usize, is_tcp: bool, reply: Option<&[u8]>) {
     let mut health = health.borrow_mut();
     match reply {
         Some(buf) => {
@@ -2603,11 +2595,11 @@ fn settle_probe(io: &Rc<RefCell<DnsMailbox>>, health: &RefCell<ServerHealth>, se
             if rcode == 0 || rcode == 3 {
                 if health.record_success(server) {
                     drop(health);
-                    push_effect(io, Effect::NotifyServerState { server, ok: true, tcp: is_tcp });
+                    effects.borrow_mut().push(Effect::NotifyServerState { server, ok: true, tcp: is_tcp });
                 }
             } else if health.record_failure(server) {
                 drop(health);
-                push_effect(io, Effect::NotifyServerState { server, ok: false, tcp: is_tcp });
+                effects.borrow_mut().push(Effect::NotifyServerState { server, ok: false, tcp: is_tcp });
             }
         }
         None => health.record_failure_time(server),
@@ -2671,10 +2663,10 @@ mod tests {
         }
     }
 
-    /// A shared-socket collision rerolls the tag and re-stamps the payload; the
-    /// mailbox's `qid` must match the actual wire bytes (the ffi reports it).
+    /// A shared-socket collision rerolls the tag and re-stamps the payload, so
+    /// the payload carries the reserved qid (which `request` reports to the ffi).
     #[test]
-    fn shared_udp_reroll_updates_payload_and_app_qid() {
+    fn shared_udp_reroll_updates_payload_qid() {
         let config = SysConfig {
             nameservers: vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)],
             ..SysConfig::default()
@@ -2686,13 +2678,10 @@ mod tests {
         let mut first = payload();
         let (conn_a, _) = client.connect_failover(&mut first, 0, false).expect("first checkout");
         assert_eq!(qid_of(&first), 0x1234);
-        assert_eq!(client.io.borrow().app.qid, 0x1234);
 
         let mut second = payload();
         let (conn_b, _) = client.connect_failover(&mut second, 0, false).expect("second checkout");
-        let final_qid = client.io.borrow().app.qid;
-        assert_ne!(final_qid, 0x1234, "colliding qid must be rerolled");
-        assert_eq!(qid_of(&second), final_qid, "payload must carry the reserved qid");
+        assert_ne!(qid_of(&second), 0x1234, "colliding qid must be rerolled");
 
         drop(conn_a);
         drop(conn_b);

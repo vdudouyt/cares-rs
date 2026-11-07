@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
-use crate::core::async_client::{DnsMailbox, DnsSignals, Effect};
+use crate::core::async_client::Effect;
 use crate::async_runtime::executor::Executor;
 use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
@@ -27,7 +27,7 @@ pub struct ChannelData {
     pub(crate) pending_write_arg: *mut libc::c_void,
     pub(crate) sock_state_cb: ares_sock_state_cb,
     pub(crate) sock_state_cb_data: *mut libc::c_void,
-    executor: Executor<DnsSignals>,
+    executor: Executor,
     pub(crate) event_mode: bool,
     pub(crate) event_stop: Arc<AtomicBool>,
     pub(crate) event_join: Option<JoinHandle<()>>,
@@ -125,26 +125,22 @@ impl ChannelData {
     /// Spawn a task and drive it once; `on` may fire inline on this first poll.
     pub(crate) fn spawn<T: 'static>(
         &mut self,
-        io: std::rc::Rc<std::cell::RefCell<DnsMailbox>>,
         fut: impl std::future::Future<Output = T> + 'static,
         on: impl FnOnce(Result<T, c_int>) + 'static,
     ) {
-        let id = self.executor.spawn(io, fut, on);
+        let id = self.executor.spawn(fut, on);
         self.advance(id);
         // New fds/timers may have been published: wake now rather than waiting
         // for the idle poll to expire.
         self.wake();
     }
 
-    /// Advance one task; on `Pending` its mailbox holds the fds it now waits on.
+    /// Advance one task; on `Pending` it has registered its interest with the reactor.
     fn advance(&mut self, id: usize) {
         let done = self.executor.poll(id);
-        // Effects are drained before delivery so the callbacks fire first; scoped
-        // so the `executor` borrow releases before the callbacks run.
-        let effects = match self.executor.io(id) {
-            Some(io) => std::mem::take(&mut io.borrow_mut().app.effects),
-            None => Vec::new(),
-        };
+        // Effects are drained before delivery so the callbacks fire first; taken
+        // out so no `RefCell` borrow is live while they run.
+        let effects = std::mem::take(&mut *self.state.effects.borrow_mut());
         for effect in effects {
             match effect {
                 Effect::NotifyServerState { server, ok, tcp } => {

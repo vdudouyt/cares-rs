@@ -2,45 +2,31 @@
 //! by the host once per `ares_process*` turn instead of by a thread). Tasks get
 //! real wakers, so any `std` future combinator works. No DNS/framing knowledge.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 
-/// Mailbox shared (`Rc<RefCell<_>>`) between one lifecycle future and the
-/// host; `app` is opaque host state the executor never inspects.
-#[derive(Default)]
-pub(crate) struct Mailbox<A> {
-    pub app: A,
-}
-
 /// One in-flight task with its output type erased, so one `Executor` drives
 /// futures of many output types side by side.
-trait AbstractTask<A> {
-    fn io(&self) -> &Rc<RefCell<Mailbox<A>>>;
+trait AbstractTask {
     /// Poll once; on `Ready`, stash the output and return `true`.
     fn poll(&mut self, cx: &mut Context<'_>) -> bool;
     /// Consume the task, delivering the stashed output or a cancel status.
     fn deliver(self: Box<Self>, cancel: Option<i32>);
 }
 
-/// Concrete task: mailbox, future, and result-delivery closure (`Ok` on
-/// completion, `Err(status)` on cancel).
-struct Task<A, T> {
-    io: Rc<RefCell<Mailbox<A>>>,
+/// Concrete task: future and result-delivery closure (`Ok` on completion,
+/// `Err(status)` on cancel).
+struct Task<T> {
     fut: Pin<Box<dyn Future<Output = T>>>,
     out: Option<T>,
     on: Box<dyn FnOnce(Result<T, i32>)>,
 }
 
-impl<A, T> AbstractTask<A> for Task<A, T> {
-    fn io(&self) -> &Rc<RefCell<Mailbox<A>>> {
-        &self.io
-    }
+impl<T> AbstractTask for Task<T> {
     fn poll(&mut self, cx: &mut Context<'_>) -> bool {
         match self.fut.as_mut().poll(cx) {
             Poll::Ready(v) => {
@@ -90,39 +76,29 @@ impl Wake for TaskWaker {
     }
 }
 
-struct Slot<A> {
-    task: Box<dyn AbstractTask<A>>,
+struct Slot {
+    task: Box<dyn AbstractTask>,
     flag: Arc<TaskWaker>,
     waker: Waker,
 }
 
 /// In-flight tasks in reused slots (`None` = reaped) plus the runnable queue
 /// (≈ async-executor's `LocalExecutor`, ticked by the host instead of a thread).
-pub(crate) struct Executor<A> {
-    slots: Vec<Option<Slot<A>>>,
+#[derive(Default)]
+pub(crate) struct Executor {
+    slots: Vec<Option<Slot>>,
     queue: RunQueue,
     next_gen: u32,
 }
 
-impl<A> Default for Executor<A> {
-    fn default() -> Self {
-        Executor { slots: Vec::new(), queue: RunQueue::default(), next_gen: 0 }
-    }
-}
-
-impl<A> Executor<A> {
+impl Executor {
     /// Register `fut` in a free slot and return its id; does not poll.
     pub(crate) fn spawn<T: 'static>(
         &mut self,
-        io: Rc<RefCell<Mailbox<A>>>,
         fut: impl Future<Output = T> + 'static,
         on: impl FnOnce(Result<T, i32>) + 'static,
-    ) -> usize
-    where
-        A: 'static,
-    {
-        let task: Box<dyn AbstractTask<A>> =
-            Box::new(Task { io, fut: Box::pin(fut), out: None, on: Box::new(on) });
+    ) -> usize {
+        let task: Box<dyn AbstractTask> = Box::new(Task { fut: Box::pin(fut), out: None, on: Box::new(on) });
         let id = self.slots.iter().position(|s| s.is_none()).unwrap_or(self.slots.len());
         // A generation per spawn: a stale waker for a reaped occupant of this
         // slot must not poll the new one.
@@ -170,11 +146,6 @@ impl<A> Executor<A> {
         slot.task.poll(&mut cx)
     }
 
-    /// Task `id`'s mailbox, for the host to drain app-specific signals.
-    pub(crate) fn io(&self, id: usize) -> Option<&Rc<RefCell<Mailbox<A>>>> {
-        self.slots.get(id).and_then(|s| s.as_ref()).map(|s| s.task.io())
-    }
-
     /// Reap `id` and deliver its output or cancel status; an already-reaped id
     /// is a no-op (a re-entrant abort cannot double-deliver).
     pub(crate) fn deliver(&mut self, id: usize, cancel: Option<i32>) {
@@ -197,11 +168,9 @@ impl<A> Executor<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::future::poll_fn;
-
-    fn mailbox() -> Rc<RefCell<Mailbox<()>>> {
-        Rc::new(RefCell::new(Mailbox::default()))
-    }
+    use std::rc::Rc;
 
     /// A future that stores its waker on first poll and completes on the second.
     fn wake_later(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
@@ -218,9 +187,9 @@ mod tests {
 
     #[test]
     fn waker_queues_task_once() {
-        let mut ex = Executor::<()>::default();
+        let mut ex = Executor::default();
         let w = Rc::new(RefCell::new(None));
-        let id = ex.spawn(mailbox(), wake_later(w.clone()), |_| {});
+        let id = ex.spawn(wake_later(w.clone()), |_| {});
         assert!(!ex.poll(id));
         let waker = w.borrow_mut().take().expect("registered waker");
         waker.wake_by_ref();
@@ -232,13 +201,13 @@ mod tests {
 
     #[test]
     fn stale_waker_does_not_poll_reused_slot() {
-        let mut ex = Executor::<()>::default();
+        let mut ex = Executor::default();
         let w = Rc::new(RefCell::new(None));
-        let id = ex.spawn(mailbox(), wake_later(w.clone()), |_| {});
+        let id = ex.spawn(wake_later(w.clone()), |_| {});
         assert!(!ex.poll(id));
         let stale = w.borrow_mut().take().expect("registered waker");
         ex.deliver(id, Some(1));
-        let id2 = ex.spawn(mailbox(), std::future::pending::<()>(), |_| {});
+        let id2 = ex.spawn(std::future::pending::<()>(), |_| {});
         assert_eq!(id, id2, "slot reused");
         stale.wake();
         assert_eq!(ex.pop_ready(), None, "stale generation must be skipped");

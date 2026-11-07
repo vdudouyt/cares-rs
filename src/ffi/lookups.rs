@@ -3,11 +3,9 @@
 
 use super::*;
 use crate::core::async_client::search_precheck;
-use crate::core::hostent::Hostent;
 use crate::core::async_client::{service_to_port, ServicePort};
-use crate::core::async_client::{AddrInfoOut, Delivery, DnsMailbox, NameinfoReply};
+use crate::core::async_client::{AddrInfoOut, Delivery, HostReply, NameinfoReply, QuerySignals};
 use crate::core::cache::{CacheKey, QueryCache};
-use crate::core::AresError;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -22,10 +20,8 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let hostname = unsafe { cstr_lossy(hostname) };
     let client = channeldata.state.derive();
-    let io = client.io.clone();
-    let io_cb = io.clone();
     let fut = client.gethostbyname(hostname.to_string(), family);
-    channeldata.spawn(io, fut, move |r| on_hostent_reply(callback, arg, &io_cb, r));
+    channeldata.spawn(fut, move |r| on_hostent_reply(callback, arg, r));
 }
 
 /// # Safety
@@ -66,10 +62,8 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *const c_voi
         return;
     };
     let client = channeldata.state.derive();
-    let io = client.io.clone();
-    let io_cb = io.clone();
     let fut = client.gethostbyaddr(ip, family);
-    channeldata.spawn(io, fut, move |r| on_hostent_reply(callback, arg, &io_cb, r));
+    channeldata.spawn(fut, move |r| on_hostent_reply(callback, arg, r));
 }
 
 /// # Safety
@@ -88,14 +82,13 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let client = channeldata.state.derive();
-    let io = client.io.clone();
     let fut = client.search(
         name_str.to_string(),
         dnsclass as u32,
         dnstype as u32,
         false,
     );
-    channeldata.spawn(io, fut, move |r| on_raw_reply(callback, arg, r));
+    channeldata.spawn(fut, move |r| on_raw_reply(callback, arg, r));
 }
 
 /// # Safety
@@ -111,9 +104,8 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     {
         Ok(payload) => {
             let client = channeldata.state.derive();
-            let io = client.io.clone();
-            let fut = client.query_raw(payload, true);
-            channeldata.spawn(io, fut, move |r| on_raw_reply(callback, arg, r));
+                    let fut = client.query_raw(payload, true, Rc::default());
+            channeldata.spawn(fut, move |r| on_raw_reply(callback, arg, r));
         }
         Err(status) => on_raw_reply(callback, arg, Err(status.code())),
     }
@@ -190,14 +182,14 @@ fn query_dnsrec_record(
     }
     let client = channeldata.state.derive();
     let cache = client.cache.clone();
-    let io = client.io.clone();
-    let fut = client.query_raw(payload, true);
-    channeldata.spawn(io.clone(), fut, move |r| {
+    let sig = Rc::new(QuerySignals::default());
+    let fut = client.query_raw(payload, true, sig.clone());
+    channeldata.spawn(fut, move |r| {
         on_dnsrec_reply(callback, arg, &cache, Some(cache_key), r)
     });
     // The first advance may have re-rolled the qid on a shared socket; report
     // the id that is actually on the wire (a zero means nothing was reserved).
-    let final_qid = io.borrow().app.qid;
+    let final_qid = sig.qid.get();
     if !qid.is_null() && final_qid != 0 {
         unsafe { *qid = final_qid; }
     }
@@ -252,9 +244,8 @@ fn search_dnsrec_record(
     let Some(channeldata) = channeldata else { return ARES_EFORMERR; };
     let client = channeldata.state.derive();
     let cache = client.cache.clone();
-    let io = client.io.clone();
     let fut = client.search_dnsrec(template, true);
-    channeldata.spawn(io, fut, move |r| on_dnsrec_reply(callback, arg, &cache, None, r));
+    channeldata.spawn(fut, move |r| on_dnsrec_reply(callback, arg, &cache, None, r));
     ARES_SUCCESS
 }
 
@@ -277,9 +268,8 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
     // Synchronous short-circuits (service-only / NUMERICHOST / no-servers) fire
     // re-entrantly on the first advance.
     let client = channeldata.state.derive();
-    let io = client.io.clone();
     let fut = client.getnameinfo(addr_info, flags);
-    channeldata.spawn(io, fut, move |r| on_nameinfo_reply(callback, arg, r));
+    channeldata.spawn(fut, move |r| on_nameinfo_reply(callback, arg, r));
 }
 
 /// ares_query / ares_send / ares_search → `ares_callback`.
@@ -335,12 +325,10 @@ pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, ca
     }
 }
 
-/// ares_gethostbyname/addr → `ares_host_callback`; timeouts come from the mailbox
-/// (there is no room for them in the `Result<Hostent, _>`).
-pub(crate) fn on_hostent_reply(callback: AresHostCallback, arg: *mut c_void, io: &Rc<RefCell<DnsMailbox>>, r: Result<Result<Hostent, AresError>, c_int>) {
+/// ares_gethostbyname/addr → `ares_host_callback`.
+pub(crate) fn on_hostent_reply(callback: AresHostCallback, arg: *mut c_void, r: Result<HostReply, c_int>) {
     match r {
-        Ok(inner) => {
-            let timeouts = io.borrow().app.timeouts;
+        Ok((inner, timeouts)) => {
             match inner {
                 Ok(hostent) => {
                     let c_hostent = unsafe { build_hostent(hostent) };
@@ -455,7 +443,6 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     // A synchronous preflight hit (IP literal / hosts file) fires re-entrantly.
     let hostname_raw = unsafe { cstr_lossy(name) };
     let client = channeldata.state.derive();
-    let io = client.io.clone();
     let fut = client.getaddrinfo(
         hostname_raw.to_string(),
         ai_family,
@@ -463,7 +450,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
         ai_socktype,
         ai_protocol,
     );
-    channeldata.spawn(io, fut, move |r| on_addrinfo_reply(callback, arg, port, r));
+    channeldata.spawn(fut, move |r| on_addrinfo_reply(callback, arg, port, r));
 }
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
@@ -600,15 +587,15 @@ where
         unsafe { *qid = new_qid; }
     }
     let client = channeldata.state.derive();
-    let io = client.io.clone();
+    let sig = Rc::new(QuerySignals::default());
     // ares_send / ares_send_dnsrec: transmit the caller's bytes unchanged (no
     // synthesized OPT/COOKIE); a caller-supplied OPT is preserved because it is
     // already part of the serialized record.
-    let fut = client.query_raw(payload, false);
-    channeldata.spawn(io.clone(), fut, move |r| on_reply(r, cache_key));
-    // Report the qid set by connect_failover, which may have re-rolled it on a
-    // shared socket after the caller was given the pre-send value above.
-    let final_qid = io.borrow().app.qid;
+    let fut = client.query_raw(payload, false, sig.clone());
+    channeldata.spawn(fut, move |r| on_reply(r, cache_key));
+    // Report the qid connect_failover reserved, which may have re-rolled it on
+    // a shared socket after the caller was given the pre-send value above.
+    let final_qid = sig.qid.get();
     if !qid.is_null() && final_qid != 0 {
         unsafe { *qid = final_qid; }
     }
