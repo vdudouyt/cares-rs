@@ -140,3 +140,55 @@ fn callback_may_reenter_on_cache_hit() {
         ares_destroy(channel);
     }
 }
+
+struct MidTurn {
+    channel: Channel,
+    first_done: bool,
+    first_status: c_int,
+    second_done: bool,
+    second_status: c_int,
+}
+
+unsafe extern "C" fn first_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
+    let st = &mut *(arg as *mut MidTurn);
+    st.first_done = true;
+    st.first_status = status;
+    // Re-enter the reactor from inside a turn: the nested turn must run with no
+    // run-queue lock or reactor borrow held by the outer one.
+    ares_process_fd(st.channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD);
+}
+
+unsafe extern "C" fn second_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
+    let st = &mut *(arg as *mut MidTurn);
+    st.second_done = true;
+    st.second_status = status;
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: UDP sockets + syscalls; Miri can't run them")]
+fn callback_may_call_ares_process_mid_turn() {
+    unsafe {
+        let server = UdpSocket::bind("127.0.0.1:0").expect("bind mini server");
+        server.set_nonblocking(true).expect("nonblocking");
+        let port = server.local_addr().unwrap().port();
+
+        let mut channel: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut channel), ARES_SUCCESS);
+        let csv = CString::new(format!("127.0.0.1:{port}")).unwrap();
+        assert_eq!(ares_set_servers_ports_csv(channel, csv.as_ptr()), ARES_SUCCESS);
+
+        let mut st = MidTurn { channel, first_done: false, first_status: -1, second_done: false, second_status: -1 };
+        let arg = &mut st as *mut _ as *mut c_void;
+        let first = CString::new("first.example").unwrap();
+        let second = CString::new("second.example").unwrap();
+        ares_query_dnsrec(channel, first.as_ptr(), C_IN, T_A, Some(first_cb), arg, ptr::null_mut());
+        ares_query_dnsrec(channel, second.as_ptr(), C_IN, T_A, Some(second_cb), arg, ptr::null_mut());
+        drive(channel, &server, &|| st.first_done && st.second_done);
+
+        assert!(st.first_done && st.second_done, "both queries must complete");
+        assert_eq!(st.first_status, ARES_SUCCESS);
+        assert_eq!(st.second_status, ARES_SUCCESS);
+
+        ares_destroy(channel);
+    }
+}

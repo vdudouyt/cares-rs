@@ -1,6 +1,27 @@
 # Plan: smol-shaped runtime with an external event loop (own executor)
 
-Status: proposed, 2026-11-07. Branch: off `final-review`.
+Status: **implemented** on branch `smol-runtime` (2026-11-07), steps 1–4.
+All 734 gtests, the fuzz corpora, `cargo test` and clippy `-D warnings` pass
+after every step; the unsafe count dropped from 1935 to 1927.
+
+### As built (differences from the design below)
+
+- `Async` exposes `readable()`/`writable()`/`read()`/`readable_this_turn()`.
+  `read_with`/`write_with` were not added: `Conn::recv_msg` needs to wait on
+  *either* fd readiness *or* a routed reply in a shared conn's inbox, so it
+  races the `Ready` future against the inbox in a small `poll_fn` instead.
+- `Async::read` records the turn it read in, so the same-turn peek
+  (`readable_this_turn`, used by `Conn::try_recv`) can't re-read a report
+  something already consumed.
+- The reactor ticker starts at 1: direction ticks start at 0, so a fresh
+  source must not look reported in the current turn.
+- `ChannelData::spawn` still polls a new task inline (cache hits and the
+  `ares_send` qid report rely on it); woken tasks run in `turn`.
+- Turn budget: `4 × live tasks + 16` polls.
+- Not added: a dedicated budget/livelock test (the budget lives in ffi, and
+  the C API can't inject a self-waking future). Added:
+  `tests/reentrant_callback.rs::callback_may_call_ares_process_mid_turn`.
+- Same-turn sibling completion (open question 2) broke no gtest.
 
 ## Goal
 
