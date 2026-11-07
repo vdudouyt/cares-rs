@@ -304,16 +304,25 @@ mod tests {
     /// `select_biased!` to an unbiased `select!` (which would pick either arm).
     #[test]
     fn recv_is_timeout_biased_under_simultaneous_readiness() {
-        for trial in 0..20 {
+        // The deadline window must outlast the first poll; under Miri that can
+        // take far longer than natively, so a window that expires before the
+        // read arm registers is widened and the trial retried.
+        let mut window = Duration::from_millis(3);
+        let mut trial = 0;
+        while trial < 20 {
             let reactor = Reactor::new();
             let sock: Rc<dyn Socket> = Rc::new(AlwaysReadable { fd: 42 });
             let mut conn = Conn::datagram(Async::new(sock, &reactor));
             let mut cx = Context::from_waker(Waker::noop());
             // Register the read arm, report the fd readable, then let the
             // deadline pass: on the next poll both arms are ready.
-            let deadline = Instant::now() + Duration::from_millis(3);
+            let deadline = Instant::now() + window;
             let mut fut = pin!(conn.recv(deadline));
-            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                assert!(window < Duration::from_secs(60), "first poll never beat the deadline");
+                window *= 4;
+                continue;
+            }
             reactor.dispatch(Instant::now(), true, |fd, w| fd == 42 && !w);
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
             match fut.as_mut().poll(&mut cx) {
@@ -325,6 +334,7 @@ mod tests {
                 ),
                 Poll::Pending => panic!("trial {trial}: both arms ready, must resolve"),
             }
+            trial += 1;
         }
     }
 }
