@@ -3,6 +3,8 @@
 
 mod request;
 
+pub(crate) use request::Probe;
+
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, CString};
 use std::io;
@@ -187,57 +189,6 @@ impl AsyncClient {
         Delivery::Raw { result, timeouts }
     }
 
-    /// One-shot failover probe to a stale server, raced against the primary; reply-
-    /// biased, looping past stray (non-QID) datagrams, and folding its outcome into
-    /// `ServerHealth`.
-    async fn run_probe(&self, probe_payload: BytesMut) {
-        let opts = self.opts();
-        let use_tcp = self.config.options.use_vc;
-        if opts.failover_chance == 0 {
-            return;
-        }
-        let primary_server = self.health.borrow().pick_next();
-        let Some(pserver) = self.health.borrow().pick_probe(opts.failover_delay, primary_server) else {
-            return;
-        };
-        let Some(ep) = self.endpoints.get(pserver) else {
-            return;
-        };
-        let sk = if use_tcp {
-            let Ok(sk) = self.rt.tcp(ep.bind) else { return };
-            let _ = sk.get_ref().connect(ep.tcp_addr);
-            sk
-        } else {
-            let Ok(sk) = self.rt.udp(ep.bind) else { return };
-            let _ = sk.get_ref().connect(ep.udp_addr);
-            sk
-        };
-        let framed = if use_tcp { frame_tcp(&probe_payload) } else { probe_payload.clone() };
-        let _ = sk.get_ref().send(&framed);
-        let mut conn = if use_tcp { Conn::stream(sk) } else { Conn::datagram(sk) };
-        let is_tcp = conn.is_tcp();
-        let timeout = Instant::now() + opts.timeout;
-        loop {
-            let mut reply = pin!(conn.recv_msg().fuse());
-            let mut t = pin!(self.rt.timer_at(timeout).fuse());
-            select_biased! {
-                r = reply => match r {
-                    Ok(buf) => {
-                        if qid_matches(&buf, &framed, use_tcp) {
-                            settle_probe(&self.effects, &self.health, pserver, is_tcp, Some(&buf));
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                },
-                _ = t => {
-                    settle_probe(&self.effects, &self.health, pserver, is_tcp, None);
-                    return;
-                }
-            }
-        }
-    }
-
     /// ares_gethostbyname: the pre-DNS cascade (ASCII/onion/family/IP-literal/
     /// hosts/localhost/HOSTALIASES/no-servers/query-cache) then search-domain DNS.
     /// Preflight has no `.await`, so a sync hit fires re-entrantly on first poll.
@@ -353,7 +304,7 @@ impl AsyncClient {
                         AF_INET6 => vec![RTYPE_AAAA],
                         _ => vec![RTYPE_A, RTYPE_AAAA],
                     };
-                    let lookup = self.resolve_addrinfo(&names, &rtypes, true).await;
+                    let lookup = self.resolve_addrinfo(&names, &rtypes).await;
                     timeouts.set(lookup.timeouts);
                     if lookup.replies.is_empty() {
                         last_error = lookup.status;
@@ -560,7 +511,6 @@ impl AsyncClient {
             SearchPlan::for_search(&search_name, self.config.options.ndots, &self.config.search, no_search);
         let mut had_nodata = false;
         let mut timeouts: c_int = 0;
-        let mut first = true;
         let not_cancelled = Cell::new(false);
 
         loop {
@@ -571,29 +521,7 @@ impl AsyncClient {
                 Ok(q) => q,
                 Err(e) => return Delivery::Raw { result: Err(e.code()), timeouts },
             };
-            // Only the first query of a lookup is eligible to spawn a failover probe.
-            let probe_payload = if first { make_payload(&plan.current).ok() } else { None };
-            first = false;
-            let mut primary = pin!(self.request(payload, &not_cancelled).fuse());
-            let (result, io_timeouts) = match probe_payload {
-                Some(pp) => {
-                    let mut probe = pin!(self.run_probe(pp).fuse());
-                    // Probe-biased race, but still drive an in-flight probe to
-                    // completion: upstream's probe is independent, and dropping it
-                    // would leave a recovered server marked failed.
-                    match select_biased! {
-                        _ = probe => None,
-                        r = primary => Some(r),
-                    } {
-                        Some(r) => {
-                            probe.await;
-                            r
-                        }
-                        None => primary.await,
-                    }
-                }
-                None => primary.await,
-            };
+            let (result, io_timeouts) = self.request(payload, &not_cancelled).await;
             timeouts += io_timeouts;
 
             let last_error: AresError = match result {
@@ -684,40 +612,15 @@ impl AsyncClient {
     }
 
     /// Shared address-resolution DNS phase for `gethostbyname`/`getaddrinfo`: try
-    /// each candidate name, querying its families with an optional one-shot probe.
-    /// A name succeeds if any family yields records.
-    async fn resolve_addrinfo(&self, names: &[String], rtypes: &[u16], probe: bool) -> AddrLookup {
-        let rd = self.recursion_desired();
+    /// each candidate name, querying its families. A name succeeds if any family
+    /// yields records.
+    async fn resolve_addrinfo(&self, names: &[String], rtypes: &[u16]) -> AddrLookup {
         let mut timeouts: c_int = 0;
         let mut last_error: AresError = ARES_ENODATA.into();
         let mut had_nodata = false;
 
         for (i, name) in names.iter().enumerate() {
-            let batch = self.query_families(name, rtypes);
-            let probe_payload = if probe && i == 0 {
-                dns_query_payload(name, u32::from(rtypes[0]), u32::from(ARES_CLASS_IN), rd).ok()
-            } else {
-                None
-            };
-            let results = match probe_payload {
-                Some(probe_payload) => {
-                    let mut b = pin!(batch.fuse());
-                    let mut p = pin!(self.run_probe(probe_payload).fuse());
-                    // Probe-biased race; still drive an in-flight probe to
-                    // completion so a recovered server is not left marked failed.
-                    match select_biased! {
-                        _ = p => None,
-                        r = b => Some(r),
-                    } {
-                        Some(r) => {
-                            p.await;
-                            r
-                        }
-                        None => b.await,
-                    }
-                }
-                None => batch.await,
-            };
+            let results = self.query_families(name, rtypes).await;
 
             let mut replies: Vec<FamilyReply> = Vec::new();
             for (&rtype, (result, io_timeouts)) in rtypes.iter().zip(results) {
@@ -904,7 +807,7 @@ impl AsyncClient {
                         no_search,
                     )
                     .into_names();
-                    let lookup = self.resolve_addrinfo(&names, &rtypes, false).await;
+                    let lookup = self.resolve_addrinfo(&names, &rtypes).await;
                     if lookup.replies.is_empty() {
                         last_error = lookup.status;
                         continue;
@@ -1049,6 +952,9 @@ fn hostaliases_lookup(hostname: &str, no_aliases: bool) -> Result<Option<String>
 /// A fire-and-forget side effect the ffi applies after a poll.
 pub(crate) enum Effect {
     NotifyServerState { server: usize, ok: bool, tcp: bool },
+    /// Spawn this failover probe as its own task (no callback), so the lookup
+    /// that raised it never waits for it.
+    Probe(Probe),
 }
 
 /// A hostent lifecycle's result plus its timeout count, for `ares_host_callback`.
@@ -1697,10 +1603,10 @@ impl AsyncClient {
         );
         {
             let src = self.health.borrow();
-            dup.health = Rc::new(RefCell::new(ServerHealth {
-                failures: src.failures.clone(),
-                last_failure: vec![None; src.last_failure.len()],
-            }));
+            let mut health = ServerHealth::default();
+            health.reset(src.len());
+            health.failures = src.failures.clone();
+            dup.health = Rc::new(RefCell::new(health));
         }
         dup.sortlist = self.sortlist.clone();
         dup.flags = self.flags;
@@ -2131,15 +2037,14 @@ impl AsyncClient {
         .unwrap_or(CookieVerdict::Accept)
     }
 
-    /// Connect-with-failover: create + connect the socket for `start`, retrying
-    /// across servers; returns the live `Conn` and server index, or `Err(())` when
-    /// the budget is spent. Shared conns open an inbox slot for the query's `qid`.
-    fn connect_failover(&self, qid: u16, start: usize, use_tcp: bool) -> Result<(Conn, usize), ()> {
-        let opts = self.opts();
+    /// Connect-with-failover: create + connect the socket for `start`, trying up
+    /// to `tries` servers; returns the live `Conn` and server index, or `Err(())`
+    /// when the budget is spent. Shared conns open an inbox slot for the query's `qid`.
+    fn connect_failover(&self, qid: u16, start: usize, use_tcp: bool, tries: u32) -> Result<(Conn, usize), ()> {
         let stayopen = self.flags & ARES_FLAG_STAYOPEN != 0;
         let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
         let mut s = start;
-        for _ in 0..opts.attempts.max(1) {
+        for _ in 0..tries.max(1) {
             let Some(ep) = self.endpoints.get(s) else { break };
             let conn = if use_tcp {
                 // Checkout-then-release: no pool guard is live while the C socket
@@ -2347,27 +2252,6 @@ fn qid_of(payload: &[u8]) -> u16 {
     }
 }
 
-/// Fold a probe reply into server health. `None` = the probe timed out (failure
-/// timestamp only).
-fn settle_probe(effects: &RefCell<Vec<Effect>>, health: &RefCell<ServerHealth>, server: usize, is_tcp: bool, reply: Option<&[u8]>) {
-    let mut health = health.borrow_mut();
-    match reply {
-        Some(buf) => {
-            let rcode = if buf.len() >= 4 { buf[3] & 0x0f } else { 0xff };
-            if rcode == 0 || rcode == 3 {
-                if health.record_success(server) {
-                    drop(health);
-                    effects.borrow_mut().push(Effect::NotifyServerState { server, ok: true, tcp: is_tcp });
-                }
-            } else if health.record_failure(server) {
-                drop(health);
-                effects.borrow_mut().push(Effect::NotifyServerState { server, ok: false, tcp: is_tcp });
-            }
-        }
-        None => health.record_failure_time(server),
-    }
-}
-
 type QueryOutcome = (Result<Vec<u8>, c_int>, c_int);
 
 #[cfg(test)]
@@ -2443,8 +2327,8 @@ mod tests {
         assert_eq!(qid_of(&first.payload), first.qid(), "the reserved id is stamped");
         assert_eq!(qid_of(&second.payload), second.qid());
 
-        let (conn_a, _) = client.connect_failover(first.qid(), 0, false).expect("first checkout");
-        let (conn_b, _) = client.connect_failover(second.qid(), 0, false).expect("second checkout");
+        let (conn_a, _) = client.connect_failover(first.qid(), 0, false, 1).expect("first checkout");
+        let (conn_b, _) = client.connect_failover(second.qid(), 0, false, 1).expect("second checkout");
         let shared = conn_a.shared_udp_handle().expect("pooled UDP");
         assert!(Rc::ptr_eq(&shared, &conn_b.shared_udp_handle().expect("pooled UDP")), "one shared socket");
         assert!(shared.borrow().has_waiter(first.qid()) && shared.borrow().has_waiter(second.qid()));

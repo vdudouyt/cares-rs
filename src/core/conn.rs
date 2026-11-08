@@ -12,9 +12,9 @@ use std::time::Instant;
 
 use futures_util::{select_biased, FutureExt};
 
-use crate::async_runtime::io::{dead, recv_datagram, recv_stream, send_when_writable, Async};
+use crate::async_runtime::io::{send_when_writable, Async};
 use crate::async_runtime::reactor::Timer;
-use crate::core::tcp_pool::{dns_frame, TcpConn};
+use crate::core::tcp_pool::TcpConn;
 use crate::core::udp_pool::{UdpConn, UdpPool};
 
 /// A query's connection.
@@ -32,23 +32,11 @@ struct UdpLease {
 }
 
 enum Wire {
-    Datagram { sock: Rc<Async> },
-    Stream { sock: Rc<Async>, rbuf: Vec<u8> },
     Shared(Rc<RefCell<TcpConn>>, u16),
     SharedUdp(Rc<RefCell<UdpConn>>, u16),
 }
 
 impl Conn {
-    /// An owned datagram socket, already connected (one recv = one message).
-    pub fn datagram(sock: Rc<Async>) -> Self {
-        Conn { wire: Wire::Datagram { sock }, udp_lease: None }
-    }
-
-    /// An owned one-shot stream socket; [`dns_frame`] cuts its bytes into messages.
-    pub fn stream(sock: Rc<Async>) -> Self {
-        Conn { wire: Wire::Stream { sock, rbuf: Vec::new() }, udp_lease: None }
-    }
-
     /// A query's handle on a shared stream conn: opens the inbox slot for its
     /// (channel-unique) `qid` and releases it on drop.
     pub fn shared(conn: Rc<RefCell<TcpConn>>, qid: u16) -> Self {
@@ -91,17 +79,12 @@ impl Conn {
         }
     }
 
-    /// The registered socket under this conn (owned or shared).
+    /// The registered socket under this conn.
     fn sock(&self) -> Rc<Async> {
         match &self.wire {
-            Wire::Datagram { sock } | Wire::Stream { sock, .. } => sock.clone(),
             Wire::Shared(c, _) => c.borrow().sock(),
             Wire::SharedUdp(c, _) => c.borrow().sock(),
         }
-    }
-
-    pub fn is_tcp(&self) -> bool {
-        matches!(&self.wire, Wire::Stream { .. } | Wire::Shared(..))
     }
 
     /// Await writability, then send `bytes` once (WouldBlock re-awaits);
@@ -110,14 +93,13 @@ impl Conn {
         send_when_writable(&self.sock(), bytes, timeout).await
     }
 
-    /// Take a message a **sibling** already routed into this tag's slot — only
-    /// possible on a shared conn, and without this conn's fd firing again (the
-    /// draining sibling consumed its readiness).
+    /// Take a message a **sibling** already routed into this tag's slot,
+    /// without this conn's fd firing again (the draining sibling consumed its
+    /// readiness).
     fn take_routed_slot(&mut self) -> Option<Vec<u8>> {
         match &self.wire {
             Wire::Shared(c, tag) => c.borrow_mut().take(*tag),
             Wire::SharedUdp(c, tag) => c.borrow_mut().take(*tag),
-            _ => None,
         }
     }
 
@@ -126,35 +108,22 @@ impl Conn {
         match &self.wire {
             Wire::Shared(c, tag) => c.borrow().has_reply(*tag),
             Wire::SharedUdp(c, tag) => c.borrow().has_reply(*tag),
-            _ => false,
         }
     }
 
-    /// On a shared conn, let a sibling's drain wake this task when it routes our reply.
+    /// Let a sibling's drain wake this task when it routes our reply.
     fn register_waker(&self, waker: &Waker) {
         match &self.wire {
             Wire::Shared(c, tag) => c.borrow_mut().register(*tag, waker),
             Wire::SharedUdp(c, tag) => c.borrow_mut().register(*tag, waker),
-            _ => {}
         }
     }
 
     /// One non-blocking read of this conn's next message (only after the
     /// caller reported the fd readable).
     fn read(&mut self) -> Poll<io::Result<Vec<u8>>> {
+        // The shared conn owns the drain, route, and per-tag demux.
         match &mut self.wire {
-            Wire::Datagram { sock } => sock.read(|s, buf| recv_datagram(s, buf)),
-            Wire::Stream { sock, rbuf } => {
-                // One-shot stream: a buffered frame delivers even on a dead
-                // socket; else a dead socket errors and an incomplete read is `Pending`.
-                let alive = sock.read(|s, buf| recv_stream(s, rbuf, buf));
-                match dns_frame(rbuf) {
-                    Some(frame) => Poll::Ready(Ok(frame)),
-                    None if !alive => Poll::Ready(Err(dead())),
-                    None => Poll::Pending,
-                }
-            }
-            // The shared conn owns the drain, route, and per-tag demux.
             Wire::Shared(c, tag) => c.borrow_mut().poll_read(*tag),
             Wire::SharedUdp(c, tag) => c.borrow_mut().poll_read(*tag),
         }
@@ -241,7 +210,6 @@ impl Drop for Conn {
                 c.borrow_mut().release(*tag);
                 Vec::new()
             }
-            _ => Vec::new(),
         };
         // Drop retired handles after the pool borrow ends so socket close
         // callbacks fire with no pool cell held.
@@ -307,7 +275,8 @@ mod tests {
         while trial < 20 {
             let reactor = Reactor::new();
             let sock: Rc<dyn Socket> = Rc::new(AlwaysReadable { fd: 42 });
-            let mut conn = Conn::datagram(Async::new(sock, &reactor));
+            // Tag 0xABAB: the datagram AlwaysReadable yields routes to us.
+            let mut conn = Conn::shared_udp(UdpConn::new(Async::new(sock, &reactor), false), 0xABAB);
             let mut cx = Context::from_waker(Waker::noop());
             // Register the read arm, report the fd readable, then let the
             // deadline pass: on the next poll both arms are ready.

@@ -33,6 +33,12 @@ impl QidRegistry {
         self.in_flight.len()
     }
 
+    /// A draw from the channel RNG (also the failover-probe chance roll, as
+    /// upstream draws both from `channel->rand_state`).
+    pub(crate) fn random_u16(&mut self) -> u16 {
+        self.rng.r#gen()
+    }
+
     /// A fresh id not in flight; `None` only when all 65536 are taken.
     fn pick(&mut self) -> Option<u16> {
         for _ in 0..RANDOM_TRIES {

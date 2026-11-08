@@ -138,6 +138,12 @@ impl ChannelData {
                 Effect::NotifyServerState { server, ok, tcp } => {
                     self.invoke_server_state_callback(server, ok, tcp)
                 }
+                // A probe is its own task with no C callback (upstream sends it
+                // with a NULL callback).
+                Effect::Probe(probe) => {
+                    let client = self.state.derive();
+                    self.spawn(client.probe(probe), |_| {});
+                }
             }
         }
         if done {

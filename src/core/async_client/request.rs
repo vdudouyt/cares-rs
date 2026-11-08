@@ -17,11 +17,40 @@ impl AsyncClient {
             return (Err(ARES_EBADQUERY), 0);
         }
         let mut q = self.start_query(query);
+        self.maybe_probe(&q);
         loop {
             if let Step::Done(result) = self.attempt(&mut q, cancelled).await {
                 return (result, q.timeouts);
             }
         }
+    }
+
+    /// Upstream `ares_probe_failed_server`, on a query's first send: with
+    /// probability 1/`retry_chance`, duplicate it (fresh qid) to a failed server
+    /// past its retry delay that has no probe in flight. The probe runs as its
+    /// own task (`Effect::Probe`), so this query never waits for it.
+    fn maybe_probe(&self, q: &QueryState) {
+        let chance = q.opts.failover_chance;
+        if chance == 0 || !self.qids.borrow_mut().random_u16().is_multiple_of(chance) {
+            return;
+        }
+        let Some(server) = self.health.borrow().pick_probe(q.opts.failover_delay, q.server) else { return };
+        let Ok(query) = self.reserve(BytesMut::from(&q.payload[..])) else { return };
+        self.health.borrow_mut().set_probing(server, true);
+        let probe = Probe { query: Some(query), server, health: self.health.clone() };
+        self.effects.borrow_mut().push(Effect::Probe(probe));
+    }
+
+    /// Run a failover probe: one no-retry attempt to its server, whose outcome
+    /// only feeds `ServerHealth` and the server-state callback (upstream sends it
+    /// with `ARES_SEND_FLAG_NORETRY`). Dropping it clears the server's
+    /// probe-in-flight mark.
+    pub(crate) async fn probe(self, mut probe: Probe) {
+        let Some(query) = probe.query.take() else { return };
+        let mut q = self.start_query(query);
+        q.server = probe.server;
+        q.no_retry = true;
+        while let Step::Retry = self.attempt(&mut q, &Cell::new(false)).await {}
     }
 
     /// Per-query state before the first attempt: starting transport, DNS 0x20
@@ -47,13 +76,15 @@ impl AsyncClient {
             failover_tries: 0,
             cookie_tries: 0,
             timeouts: 0,
+            no_retry: false,
         }
     }
 
     /// One attempt: check out a conn (failing over past unreachable servers),
     /// send once, then listen until a reply, timeout or dead socket decides.
     async fn attempt(&self, q: &mut QueryState, cancelled: &Cell<bool>) -> Step {
-        let Ok((mut conn, server)) = self.connect_failover(q.qid.id(), q.server, q.use_tcp) else {
+        let tries = if q.no_retry { 1 } else { q.opts.attempts };
+        let Ok((mut conn, server)) = self.connect_failover(q.qid.id(), q.server, q.use_tcp, tries) else {
             return Step::Done(Err(ARES_ECONNREFUSED));
         };
         q.server = server;
@@ -125,6 +156,8 @@ impl AsyncClient {
         );
         self.notify(actions);
         Some(match verdict {
+            // A probe never moves on: the verdict is already recorded in health.
+            TaskVerdict::RetryNextServer { .. } if q.no_retry => Step::Done(Ok(buf)),
             TaskVerdict::RetryNextServer { server, tries } => {
                 q.server = server;
                 q.failover_tries = tries;
@@ -143,7 +176,7 @@ impl AsyncClient {
     /// the attempt budget lasts.
     fn on_send_failed(&self, q: &mut QueryState, conn: &Conn) -> Step {
         self.discard_conn(q, conn);
-        if q.tries + 1 >= q.opts.attempts.max(1) {
+        if q.no_retry || q.tries + 1 >= q.opts.attempts.max(1) {
             return Step::Done(Err(ARES_ECONNREFUSED));
         }
         q.tries += 1;
@@ -207,6 +240,8 @@ impl AsyncClient {
         }
         self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
         match on_timeout(q.tries, q.opts.attempts, q.server, &mut self.health.borrow_mut()) {
+            // A probe's failure is recorded (by `on_timeout`); it is not retried.
+            TimeoutVerdict::Retry { .. } if q.no_retry => Step::Done(Err(expire)),
             TimeoutVerdict::Retry { server } => {
                 q.tries += 1;
                 q.try_count += 1;
@@ -241,6 +276,23 @@ struct QueryState {
     cookie_tries: u32,
     /// Timed-out attempts, reported to the caller.
     timeouts: c_int,
+    /// A failover probe: one server, no failover or retries.
+    no_retry: bool,
+}
+
+/// A pending failover probe (see [`AsyncClient::maybe_probe`]): its packet,
+/// target server, and the probe-in-flight mark it clears when dropped, whether
+/// it ran to completion or was aborted with the channel.
+pub(crate) struct Probe {
+    query: Option<ReservedQuery>,
+    server: usize,
+    health: Rc<RefCell<ServerHealth>>,
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.health.borrow_mut().set_probing(self.server, false);
+    }
 }
 
 impl QueryState {

@@ -365,10 +365,6 @@ impl Runtime {
         let sock: Rc<dyn Socket> = self.factory.create_tcp(bind)?;
         Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
     }
-
-    pub(crate) fn timer_at(&self, when: Instant) -> Timer {
-        Timer::at(&self.reactor, when)
-    }
 }
 
 #[cfg(test)]

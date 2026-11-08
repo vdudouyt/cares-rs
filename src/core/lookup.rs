@@ -215,6 +215,8 @@ pub fn on_timeout(tries_done: u32, attempts: u32, server: usize, health: &mut Se
 pub struct ServerHealth {
     pub failures: Vec<u32>,
     pub last_failure: Vec<Option<Instant>>,
+    /// A probe to this server is in flight (upstream `probe_pending`).
+    probing: Vec<bool>,
 }
 
 impl ServerHealth {
@@ -231,11 +233,13 @@ impl ServerHealth {
     pub fn reset(&mut self, n: usize) {
         self.failures = vec![0; n];
         self.last_failure = vec![None; n];
+        self.probing = vec![false; n];
     }
 
     pub fn clear(&mut self) {
         self.failures.clear();
         self.last_failure.clear();
+        self.probing.clear();
     }
 
     /// Lowest failure count, tie broken by index; 0 when empty.
@@ -255,13 +259,13 @@ impl ServerHealth {
     }
 
     /// Lowest-failure server whose failure timestamp expired past `retry_delay`,
-    /// excluding `exclude_server`.
+    /// excluding `exclude_server` and servers with a probe already in flight.
     pub fn pick_probe(&self, retry_delay_ms: u64, exclude_server: usize) -> Option<usize> {
         let now = Instant::now();
         let retry_delay = Duration::from_millis(retry_delay_ms);
         let mut best: Option<(u32, usize)> = None;
         for (i, &failures) in self.failures.iter().enumerate() {
-            if failures == 0 || i == exclude_server {
+            if failures == 0 || i == exclude_server || self.probing.get(i) == Some(&true) {
                 continue;
             }
             let Some(Some(last_fail)) = self.last_failure.get(i) else { continue };
@@ -295,9 +299,10 @@ impl ServerHealth {
 
     /// Refresh only the timestamp: a failing probe is not an additional server
     /// failure.
-    pub fn record_failure_time(&mut self, idx: usize) {
-        if idx < self.last_failure.len() {
-            self.last_failure[idx] = Some(Instant::now());
+    /// Mark a probe to `idx` as in flight (or finished); out of bounds is a no-op.
+    pub fn set_probing(&mut self, idx: usize, on: bool) {
+        if let Some(p) = self.probing.get_mut(idx) {
+            *p = on;
         }
     }
 
@@ -412,6 +417,11 @@ mod tests {
         assert_eq!(h.pick_probe(0, 0), Some(1));
         // the primary server is excluded
         assert_eq!(h.pick_probe(0, 1), None);
+        // a server with a probe already in flight is not probed twice
+        h.set_probing(1, true);
+        assert_eq!(h.pick_probe(0, 0), None);
+        h.set_probing(1, false);
+        assert_eq!(h.pick_probe(0, 0), Some(1));
     }
 
     #[test]
@@ -420,7 +430,7 @@ mod tests {
         h.reset(1);
         assert!(!h.record_failure(5));
         assert!(!h.record_success(5));
-        h.record_failure_time(5); // no panic
+        h.set_probing(5, true); // no panic
         assert_eq!(h.failures, vec![0]);
     }
 
