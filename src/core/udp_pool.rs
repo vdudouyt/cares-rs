@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::async_runtime::io::{dead, recv_datagram};
 use crate::async_runtime::io::Async;
+use crate::core::lookup::ServerId;
 use crate::core::tcp_pool::dns_tag;
 
 pub(crate) type Conn = Rc<RefCell<UdpConn>>;
@@ -206,7 +207,7 @@ impl UdpConn {
 /// Shared datagram connections per server, capped by `channel->udp_max_queries`
 /// (upstream `server->connections`).
 pub(crate) struct UdpPool {
-    conns: HashMap<usize, Vec<Conn>>,
+    conns: HashMap<ServerId, Vec<Conn>>,
 }
 
 impl UdpPool {
@@ -224,13 +225,13 @@ impl UdpPool {
         retired
     }
 
-    pub fn insert(&mut self, server: usize, conn: Conn) {
+    pub fn insert(&mut self, server: ServerId, conn: Conn) {
         self.conns.entry(server).or_default().push(conn);
     }
 
     /// Any pooled conn for `server` hit a hard socket error, so a sibling's
     /// timeout is attributable to that failure rather than a genuine query timeout.
-    pub fn has_dead(&self, server: usize) -> bool {
+    pub fn has_dead(&self, server: ServerId) -> bool {
         self.conns
             .get(&server)
             .is_some_and(|list| list.iter().any(|c| c.borrow().is_dead()))
@@ -239,7 +240,7 @@ impl UdpPool {
     /// Remove `conn` from `server`'s list, returning it for dropping outside the borrow.
     pub fn remove(
         &mut self,
-        server: usize,
+        server: ServerId,
         conn: &Conn,
     ) -> Vec<Conn> {
         let Some(list) = self.conns.get_mut(&server) else {
@@ -265,7 +266,7 @@ impl UdpPool {
     /// returns the handle for dropping after the pool borrow.
     pub fn release_if_done(
         &mut self,
-        server: usize,
+        server: ServerId,
         conn: &Conn,
         stayopen: bool,
         max_queries: usize,
@@ -288,7 +289,7 @@ impl UdpPool {
     /// Idle conns are pruned unless stay-open; exhausted ones always are.
     pub fn pick_or_none(
         &mut self,
-        server: usize,
+        server: ServerId,
         max_queries: usize,
         stayopen: bool,
     ) -> Checkout {
@@ -419,22 +420,22 @@ mod tests {
     fn pool_respects_total_queries_not_just_waiters() {
         let mut pool = UdpPool::new();
         let conn = UdpConn::new(sock(DummySock), false);
-        pool.insert(0, conn.clone());
+        pool.insert(ServerId(0), conn.clone());
 
-        let (picked, retired) = pool.pick_or_none(0, 2, true);
+        let (picked, retired) = pool.pick_or_none(ServerId(0), 2, true);
         assert!(picked.is_some() && retired.is_empty());
         conn.borrow_mut().register_query(1);
         conn.borrow_mut().release(1);
         assert_eq!(conn.borrow().total_queries(), 1);
 
-        let (picked, retired) = pool.pick_or_none(0, 2, true);
+        let (picked, retired) = pool.pick_or_none(ServerId(0), 2, true);
         assert!(picked.is_some() && retired.is_empty());
         conn.borrow_mut().register_query(2);
         conn.borrow_mut().release(2);
         assert_eq!(conn.borrow().total_queries(), 2);
 
         // Exhausted even with STAYOPEN: pruned; caller must create a new conn.
-        let (picked, retired) = pool.pick_or_none(0, 2, true);
+        let (picked, retired) = pool.pick_or_none(ServerId(0), 2, true);
         assert!(picked.is_none());
         assert_eq!(retired.len(), 1);
     }
@@ -443,11 +444,11 @@ mod tests {
     fn release_retires_exhausted_conn_even_when_stayopen() {
         let mut pool = UdpPool::new();
         let conn = UdpConn::new(sock(DummySock), false);
-        pool.insert(0, conn.clone());
+        pool.insert(ServerId(0), conn.clone());
         conn.borrow_mut().register_query(3);
         conn.borrow_mut().release(3);
 
-        let retired = pool.release_if_done(0, &conn, true, 1);
+        let retired = pool.release_if_done(ServerId(0), &conn, true, 1);
         assert_eq!(retired.len(), 1);
     }
 

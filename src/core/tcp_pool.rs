@@ -9,6 +9,7 @@ use std::task::{Poll, Waker};
 
 use crate::async_runtime::io::{dead, recv_stream};
 use crate::async_runtime::io::Async;
+use crate::core::lookup::ServerId;
 
 /// Demux tag of a frame — its transaction id (header bytes 0..2). `None` for a
 /// frame too short to carry one: it is handed to an awaiting waiter, which then
@@ -137,7 +138,7 @@ impl TcpConn {
 /// Shared stream connections per server (upstream: one `server->tcp_conn`, all
 /// queries pipelined on it).
 pub(crate) struct TcpPool {
-    conns: HashMap<usize, Rc<RefCell<TcpConn>>>,
+    conns: HashMap<ServerId, Rc<RefCell<TcpConn>>>,
 }
 
 impl TcpPool {
@@ -149,17 +150,17 @@ impl TcpPool {
         self.conns.clear();
     }
 
-    pub fn remove(&mut self, key: usize) {
+    pub fn remove(&mut self, key: ServerId) {
         self.conns.remove(&key);
     }
 
     /// The live connection to `key`. Callers clone the `Rc` so no pool borrow
     /// outlives this call: socket creation on a miss needs the pool unborrowed.
-    pub fn get(&self, key: usize) -> Option<Rc<RefCell<TcpConn>>> {
+    pub fn get(&self, key: ServerId) -> Option<Rc<RefCell<TcpConn>>> {
         self.conns.get(&key).cloned()
     }
 
-    pub fn insert(&mut self, key: usize, conn: Rc<RefCell<TcpConn>>) {
+    pub fn insert(&mut self, key: ServerId, conn: Rc<RefCell<TcpConn>>) {
         self.conns.insert(key, conn);
     }
 }

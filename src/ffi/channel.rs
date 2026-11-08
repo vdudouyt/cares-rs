@@ -6,6 +6,7 @@ use super::*;
 use crate::core::async_client::{normalize_port, AsyncClient, ServerSpec};
 use crate::core::fds::{clamp_timeout, getsock_mask, nfds, TimeoutChoice};
 use crate::core::async_client::Effect;
+use crate::core::lookup::ServerId;
 use crate::async_runtime::executor::Executor;
 use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
@@ -243,9 +244,9 @@ impl ChannelData {
     }
 
     /// Fire the server-state callback if installed; a stale index is skipped.
-    pub(crate) fn invoke_server_state_callback(&self, server_index: usize, success: bool, is_tcp: bool) {
+    pub(crate) fn invoke_server_state_callback(&self, server: ServerId, success: bool, is_tcp: bool) {
         if let Some(cb) = self.server_state_callback {
-            let Some(server_str) = self.state.server_state_string(server_index, is_tcp) else {
+            let Some(server_str) = self.state.server_state_string(server, is_tcp) else {
                 return;
             };
             let c_server_str = CString::new(server_str).unwrap_or_default();

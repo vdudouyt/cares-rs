@@ -16,6 +16,7 @@ use crate::async_runtime::io::{send_when_writable, Async};
 use crate::async_runtime::reactor::Timer;
 use crate::core::tcp_pool::TcpConn;
 use crate::core::async_client::ChannelShared;
+use crate::core::lookup::ServerId;
 use crate::core::udp_pool::UdpConn;
 
 /// A query's connection.
@@ -27,7 +28,7 @@ pub(crate) struct Conn {
 
 struct UdpLease {
     shared: Rc<ChannelShared>,
-    server: usize,
+    server: ServerId,
     stayopen: bool,
     max_queries: usize,
 }
@@ -57,7 +58,7 @@ impl Conn {
     pub fn with_udp_lease(
         mut self,
         shared: Rc<ChannelShared>,
-        server: usize,
+        server: ServerId,
         stayopen: bool,
         max_queries: usize,
     ) -> Self {

@@ -462,9 +462,9 @@ impl AsyncClient {
     }
 
     /// The `ip:port` string reported to the server-state callback (IPv6
-    /// bracketed); None when the index is stale.
-    pub fn server_state_string(&self, server_index: usize, is_tcp: bool) -> Option<String> {
-        let (ip, port) = self.config.nameservers.get(server_index)?;
+    /// bracketed); None when the server id is stale.
+    pub fn server_state_string(&self, server: ServerId, is_tcp: bool) -> Option<String> {
+        let (ip, port) = self.config.nameservers.get(server.0)?;
         let port_val = port.unwrap_or(if is_tcp {
             self.default_tcp_port
         } else {

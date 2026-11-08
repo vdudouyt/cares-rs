@@ -118,17 +118,23 @@ pub use libc::{AF_INET, AF_INET6};
 pub(crate) const RTYPE_A: u16 = 0x01;
 pub(crate) const RTYPE_AAAA: u16 = 0x1c;
 
+/// A server's position in the channel's server list (`config.nameservers`,
+/// and the parallel `ServerHealth`/endpoint/cookie vectors). A distinct type so
+/// it cannot be swapped with the try counters and ids it travels beside.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServerId(pub usize);
+
 /// Reactor-level side effect (executed by ares_process).
 #[derive(Debug, PartialEq)]
 pub enum ReactorAction {
-    NotifyServerState { server: usize, ok: bool, tcp: bool },
+    NotifyServerState { server: ServerId, ok: bool, tcp: bool },
 }
 
 /// Reactor-level verdict for a datagram that already passed QID matching.
 #[derive(Debug, PartialEq)]
 pub enum TaskVerdict {
     /// Server-error failover: resend to `server`, carrying `tries` onto the retry.
-    RetryNextServer { server: usize, tries: u32 },
+    RetryNextServer { server: ServerId, tries: u32 },
     /// Truncated UDP reply: resend over TCP to the same server.
     RetryTcp,
     Deliver,
@@ -148,7 +154,7 @@ pub struct ReplyPolicy {
 /// (`nservers * attempts`), so a single server is retried in place.
 pub fn on_datagram(
     summary: &ReplySummary,
-    server: usize,
+    server: ServerId,
     is_tcp: bool,
     attempts: u32,
     tries: u32,
@@ -187,14 +193,14 @@ pub fn on_datagram(
 /// Verdict for an expired (timed-out) task.
 #[derive(Debug, PartialEq)]
 pub enum TimeoutVerdict {
-    Retry { server: usize },
+    Retry { server: ServerId },
     /// Out of attempts: deliver ARES_ETIMEOUT.
     Expire,
 }
 
 /// Retry until `attempts` are used up; a timeout counts as a failure and moves
 /// to the next server only when there is more than one.
-pub fn on_timeout(tries_done: u32, attempts: u32, server: usize, health: &mut ServerHealth) -> TimeoutVerdict {
+pub fn on_timeout(tries_done: u32, attempts: u32, server: ServerId, health: &mut ServerHealth) -> TimeoutVerdict {
     if tries_done < attempts {
         let server = if health.len() > 1 {
             health.record_failure(server);
@@ -242,8 +248,8 @@ impl ServerHealth {
         self.probing.clear();
     }
 
-    /// Lowest failure count, tie broken by index; 0 when empty.
-    pub fn pick_next(&self) -> usize {
+    /// Lowest failure count, tie broken by index; server 0 when empty.
+    pub fn pick_next(&self) -> ServerId {
         let mut best: Option<(u32, usize)> = None;
         for (i, &failures) in self.failures.iter().enumerate() {
             match best {
@@ -255,17 +261,17 @@ impl ServerHealth {
                 }
             }
         }
-        best.map(|(_, i)| i).unwrap_or(0)
+        ServerId(best.map(|(_, i)| i).unwrap_or(0))
     }
 
     /// Lowest-failure server whose failure timestamp expired past `retry_delay`,
-    /// excluding `exclude_server` and servers with a probe already in flight.
-    pub fn pick_probe(&self, retry_delay_ms: u64, exclude_server: usize) -> Option<usize> {
+    /// excluding `exclude` and servers with a probe already in flight.
+    pub fn pick_probe(&self, retry_delay_ms: u64, exclude: ServerId) -> Option<ServerId> {
         let now = Instant::now();
         let retry_delay = Duration::from_millis(retry_delay_ms);
         let mut best: Option<(u32, usize)> = None;
         for (i, &failures) in self.failures.iter().enumerate() {
-            if failures == 0 || i == exclude_server || self.probing.get(i) == Some(&true) {
+            if failures == 0 || i == exclude.0 || self.probing.get(i) == Some(&true) {
                 continue;
             }
             let Some(Some(last_fail)) = self.last_failure.get(i) else { continue };
@@ -281,12 +287,13 @@ impl ServerHealth {
                 }
             }
         }
-        best.map(|(_, i)| i)
+        best.map(|(_, i)| ServerId(i))
     }
 
-    /// Count a failure against `idx`; `false` when out of bounds (server list
+    /// Count a failure against `server`; `false` when out of bounds (server list
     /// changed under the query).
-    pub fn record_failure(&mut self, idx: usize) -> bool {
+    pub fn record_failure(&mut self, server: ServerId) -> bool {
+        let idx = server.0;
         if idx >= self.failures.len() {
             return false;
         }
@@ -297,17 +304,16 @@ impl ServerHealth {
         true
     }
 
-    /// Refresh only the timestamp: a failing probe is not an additional server
-    /// failure.
-    /// Mark a probe to `idx` as in flight (or finished); out of bounds is a no-op.
-    pub fn set_probing(&mut self, idx: usize, on: bool) {
-        if let Some(p) = self.probing.get_mut(idx) {
+    /// Mark a probe to `server` as in flight (or finished); out of bounds is a no-op.
+    pub fn set_probing(&mut self, server: ServerId, on: bool) {
+        if let Some(p) = self.probing.get_mut(server.0) {
             *p = on;
         }
     }
 
-    /// Mark `idx` healthy; `false` when out of bounds.
-    pub fn record_success(&mut self, idx: usize) -> bool {
+    /// Mark `server` healthy; `false` when out of bounds.
+    pub fn record_success(&mut self, server: ServerId) -> bool {
+        let idx = server.0;
         if idx >= self.failures.len() {
             return false;
         }
@@ -393,44 +399,44 @@ mod tests {
     #[test]
     fn pick_next_lowest_failures_then_index() {
         let mut h = ServerHealth::default();
-        assert_eq!(h.pick_next(), 0); // empty -> 0
+        assert_eq!(h.pick_next(), ServerId(0)); // empty -> 0
         h.reset(3);
-        assert_eq!(h.pick_next(), 0);
-        h.record_failure(0);
-        assert_eq!(h.pick_next(), 1);
-        h.record_failure(1);
-        h.record_failure(1);
-        assert_eq!(h.pick_next(), 2);
-        h.record_success(0);
-        assert_eq!(h.pick_next(), 0);
+        assert_eq!(h.pick_next(), ServerId(0));
+        h.record_failure(ServerId(0));
+        assert_eq!(h.pick_next(), ServerId(1));
+        h.record_failure(ServerId(1));
+        h.record_failure(ServerId(1));
+        assert_eq!(h.pick_next(), ServerId(2));
+        h.record_success(ServerId(0));
+        assert_eq!(h.pick_next(), ServerId(0));
     }
 
     #[test]
     fn pick_probe_requires_expired_failure() {
         let mut h = ServerHealth::default();
         h.reset(3);
-        assert_eq!(h.pick_probe(0, 0), None); // no failures anywhere
-        h.record_failure(1);
+        assert_eq!(h.pick_probe(0, ServerId(0)), None); // no failures anywhere
+        h.record_failure(ServerId(1));
         // failure recorded just now: not yet expired for a long delay
-        assert_eq!(h.pick_probe(60_000, 0), None);
+        assert_eq!(h.pick_probe(60_000, ServerId(0)), None);
         // zero delay: immediately eligible
-        assert_eq!(h.pick_probe(0, 0), Some(1));
+        assert_eq!(h.pick_probe(0, ServerId(0)), Some(ServerId(1)));
         // the primary server is excluded
-        assert_eq!(h.pick_probe(0, 1), None);
+        assert_eq!(h.pick_probe(0, ServerId(1)), None);
         // a server with a probe already in flight is not probed twice
-        h.set_probing(1, true);
-        assert_eq!(h.pick_probe(0, 0), None);
-        h.set_probing(1, false);
-        assert_eq!(h.pick_probe(0, 0), Some(1));
+        h.set_probing(ServerId(1), true);
+        assert_eq!(h.pick_probe(0, ServerId(0)), None);
+        h.set_probing(ServerId(1), false);
+        assert_eq!(h.pick_probe(0, ServerId(0)), Some(ServerId(1)));
     }
 
     #[test]
     fn record_out_of_bounds_is_noop() {
         let mut h = ServerHealth::default();
         h.reset(1);
-        assert!(!h.record_failure(5));
-        assert!(!h.record_success(5));
-        h.set_probing(5, true); // no panic
+        assert!(!h.record_failure(ServerId(5)));
+        assert!(!h.record_success(ServerId(5)));
+        h.set_probing(ServerId(5), true); // no panic
         assert_eq!(h.failures, vec![0]);
     }
 
@@ -442,42 +448,42 @@ mod tests {
         // success rcode: notify-ok, reset failures, Deliver
         let mut h = ServerHealth::default();
         h.reset(2);
-        h.record_failure(0);
-        let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), 0, false, 2, 0, ReplyPolicy::default(), &mut h);
+        h.record_failure(ServerId(0));
+        let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
-        assert_eq!(a, vec![notify_ok(0)]);
+        assert_eq!(a, vec![notify_ok(ServerId(0))]);
         assert_eq!(h.failures[0], 0, "success resets failures");
 
         // SERVFAIL, 2 servers: fail over to the next server, notify fail.
         let mut h = ServerHealth::default();
         h.reset(2);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::RetryNextServer { server: 1, tries: 1 });
-        assert_eq!(a, vec![notify_fail(0)]);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
+        assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId(1), tries: 1 });
+        assert_eq!(a, vec![notify_fail(ServerId(0))]);
         assert_eq!(h.failures[0], 1);
 
         // SERVFAIL, single server: retried in place (pick_next returns the same
         // server), failure recorded, still notified.
         let mut h = ServerHealth::default();
         h.reset(1);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::RetryNextServer { server: 0, tries: 1 });
-        assert_eq!(a, vec![notify_fail(0)]);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
+        assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId(0), tries: 1 });
+        assert_eq!(a, vec![notify_fail(ServerId(0))]);
         assert_eq!(h.failures[0], 1);
 
         // budget exhausted: tries+1 >= nservers*attempts falls through to Deliver
         let mut h = ServerHealth::default();
         h.reset(2);
-        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), 0, false, 2, 3, ReplyPolicy::default(), &mut h);
+        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId(0), false, 2, 3, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
 
         // TC flag on UDP: RetryTcp; already-TCP never TC-retries.
         let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
         let mut h = ServerHealth::default();
         h.reset(1);
-        let (_, v) = on_datagram(&summarize(&tc, 0), 0, false, 2, 0, ReplyPolicy::default(), &mut h);
+        let (_, v) = on_datagram(&summarize(&tc, 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::RetryTcp);
-        let (_, v) = on_datagram(&summarize(&tc, 0), 0, true, 2, 0, ReplyPolicy::default(), &mut h);
+        let (_, v) = on_datagram(&summarize(&tc, 0), ServerId(0), true, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
     }
 
@@ -490,7 +496,7 @@ mod tests {
         h.reset(1);
         let (_, v) = on_datagram(
             &summarize(&tc, 0),
-            0,
+            ServerId(0),
             false,
             2,
             0,
@@ -506,7 +512,7 @@ mod tests {
         h.reset(1);
         let (a, v) = on_datagram(
             &summarize(&tc_servfail, 0),
-            0,
+            ServerId(0),
             false,
             2,
             0,
@@ -525,7 +531,7 @@ mod tests {
             h.reset(2);
             let (a, v) = on_datagram(
                 &summarize(&reply(rcode, 0), 0),
-                0,
+                ServerId(0),
                 false,
                 2,
                 0,
@@ -535,7 +541,7 @@ mod tests {
             assert_eq!(v, TaskVerdict::Deliver);
             assert_eq!(
                 a,
-                vec![ReactorAction::NotifyServerState { server: 0, ok: true, tcp: false }]
+                vec![ReactorAction::NotifyServerState { server: ServerId(0), ok: true, tcp: false }]
             );
             assert_eq!(h.failures[0], 0);
         }
@@ -546,15 +552,15 @@ mod tests {
         // retries left, multiple servers: count a failure, move on
         let mut h = ServerHealth::default();
         h.reset(2);
-        assert_eq!(on_timeout(1, 3, 0, &mut h), TimeoutVerdict::Retry { server: 1 });
+        assert_eq!(on_timeout(1, 3, ServerId(0), &mut h), TimeoutVerdict::Retry { server: ServerId(1) });
         assert_eq!(h.failures[0], 1);
         // retries left, single server: same server, no failure counted
         let mut h = ServerHealth::default();
         h.reset(1);
-        assert_eq!(on_timeout(1, 3, 0, &mut h), TimeoutVerdict::Retry { server: 0 });
+        assert_eq!(on_timeout(1, 3, ServerId(0), &mut h), TimeoutVerdict::Retry { server: ServerId(0) });
         assert_eq!(h.failures[0], 0);
         // out of attempts
-        assert_eq!(on_timeout(3, 3, 0, &mut h), TimeoutVerdict::Expire);
+        assert_eq!(on_timeout(3, 3, ServerId(0), &mut h), TimeoutVerdict::Expire);
     }
 
     #[test]

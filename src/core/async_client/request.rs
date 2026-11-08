@@ -84,7 +84,7 @@ impl AsyncClient {
     /// send once, then listen until a reply, timeout or dead socket decides.
     async fn attempt(&self, q: &mut QueryState, cancelled: &Cell<bool>) -> Step {
         let tries = if q.no_retry { 1 } else { q.opts.attempts };
-        let Ok((mut conn, server)) = self.connect_failover(q.qid.id(), q.server, q.use_tcp, tries) else {
+        let Some((mut conn, server)) = self.connect_with_failover(q.qid.id(), q.server, q.use_tcp, tries) else {
             return Step::Done(Err(ARES_ECONNREFUSED));
         };
         q.server = server;
@@ -265,7 +265,7 @@ struct QueryState {
     payload: Vec<u8>,
     /// Starts at ARES_FLAG_USEVC; a TC reply or persistent BADCOOKIE upgrades.
     use_tcp: bool,
-    server: usize,
+    server: ServerId,
     /// DNS 0x20: the randomized question name replies must echo (UDP only).
     dns0x20: Option<Vec<u8>>,
     /// Retries counted against `opts.attempts`.
@@ -285,7 +285,7 @@ struct QueryState {
 /// it ran to completion or was aborted with the channel.
 pub(crate) struct Probe {
     query: Option<ReservedQuery>,
-    server: usize,
+    server: ServerId,
     shared: Rc<ChannelShared>,
 }
 
@@ -372,20 +372,20 @@ impl AsyncClient {
 
     /// Remove a dead/timed-out shared UDP conn so the next attempt opens a fresh
     /// socket. The `Rc` drops after the pool borrow ends (it may close a socket).
-    fn retire_udp(&self, server: usize, conn: &Conn) {
+    fn retire_udp(&self, server: ServerId, conn: &Conn) {
         let Some(c) = conn.shared_udp_handle() else { return };
         let retired = self.shared.udp_pool.borrow_mut().remove(server, &c);
         drop(retired);
     }
 
     /// Grow the per-server cookie table to cover `server` and pass it to `f`.
-    fn with_cookie<R>(&self, server: usize, f: impl FnOnce(&mut ServerCookie) -> R) -> Option<R> {
+    fn with_cookie<R>(&self, server: ServerId, f: impl FnOnce(&mut ServerCookie) -> R) -> Option<R> {
         let mut cookies = self.shared.cookies.borrow_mut();
-        let needed = self.endpoints.len().max(server + 1);
+        let needed = self.endpoints.len().max(server.0 + 1);
         if cookies.len() < needed {
             cookies.resize_with(needed, ServerCookie::default);
         }
-        cookies.get_mut(server).map(f)
+        cookies.get_mut(server.0).map(f)
     }
 
     /// Attach the COOKIE option for this send (UDP only; removed on TCP). Returns
@@ -394,7 +394,7 @@ impl AsyncClient {
     fn apply_cookie(
         &self,
         payload: &mut Vec<u8>,
-        server: usize,
+        server: ServerId,
         use_tcp: bool,
     ) -> Result<Option<[u8; 8]>, AresError> {
         if !edns::has_opt(payload) {
@@ -432,7 +432,7 @@ impl AsyncClient {
         &self,
         resp: &[u8],
         sent_client: Option<&[u8; 8]>,
-        server: usize,
+        server: ServerId,
         rcode: u16,
     ) -> CookieVerdict {
         self.with_cookie(server, |cookie| {
@@ -441,15 +441,16 @@ impl AsyncClient {
         .unwrap_or(CookieVerdict::Accept)
     }
 
-    /// Connect-with-failover: create + connect the socket for `start`, trying up
-    /// to `tries` servers; returns the live `Conn` and server index, or `Err(())`
-    /// when the budget is spent. Shared conns open an inbox slot for the query's `qid`.
-    fn connect_failover(&self, qid: u16, start: usize, use_tcp: bool, tries: u32) -> Result<(Conn, usize), ()> {
+    /// Check out a pooled conn (or open one) to the `preferred` server, failing
+    /// over to the healthiest other server when a socket cannot be created, for
+    /// up to `tries` servers. Returns the conn and the server it reached, or
+    /// `None` once the budget is spent. Shared conns open an inbox slot for `qid`.
+    fn connect_with_failover(&self, qid: u16, preferred: ServerId, use_tcp: bool, tries: u32) -> Option<(Conn, ServerId)> {
         let stayopen = self.flags & ARES_FLAG_STAYOPEN != 0;
         let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
-        let mut s = start;
+        let mut s = preferred;
         for _ in 0..tries.max(1) {
-            let Some(ep) = self.endpoints.get(s) else { break };
+            let Some(ep) = self.endpoints.get(s.0) else { break };
             let conn = if use_tcp {
                 // Checkout-then-release: no pool guard is live while the C socket
                 // callbacks fire during creation, nor while `Conn::shared` borrows.
@@ -483,14 +484,14 @@ impl AsyncClient {
                 })
             };
             if let Some(conn) = conn {
-                return Ok((conn, s));
+                return Some((conn, s));
             }
             if self.shared.health.borrow().len() > 1 {
                 self.shared.health.borrow_mut().record_failure(s);
                 s = self.shared.health.borrow().pick_next();
             }
         }
-        Err(())
+        None
     }
 }
 
@@ -598,8 +599,8 @@ mod tests {
         assert_eq!(qid_of(&first.payload), first.qid(), "the reserved id is stamped");
         assert_eq!(qid_of(&second.payload), second.qid());
 
-        let (conn_a, _) = client.connect_failover(first.qid(), 0, false, 1).expect("first checkout");
-        let (conn_b, _) = client.connect_failover(second.qid(), 0, false, 1).expect("second checkout");
+        let (conn_a, _) = client.connect_with_failover(first.qid(), ServerId(0), false, 1).expect("first checkout");
+        let (conn_b, _) = client.connect_with_failover(second.qid(), ServerId(0), false, 1).expect("second checkout");
         let shared = conn_a.shared_udp_handle().expect("pooled UDP");
         assert!(Rc::ptr_eq(&shared, &conn_b.shared_udp_handle().expect("pooled UDP")), "one shared socket");
         assert!(shared.borrow().has_waiter(first.qid()) && shared.borrow().has_waiter(second.qid()));

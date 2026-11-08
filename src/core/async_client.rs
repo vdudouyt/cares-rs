@@ -46,7 +46,7 @@ use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
     is_localhost, is_onion_domain, on_datagram, on_timeout, qid_matches,
-    summarize, ReactorAction, ReplyPolicy, SearchPlan, ServerHealth, TaskVerdict,
+    summarize, ReactorAction, ReplyPolicy, SearchPlan, ServerHealth, ServerId, TaskVerdict,
     TimeoutVerdict, AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
@@ -241,7 +241,7 @@ impl AsyncClient {
 
 /// A fire-and-forget side effect the ffi applies after a poll.
 pub(crate) enum Effect {
-    NotifyServerState { server: usize, ok: bool, tcp: bool },
+    NotifyServerState { server: ServerId, ok: bool, tcp: bool },
     /// Spawn this failover probe as its own task (no callback), so the lookup
     /// that raised it never waits for it.
     Probe(Probe),
