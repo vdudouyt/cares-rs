@@ -4,7 +4,7 @@
 use super::*;
 use crate::core::async_client::search_precheck;
 use crate::core::async_client::{service_to_port, ServicePort};
-use crate::core::async_client::{AddrInfoOut, Delivery, HostReply, NameinfoReply, QuerySignals};
+use crate::core::async_client::{AddrInfoOut, Delivery, HostReply, NameinfoReply};
 use crate::core::cache::{CacheKey, QueryCache};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -104,7 +104,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     {
         Ok(payload) => {
             let client = channeldata.state.derive();
-                    let fut = client.query_raw(payload, Rc::default());
+                    let fut = client.query_raw(payload);
             channeldata.spawn(fut, move |r| on_raw_reply(callback, arg, r));
         }
         Err(status) => on_raw_reply(callback, arg, Err(status.code())),
@@ -177,22 +177,15 @@ fn query_dnsrec_record(
             return ARES_SUCCESS;
         }
     }
-    if !qid.is_null() && payload.len() >= 2 {
-        unsafe { *qid = u16::from_be_bytes([payload[0], payload[1]]); }
+    if !qid.is_null() {
+        unsafe { *qid = payload.qid(); }
     }
     let client = channeldata.state.derive();
     let cache = client.cache.clone();
-    let sig = Rc::new(QuerySignals::default());
-    let fut = client.query_raw(payload, sig.clone());
+    let fut = client.query_raw(payload);
     channeldata.spawn(fut, move |r| {
         on_dnsrec_reply(callback, arg, &cache, Some(cache_key), r)
     });
-    // The first advance may have re-rolled the qid on a shared socket; report
-    // the id that is actually on the wire (a zero means nothing was reserved).
-    let final_qid = sig.qid.get();
-    if !qid.is_null() && final_qid != 0 {
-        unsafe { *qid = final_qid; }
-    }
     ARES_SUCCESS
 }
 
@@ -558,7 +551,7 @@ where
             return Ok(Some(buf));
         }
     }
-    let mut buf = serialize_send_record(rec)?;
+    let buf = serialize_send_record(rec)?;
     // Upstream duplicates the record through a write+parse round-trip before
     // sending; a parse failure (EBADRESP) surfaces as EBADQUERY.
     if let Err(e) = crate::core::dns_record::parse_record(&buf, 0) {
@@ -572,33 +565,21 @@ where
     if buf.len() > u16::MAX as usize || buf.len() < 12 {
         return Err(ARES_EBADQUERY);
     }
-    // No channel-wide in-flight-qid registry exists, so a random non-zero id is
-    // used (documented approximation).
-    let new_qid = {
-        let id = rand::random::<u16>();
-        if id == 0 { 1 } else { id }
-    };
-    buf[0..2].copy_from_slice(&new_qid.to_be_bytes());
+    // send_payload stamps a fresh channel-unique id (upstream overwrites the
+    // caller's id too); it stays fixed for every retry.
     let payload = match channeldata.state.send_payload(&buf) {
         Ok(p) => p,
         Err(e) => return Err(e.code()),
     };
     if !qid.is_null() {
-        unsafe { *qid = new_qid; }
+        unsafe { *qid = payload.qid(); }
     }
     let client = channeldata.state.derive();
-    let sig = Rc::new(QuerySignals::default());
     // ares_send / ares_send_dnsrec: transmit the caller's bytes unchanged (no
     // synthesized OPT/COOKIE); a caller-supplied OPT is preserved because it is
     // already part of the serialized record.
-    let fut = client.query_raw(payload, sig.clone());
+    let fut = client.query_raw(payload);
     channeldata.spawn(fut, move |r| on_reply(r, cache_key));
-    // Report the qid connect_failover reserved, which may have re-rolled it on
-    // a shared socket after the caller was given the pre-send value above.
-    let final_qid = sig.qid.get();
-    if !qid.is_null() && final_qid != 0 {
-        unsafe { *qid = final_qid; }
-    }
     Ok(None)
 }
 

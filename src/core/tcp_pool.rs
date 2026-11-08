@@ -67,20 +67,10 @@ impl TcpConn {
         Rc::new(RefCell::new(TcpConn { sock, rbuf: Vec::new(), inbox: HashMap::new() }))
     }
 
-    /// Reserve a free inbox tag for a query. Rerolls from `qid` on collision (≈
-    /// upstream `generate_unique_qid`, or two queries would clobber one slot);
-    /// the caller must re-stamp its payload on a re-roll.
-    pub(crate) fn reserve(
-        &mut self,
-        qid: u16,
-        mut reroll: impl FnMut() -> u16,
-    ) -> u16 {
-        let mut tag = qid;
-        while self.inbox.contains_key(&tag) {
-            tag = reroll();
-        }
-        self.inbox.insert(tag, InboxSlot { reply: None, waker: None });
-        tag
+    /// Open an inbox slot for a query's id. Ids are unique channel-wide
+    /// (`core::qid`), so the slot is never already taken.
+    pub(crate) fn register_query(&mut self, qid: u16) {
+        self.inbox.insert(qid, InboxSlot { reply: None, waker: None });
     }
 
     /// Remember the task waiting on `tag`, to be woken when a sibling routes its reply.
@@ -219,17 +209,12 @@ mod tests {
         assert!(rbuf.is_empty());
     }
 
-    /// A colliding transaction id must be re-rolled until free (≈ upstream
-    /// `generate_unique_qid`), and `release` frees only that tag.
+    /// `release` frees only its own query's slot.
     #[test]
-    fn reserve_rerolls_colliding_tag() {
+    fn release_frees_only_its_slot() {
         let mut tc = TcpConn { sock: Async::new(Rc::new(DummySock), &Reactor::new()), rbuf: Vec::new(), inbox: HashMap::new() };
-        assert_eq!(tc.reserve(7, || panic!("free qid must not reroll")), 7);
-
-        // The reroll may collide again (7) before drawing a free id (9).
-        let rolls = RefCell::new(vec![9u16, 7u16]); // popped back-to-front: 7, then 9
-        assert_eq!(tc.reserve(7, || rolls.borrow_mut().pop().unwrap()), 9);
-        assert!(rolls.borrow().is_empty());
+        tc.register_query(7);
+        tc.register_query(9);
         assert!(tc.has_waiter(7) && tc.has_waiter(9));
 
         tc.release(7);

@@ -49,20 +49,18 @@ impl Conn {
         Conn { wire: Wire::Stream { sock, rbuf: Vec::new() }, udp_lease: None }
     }
 
-    /// A query's handle on a shared stream conn: reserves a tag (rerolling `qid`
-    /// on collision — see [`TcpConn::reserve`]) and releases it on drop. Returns
-    /// the handle and the tag actually reserved; the caller must re-stamp on a re-roll.
-    pub fn shared(conn: Rc<RefCell<TcpConn>>, qid: u16, reroll: impl FnMut() -> u16) -> (Self, u16) {
-        let tag = conn.borrow_mut().reserve(qid, reroll);
-        (Conn { wire: Wire::Shared(conn, tag), udp_lease: None }, tag)
+    /// A query's handle on a shared stream conn: opens the inbox slot for its
+    /// (channel-unique) `qid` and releases it on drop.
+    pub fn shared(conn: Rc<RefCell<TcpConn>>, qid: u16) -> Self {
+        conn.borrow_mut().register_query(qid);
+        Conn { wire: Wire::Shared(conn, qid), udp_lease: None }
     }
 
-    /// A query's handle on a shared datagram conn: reserves a tag (rerolling `qid`
-    /// on collision — see [`UdpConn::reserve`]) and releases it on drop. Returns
-    /// the handle and the tag actually reserved; the caller must re-stamp on a re-roll.
-    pub fn shared_udp(conn: Rc<RefCell<UdpConn>>, qid: u16, reroll: impl FnMut() -> u16) -> (Self, u16) {
-        let tag = conn.borrow_mut().reserve(qid, reroll);
-        (Conn { wire: Wire::SharedUdp(conn, tag), udp_lease: None }, tag)
+    /// A query's handle on a shared datagram conn: opens the inbox slot for its
+    /// (channel-unique) `qid` and releases it on drop.
+    pub fn shared_udp(conn: Rc<RefCell<UdpConn>>, qid: u16) -> Self {
+        conn.borrow_mut().register_query(qid);
+        Conn { wire: Wire::SharedUdp(conn, qid), udp_lease: None }
     }
 
     /// Attach the pool lease for a shared-UDP checkout so the conn can retire
@@ -280,17 +278,14 @@ mod tests {
         }
     }
 
-    /// `Conn::shared` propagates the reserved tag, and dropping a `Conn` frees
-    /// exactly its own shared-conn slot (RAII).
+    /// Dropping a `Conn` frees exactly its own shared-conn slot (RAII).
     #[test]
     fn shared_conn_releases_slot_on_drop() {
         let reactor = Reactor::new();
         let tc = TcpConn::new(Async::new(Rc::new(AlwaysReadable { fd: 5 }), &reactor));
 
-        let (a, ta) = Conn::shared(tc.clone(), 7, || panic!("free qid must not reroll"));
-        assert_eq!(ta, 7);
-        let (b, tb) = Conn::shared(tc.clone(), 7, || 9);
-        assert_eq!(tb, 9);
+        let a = Conn::shared(tc.clone(), 7);
+        let b = Conn::shared(tc.clone(), 9);
         assert!(tc.borrow().has_waiter(7) && tc.borrow().has_waiter(9));
 
         drop(a);

@@ -8,17 +8,17 @@ use super::*;
 impl AsyncClient {
     /// The single-query driver every lookup runs on: run attempts (connect with
     /// failover, send, listen) until one reaches a verdict. Starts on TCP iff
-    /// ARES_FLAG_USEVC; `sig.cancelled` stops retries but still delivers an
-    /// in-flight reply.
-    pub(super) async fn request(&self, payload: BytesMut, sig: &QuerySignals) -> QueryOutcome {
+    /// ARES_FLAG_USEVC; `cancelled` (A-cancels-AAAA) stops retries but still
+    /// delivers an in-flight reply. The query's id stays reserved until it ends.
+    pub(super) async fn request(&self, query: ReservedQuery, cancelled: &Cell<bool>) -> QueryOutcome {
         // A packet over the 16-bit wire length cannot be framed; upstream's TCP
         // writer reports EBADQUERY rather than truncating the length prefix.
-        if payload.len() > u16::MAX as usize {
+        if query.payload.len() > u16::MAX as usize {
             return (Err(ARES_EBADQUERY), 0);
         }
-        let mut q = self.start_query(payload);
+        let mut q = self.start_query(query);
         loop {
-            if let Step::Done(result) = self.attempt(&mut q, sig).await {
+            if let Step::Done(result) = self.attempt(&mut q, cancelled).await {
                 return (result, q.timeouts);
             }
         }
@@ -27,9 +27,9 @@ impl AsyncClient {
     /// Per-query state before the first attempt: starting transport, DNS 0x20
     /// case randomization (once per UDP query, kept for retries and enforced on
     /// replies) and the first server.
-    fn start_query(&self, payload: BytesMut) -> QueryState {
+    fn start_query(&self, query: ReservedQuery) -> QueryState {
         let use_tcp = self.config.options.use_vc;
-        let mut payload = payload.to_vec();
+        let mut payload = query.payload.to_vec();
         let dns0x20 = if self.flags & ARES_FLAG_DNS0x20 != 0 && !use_tcp {
             edns::randomize_question_name(&mut payload)
         } else {
@@ -37,6 +37,7 @@ impl AsyncClient {
         };
         QueryState {
             opts: self.opts(),
+            qid: query.lease,
             payload,
             use_tcp,
             server: self.health.borrow().pick_next(),
@@ -51,12 +52,11 @@ impl AsyncClient {
 
     /// One attempt: check out a conn (failing over past unreachable servers),
     /// send once, then listen until a reply, timeout or dead socket decides.
-    async fn attempt(&self, q: &mut QueryState, sig: &QuerySignals) -> Step {
-        let Ok((mut conn, server)) = self.connect_failover(&mut q.payload, q.server, q.use_tcp) else {
+    async fn attempt(&self, q: &mut QueryState, cancelled: &Cell<bool>) -> Step {
+        let Ok((mut conn, server)) = self.connect_failover(q.qid.id(), q.server, q.use_tcp) else {
             return Step::Done(Err(ARES_ECONNREFUSED));
         };
         q.server = server;
-        sig.qid.set(qid_of(&q.payload));
         // Cookies are re-evaluated per server/transport before every send: a
         // BADCOOKIE retry must pick up the learned server cookie, a TCP
         // upgrade must strip it. No OPT on the payload → untouched.
@@ -77,8 +77,8 @@ impl AsyncClient {
         loop {
             let step = match recv_reply(&mut conn, deadline).await {
                 Ok(buf) => self.on_reply(q, buf, sent_cookie.as_ref()),
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(self.on_timed_out(q, &conn, sig)),
-                Err(_) => Some(self.on_dead_socket(q, &conn, sig)),
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(self.on_timed_out(q, &conn, cancelled)),
+                Err(_) => Some(self.on_dead_socket(q, &conn, cancelled)),
             };
             if let Some(step) = step {
                 return step;
@@ -156,16 +156,16 @@ impl AsyncClient {
     }
 
     /// No reply before the deadline.
-    fn on_timed_out(&self, q: &mut QueryState, conn: &Conn, sig: &QuerySignals) -> Step {
+    fn on_timed_out(&self, q: &mut QueryState, conn: &Conn, cancelled: &Cell<bool>) -> Step {
         // If any UDP socket to this server already died, a timeout is the same
         // unreachable condition (the kernel may rate-limit ICMP across parallel
         // sockets): mark dead and retry uncounted.
         if !q.use_tcp && self.optmask & ARES_OPT_EVENT_THREAD != 0 && self.udp_pool.borrow().has_dead(q.server) {
             conn.mark_dead();
-            return self.fail_over(q, sig, false, ARES_ECONNREFUSED);
+            return self.fail_over(q, cancelled, false, ARES_ECONNREFUSED);
         }
         let server = q.server;
-        let step = self.fail_over(q, sig, true, ARES_ETIMEOUT);
+        let step = self.fail_over(q, cancelled, true, ARES_ETIMEOUT);
         if matches!(step, Step::Retry) && !q.use_tcp {
             self.retire_udp(server, conn);
         }
@@ -175,12 +175,12 @@ impl AsyncClient {
     /// Dead socket (EOF/hard error). For UDP this is ICMP port-unreachable
     /// (upstream issue #819): a critical failure, not a timeout, so the retry is
     /// uncounted and expiry reports ECONNREFUSED.
-    fn on_dead_socket(&self, q: &mut QueryState, conn: &Conn, sig: &QuerySignals) -> Step {
+    fn on_dead_socket(&self, q: &mut QueryState, conn: &Conn, cancelled: &Cell<bool>) -> Step {
         self.discard_conn(q, conn);
         if q.use_tcp {
-            self.fail_over(q, sig, true, ARES_ETIMEOUT)
+            self.fail_over(q, cancelled, true, ARES_ETIMEOUT)
         } else {
-            self.fail_over(q, sig, false, ARES_ECONNREFUSED)
+            self.fail_over(q, cancelled, false, ARES_ECONNREFUSED)
         }
     }
 
@@ -201,8 +201,8 @@ impl AsyncClient {
     /// Shared tail of the failure paths: stop if cancelled, report the server
     /// down, then retry on the next server or expire with `expire`.
     /// `counts_timeout` decides whether this failure is reported in `timeouts`.
-    fn fail_over(&self, q: &mut QueryState, sig: &QuerySignals, counts_timeout: bool, expire: c_int) -> Step {
-        if sig.cancelled.get() {
+    fn fail_over(&self, q: &mut QueryState, cancelled: &Cell<bool>, counts_timeout: bool, expire: c_int) -> Step {
+        if cancelled.get() {
             return Step::Done(Err(ARES_ETIMEOUT));
         }
         self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
@@ -224,7 +224,9 @@ impl AsyncClient {
 /// Mutable state of one `request()` across its attempts (upstream `ares_query_t`).
 struct QueryState {
     opts: QueryOpts,
-    /// The query as sent: qid may be rerolled, OPT stripped by FORMERR fallback.
+    /// The channel-unique transaction id, reserved for the query's whole life.
+    qid: QidLease,
+    /// The query as sent; the FORMERR fallback may strip its OPT.
     payload: Vec<u8>,
     /// Starts at ARES_FLAG_USEVC; a TC reply or persistent BADCOOKIE upgrades.
     use_tcp: bool,

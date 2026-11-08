@@ -31,6 +31,7 @@ use crate::core::lookup::{
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
 use crate::core::edns::{self, CookieVerdict, EDNS_PACKETSZ, ServerCookie};
 use crate::core::packets::AddrRecord;
+use crate::core::qid::{QidLease, QidRegistry, ReservedQuery};
 use crate::core::response::{addr_reply, push_synthetic_ptr, CnameEntry, ParsedRRs, ParsedResponse, ReplyRequire};
 use crate::core::services::Services;
 use crate::async_runtime::socket::SocketFactory;
@@ -52,7 +53,7 @@ use crate::ffi::ares_options::{
 };
 use crate::ffi::error::{
     ARES_ECONNREFUSED, ARES_EBADFLAGS, ARES_EBADNAME, ARES_EBADQUERY, ARES_EBADSTR, ARES_EFILE,
-    ARES_EFORMERR, ARES_ENODATA, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED,
+    ARES_EFORMERR, ARES_ENODATA, ARES_ENOMEM, ARES_ENOSERVER, ARES_ENOTFOUND, ARES_ENOTIMP, ARES_EREFUSED,
     ARES_ESERVFAIL, ARES_ETIMEOUT,
 };
 use crate::ffi::{
@@ -110,6 +111,8 @@ pub(crate) struct AsyncClient {
     /// Server-state notifications raised by in-flight lookups, drained by the
     /// host after each task poll (shared by every lookup copy).
     pub effects: Rc<RefCell<Vec<Effect>>>,
+    /// The channel's in-flight transaction ids (shared by every lookup copy).
+    pub qids: Rc<RefCell<QidRegistry>>,
 }
 
 impl AsyncClient {
@@ -146,6 +149,7 @@ impl AsyncClient {
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
             effects: self.effects.clone(),
+            qids: self.qids.clone(),
         }
     }
 
@@ -177,9 +181,9 @@ impl AsyncClient {
 
     /// ares_query / ares_send: the raw single query, wrapped into `Delivery::Raw`.
     /// The payload goes on the wire as given (`query_payload` already added EDNS;
-    /// raw send APIs must not). `sig.qid` reports the transaction id actually reserved.
-    pub(crate) async fn query_raw(self, payload: BytesMut, sig: Rc<QuerySignals>) -> Delivery {
-        let (result, timeouts) = self.request(payload, &sig).await;
+    /// raw send APIs must not), under the id reserved with it.
+    pub(crate) async fn query_raw(self, query: ReservedQuery) -> Delivery {
+        let (result, timeouts) = self.request(query, &Cell::new(false)).await;
         Delivery::Raw { result, timeouts }
     }
 
@@ -404,11 +408,12 @@ impl AsyncClient {
             self.recursion_desired(),
         )
         .and_then(|p| self.with_edns(p))
+        .and_then(|p| self.reserve(p))
         {
-            Ok(p) => p,
+            Ok(q) => q,
             Err(e) => return (Err(e), 0),
         };
-        let (result, timeouts) = self.request(payload, &QuerySignals::default()).await;
+        let (result, timeouts) = self.request(payload, &Cell::new(false)).await;
         let result = match result {
             Ok(buf) => on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip)),
             Err(status) => Err(AresError::from(status)),
@@ -462,8 +467,9 @@ impl AsyncClient {
             self.recursion_desired(),
         )
         .and_then(|p| self.with_edns(p))
+        .and_then(|p| self.reserve(p))
         {
-            Ok(p) => p,
+            Ok(q) => q,
             Err(e) => {
                 return NameinfoReply {
                     status: e,
@@ -473,7 +479,7 @@ impl AsyncClient {
                 }
             }
         };
-        let (result, io_timeouts) = self.request(payload, &QuerySignals::default()).await;
+        let (result, io_timeouts) = self.request(payload, &Cell::new(false)).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -555,17 +561,20 @@ impl AsyncClient {
         let mut had_nodata = false;
         let mut timeouts: c_int = 0;
         let mut first = true;
-        let sig = QuerySignals::default();
+        let not_cancelled = Cell::new(false);
 
         loop {
-            let payload = match make_payload(&plan.current).and_then(|p| if synthesize_edns { self.with_edns(p) } else { Ok(p) }) {
-                Ok(p) => p,
+            let payload = match make_payload(&plan.current)
+                .and_then(|p| if synthesize_edns { self.with_edns(p) } else { Ok(p) })
+                .and_then(|p| self.reserve(p))
+            {
+                Ok(q) => q,
                 Err(e) => return Delivery::Raw { result: Err(e.code()), timeouts },
             };
             // Only the first query of a lookup is eligible to spawn a failover probe.
             let probe_payload = if first { make_payload(&plan.current).ok() } else { None };
             first = false;
-            let mut primary = pin!(self.request(payload, &sig).fuse());
+            let mut primary = pin!(self.request(payload, &not_cancelled).fuse());
             let (result, io_timeouts) = match probe_payload {
                 Some(pp) => {
                     let mut probe = pin!(self.run_probe(pp).fuse());
@@ -633,15 +642,17 @@ impl AsyncClient {
         let rd = self.recursion_desired();
         let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
         // Shared by both families: an A answer cancels the AAAA sibling's retries.
-        let sig = QuerySignals::default();
+        let cancelled = Cell::new(false);
         let mut results: Vec<Option<QueryOutcome>> = (0..rtypes.len()).map(|_| None).collect();
 
-        let sig = &sig;
+        let cancelled = &cancelled;
         let sub = |i: usize| {
-            let payload = dns_query_payload(name, u32::from(rtypes[i]), u32::from(ARES_CLASS_IN), rd).and_then(|p| self.with_edns(p));
+            let payload = dns_query_payload(name, u32::from(rtypes[i]), u32::from(ARES_CLASS_IN), rd)
+                .and_then(|p| self.with_edns(p))
+                .and_then(|p| self.reserve(p));
             async move {
                 match payload {
-                    Ok(p) => self.request(p, sig).await,
+                    Ok(q) => self.request(q, cancelled).await,
                     Err(e) => (Err(e.code()), 0),
                 }
             }
@@ -659,7 +670,7 @@ impl AsyncClient {
                             if let (Ok(buf), _) = &r {
                                 let s = summarize(buf, 0);
                                 if s.rcode == 0 && s.ancount > 0 {
-                                    sig.cancelled.set(true);
+                                    cancelled.set(true);
                                 }
                             }
                         }
@@ -1038,18 +1049,6 @@ fn hostaliases_lookup(hostname: &str, no_aliases: bool) -> Result<Option<String>
 /// A fire-and-forget side effect the ffi applies after a poll.
 pub(crate) enum Effect {
     NotifyServerState { server: usize, ok: bool, tcp: bool },
-}
-
-/// Signals shared between the `request`s of one lookup and their host.
-#[derive(Default)]
-pub(crate) struct QuerySignals {
-    /// Intra-lookup coordination: `query_families` sets this once its A answer
-    /// has real records so the sibling AAAA `request` stops retrying (an
-    /// in-flight reply still delivers).
-    pub cancelled: Cell<bool>,
-    /// The transaction id actually reserved on the wire for the current query
-    /// (after any shared-socket reroll); `0` means none was reserved.
-    pub qid: Cell<u16>,
 }
 
 /// A hostent lifecycle's result plus its timeout count, for `ares_host_callback`.
@@ -1670,6 +1669,7 @@ impl AsyncClient {
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
             effects: Rc::new(RefCell::new(Vec::new())),
+            qids: QidRegistry::new(),
         }
     }
 
@@ -2133,8 +2133,8 @@ impl AsyncClient {
 
     /// Connect-with-failover: create + connect the socket for `start`, retrying
     /// across servers; returns the live `Conn` and server index, or `Err(())` when
-    /// the budget is spent. A colliding in-flight qid is re-rolled and re-stamped.
-    fn connect_failover(&self, payload: &mut [u8], start: usize, use_tcp: bool) -> Result<(Conn, usize), ()> {
+    /// the budget is spent. Shared conns open an inbox slot for the query's `qid`.
+    fn connect_failover(&self, qid: u16, start: usize, use_tcp: bool) -> Result<(Conn, usize), ()> {
         let opts = self.opts();
         let stayopen = self.flags & ARES_FLAG_STAYOPEN != 0;
         let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
@@ -2152,14 +2152,7 @@ impl AsyncClient {
                     self.tcp_pool.borrow_mut().insert(s, c.clone());
                     Some(c)
                 });
-                checked_out.map(|c| {
-                    let (conn, tag) =
-                        Conn::shared(c, qid_of(payload), || rand::thread_rng().r#gen());
-                    if payload.len() >= 2 {
-                        payload[0..2].copy_from_slice(&tag.to_be_bytes());
-                    }
-                    conn
-                })
+                checked_out.map(|c| Conn::shared(c, qid))
             } else {
                 // Checkout an existing shared datagram conn (pruning idle ones when
                 // not staying open), or create one if `udp_max_queries` is hit.
@@ -2177,20 +2170,7 @@ impl AsyncClient {
                     Some(c)
                 });
                 checked_out.map(|c| {
-                    let (conn, tag) = Conn::shared_udp(
-                        c,
-                        qid_of(payload),
-                        || rand::thread_rng().r#gen(),
-                    );
-                    if payload.len() >= 2 {
-                        payload[0..2].copy_from_slice(&tag.to_be_bytes());
-                    }
-                    conn.with_udp_lease(
-                        self.udp_pool.clone(),
-                        s,
-                        stayopen,
-                        self.udp_max_queries,
-                    )
+                    Conn::shared_udp(c, qid).with_udp_lease(self.udp_pool.clone(), s, stayopen, self.udp_max_queries)
                 })
             };
             if let Some(conn) = conn {
@@ -2211,26 +2191,39 @@ impl AsyncClient {
         name: &str,
         qtype: u32,
         qclass: u32,
-    ) -> Result<BytesMut, AresError> {
+    ) -> Result<ReservedQuery, AresError> {
         // Constructed queries validate the wide EDNSPSZ here, before spawning.
         self.edns_udp_size()?;
         let payload = self.with_edns(dns_query_payload(name, qtype, qclass, self.recursion_desired())?)?;
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        Ok(payload)
+        self.reserve(payload)
     }
 
     /// ares_send / ares_send_dnsrec: length + `no_servers` preflight, then the
-    /// raw payload (caller packets keep their own flags/class).
-    pub(crate) fn send_payload(&self, query_buf: &[u8]) -> Result<BytesMut, AresError> {
+    /// raw payload under a freshly reserved id (caller packets keep their own
+    /// flags/class; their id is replaced, as upstream does).
+    pub(crate) fn send_payload(&self, query_buf: &[u8]) -> Result<ReservedQuery, AresError> {
         if query_buf.len() < 12 || query_buf.len() >= (1 << 16) {
             return Err(ARES_EBADQUERY.into());
         }
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        Ok(BytesMut::from(query_buf))
+        self.reserve(BytesMut::from(query_buf))
+    }
+
+    /// Reserve a channel-unique transaction id (upstream `generate_unique_qid`)
+    /// and stamp it on `payload`; it stays reserved until the query ends.
+    /// `ARES_ENOMEM` when all 65536 ids are in flight.
+    pub(crate) fn reserve(&self, mut payload: BytesMut) -> Result<ReservedQuery, AresError> {
+        if payload.len() < 2 {
+            return Err(ARES_EBADQUERY.into());
+        }
+        let lease = QidLease::reserve(&self.qids).ok_or(AresError::from(ARES_ENOMEM))?;
+        payload[0..2].copy_from_slice(&lease.id().to_be_bytes());
+        Ok(ReservedQuery { payload, lease })
     }
 
     pub(crate) fn gethostbyname_file(&mut self, name: &str, family: i32) -> Result<Hostent, AresError> {
@@ -2345,6 +2338,7 @@ pub(crate) struct SavedOptions {
     pub base_mask: i32,
 }
 
+#[cfg(test)]
 fn qid_of(payload: &[u8]) -> u16 {
     if payload.len() >= 2 {
         u16::from_be_bytes([payload[0], payload[1]])
@@ -2431,10 +2425,10 @@ mod tests {
         }
     }
 
-    /// A shared-socket collision rerolls the tag and re-stamps the payload, so
-    /// the payload carries the reserved qid (which `request` reports to the ffi).
+    /// Concurrent queries get distinct channel-wide ids stamped on their
+    /// payloads, share one UDP socket without clashing, and free the id on drop.
     #[test]
-    fn shared_udp_reroll_updates_payload_qid() {
+    fn reserved_qids_are_unique_and_share_a_socket() {
         let config = SysConfig {
             nameservers: vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)],
             ..SysConfig::default()
@@ -2443,16 +2437,23 @@ mod tests {
         client.endpoints = Rc::new(client.endpoint_snapshot());
 
         let payload = || BytesMut::from(&[0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]);
-        let mut first = payload();
-        let (conn_a, _) = client.connect_failover(&mut first, 0, false).expect("first checkout");
-        assert_eq!(qid_of(&first), 0x1234);
+        let first = client.reserve(payload()).expect("first reserve");
+        let second = client.reserve(payload()).expect("second reserve");
+        assert_ne!(first.qid(), second.qid());
+        assert_eq!(qid_of(&first.payload), first.qid(), "the reserved id is stamped");
+        assert_eq!(qid_of(&second.payload), second.qid());
 
-        let mut second = payload();
-        let (conn_b, _) = client.connect_failover(&mut second, 0, false).expect("second checkout");
-        assert_ne!(qid_of(&second), 0x1234, "colliding qid must be rerolled");
+        let (conn_a, _) = client.connect_failover(first.qid(), 0, false).expect("first checkout");
+        let (conn_b, _) = client.connect_failover(second.qid(), 0, false).expect("second checkout");
+        let shared = conn_a.shared_udp_handle().expect("pooled UDP");
+        assert!(Rc::ptr_eq(&shared, &conn_b.shared_udp_handle().expect("pooled UDP")), "one shared socket");
+        assert!(shared.borrow().has_waiter(first.qid()) && shared.borrow().has_waiter(second.qid()));
 
         drop(conn_a);
         drop(conn_b);
+        assert_eq!(client.qids.borrow().len(), 2, "ids stay reserved while the queries live");
+        drop(first);
+        assert_eq!(client.qids.borrow().len(), 1);
     }
 
     #[test]

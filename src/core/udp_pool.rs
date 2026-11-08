@@ -68,20 +68,12 @@ impl UdpConn {
         }))
     }
 
-    /// Reserve a free inbox tag for a query. Rerolls from `qid` on collision (≈
-    /// upstream `generate_unique_qid`); the caller must re-stamp its payload on a re-roll.
-    pub(crate) fn reserve(
-        &mut self,
-        qid: u16,
-        mut reroll: impl FnMut() -> u16,
-    ) -> u16 {
-        let mut tag = qid;
-        while self.inbox.contains_key(&tag) {
-            tag = reroll();
-        }
-        self.inbox.insert(tag, InboxSlot { reply: None, waker: None });
+    /// Open an inbox slot for a query's id and count it against
+    /// `udp_max_queries`. Ids are unique channel-wide (`core::qid`), so the
+    /// slot is never already taken.
+    pub(crate) fn register_query(&mut self, qid: u16) {
+        self.inbox.insert(qid, InboxSlot { reply: None, waker: None });
         self.total_queries += 1;
-        tag
     }
 
     /// Remember the task waiting on `tag`, to be woken when a sibling routes its reply.
@@ -404,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_rerolls_colliding_tag() {
+    fn register_counts_queries_and_release_frees_only_its_slot() {
         let mut uc = UdpConn {
             sock: sock(DummySock),
             inbox: HashMap::new(),
@@ -413,10 +405,8 @@ mod tests {
             dead_since: None,
             event_driven: false,
         };
-        assert_eq!(uc.reserve(7, || panic!("free qid must not reroll")), 7);
-        let rolls = RefCell::new(vec![9u16, 7u16]); // popped back-to-front: 7, then 9
-        assert_eq!(uc.reserve(7, || rolls.borrow_mut().pop().unwrap()), 9);
-        assert!(rolls.borrow().is_empty());
+        uc.register_query(7);
+        uc.register_query(9);
         assert!(uc.has_waiter(7) && uc.has_waiter(9));
         assert_eq!(uc.total_queries(), 2);
 
@@ -433,13 +423,13 @@ mod tests {
 
         let (picked, retired) = pool.pick_or_none(0, 2, true);
         assert!(picked.is_some() && retired.is_empty());
-        conn.borrow_mut().reserve(1, || panic!("free qid"));
+        conn.borrow_mut().register_query(1);
         conn.borrow_mut().release(1);
         assert_eq!(conn.borrow().total_queries(), 1);
 
         let (picked, retired) = pool.pick_or_none(0, 2, true);
         assert!(picked.is_some() && retired.is_empty());
-        conn.borrow_mut().reserve(2, || panic!("free qid"));
+        conn.borrow_mut().register_query(2);
         conn.borrow_mut().release(2);
         assert_eq!(conn.borrow().total_queries(), 2);
 
@@ -454,7 +444,7 @@ mod tests {
         let mut pool = UdpPool::new();
         let conn = UdpConn::new(sock(DummySock), false);
         pool.insert(0, conn.clone());
-        conn.borrow_mut().reserve(3, || panic!("free qid"));
+        conn.borrow_mut().register_query(3);
         conn.borrow_mut().release(3);
 
         let retired = pool.release_if_done(0, &conn, true, 1);
@@ -471,8 +461,8 @@ mod tests {
         );
         let b = std::sync::Arc::new(Flag(Default::default()));
 
-        uc.borrow_mut().reserve(0x1111, || panic!("free qid"));
-        uc.borrow_mut().reserve(0x1234, || panic!("free qid"));
+        uc.borrow_mut().register_query(0x1111);
+        uc.borrow_mut().register_query(0x1234);
         uc.borrow_mut().register(0x1234, &Waker::from(b.clone()));
         assert!(!b.fired());
 

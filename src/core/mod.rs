@@ -10,6 +10,7 @@ pub mod async_client;
 pub mod hostent;
 pub mod lookup;
 pub mod packets;
+pub mod qid;
 pub mod response;
 pub mod sortlist;
 pub mod sysconfig;
