@@ -174,16 +174,12 @@ impl AsyncClient {
     }
 
     /// The single-query driver every lookup runs on: pick a server, connect with
-    /// failover, send, then loop until a verdict. `use_tcp` is the starting transport;
+    /// failover, send, then loop until a verdict. Starts on TCP iff ARES_FLAG_USEVC;
     /// `cancelled` stops retries but still delivers an in-flight reply.
-    async fn request(
-        &self,
-        payload: BytesMut,
-        mut use_tcp: bool,
-        synthesize_edns: bool,
-        sig: &QuerySignals,
-    ) -> QueryOutcome {
+    async fn request(&self, payload: BytesMut, synthesize_edns: bool, sig: &QuerySignals) -> QueryOutcome {
         let opts = self.opts();
+        // Starting transport; a TC reply or persistent BADCOOKIE upgrades to TCP.
+        let mut use_tcp = self.config.options.use_vc;
         let mut timeouts: c_int = 0;
         // Per-query EDNS/0x20/cookie state lives in locals, not the mailbox:
         // concurrent A/AAAA siblings share it. Raw send (`synthesize_edns =
@@ -424,16 +420,16 @@ impl AsyncClient {
     /// for raw send APIs, whose bytes must go on the wire unchanged.
     /// `sig.qid` reports the transaction id actually reserved on the wire.
     pub(crate) async fn query_raw(self, payload: BytesMut, synthesize_edns: bool, sig: Rc<QuerySignals>) -> Delivery {
-        let use_vc = self.config.options.use_vc;
-        let (result, timeouts) = self.request(payload, use_vc, synthesize_edns, &sig).await;
+        let (result, timeouts) = self.request(payload, synthesize_edns, &sig).await;
         Delivery::Raw { result, timeouts }
     }
 
     /// One-shot failover probe to a stale server, raced against the primary; reply-
     /// biased, looping past stray (non-QID) datagrams, and folding its outcome into
     /// `ServerHealth`.
-    async fn run_probe(&self, probe_payload: BytesMut, use_tcp: bool) {
+    async fn run_probe(&self, probe_payload: BytesMut) {
         let opts = self.opts();
+        let use_tcp = self.config.options.use_vc;
         if opts.failover_chance == 0 {
             return;
         }
@@ -651,8 +647,7 @@ impl AsyncClient {
             Ok(p) => p,
             Err(e) => return (Err(e), 0),
         };
-        let use_vc = self.config.options.use_vc;
-        let (result, timeouts) = self.request(payload, use_vc, true, &QuerySignals::default()).await;
+        let (result, timeouts) = self.request(payload, true, &QuerySignals::default()).await;
         let result = match result {
             Ok(buf) => on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip)),
             Err(status) => Err(AresError::from(status)),
@@ -715,8 +710,7 @@ impl AsyncClient {
                 }
             }
         };
-        let use_vc = self.config.options.use_vc;
-        let (result, io_timeouts) = self.request(payload, use_vc, true, &QuerySignals::default()).await;
+        let (result, io_timeouts) = self.request(payload, true, &QuerySignals::default()).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -808,11 +802,10 @@ impl AsyncClient {
             // Only the first query of a lookup is eligible to spawn a failover probe.
             let probe_payload = if first { make_payload(&plan.current).ok() } else { None };
             first = false;
-            let use_vc = self.config.options.use_vc;
-            let mut primary = pin!(self.request(payload, use_vc, synthesize_edns, &sig).fuse());
+            let mut primary = pin!(self.request(payload, synthesize_edns, &sig).fuse());
             let (result, io_timeouts) = match probe_payload {
                 Some(pp) => {
-                    let mut probe = pin!(self.run_probe(pp, use_vc).fuse());
+                    let mut probe = pin!(self.run_probe(pp).fuse());
                     // Probe-biased race, but still drive an in-flight probe to
                     // completion: upstream's probe is independent, and dropping it
                     // would leave a recovered server marked failed.
@@ -874,7 +867,6 @@ impl AsyncClient {
     /// self-demux by fd). An A answer with real records sets `cancelled` so the AAAA
     /// sibling stops retrying; IPv6 success does NOT cancel A.
     async fn query_families(&self, name: &str, rtypes: &[u16]) -> Vec<QueryOutcome> {
-        let use_vc = self.config.options.use_vc;
         let rd = self.recursion_desired();
         let a_idx = rtypes.iter().position(|&rt| rt == RTYPE_A);
         // Shared by both families: an A answer cancels the AAAA sibling's retries.
@@ -886,7 +878,7 @@ impl AsyncClient {
             let payload = dns_query_payload(name, u32::from(rtypes[i]), u32::from(ARES_CLASS_IN), rd);
             async move {
                 match payload {
-                    Ok(p) => self.request(p, use_vc, true, sig).await,
+                    Ok(p) => self.request(p, true, sig).await,
                     Err(e) => (Err(e.code()), 0),
                 }
             }
@@ -921,7 +913,6 @@ impl AsyncClient {
     /// each candidate name, querying its families with an optional one-shot probe.
     /// A name succeeds if any family yields records.
     async fn resolve_addrinfo(&self, names: &[String], rtypes: &[u16], probe: bool) -> AddrLookup {
-        let use_vc = self.config.options.use_vc;
         let rd = self.recursion_desired();
         let mut timeouts: c_int = 0;
         let mut last_error: AresError = ARES_ENODATA.into();
@@ -937,7 +928,7 @@ impl AsyncClient {
             let results = match probe_payload {
                 Some(probe_payload) => {
                     let mut b = pin!(batch.fuse());
-                    let mut p = pin!(self.run_probe(probe_payload, use_vc).fuse());
+                    let mut p = pin!(self.run_probe(probe_payload).fuse());
                     // Probe-biased race; still drive an in-flight probe to
                     // completion so a recovered server is not left marked failed.
                     match select_biased! {
