@@ -15,7 +15,8 @@ use futures_util::{select_biased, FutureExt};
 use crate::async_runtime::io::{send_when_writable, Async};
 use crate::async_runtime::reactor::Timer;
 use crate::core::tcp_pool::TcpConn;
-use crate::core::udp_pool::{UdpConn, UdpPool};
+use crate::core::async_client::ChannelShared;
+use crate::core::udp_pool::UdpConn;
 
 /// A query's connection.
 pub(crate) struct Conn {
@@ -25,7 +26,7 @@ pub(crate) struct Conn {
 }
 
 struct UdpLease {
-    pool: Rc<RefCell<UdpPool>>,
+    shared: Rc<ChannelShared>,
     server: usize,
     stayopen: bool,
     max_queries: usize,
@@ -55,12 +56,12 @@ impl Conn {
     /// when its queries finish.
     pub fn with_udp_lease(
         mut self,
-        pool: Rc<RefCell<UdpPool>>,
+        shared: Rc<ChannelShared>,
         server: usize,
         stayopen: bool,
         max_queries: usize,
     ) -> Self {
-        self.udp_lease = Some(UdpLease { pool, server, stayopen, max_queries });
+        self.udp_lease = Some(UdpLease { shared, server, stayopen, max_queries });
         self
     }
 
@@ -198,7 +199,7 @@ impl Drop for Conn {
             }
             (Wire::SharedUdp(c, tag), Some(lease)) => {
                 c.borrow_mut().release(*tag);
-                let retired = lease.pool.borrow_mut().release_if_done(
+                let retired = lease.shared.udp_pool.borrow_mut().release_if_done(
                     lease.server,
                     c,
                     lease.stayopen,

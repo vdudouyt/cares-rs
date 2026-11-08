@@ -133,7 +133,7 @@ impl ChannelData {
         let done = self.executor.poll(id);
         // Effects are drained before delivery so the callbacks fire first; taken
         // out so no `RefCell` borrow is live while they run.
-        let effects = std::mem::take(&mut *self.state.effects.borrow_mut());
+        let effects = std::mem::take(&mut *self.state.shared.effects.borrow_mut());
         for effect in effects {
             match effect {
                 Effect::NotifyServerState { server, ok, tcp } => {
@@ -191,8 +191,8 @@ impl ChannelData {
         for id in self.executor.ids() {
             self.executor.deliver(id, Some(status));
         }
-        self.state.tcp_pool.borrow_mut().clear();
-        let retired = self.state.udp_pool.borrow_mut().clear();
+        self.state.shared.tcp_pool.borrow_mut().clear();
+        let retired = self.state.shared.udp_pool.borrow_mut().clear();
         drop(retired);
     }
 

@@ -1,6 +1,6 @@
 //! `AsyncClient` is both the ffi channel state and the resolver client; every
-//! lookup runs on a [`AsyncClient::derive`]d copy (same runtime handle, shared
-//! `Rc`s for cache/health/pools/effects/qids, endpoints snapshotted).
+//! lookup runs on a [`AsyncClient::derive`]d copy (same runtime handle, the
+//! same [`ChannelShared`], endpoints snapshotted).
 //!
 //! This file holds the struct, `derive`, the shared result/effect types and the
 //! hosts-file helpers. The rest lives in child modules (which see the private
@@ -100,15 +100,13 @@ pub(crate) struct AsyncClient {
     pub local_ip4: u32,
     pub local_ip6: [u8; 16],
     pub local_dev: String,
-    /// Shared with in-flight lookups so failover accounting and probes agree.
-    pub health: Rc<RefCell<ServerHealth>>,
+    /// Channel-wide mutable state, shared by every lookup copy.
+    pub shared: Rc<ChannelShared>,
     pub sortlist: Vec<SortlistEntry>,
     pub flags: i32,
     /// `ARES_OPT_EDNSPSZ` kept full-width until query construction, where
     /// values above 65535 are rejected with `ARES_EFORMERR`.
     pub ednspsz: i32,
-    /// Per-server DNS cookie state, shared across lookups; reset by `duplicate`.
-    pub cookies: Rc<RefCell<Vec<ServerCookie>>>,
     pub maxtimeout: i32,
     /// Option mask the channel was initialized with; `ares_reinit` preserves
     /// explicitly-set values.
@@ -116,12 +114,6 @@ pub(crate) struct AsyncClient {
     pub lookups: String,
     pub resolvconf_path: String,
     pub hosts_path: String,
-    pub cache: Rc<RefCell<QueryCache>>,
-    /// Shared TCP sockets (parallel lookups to one server share a connection).
-    pub tcp_pool: Rc<RefCell<TcpPool>>,
-    /// Shared UDP sockets (parallel lookups to one server share a socket, split
-    /// across several once [`udp_max_queries`](Self::udp_max_queries) is reached).
-    pub udp_pool: Rc<RefCell<UdpPool>>,
     /// `ARES_OPT_UDP_MAX_QUERIES`: max in-flight queries per UDP socket; 0 =
     /// unlimited (upstream default).
     pub udp_max_queries: usize,
@@ -130,11 +122,45 @@ pub(crate) struct AsyncClient {
     pub endpoints: Rc<Vec<ServerEndpoint>>,
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
-    /// Server-state notifications raised by in-flight lookups, drained by the
-    /// host after each task poll (shared by every lookup copy).
-    pub effects: Rc<RefCell<Vec<Effect>>>,
-    /// The channel's in-flight transaction ids (shared by every lookup copy).
-    pub qids: Rc<RefCell<QidRegistry>>,
+}
+
+/// The channel's mutable state, shared (one `Rc`) by the channel-owned
+/// `AsyncClient` and every `derive`d lookup copy, and by the handles that must
+/// outlive a lookup step (probe, UDP lease, qid lease). Each part has its own
+/// `RefCell`: borrows of different parts overlap, and none is held across an
+/// `.await`.
+pub(crate) struct ChannelShared {
+    /// Per-server failure counts and probe marks: server selection, failover
+    /// and probes all read and update the same view.
+    pub health: RefCell<ServerHealth>,
+    /// Per-server DNS cookie state; reset by `duplicate`.
+    pub cookies: RefCell<Vec<ServerCookie>>,
+    /// The answer cache (`ARES_OPT_QUERY_CACHE`).
+    pub cache: RefCell<QueryCache>,
+    /// Shared TCP sockets (parallel lookups to one server share a connection).
+    pub tcp_pool: RefCell<TcpPool>,
+    /// Shared UDP sockets (parallel lookups to one server share a socket, split
+    /// across several once [`udp_max_queries`](AsyncClient::udp_max_queries) is reached).
+    pub udp_pool: RefCell<UdpPool>,
+    /// Effects raised by in-flight lookups (server-state notifications, probe
+    /// spawns), drained by the ffi after each task poll.
+    pub effects: RefCell<Vec<Effect>>,
+    /// The channel's in-flight transaction ids and RNG.
+    pub qids: RefCell<QidRegistry>,
+}
+
+impl ChannelShared {
+    pub(crate) fn new() -> Rc<Self> {
+        Rc::new(ChannelShared {
+            health: RefCell::new(ServerHealth::default()),
+            cookies: RefCell::new(Vec::new()),
+            cache: RefCell::new(QueryCache::default()),
+            tcp_pool: RefCell::new(TcpPool::new()),
+            udp_pool: RefCell::new(UdpPool::new()),
+            effects: RefCell::new(Vec::new()),
+            qids: RefCell::new(QidRegistry::new()),
+        })
+    }
 }
 
 impl AsyncClient {
@@ -153,25 +179,19 @@ impl AsyncClient {
             local_ip4: self.local_ip4,
             local_ip6: self.local_ip6,
             local_dev: self.local_dev.clone(),
-            health: self.health.clone(),
+            shared: self.shared.clone(),
             sortlist: self.sortlist.clone(),
             flags: self.flags,
             ednspsz: self.ednspsz,
-            cookies: self.cookies.clone(),
             maxtimeout: self.maxtimeout,
             optmask: self.optmask,
             lookups: self.lookups.clone(),
             resolvconf_path: self.resolvconf_path.clone(),
             hosts_path: self.hosts_path.clone(),
-            cache: self.cache.clone(),
-            tcp_pool: self.tcp_pool.clone(),
-            udp_pool: self.udp_pool.clone(),
             udp_max_queries: self.udp_max_queries,
             endpoints: Rc::new(self.endpoint_snapshot()),
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
-            effects: self.effects.clone(),
-            qids: self.qids.clone(),
         }
     }
 
@@ -208,7 +228,7 @@ impl AsyncClient {
 
     /// Queue server-state notifications for the ffi to fire after this poll.
     fn notify(&self, actions: Vec<ReactorAction>) {
-        let mut effects = self.effects.borrow_mut();
+        let mut effects = self.shared.effects.borrow_mut();
         for a in actions {
             match a {
                 ReactorAction::NotifyServerState { server, ok, tcp } => {

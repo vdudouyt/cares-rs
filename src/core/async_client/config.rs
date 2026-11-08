@@ -10,7 +10,7 @@ impl AsyncClient {
     pub fn from_sysconfig_path(factory: Rc<dyn SocketFactory>, path: Option<&str>) -> Self {
         let mut client = AsyncClient::build(build_sysconfig(path), factory, 53, 53);
         let n = client.config.nameservers.len();
-        client.health.borrow_mut().reset(n);
+        client.shared.health.borrow_mut().reset(n);
         // Upstream init_by_defaults: hosts file first, then DNS.
         client.lookups = "fb".to_string();
         if let Some(lookups) = client.config.lookups.clone() {
@@ -70,12 +70,12 @@ impl AsyncClient {
             self.config.options.use_vc = true;
         }
         if servers_changed {
-            self.health.borrow_mut().reset(self.config.nameservers.len());
-            self.cookies.borrow_mut().clear();
-            let retired = self.udp_pool.borrow_mut().clear();
+            self.shared.health.borrow_mut().reset(self.config.nameservers.len());
+            self.shared.cookies.borrow_mut().clear();
+            let retired = self.shared.udp_pool.borrow_mut().clear();
             drop(retired);
         }
-        self.cache.borrow_mut().flush();
+        self.shared.cache.borrow_mut().flush();
         Ok(())
     }
 
@@ -93,8 +93,8 @@ impl AsyncClient {
             self.config.nameservers.push((IpAddr::V4(Ipv4Addr::LOCALHOST), None));
             self.config.tcp_ports.push(None);
         }
-        self.health.borrow_mut().reset(self.config.nameservers.len());
-        self.cookies.borrow_mut().clear();
+        self.shared.health.borrow_mut().reset(self.config.nameservers.len());
+        self.shared.cookies.borrow_mut().clear();
     }
 
     pub(super) fn build(
@@ -114,25 +114,19 @@ impl AsyncClient {
             local_ip4: 0,
             local_ip6: [0; 16],
             local_dev: String::new(),
-            health: Rc::new(RefCell::new(ServerHealth::default())),
+            shared: ChannelShared::new(),
             sortlist: vec![],
             flags: 0,
             ednspsz: EDNS_PACKETSZ as i32,
-            cookies: Rc::new(RefCell::new(Vec::new())),
             maxtimeout: 0,
             optmask: 0,
             lookups: String::new(),
             resolvconf_path: String::new(),
             hosts_path: String::new(),
-            cache: Rc::new(RefCell::new(QueryCache::default())),
-            tcp_pool: Rc::new(RefCell::new(TcpPool::new())),
-            udp_pool: Rc::new(RefCell::new(UdpPool::new())),
             udp_max_queries: 0,
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
-            effects: Rc::new(RefCell::new(Vec::new())),
-            qids: QidRegistry::new(),
         }
     }
 
@@ -159,11 +153,11 @@ impl AsyncClient {
             self.default_tcp_port,
         );
         {
-            let src = self.health.borrow();
+            let src = self.shared.health.borrow();
             let mut health = ServerHealth::default();
             health.reset(src.len());
             health.failures = src.failures.clone();
-            dup.health = Rc::new(RefCell::new(health));
+            *dup.shared.health.borrow_mut() = health;
         }
         dup.sortlist = self.sortlist.clone();
         dup.flags = self.flags;
@@ -179,7 +173,7 @@ impl AsyncClient {
         dup.lookups = self.lookups.clone();
         dup.resolvconf_path = self.resolvconf_path.clone();
         dup.hosts_path = self.hosts_path.clone();
-        dup.cache.borrow_mut().set_max_ttl(self.cache.borrow().max_ttl());
+        dup.shared.cache.borrow_mut().set_max_ttl(self.shared.cache.borrow().max_ttl());
         dup.server_failover_retry_chance = self.server_failover_retry_chance;
         dup.server_failover_retry_delay = self.server_failover_retry_delay;
         dup
@@ -276,7 +270,7 @@ impl AsyncClient {
             }
         }
         if optmask & ARES_OPT_QUERY_CACHE != 0 {
-            self.cache.borrow_mut().set_max_ttl(o.qcache_max_ttl);
+            self.shared.cache.borrow_mut().set_max_ttl(o.qcache_max_ttl);
         }
         if optmask & ARES_OPT_UDP_MAX_QUERIES != 0 {
             // Upstream drops the bit for a non-positive value (= unlimited).
@@ -406,9 +400,9 @@ impl AsyncClient {
             self.config.tcp_ports.push(server.tcp_port);
         }
         self.optmask |= ARES_OPT_SERVERS;
-        self.health.borrow_mut().reset(self.config.nameservers.len());
-        self.cookies.borrow_mut().clear();
-        let retired = self.udp_pool.borrow_mut().clear();
+        self.shared.health.borrow_mut().reset(self.config.nameservers.len());
+        self.shared.cookies.borrow_mut().clear();
+        let retired = self.shared.udp_pool.borrow_mut().clear();
         drop(retired);
     }
 
@@ -417,9 +411,9 @@ impl AsyncClient {
         self.config.nameservers.clear();
         self.config.tcp_ports.clear();
         self.optmask |= ARES_OPT_SERVERS;
-        self.health.borrow_mut().clear();
-        self.cookies.borrow_mut().clear();
-        let retired = self.udp_pool.borrow_mut().clear();
+        self.shared.health.borrow_mut().clear();
+        self.shared.cookies.borrow_mut().clear();
+        let retired = self.shared.udp_pool.borrow_mut().clear();
         drop(retired);
     }
 
@@ -427,11 +421,11 @@ impl AsyncClient {
     /// `ip:port` sets both transports; the ports variant can still override TCP.
     pub fn install_csv_servers(&mut self, ns: Vec<(IpAddr, Option<u16>)>) {
         self.config.tcp_ports = ns.iter().map(|&(_, port)| port).collect();
-        self.health.borrow_mut().reset(ns.len());
+        self.shared.health.borrow_mut().reset(ns.len());
         self.config.nameservers = ns;
         self.optmask |= ARES_OPT_SERVERS;
-        self.cookies.borrow_mut().clear();
-        let retired = self.udp_pool.borrow_mut().clear();
+        self.shared.cookies.borrow_mut().clear();
+        let retired = self.shared.udp_pool.borrow_mut().clear();
         drop(retired);
     }
 
@@ -609,16 +603,16 @@ mod reinit_tests {
         );
         let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53);
         client.resolvconf_path = path.to_string_lossy().into_owned();
-        client.cache.borrow_mut().set_max_ttl(3600);
+        client.shared.cache.borrow_mut().set_max_ttl(3600);
         let key = CacheKey::new("cached.test", 1, ARES_CLASS_IN, 0, true, false);
-        client.cache.borrow_mut().store_names(
+        client.shared.cache.borrow_mut().store_names(
             vec![key.name.clone()],
             &key,
             60,
             &[0u8; 12],
             Instant::now(),
         );
-        assert!(client.cache.borrow_mut().get(&key, Instant::now()).is_some());
+        assert!(client.shared.cache.borrow_mut().get(&key, Instant::now()).is_some());
 
         client.reinit().expect("reinit");
 
@@ -632,7 +626,7 @@ mod reinit_tests {
         assert_eq!(client.config.options.timeout_ms, 1000);
         assert_eq!(client.lookups, "bf");
         assert!(!client.sortlist.is_empty());
-        assert!(client.cache.borrow_mut().get(&key, Instant::now()).is_none());
+        assert!(client.shared.cache.borrow_mut().get(&key, Instant::now()).is_none());
         let _ = std::fs::remove_file(path);
     }
 

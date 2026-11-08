@@ -8,7 +8,6 @@ use crate::core::async_client::{AddrInfoOut, Delivery, HostReply};
 use crate::core::nameinfo::NameinfoReply;
 use crate::core::cache::{CacheKey, QueryCache};
 use std::cell::RefCell;
-use std::rc::Rc;
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
@@ -169,7 +168,7 @@ fn query_dnsrec_record(
         channeldata.state.recursion_desired(),
         false,
     );
-    let cached = channeldata.state.cache.borrow_mut().get(&cache_key, Instant::now());
+    let cached = channeldata.state.shared.cache.borrow_mut().get(&cache_key, Instant::now());
     if let Some(cached_buf) = cached {
         if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf, 0) {
             let dnsrec = Box::into_raw(Box::new(rec));
@@ -182,10 +181,10 @@ fn query_dnsrec_record(
         unsafe { *qid = payload.qid(); }
     }
     let client = channeldata.state.derive();
-    let cache = client.cache.clone();
+    let shared = client.shared.clone();
     let fut = client.query_raw(payload);
     channeldata.spawn(fut, move |r| {
-        on_dnsrec_reply(callback, arg, &cache, Some(cache_key), r)
+        on_dnsrec_reply(callback, arg, &shared.cache, Some(cache_key), r)
     });
     ARES_SUCCESS
 }
@@ -237,9 +236,9 @@ fn search_dnsrec_record(
     };
     let Some(channeldata) = channeldata else { return ARES_EFORMERR; };
     let client = channeldata.state.derive();
-    let cache = client.cache.clone();
+    let shared = client.shared.clone();
     let fut = client.search_dnsrec(template, true);
-    channeldata.spawn(fut, move |r| on_dnsrec_reply(callback, arg, &cache, None, r));
+    channeldata.spawn(fut, move |r| on_dnsrec_reply(callback, arg, &shared.cache, None, r));
     ARES_SUCCESS
 }
 
@@ -279,7 +278,7 @@ pub(crate) fn on_raw_reply(callback: AresCallback, arg: *mut c_void, r: Result<D
 }
 
 /// ares_send → `ares_callback`; stores the reply in the cache first.
-pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, key: Option<CacheKey>, r: Result<Delivery, c_int>) {
+pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache: &RefCell<QueryCache>, key: Option<CacheKey>, r: Result<Delivery, c_int>) {
     let (result, timeouts) = match r {
         Ok(Delivery::Raw { result, timeouts }) => (result, timeouts),
         Err(status) => (Err(status), 0),
@@ -296,7 +295,7 @@ pub(crate) fn on_send_raw_reply(callback: AresCallback, arg: *mut c_void, cache:
 }
 
 /// ares_query_dnsrec / ares_search_dnsrec → `ares_callback_dnsrec`.
-pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, cache: &Rc<RefCell<QueryCache>>, key: Option<CacheKey>, r: Result<Delivery, c_int>) {
+pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, cache: &RefCell<QueryCache>, key: Option<CacheKey>, r: Result<Delivery, c_int>) {
     let (result, timeouts) = match r {
         Ok(Delivery::Raw { result, timeouts }) => (result, timeouts),
         Err(status) => (Err(status), 0),
@@ -479,12 +478,12 @@ fn send_raw_packet(
             return;
         }
     };
-    let cache = channeldata.state.cache.clone();
+    let shared = channeldata.state.shared.clone();
     let outcome = send_record(
         channeldata,
         &rec,
         std::ptr::null_mut(),
-        move |r, key| on_send_raw_reply(callback, arg, &cache, key, r),
+        move |r, key| on_send_raw_reply(callback, arg, &shared.cache, key, r),
     );
     match outcome {
         Ok(Some(buf)) => unsafe {
@@ -543,11 +542,7 @@ where
     }
     let cache_key = record_cache_key(rec);
     if let Some(key) = cache_key.as_ref() {
-        let cached = channeldata
-            .state
-            .cache
-            .borrow_mut()
-            .get(key, Instant::now());
+        let cached = channeldata.state.shared.cache.borrow_mut().get(key, Instant::now());
         if let Some(buf) = cached {
             return Ok(Some(buf));
         }
@@ -609,12 +604,12 @@ fn send_dnsrec_record(
     qid: *mut libc::c_ushort,
 ) -> crate::ffi::ares_status_t {
     let Some(channeldata) = channeldata else { return ARES_EFORMERR; };
-    let cache = channeldata.state.cache.clone();
+    let shared = channeldata.state.shared.clone();
     let outcome = send_record(
         channeldata,
         rec,
         qid,
-        move |r, key| on_dnsrec_reply(callback, arg, &cache, key, r),
+        move |r, key| on_dnsrec_reply(callback, arg, &shared.cache, key, r),
     );
     match outcome {
         Ok(Some(buf)) => {

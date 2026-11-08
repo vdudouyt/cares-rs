@@ -4,11 +4,12 @@
 //! ends. Because a shared socket only ever carries this channel's queries, a
 //! per-socket inbox keyed by qid can never see a clash.
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use bytes::BytesMut;
+
+use crate::core::async_client::ChannelShared;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -23,8 +24,8 @@ pub(crate) struct QidRegistry {
 }
 
 impl QidRegistry {
-    pub(crate) fn new() -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(QidRegistry { in_flight: HashSet::new(), rng: StdRng::from_entropy() }))
+    pub(crate) fn new() -> Self {
+        QidRegistry { in_flight: HashSet::new(), rng: StdRng::from_entropy() }
     }
 
     /// Number of ids currently in flight.
@@ -54,16 +55,16 @@ impl QidRegistry {
 /// One reserved id; dropping it returns the id to the registry.
 pub(crate) struct QidLease {
     id: u16,
-    registry: Rc<RefCell<QidRegistry>>,
+    shared: Rc<ChannelShared>,
 }
 
 impl QidLease {
     /// Reserve a fresh id; `None` if every id is in flight.
-    pub(crate) fn reserve(registry: &Rc<RefCell<QidRegistry>>) -> Option<Self> {
-        let mut reg = registry.borrow_mut();
+    pub(crate) fn reserve(shared: &Rc<ChannelShared>) -> Option<Self> {
+        let mut reg = shared.qids.borrow_mut();
         let id = reg.pick()?;
         reg.in_flight.insert(id);
-        Some(QidLease { id, registry: registry.clone() })
+        Some(QidLease { id, shared: shared.clone() })
     }
 
     pub(crate) fn id(&self) -> u16 {
@@ -73,7 +74,7 @@ impl QidLease {
 
 impl Drop for QidLease {
     fn drop(&mut self) {
-        self.registry.borrow_mut().in_flight.remove(&self.id);
+        self.shared.qids.borrow_mut().in_flight.remove(&self.id);
     }
 }
 
@@ -97,24 +98,24 @@ mod tests {
 
     #[test]
     fn concurrent_leases_are_distinct_and_released_on_drop() {
-        let reg = QidRegistry::new();
-        let a = QidLease::reserve(&reg).unwrap();
-        let b = QidLease::reserve(&reg).unwrap();
+        let sh = ChannelShared::new();
+        let a = QidLease::reserve(&sh).unwrap();
+        let b = QidLease::reserve(&sh).unwrap();
         assert_ne!(a.id(), b.id());
-        assert_eq!(reg.borrow().in_flight.len(), 2);
+        assert_eq!(sh.qids.borrow().in_flight.len(), 2);
         let freed = a.id();
         drop(a);
-        assert!(!reg.borrow().in_flight.contains(&freed));
-        assert_eq!(reg.borrow().in_flight.len(), 1);
+        assert!(!sh.qids.borrow().in_flight.contains(&freed));
+        assert_eq!(sh.qids.borrow().in_flight.len(), 1);
     }
 
     #[test]
     fn exhaustion_returns_none_and_a_release_makes_room() {
-        let reg = QidRegistry::new();
-        reg.borrow_mut().in_flight.extend(0..=u16::MAX);
-        assert!(QidLease::reserve(&reg).is_none());
-        reg.borrow_mut().in_flight.remove(&4242);
-        let lease = QidLease::reserve(&reg).unwrap();
+        let sh = ChannelShared::new();
+        sh.qids.borrow_mut().in_flight.extend(0..=u16::MAX);
+        assert!(QidLease::reserve(&sh).is_none());
+        sh.qids.borrow_mut().in_flight.remove(&4242);
+        let lease = QidLease::reserve(&sh).unwrap();
         assert_eq!(lease.id(), 4242, "the scan finds the only free id");
     }
 }

@@ -42,7 +42,7 @@ impl AsyncClient {
         if payload.len() < 2 {
             return Err(ARES_EBADQUERY.into());
         }
-        let lease = QidLease::reserve(&self.qids).ok_or(AresError::from(ARES_ENOMEM))?;
+        let lease = QidLease::reserve(&self.shared).ok_or(AresError::from(ARES_ENOMEM))?;
         payload[0..2].copy_from_slice(&lease.id().to_be_bytes());
         Ok(ReservedQuery { payload, lease })
     }

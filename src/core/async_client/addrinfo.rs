@@ -97,7 +97,7 @@ impl AsyncClient {
                         self.recursion_desired(),
                         false,
                     );
-                    let cached = self.cache.borrow_mut().get(&cache_key, Instant::now());
+                    let cached = self.shared.cache.borrow_mut().get(&cache_key, Instant::now());
                     if let Some(cached) = cached {
                         if let Ok(rrs) = addr_reply(&cached, cache_rtype, ReplyRequire::Items) {
                             return Ok(self.finalize_hostent(Hostent::from_parsed(rrs, cache_family)));
@@ -135,7 +135,7 @@ impl AsyncClient {
                     };
                     let hfamily = if reply.rtype == RTYPE_AAAA { AF_INET6 } else { AF_INET };
 
-                    if self.cache.borrow().enabled() {
+                    if self.shared.cache.borrow().enabled() {
                         let mut store = vec![lookup.name.clone()];
                         if resolved != lookup.name {
                             store.push(resolved.clone());
@@ -149,7 +149,7 @@ impl AsyncClient {
                             self.recursion_desired(),
                             false,
                         );
-                        self.cache.borrow_mut().store_names(store, &template, ttl, &reply.buf, Instant::now());
+                        self.shared.cache.borrow_mut().store_names(store, &template, ttl, &reply.buf, Instant::now());
                     }
                     let rrs = reply.rrs;
                     return Ok(self.finalize_hostent(Hostent::from_parsed(rrs, hfamily)));

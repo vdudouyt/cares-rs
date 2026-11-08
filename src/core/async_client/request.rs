@@ -31,14 +31,14 @@ impl AsyncClient {
     /// own task (`Effect::Probe`), so this query never waits for it.
     fn maybe_probe(&self, q: &QueryState) {
         let chance = q.opts.failover_chance;
-        if chance == 0 || !self.qids.borrow_mut().random_u16().is_multiple_of(chance) {
+        if chance == 0 || !self.shared.qids.borrow_mut().random_u16().is_multiple_of(chance) {
             return;
         }
-        let Some(server) = self.health.borrow().pick_probe(q.opts.failover_delay, q.server) else { return };
+        let Some(server) = self.shared.health.borrow().pick_probe(q.opts.failover_delay, q.server) else { return };
         let Ok(query) = self.reserve(BytesMut::from(&q.payload[..])) else { return };
-        self.health.borrow_mut().set_probing(server, true);
-        let probe = Probe { query: Some(query), server, health: self.health.clone() };
-        self.effects.borrow_mut().push(Effect::Probe(probe));
+        self.shared.health.borrow_mut().set_probing(server, true);
+        let probe = Probe { query: Some(query), server, shared: self.shared.clone() };
+        self.shared.effects.borrow_mut().push(Effect::Probe(probe));
     }
 
     /// Run a failover probe: one no-retry attempt to its server, whose outcome
@@ -69,7 +69,7 @@ impl AsyncClient {
             qid: query.lease,
             payload,
             use_tcp,
-            server: self.health.borrow().pick_next(),
+            server: self.shared.health.borrow().pick_next(),
             dns0x20,
             tries: 0,
             try_count: 0,
@@ -152,7 +152,7 @@ impl AsyncClient {
             q.opts.attempts,
             q.failover_tries,
             policy,
-            &mut self.health.borrow_mut(),
+            &mut self.shared.health.borrow_mut(),
         );
         self.notify(actions);
         Some(match verdict {
@@ -181,9 +181,9 @@ impl AsyncClient {
         }
         q.tries += 1;
         q.try_count += 1;
-        if self.health.borrow().len() > 1 {
-            self.health.borrow_mut().record_failure(q.server);
-            q.server = self.health.borrow().pick_next();
+        if self.shared.health.borrow().len() > 1 {
+            self.shared.health.borrow_mut().record_failure(q.server);
+            q.server = self.shared.health.borrow().pick_next();
         }
         Step::Retry
     }
@@ -193,7 +193,7 @@ impl AsyncClient {
         // If any UDP socket to this server already died, a timeout is the same
         // unreachable condition (the kernel may rate-limit ICMP across parallel
         // sockets): mark dead and retry uncounted.
-        if !q.use_tcp && self.optmask & ARES_OPT_EVENT_THREAD != 0 && self.udp_pool.borrow().has_dead(q.server) {
+        if !q.use_tcp && self.optmask & ARES_OPT_EVENT_THREAD != 0 && self.shared.udp_pool.borrow().has_dead(q.server) {
             conn.mark_dead();
             return self.fail_over(q, cancelled, false, ARES_ECONNREFUSED);
         }
@@ -223,7 +223,7 @@ impl AsyncClient {
     /// conn is retired.
     fn discard_conn(&self, q: &QueryState, conn: &Conn) {
         if q.use_tcp {
-            self.tcp_pool.borrow_mut().remove(q.server);
+            self.shared.tcp_pool.borrow_mut().remove(q.server);
         } else if self.optmask & ARES_OPT_EVENT_THREAD != 0 {
             conn.mark_dead();
         } else {
@@ -239,7 +239,7 @@ impl AsyncClient {
             return Step::Done(Err(ARES_ETIMEOUT));
         }
         self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
-        match on_timeout(q.tries, q.opts.attempts, q.server, &mut self.health.borrow_mut()) {
+        match on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut()) {
             // A probe's failure is recorded (by `on_timeout`); it is not retried.
             TimeoutVerdict::Retry { .. } if q.no_retry => Step::Done(Err(expire)),
             TimeoutVerdict::Retry { server } => {
@@ -286,12 +286,12 @@ struct QueryState {
 pub(crate) struct Probe {
     query: Option<ReservedQuery>,
     server: usize,
-    health: Rc<RefCell<ServerHealth>>,
+    shared: Rc<ChannelShared>,
 }
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        self.health.borrow_mut().set_probing(self.server, false);
+        self.shared.health.borrow_mut().set_probing(self.server, false);
     }
 }
 
@@ -374,13 +374,13 @@ impl AsyncClient {
     /// socket. The `Rc` drops after the pool borrow ends (it may close a socket).
     fn retire_udp(&self, server: usize, conn: &Conn) {
         let Some(c) = conn.shared_udp_handle() else { return };
-        let retired = self.udp_pool.borrow_mut().remove(server, &c);
+        let retired = self.shared.udp_pool.borrow_mut().remove(server, &c);
         drop(retired);
     }
 
     /// Grow the per-server cookie table to cover `server` and pass it to `f`.
     fn with_cookie<R>(&self, server: usize, f: impl FnOnce(&mut ServerCookie) -> R) -> Option<R> {
-        let mut cookies = self.cookies.borrow_mut();
+        let mut cookies = self.shared.cookies.borrow_mut();
         let needed = self.endpoints.len().max(server + 1);
         if cookies.len() < needed {
             cookies.resize_with(needed, ServerCookie::default);
@@ -453,12 +453,12 @@ impl AsyncClient {
             let conn = if use_tcp {
                 // Checkout-then-release: no pool guard is live while the C socket
                 // callbacks fire during creation, nor while `Conn::shared` borrows.
-                let pooled = self.tcp_pool.borrow().get(s);
+                let pooled = self.shared.tcp_pool.borrow().get(s);
                 let checked_out = pooled.or_else(|| {
                     let sock = self.rt.tcp(ep.bind).ok()?;
                     let _ = sock.get_ref().connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
                     let c = TcpConn::new(sock);
-                    self.tcp_pool.borrow_mut().insert(s, c.clone());
+                    self.shared.tcp_pool.borrow_mut().insert(s, c.clone());
                     Some(c)
                 });
                 checked_out.map(|c| Conn::shared(c, qid))
@@ -467,7 +467,7 @@ impl AsyncClient {
                 // not staying open), or create one if `udp_max_queries` is hit.
                 // Creation runs with the pool unborrowed so C callbacks fire cleanly.
                 let (pooled, retired) = {
-                    let mut pool = self.udp_pool.borrow_mut();
+                    let mut pool = self.shared.udp_pool.borrow_mut();
                     pool.pick_or_none(s, self.udp_max_queries, stayopen)
                 };
                 drop(retired);
@@ -475,19 +475,19 @@ impl AsyncClient {
                     let sk = self.rt.udp(ep.bind).ok()?;
                     let _ = sk.get_ref().connect(ep.udp_addr);
                     let c = UdpConn::new(sk, event_driven);
-                    self.udp_pool.borrow_mut().insert(s, c.clone());
+                    self.shared.udp_pool.borrow_mut().insert(s, c.clone());
                     Some(c)
                 });
                 checked_out.map(|c| {
-                    Conn::shared_udp(c, qid).with_udp_lease(self.udp_pool.clone(), s, stayopen, self.udp_max_queries)
+                    Conn::shared_udp(c, qid).with_udp_lease(self.shared.clone(), s, stayopen, self.udp_max_queries)
                 })
             };
             if let Some(conn) = conn {
                 return Ok((conn, s));
             }
-            if self.health.borrow().len() > 1 {
-                self.health.borrow_mut().record_failure(s);
-                s = self.health.borrow().pick_next();
+            if self.shared.health.borrow().len() > 1 {
+                self.shared.health.borrow_mut().record_failure(s);
+                s = self.shared.health.borrow().pick_next();
             }
         }
         Err(())
@@ -606,9 +606,9 @@ mod tests {
 
         drop(conn_a);
         drop(conn_b);
-        assert_eq!(client.qids.borrow().len(), 2, "ids stay reserved while the queries live");
+        assert_eq!(client.shared.qids.borrow().len(), 2, "ids stay reserved while the queries live");
         drop(first);
-        assert_eq!(client.qids.borrow().len(), 1);
+        assert_eq!(client.shared.qids.borrow().len(), 1);
     }
 
     #[test]
