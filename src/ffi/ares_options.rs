@@ -174,7 +174,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
         Ok(channeldata) => {
             let channel = Box::into_raw(Box::new(channeldata));
             let event_mode = unsafe { (*channel).event_mode };
-            if event_mode && !crate::ffi::channel::start_event_thread(channel) {
+            if event_mode && !crate::ffi::event_thread::start(channel) {
                 drop(unsafe { Box::from_raw(channel) });
                 return crate::ffi::error::ARES_ENOMEM;
             }
