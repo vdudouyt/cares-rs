@@ -3,7 +3,8 @@
 //! (`event_thread.rs`).
 
 use super::*;
-use crate::core::async_client::{getsock_mask, normalize_port, AsyncClient, ServerSpec};
+use crate::core::async_client::{normalize_port, AsyncClient, ServerSpec};
+use crate::core::fds::{clamp_timeout, getsock_mask, nfds, TimeoutChoice};
 use crate::core::async_client::Effect;
 use crate::async_runtime::executor::Executor;
 use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
@@ -426,7 +427,7 @@ pub unsafe extern "C" fn ares_fds(channel: *const ChannelData, read_fds: &mut li
     for (fd, wants_write) in &fds {
         unsafe { if *wants_write { libc::FD_SET(*fd, write_fds) } else { libc::FD_SET(*fd, read_fds) } };
     }
-    crate::core::async_client::nfds(&fds)
+    nfds(&fds)
 }
 
 #[no_mangle]
@@ -436,12 +437,12 @@ pub unsafe extern "C" fn ares_timeout(channel: Channel, maxtv: *mut libc::timeva
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return std::ptr::null_mut(); };
     let maxtv_ms = (!maxtv.is_null())
         .then(|| unsafe { (*maxtv).tv_sec as u128 * 1000 + (*maxtv).tv_usec as u128 / 1000 });
-    match crate::core::async_client::clamp_timeout(channeldata.next_timeout_ms(), maxtv_ms) {
-        crate::core::async_client::TimeoutChoice::NoTasks => {
+    match clamp_timeout(channeldata.next_timeout_ms(), maxtv_ms) {
+        TimeoutChoice::NoTasks => {
             if maxtv.is_null() { return std::ptr::null_mut(); }
             maxtv
         }
-        crate::core::async_client::TimeoutChoice::Wait { ms, use_max } => {
+        TimeoutChoice::Wait { ms, use_max } => {
             unsafe {
                 (*tv).tv_sec = (ms / 1000) as i64;
                 (*tv).tv_usec = 1000 * (ms % 1000) as i64;

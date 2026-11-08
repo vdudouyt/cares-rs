@@ -327,3 +327,303 @@ async fn recv_reply(conn: &mut Conn, deadline: Instant) -> io::Result<Vec<u8>> {
         other => other,
     }
 }
+
+// ---- Transport helpers: connection checkout, cookies, timeouts ----
+
+impl AsyncClient {
+    /// Snapshot per-server connect endpoints so a lookup never re-reads config.
+    pub(super) fn endpoint_snapshot(&self) -> Vec<ServerEndpoint> {
+        let default_udp = self.default_udp_port;
+        let default_tcp = self.default_tcp_port;
+        self.config
+            .nameservers
+            .iter()
+            .enumerate()
+            .map(|(i, &(ip, udp_override))| {
+                let udp_port = udp_override.unwrap_or(default_udp);
+                let tcp_port = self.config.tcp_ports.get(i).copied().flatten().unwrap_or(default_tcp);
+                let bind = if ip.is_ipv6() {
+                    SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+                } else {
+                    SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+                };
+                ServerEndpoint {
+                    udp_addr: SocketAddr::from((ip, udp_port)),
+                    tcp_addr: SocketAddr::from((ip, tcp_port)),
+                    bind,
+                }
+            })
+            .collect()
+    }
+
+    /// The retry/timeout knobs an async lifecycle needs.
+    pub(super) fn opts(&self) -> QueryOpts {
+        QueryOpts {
+            attempts: self.config.options.attempts,
+            timeout: Duration::from_millis(self.config.options.timeout_ms as u64),
+            maxtimeout: (self.maxtimeout > 0)
+                .then(|| Duration::from_millis(self.maxtimeout as u64)),
+            failover_chance: self.server_failover_retry_chance,
+            failover_delay: self.server_failover_retry_delay,
+            ignore_tc: self.flags & ARES_FLAG_IGNTC != 0,
+            no_check_resp: self.flags & ARES_FLAG_NOCHECKRESP != 0,
+        }
+    }
+
+    /// Remove a dead/timed-out shared UDP conn so the next attempt opens a fresh
+    /// socket. The `Rc` drops after the pool borrow ends (it may close a socket).
+    fn retire_udp(&self, server: usize, conn: &Conn) {
+        let Some(c) = conn.shared_udp_handle() else { return };
+        let retired = self.udp_pool.borrow_mut().remove(server, &c);
+        drop(retired);
+    }
+
+    /// Grow the per-server cookie table to cover `server` and pass it to `f`.
+    fn with_cookie<R>(&self, server: usize, f: impl FnOnce(&mut ServerCookie) -> R) -> Option<R> {
+        let mut cookies = self.cookies.borrow_mut();
+        let needed = self.endpoints.len().max(server + 1);
+        if cookies.len() < needed {
+            cookies.resize_with(needed, ServerCookie::default);
+        }
+        cookies.get_mut(server).map(f)
+    }
+
+    /// Attach the COOKIE option for this send (UDP only; removed on TCP). Returns
+    /// the 8-byte client cookie placed on the wire, which the response must echo.
+    /// `ARES_EFORMERR` means the rewrite would exceed the 16-bit DNS limit.
+    fn apply_cookie(
+        &self,
+        payload: &mut Vec<u8>,
+        server: usize,
+        use_tcp: bool,
+    ) -> Result<Option<[u8; 8]>, AresError> {
+        if !edns::has_opt(payload) {
+            return Ok(None);
+        }
+        if use_tcp {
+            // Cookies are deliberately not used over TCP; strip a stale one
+            // (e.g. after a BADCOOKIE-driven upgrade).
+            if !edns::set_cookie_option(payload, None) {
+                return Err(ARES_EFORMERR.into());
+            }
+            return Ok(None);
+        }
+        let cookie = self.with_cookie(server, ServerCookie::cookie_for_query).flatten();
+        let Some(cookie) = cookie else {
+            // Server is known to be unsupported: no cookie.
+            if !edns::set_cookie_option(payload, None) {
+                return Err(ARES_EFORMERR.into());
+            }
+            return Ok(None);
+        };
+        if cookie.len() < 8 {
+            return Ok(None);
+        }
+        let mut client = [0u8; 8];
+        client.copy_from_slice(&cookie[..8]);
+        if !edns::set_cookie_option(payload, Some(&cookie)) {
+            return Err(ARES_EFORMERR.into());
+        }
+        Ok(Some(client))
+    }
+
+    /// Validate a response's COOKIE option against this server's state.
+    fn validate_cookie(
+        &self,
+        resp: &[u8],
+        sent_client: Option<&[u8; 8]>,
+        server: usize,
+        rcode: u16,
+    ) -> CookieVerdict {
+        self.with_cookie(server, |cookie| {
+            cookie.validate_response(resp, sent_client, rcode)
+        })
+        .unwrap_or(CookieVerdict::Accept)
+    }
+
+    /// Connect-with-failover: create + connect the socket for `start`, trying up
+    /// to `tries` servers; returns the live `Conn` and server index, or `Err(())`
+    /// when the budget is spent. Shared conns open an inbox slot for the query's `qid`.
+    fn connect_failover(&self, qid: u16, start: usize, use_tcp: bool, tries: u32) -> Result<(Conn, usize), ()> {
+        let stayopen = self.flags & ARES_FLAG_STAYOPEN != 0;
+        let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
+        let mut s = start;
+        for _ in 0..tries.max(1) {
+            let Some(ep) = self.endpoints.get(s) else { break };
+            let conn = if use_tcp {
+                // Checkout-then-release: no pool guard is live while the C socket
+                // callbacks fire during creation, nor while `Conn::shared` borrows.
+                let pooled = self.tcp_pool.borrow().get(s);
+                let checked_out = pooled.or_else(|| {
+                    let sock = self.rt.tcp(ep.bind).ok()?;
+                    let _ = sock.get_ref().connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
+                    let c = TcpConn::new(sock);
+                    self.tcp_pool.borrow_mut().insert(s, c.clone());
+                    Some(c)
+                });
+                checked_out.map(|c| Conn::shared(c, qid))
+            } else {
+                // Checkout an existing shared datagram conn (pruning idle ones when
+                // not staying open), or create one if `udp_max_queries` is hit.
+                // Creation runs with the pool unborrowed so C callbacks fire cleanly.
+                let (pooled, retired) = {
+                    let mut pool = self.udp_pool.borrow_mut();
+                    pool.pick_or_none(s, self.udp_max_queries, stayopen)
+                };
+                drop(retired);
+                let checked_out = pooled.or_else(|| {
+                    let sk = self.rt.udp(ep.bind).ok()?;
+                    let _ = sk.get_ref().connect(ep.udp_addr);
+                    let c = UdpConn::new(sk, event_driven);
+                    self.udp_pool.borrow_mut().insert(s, c.clone());
+                    Some(c)
+                });
+                checked_out.map(|c| {
+                    Conn::shared_udp(c, qid).with_udp_lease(self.udp_pool.clone(), s, stayopen, self.udp_max_queries)
+                })
+            };
+            if let Some(conn) = conn {
+                return Ok((conn, s));
+            }
+            if self.health.borrow().len() > 1 {
+                self.health.borrow_mut().record_failure(s);
+                s = self.health.borrow().pick_next();
+            }
+        }
+        Err(())
+    }
+}
+
+/// A server's precomputed connect targets.
+#[derive(Clone)]
+pub(crate) struct ServerEndpoint {
+    pub udp_addr: SocketAddr,
+    pub tcp_addr: SocketAddr,
+    pub bind: SocketAddr,
+}
+
+/// The retry/timeout knobs a query needs, snapshotted at launch.
+#[derive(Clone, Copy)]
+pub(crate) struct QueryOpts {
+    pub attempts: u32,
+    pub timeout: Duration,
+    pub maxtimeout: Option<Duration>,
+    pub failover_chance: u16,
+    pub failover_delay: u64,
+    pub ignore_tc: bool,
+    pub no_check_resp: bool,
+}
+
+/// Upstream `ares_calc_query_timeout`: base timeout doubled per full server
+/// round, capped by ARES_OPT_MAXTIMEOUTMS, jittered into [0.5, 1.0]× for retries.
+/// Never below the base.
+fn calc_query_timeout(
+    base: Duration,
+    try_count: u32,
+    nservers: usize,
+    maxtimeout: Option<Duration>,
+) -> Duration {
+    let mut timeout = base;
+    let rounds = (try_count as usize)
+        .checked_div(nservers)
+        .unwrap_or(0);
+    if rounds > 0 {
+        let factor = 1u32.checked_shl(rounds as u32).unwrap_or(u32::MAX);
+        timeout = timeout.saturating_mul(factor);
+        if let Some(max) = maxtimeout.filter(|m| !m.is_zero()) {
+            if timeout > max {
+                timeout = max;
+            }
+        }
+        // Jitter: r / u16::MAX * 0.5 subtracted (upstream float arithmetic).
+        let r = rand::thread_rng().r#gen::<u16>();
+        let delta_multiplier = (r as f64 / u16::MAX as f64) * 0.5;
+        timeout = timeout.mul_f64(1.0 - delta_multiplier);
+    }
+    if timeout < base {
+        timeout = base;
+    }
+    timeout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qid_of(payload: &[u8]) -> u16 {
+        u16::from_be_bytes([payload[0], payload[1]])
+    }
+
+    struct TestSock;
+    impl crate::async_runtime::socket::Socket for TestSock {
+        fn as_raw_fd(&self) -> i32 {
+            21
+        }
+        fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
+            Ok(())
+        }
+        fn recv(&self, _buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+        fn send(&self, data: &[u8]) -> io::Result<usize> {
+            Ok(data.len())
+        }
+    }
+
+    struct TestFactory;
+    impl SocketFactory for TestFactory {
+        fn create_udp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
+            Ok(Rc::new(TestSock))
+        }
+        fn create_tcp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
+            Ok(Rc::new(TestSock))
+        }
+    }
+
+    /// Concurrent queries get distinct channel-wide ids stamped on their
+    /// payloads, share one UDP socket without clashing, and free the id on drop.
+    #[test]
+    fn reserved_qids_are_unique_and_share_a_socket() {
+        let config = SysConfig {
+            nameservers: vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)],
+            ..SysConfig::default()
+        };
+        let mut client = AsyncClient::build(config, Rc::new(TestFactory), 53, 53);
+        client.endpoints = Rc::new(client.endpoint_snapshot());
+
+        let payload = || BytesMut::from(&[0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]);
+        let first = client.reserve(payload()).expect("first reserve");
+        let second = client.reserve(payload()).expect("second reserve");
+        assert_ne!(first.qid(), second.qid());
+        assert_eq!(qid_of(&first.payload), first.qid(), "the reserved id is stamped");
+        assert_eq!(qid_of(&second.payload), second.qid());
+
+        let (conn_a, _) = client.connect_failover(first.qid(), 0, false, 1).expect("first checkout");
+        let (conn_b, _) = client.connect_failover(second.qid(), 0, false, 1).expect("second checkout");
+        let shared = conn_a.shared_udp_handle().expect("pooled UDP");
+        assert!(Rc::ptr_eq(&shared, &conn_b.shared_udp_handle().expect("pooled UDP")), "one shared socket");
+        assert!(shared.borrow().has_waiter(first.qid()) && shared.borrow().has_waiter(second.qid()));
+
+        drop(conn_a);
+        drop(conn_b);
+        assert_eq!(client.qids.borrow().len(), 2, "ids stay reserved while the queries live");
+        drop(first);
+        assert_eq!(client.qids.borrow().len(), 1);
+    }
+
+    #[test]
+    fn query_timeout_doubles_per_round_and_caps() {
+        let base = Duration::from_millis(100);
+        // First attempt: exactly the base timeout.
+        assert_eq!(calc_query_timeout(base, 0, 2, None), base);
+        // After one full round: 2x, jittered into [1x, 2x].
+        let t = calc_query_timeout(base, 2, 2, None);
+        assert!(t >= Duration::from_millis(100) && t <= Duration::from_millis(200));
+        // Two rounds: 4x, capped at 250ms, jittered into [125, 250].
+        let t = calc_query_timeout(base, 4, 2, Some(Duration::from_millis(250)));
+        assert!(t >= Duration::from_millis(125) && t <= Duration::from_millis(250));
+        // A cap below the base never reduces the base timeout.
+        let t = calc_query_timeout(base, 0, 1, Some(Duration::from_millis(10)));
+        assert_eq!(t, base);
+    }
+}

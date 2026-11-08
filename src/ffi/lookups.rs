@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::core::async_client::search_precheck;
-use crate::core::async_client::{service_to_port, ServicePort};
-use crate::core::async_client::{AddrInfoOut, Delivery, HostReply, NameinfoReply};
+use crate::core::nameinfo::{service_to_port, ServicePort};
+use crate::core::async_client::{AddrInfoOut, Delivery, HostReply};
+use crate::core::nameinfo::NameinfoReply;
 use crate::core::cache::{CacheKey, QueryCache};
 use std::cell::RefCell;
 use std::rc::Rc;
