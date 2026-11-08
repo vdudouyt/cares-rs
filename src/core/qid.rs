@@ -10,23 +10,18 @@ use std::rc::Rc;
 use bytes::BytesMut;
 
 use crate::core::async_client::ChannelShared;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::Rng;
 
 /// Random draws before falling back to a linear scan for a free id.
 const RANDOM_TRIES: usize = 64;
 
-/// The channel's in-flight transaction ids and the RNG they are drawn from
-/// (channel-owned, like upstream's `channel->rand_state`).
+/// The channel's in-flight transaction ids.
+#[derive(Default)]
 pub(crate) struct QidRegistry {
     in_flight: HashSet<u16>,
-    rng: StdRng,
 }
 
 impl QidRegistry {
-    pub(crate) fn new() -> Self {
-        QidRegistry { in_flight: HashSet::new(), rng: StdRng::from_entropy() }
-    }
 
     /// Number of ids currently in flight.
     #[cfg(test)]
@@ -34,16 +29,11 @@ impl QidRegistry {
         self.in_flight.len()
     }
 
-    /// A draw from the channel RNG (also the failover-probe chance roll, as
-    /// upstream draws both from `channel->rand_state`).
-    pub(crate) fn random_u16(&mut self) -> u16 {
-        self.rng.r#gen()
-    }
-
     /// A fresh id not in flight; `None` only when all 65536 are taken.
-    fn pick(&mut self) -> Option<u16> {
+    fn pick(&self) -> Option<u16> {
+        let mut rng = rand::thread_rng();
         for _ in 0..RANDOM_TRIES {
-            let id = self.rng.r#gen::<u16>();
+            let id = rng.r#gen::<u16>();
             if !self.in_flight.contains(&id) {
                 return Some(id);
             }

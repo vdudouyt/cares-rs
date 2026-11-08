@@ -8,7 +8,7 @@ A Rust rewrite of the [c-ares](https://c-ares.org/) asynchronous DNS resolver, s
 
 * Use non-blocking I/O following the reactor pattern. Never use blocking I/O requests.
 * All functions and structures exported in C must be `pub`.
-* **No thread-local (or global mutable) state.** Working state lives in structures owned — directly or transitively — by the channel (`ChannelData`); e.g. the receive scratch buffer is a field of the channel's `Reactor`, not a `thread_local!`.
+* **No thread-local (or global mutable) state.** Working state lives in structures owned — directly or transitively — by the channel (`ChannelData`); e.g. the receive scratch buffer is a field of the channel's `Reactor`, not a `thread_local!`. **Exception: random numbers** — use `rand::thread_rng()`. Its state never influences a result (any draw is just "a random value"), so it cannot leak behavior between channels or threads, and it is a reseeding CSPRNG that rand reseeds after `fork()`. Do not add channel-owned RNGs.
 * **No panic paths in production code** — a panic in a C-ABI library aborts the host process. No `panic!`/`todo!`/`unimplemented!`/`unreachable!`/`.unwrap()`/`.expect()` outside `cfg(test)`; degrade gracefully (error status, fallback value, or skip) even for invariants that "can't" fail. Enforced by the deny wall in `src/lib.rs` (fires under clippy, which CI runs with `-D warnings`). For C-string constants use native `c"..."` literals (`c"...".as_ptr()`) — an interior NUL is rejected by the compiler itself, so no conversion or panic machinery is ever involved.
 * Commit with **zero** build/clippy warnings.
 * **Porting tests:** copy `.c`/`.cc` files from the original c-ares tree at `/root/c-ares-1.34.6/` with as few changes as possible, for logical consistency and easy updates. Copy them verbatim; the only tests you may comment out or skip are malloc/alloc-failure ones.
@@ -64,7 +64,7 @@ The refactoring goal is a shrinking unsafe surface: any logic found in `ffi/` sh
 - `udp_pool.rs` — DNS-over-UDP connection pooling: `UdpPool` (per-server list of shared datagram conns, capped by `ARES_OPT_UDP_MAX_QUERIES` and pruned when `ARES_FLAG_STAYOPEN` is clear) + `UdpConn` (per-QID inbox demux over connected datagrams, same reroll/RAII shape as `TcpConn`).
 - `nameinfo.rs` — getnameinfo's pure parts: `assemble_nameinfo` (NOFQDN, numeric fallback, LOOKUPSERVICE), `format_ip_with_scope`, `get_service_string`, `service_to_port`.
 - `fds.rs` — the `ares_fds`/`ares_getsock`/`ares_timeout` tallies (`nfds`, `getsock_mask`, `clamp_timeout`).
-- `qid.rs` — channel-wide transaction ids: `QidRegistry` (in-flight set + channel-owned `StdRng`), `QidLease` (RAII release), `ReservedQuery` (payload + lease).
+- `qid.rs` — channel-wide transaction ids: `QidRegistry` (the in-flight id set), `QidLease` (RAII release), `ReservedQuery` (payload + lease).
 - `lookup.rs` — the per-reply verdict logic: `on_datagram`/`on_timeout` (retry / failover / TC-retry decisions as pure functions), `summarize`/`qid_matches`, `SearchPlan` (ndots/bare-name iteration), `ServerHealth` (lowest-failures-first selection), `ServerId` (the server-list index newtype used everywhere a server is named: health, verdicts, pools, effects), `is_localhost`/`is_onion_domain`.
 - `hostent.rs` — `HostentBlueprint` (family/alias/addr decisions) + `addrttl_fill`.
 - `dns_record.rs` — the record model (`ares_dns_record_t`/`ares_dns_rr_t`) + codec + metadata tables.

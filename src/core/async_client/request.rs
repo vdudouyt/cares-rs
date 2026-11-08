@@ -31,7 +31,7 @@ impl AsyncClient {
     /// own task (`Effect::Probe`), so this query never waits for it.
     fn maybe_probe(&self, q: &QueryState) {
         let chance = q.opts.failover_chance;
-        if chance == 0 || !self.shared.qids.borrow_mut().random_u16().is_multiple_of(chance) {
+        if chance == 0 || !rand::thread_rng().r#gen::<u16>().is_multiple_of(chance) {
             return;
         }
         let Some(server) = self.shared.health.borrow().pick_probe(q.opts.failover_delay, q.server) else { return };

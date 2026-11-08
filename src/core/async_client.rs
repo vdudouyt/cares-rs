@@ -145,7 +145,7 @@ pub(crate) struct ChannelShared {
     /// Effects raised by in-flight lookups (server-state notifications, probe
     /// spawns), drained by the ffi after each task poll.
     pub effects: RefCell<Vec<Effect>>,
-    /// The channel's in-flight transaction ids and RNG.
+    /// The channel's in-flight transaction ids.
     pub qids: RefCell<QidRegistry>,
 }
 
@@ -158,7 +158,7 @@ impl ChannelShared {
             tcp_pool: RefCell::new(TcpPool::new()),
             udp_pool: RefCell::new(UdpPool::new()),
             effects: RefCell::new(Vec::new()),
-            qids: RefCell::new(QidRegistry::new()),
+            qids: RefCell::new(QidRegistry::default()),
         })
     }
 }
