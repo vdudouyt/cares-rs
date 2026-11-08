@@ -104,7 +104,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     {
         Ok(payload) => {
             let client = channeldata.state.derive();
-                    let fut = client.query_raw(payload, true, Rc::default());
+                    let fut = client.query_raw(payload, Rc::default());
             channeldata.spawn(fut, move |r| on_raw_reply(callback, arg, r));
         }
         Err(status) => on_raw_reply(callback, arg, Err(status.code())),
@@ -183,7 +183,7 @@ fn query_dnsrec_record(
     let client = channeldata.state.derive();
     let cache = client.cache.clone();
     let sig = Rc::new(QuerySignals::default());
-    let fut = client.query_raw(payload, true, sig.clone());
+    let fut = client.query_raw(payload, sig.clone());
     channeldata.spawn(fut, move |r| {
         on_dnsrec_reply(callback, arg, &cache, Some(cache_key), r)
     });
@@ -591,7 +591,7 @@ where
     // ares_send / ares_send_dnsrec: transmit the caller's bytes unchanged (no
     // synthesized OPT/COOKIE); a caller-supplied OPT is preserved because it is
     // already part of the serialized record.
-    let fut = client.query_raw(payload, false, sig.clone());
+    let fut = client.query_raw(payload, sig.clone());
     channeldata.spawn(fut, move |r| on_reply(r, cache_key));
     // Report the qid connect_failover reserved, which may have re-rolled it on
     // a shared socket after the caller was given the pre-send value above.

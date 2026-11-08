@@ -176,27 +176,14 @@ impl AsyncClient {
     /// The single-query driver every lookup runs on: pick a server, connect with
     /// failover, send, then loop until a verdict. Starts on TCP iff ARES_FLAG_USEVC;
     /// `cancelled` stops retries but still delivers an in-flight reply.
-    async fn request(&self, payload: BytesMut, synthesize_edns: bool, sig: &QuerySignals) -> QueryOutcome {
+    async fn request(&self, payload: BytesMut, sig: &QuerySignals) -> QueryOutcome {
         let opts = self.opts();
         // Starting transport; a TC reply or persistent BADCOOKIE upgrades to TCP.
         let mut use_tcp = self.config.options.use_vc;
         let mut timeouts: c_int = 0;
-        // Per-query EDNS/0x20/cookie state lives in locals, not the mailbox:
-        // concurrent A/AAAA siblings share it. Raw send (`synthesize_edns =
-        // false`) forwards caller bytes (incl. any OPT) untouched.
+        // Per-query 0x20/cookie state lives in locals: concurrent A/AAAA
+        // siblings share the channel. Any OPT was added by the caller (`with_edns`).
         let mut payload = payload.to_vec();
-        if synthesize_edns && !edns::has_opt(&payload) {
-            match self.edns_udp_size() {
-                Ok(Some(size)) => {
-                    if !edns::append_opt(&mut payload, size) {
-                        return (Err(ARES_EFORMERR), timeouts);
-                    }
-                }
-                Ok(None) => {}
-                // EDNSPSZ wider than the 16-bit OPT CLASS: rejected before any send.
-                Err(e) => return (Err(e.code()), timeouts),
-            }
-        }
         // DNS 0x20: randomize question 0's case once per UDP query; the exact
         // case is retained for retries and validated against the reply.
         let dns0x20_expected = if self.flags & ARES_FLAG_DNS0x20 != 0 && !use_tcp {
@@ -416,11 +403,10 @@ impl AsyncClient {
     }
 
     /// ares_query / ares_send: the raw single query, wrapped into `Delivery::Raw`.
-    /// The starting transport honors ARES_FLAG_USEVC; `synthesize_edns` is false
-    /// for raw send APIs, whose bytes must go on the wire unchanged.
-    /// `sig.qid` reports the transaction id actually reserved on the wire.
-    pub(crate) async fn query_raw(self, payload: BytesMut, synthesize_edns: bool, sig: Rc<QuerySignals>) -> Delivery {
-        let (result, timeouts) = self.request(payload, synthesize_edns, &sig).await;
+    /// The payload goes on the wire as given (`query_payload` already added EDNS;
+    /// raw send APIs must not). `sig.qid` reports the transaction id actually reserved.
+    pub(crate) async fn query_raw(self, payload: BytesMut, sig: Rc<QuerySignals>) -> Delivery {
+        let (result, timeouts) = self.request(payload, &sig).await;
         Delivery::Raw { result, timeouts }
     }
 
@@ -643,11 +629,13 @@ impl AsyncClient {
             u32::from(RECORD_TYPE_PTR),
             u32::from(ARES_CLASS_IN),
             self.recursion_desired(),
-        ) {
+        )
+        .and_then(|p| self.with_edns(p))
+        {
             Ok(p) => p,
             Err(e) => return (Err(e), 0),
         };
-        let (result, timeouts) = self.request(payload, true, &QuerySignals::default()).await;
+        let (result, timeouts) = self.request(payload, &QuerySignals::default()).await;
         let result = match result {
             Ok(buf) => on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip)),
             Err(status) => Err(AresError::from(status)),
@@ -699,7 +687,9 @@ impl AsyncClient {
             u32::from(RECORD_TYPE_PTR),
             u32::from(ARES_CLASS_IN),
             self.recursion_desired(),
-        ) {
+        )
+        .and_then(|p| self.with_edns(p))
+        {
             Ok(p) => p,
             Err(e) => {
                 return NameinfoReply {
@@ -710,7 +700,7 @@ impl AsyncClient {
                 }
             }
         };
-        let (result, io_timeouts) = self.request(payload, true, &QuerySignals::default()).await;
+        let (result, io_timeouts) = self.request(payload, &QuerySignals::default()).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -795,14 +785,14 @@ impl AsyncClient {
         let sig = QuerySignals::default();
 
         loop {
-            let payload = match make_payload(&plan.current) {
+            let payload = match make_payload(&plan.current).and_then(|p| if synthesize_edns { self.with_edns(p) } else { Ok(p) }) {
                 Ok(p) => p,
                 Err(e) => return Delivery::Raw { result: Err(e.code()), timeouts },
             };
             // Only the first query of a lookup is eligible to spawn a failover probe.
             let probe_payload = if first { make_payload(&plan.current).ok() } else { None };
             first = false;
-            let mut primary = pin!(self.request(payload, synthesize_edns, &sig).fuse());
+            let mut primary = pin!(self.request(payload, &sig).fuse());
             let (result, io_timeouts) = match probe_payload {
                 Some(pp) => {
                     let mut probe = pin!(self.run_probe(pp).fuse());
@@ -875,10 +865,10 @@ impl AsyncClient {
 
         let sig = &sig;
         let sub = |i: usize| {
-            let payload = dns_query_payload(name, u32::from(rtypes[i]), u32::from(ARES_CLASS_IN), rd);
+            let payload = dns_query_payload(name, u32::from(rtypes[i]), u32::from(ARES_CLASS_IN), rd).and_then(|p| self.with_edns(p));
             async move {
                 match payload {
-                    Ok(p) => self.request(p, true, sig).await,
+                    Ok(p) => self.request(p, sig).await,
                     Err(e) => (Err(e.code()), 0),
                 }
             }
@@ -1858,6 +1848,20 @@ impl AsyncClient {
         Ok(Some(size as u16))
     }
 
+    /// Append the channel's EDNS OPT (ARES_FLAG_EDNS) unless the query has one.
+    fn with_edns(&self, payload: BytesMut) -> Result<BytesMut, AresError> {
+        if edns::has_opt(&payload) {
+            return Ok(payload);
+        }
+        // EDNSPSZ wider than the 16-bit OPT CLASS: rejected before any send.
+        let Some(size) = self.edns_udp_size()? else { return Ok(payload) };
+        let mut buf = payload.to_vec();
+        if !edns::append_opt(&mut buf, size) {
+            return Err(ARES_EFORMERR.into());
+        }
+        Ok(BytesMut::from(buf.as_slice()))
+    }
+
     fn build(
         config: SysConfig,
         factory: Rc<dyn SocketFactory>,
@@ -2437,7 +2441,7 @@ impl AsyncClient {
     ) -> Result<BytesMut, AresError> {
         // Constructed queries validate the wide EDNSPSZ here, before spawning.
         self.edns_udp_size()?;
-        let payload = dns_query_payload(name, qtype, qclass, self.recursion_desired())?;
+        let payload = self.with_edns(dns_query_payload(name, qtype, qclass, self.recursion_desired())?)?;
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
