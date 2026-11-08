@@ -10,10 +10,11 @@
 
 use super::*;
 use crate::ffi::ares_socket::{ares_fd_events_t, ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
-use crate::ffi::channel::ReentrantMutex;
+use crate::ffi::channel::{channel_access, ReentrantMutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Upper bound on the event thread's poll wait; new work wakes it via the wake pipe.
 const EVENT_MAX_WAIT_MS: u128 = 1000;
@@ -131,6 +132,31 @@ fn event_thread_main(channel: usize, stop: Arc<AtomicBool>, lock: &'static Reent
             let data = unsafe { &mut *(channel as *mut ChannelData) };
             data.process_events(&events, false);
         }
+    }
+}
+
+/// # Safety
+/// `channel` must be NULL or a live channel handle.
+#[no_mangle]
+pub unsafe extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_int) -> c_int {
+    wait_empty_impl(channel, timeout_ms)
+}
+
+/// Sleep-poll the executor's active count, releasing the channel lock between
+/// checks so the event thread can finish the queries. Blocking by contract, like
+/// upstream (which waits on a condvar instead); it never drives I/O itself, so it
+/// only returns early when another thread (normally this event thread) runs turns.
+fn wait_empty_impl(channel: *mut ChannelData, timeout_ms: c_int) -> c_int {
+    let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
+    if data.active_queries() == 0 { return ARES_SUCCESS; }
+    drop(guard);
+    let start = Instant::now();
+    loop {
+        let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
+        if data.active_queries() == 0 { return ARES_SUCCESS; }
+        drop(guard);
+        if timeout_ms >= 0 && start.elapsed().as_millis() >= timeout_ms as u128 { return ARES_ETIMEOUT; }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 

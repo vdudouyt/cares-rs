@@ -35,6 +35,7 @@ mod process;
 pub use addrinfo::*;
 pub(crate) use convert::*;
 pub use channel::*;
+pub use event_thread::ares_queue_wait_empty;
 pub(crate) use channel::channel_access;
 pub use lookups::*;
 pub use parsers::*;

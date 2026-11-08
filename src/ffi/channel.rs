@@ -10,7 +10,6 @@ use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
 use crate::ffi::event_thread::{self, EventThread};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
 
 /// The C-visible channel: core state plus the channel-level C callbacks.
 pub struct ChannelData {
@@ -192,6 +191,11 @@ impl ChannelData {
 
     pub(crate) fn all_poll_fds(&self) -> Vec<(i32, bool)> {
         self.state.rt.reactor().interests()
+    }
+
+    /// Lookups still in flight (spawned, not yet delivered).
+    pub(crate) fn active_queries(&self) -> usize {
+        self.executor.active_count()
     }
 
     pub(crate) fn next_timeout_ms(&self) -> Option<u128> {
@@ -746,7 +750,7 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
 #[no_mangle]
 pub unsafe extern "C" fn ares_queue_active_queries(channel: *const ChannelData) -> libc::size_t {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return 0; };
-    channeldata.executor.active_count()
+    channeldata.active_queries()
 }
 
 /// Store the pending-write callback (copied by ares_dup) but never fire it:
@@ -768,27 +772,4 @@ pub unsafe extern "C" fn ares_set_pending_write_cb(
 #[no_mangle]
 pub extern "C" fn ares_process_pending_write(channel: Channel) {
     if channel.is_null() {}
-}
-
-/// # Safety
-/// `channel` must be NULL or a live channel handle.
-#[no_mangle]
-pub unsafe extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_int) -> c_int {
-    wait_empty_impl(channel, timeout_ms)
-}
-
-/// Poll the executor's active count, releasing the channel lock while sleeping
-/// so the event thread can run.
-fn wait_empty_impl(channel: *mut ChannelData, timeout_ms: c_int) -> c_int {
-    let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
-    if data.executor.active_count() == 0 { return ARES_SUCCESS; }
-    drop(guard);
-    let start = Instant::now();
-    loop {
-        let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
-        if data.executor.active_count() == 0 { return ARES_SUCCESS; }
-        drop(guard);
-        if timeout_ms >= 0 && start.elapsed().as_millis() >= timeout_ms as u128 { return ARES_ETIMEOUT; }
-        std::thread::sleep(Duration::from_millis(1));
-    }
 }
