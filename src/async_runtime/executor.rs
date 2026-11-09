@@ -77,13 +77,23 @@ impl Wake for TaskWaker {
 }
 
 struct Slot {
-    task: Box<dyn AbstractTask>,
+    /// `None` while the task is being polled: [`Executor::poll`] moves it onto
+    /// the stack, so nothing that runs during the poll can free or move it.
+    task: Option<Box<dyn AbstractTask>>,
+    /// A cancel that arrived while the task was being polled, applied when the
+    /// poll returns.
+    cancel: Option<i32>,
     flag: Arc<TaskWaker>,
     waker: Waker,
 }
 
 /// In-flight tasks in reused slots (`None` = reaped) plus the runnable queue
 /// (≈ async-executor's `LocalExecutor`, ticked by the host instead of a thread).
+///
+/// Re-entrant use is safe: a C callback that fires during a poll may call back
+/// into the channel, and so into this executor (`spawn` may grow `slots`,
+/// `deliver` may target the running task). The poll holds no reference into
+/// `slots`, and a `deliver` aimed at the running task only records the cancel.
 #[derive(Default)]
 pub(crate) struct Executor {
     slots: Vec<Option<Slot>>,
@@ -110,7 +120,7 @@ impl Executor {
             queue: self.queue.clone(),
         });
         let waker = Waker::from(flag.clone());
-        let slot = Some(Slot { task, flag, waker });
+        let slot = Some(Slot { task: Some(task), cancel: None, flag, waker });
         match self.slots.get_mut(id) {
             Some(s) => *s = slot,
             None => self.slots.push(slot),
@@ -135,22 +145,49 @@ impl Executor {
     }
 
     /// Poll `id` once with its own waker; `true` when it completed. A reaped id
-    /// yields `false`.
+    /// yields `false`. If the task was cancelled during the poll, it is
+    /// delivered with that status here and the call returns `false`.
     pub(crate) fn poll(&mut self, id: usize) -> bool {
         let Some(slot) = self.slots.get_mut(id).and_then(|s| s.as_mut()) else {
             return false;
         };
+        let Some(mut task) = slot.task.take() else {
+            // Already being polled further up the stack (a re-entrant turn):
+            // re-queue it so this wake isn't lost.
+            slot.flag.scheduled.store(false, Ordering::Release);
+            slot.waker.wake_by_ref();
+            return false;
+        };
         // Cleared before the poll so a wake during it re-queues the task.
         slot.flag.scheduled.store(false, Ordering::Release);
-        let mut cx = Context::from_waker(&slot.waker);
-        slot.task.poll(&mut cx)
+        let waker = slot.waker.clone();
+        let done = task.poll(&mut Context::from_waker(&waker));
+        // Look the slot up again: a re-entrant spawn may have moved `slots`.
+        // (A running slot is never reaped or reused, so it is still there.)
+        let Some(entry) = self.slots.get_mut(id) else { return false };
+        let Some(slot) = entry.as_mut() else { return false };
+        if let Some(status) = slot.cancel.take() {
+            *entry = None;
+            task.deliver(Some(status));
+            return false;
+        }
+        slot.task = Some(task);
+        done
     }
 
     /// Reap `id` and deliver its output or cancel status; an already-reaped id
-    /// is a no-op (a re-entrant abort cannot double-deliver).
+    /// is a no-op (a re-entrant abort cannot double-deliver). A cancel aimed at
+    /// a task that is being polled is recorded and applied when its poll returns.
     pub(crate) fn deliver(&mut self, id: usize, cancel: Option<i32>) {
-        if let Some(slot) = self.slots.get_mut(id).and_then(|s| s.take()) {
-            slot.task.deliver(cancel);
+        let Some(entry) = self.slots.get_mut(id) else { return };
+        if let Some(slot) = entry.as_mut().filter(|slot| slot.task.is_none()) {
+            if let Some(status) = cancel {
+                slot.cancel.get_or_insert(status);
+            }
+            return;
+        }
+        if let Some(task) = entry.take().and_then(|slot| slot.task) {
+            task.deliver(cancel);
         }
     }
 

@@ -192,3 +192,103 @@ fn callback_may_call_ares_process_mid_turn() {
         ares_destroy(channel);
     }
 }
+
+// --- Server-state callback re-entry ---------------------------------------
+//
+// The server-state callback fires synchronously from inside a task's poll
+// (`AsyncClient::notify`). Re-entering the channel from it must not free or
+// move the task being polled: a cancel only marks it, and a spawn may grow the
+// executor's slot table without invalidating the poll in progress.
+
+const ARES_ECANCELLED: c_int = 24;
+
+struct ServState {
+    channel: Channel,
+    name: *const libc::c_char,
+    /// How many queries to spawn from the first server-state callback.
+    spawn: usize,
+    /// Cancel the channel from the first server-state callback.
+    cancel: bool,
+    state_calls: usize,
+    outer_calls: usize,
+    outer_status: c_int,
+    inner_calls: usize,
+    inner_ok: usize,
+}
+
+unsafe extern "C" fn servstate_outer_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
+    let st = &mut *(arg as *mut ServState);
+    st.outer_calls += 1;
+    st.outer_status = status;
+}
+
+unsafe extern "C" fn servstate_inner_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
+    let st = &mut *(arg as *mut ServState);
+    st.inner_calls += 1;
+    if status == ARES_SUCCESS {
+        st.inner_ok += 1;
+    }
+}
+
+unsafe extern "C" fn servstate_cb(_server: *const libc::c_char, _success: c_int, _flags: c_int, arg: *mut c_void) {
+    let st = &mut *(arg as *mut ServState);
+    st.state_calls += 1;
+    if st.state_calls != 1 {
+        return;
+    }
+    if st.cancel {
+        ares_cancel(st.channel);
+    }
+    for _ in 0..st.spawn {
+        ares_query_dnsrec(st.channel, st.name, C_IN, T_A, Some(servstate_inner_cb), arg, ptr::null_mut());
+    }
+}
+
+unsafe fn run_servstate(spawn: usize, cancel: bool) -> ServState {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind mini server");
+    server.set_nonblocking(true).expect("nonblocking");
+    let port = server.local_addr().unwrap().port();
+
+    let mut channel: Channel = ptr::null_mut();
+    assert_eq!(ares_init(&mut channel), ARES_SUCCESS);
+    let csv = CString::new(format!("127.0.0.1:{port}")).unwrap();
+    assert_eq!(ares_set_servers_ports_csv(channel, csv.as_ptr()), ARES_SUCCESS);
+
+    let name = CString::new("servstate.example").unwrap();
+    let mut st = ServState {
+        channel,
+        name: name.as_ptr(),
+        spawn,
+        cancel,
+        state_calls: 0,
+        outer_calls: 0,
+        outer_status: -1,
+        inner_calls: 0,
+        inner_ok: 0,
+    };
+    let arg = &mut st as *mut _ as *mut c_void;
+    ares_set_server_state_callback(channel, Some(servstate_cb), arg);
+    ares_query_dnsrec(channel, name.as_ptr(), C_IN, T_A, Some(servstate_outer_cb), arg, ptr::null_mut());
+    drive(channel, &server, &|| st.outer_calls > 0 && st.inner_calls == st.spawn);
+    ares_destroy(channel);
+    st
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: UDP sockets + syscalls; Miri can't run them")]
+fn server_state_callback_may_cancel_the_polled_query() {
+    let st = unsafe { run_servstate(0, true) };
+    assert_eq!(st.outer_calls, 1, "the polled query is delivered exactly once");
+    assert_eq!(st.outer_status, ARES_ECANCELLED, "a cancel during its poll wins");
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: UDP sockets + syscalls; Miri can't run them")]
+fn server_state_callback_may_spawn_queries() {
+    // Enough spawns to reallocate the executor's slot table mid-poll.
+    let st = unsafe { run_servstate(64, false) };
+    assert_eq!(st.outer_calls, 1);
+    assert_eq!(st.outer_status, ARES_SUCCESS);
+    assert_eq!(st.inner_calls, 64, "every spawned query completes");
+    assert_eq!(st.inner_ok, 64);
+}
