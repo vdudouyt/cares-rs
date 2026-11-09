@@ -108,53 +108,49 @@ impl UdpConn {
 
     /// Drain + route waiting datagrams, then resolve `tag`: `Ready(Ok)` if a
     /// message is now in its slot, `Ready(Err(UnexpectedEof))` if the socket died, else `Pending`.
-    pub(crate) fn poll_read(&mut self, tag: u16) -> Poll<io::Result<Vec<u8>>> {
-        if self.dead {
-            return Poll::Ready(Err(dead()));
+    ///
+    /// Takes the cell rather than `&mut self`: the socket is read with `conn`
+    /// unborrowed, since a custom `arecvfrom` may re-enter the channel (and touch
+    /// this conn, e.g. a new query joining it or a cancel releasing its slots).
+    pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<Vec<u8>>> {
+        let sock = {
+            let this = conn.borrow();
+            if this.dead {
+                return Poll::Ready(Err(dead()));
+            }
+            this.sock.clone()
+        };
+        let (frames, alive) = read_datagrams(&sock);
+        let mut this = conn.borrow_mut();
+        for frame in frames {
+            this.route(frame);
         }
-        let alive = self.recv_and_route();
         if !alive {
             // A hard error is sticky: wake every sibling waiter, since their
             // replies can never arrive now.
-            self.dead = true;
-            self.dead_since.get_or_insert_with(Instant::now);
-            for slot in self.inbox.values() {
+            this.dead = true;
+            this.dead_since.get_or_insert_with(Instant::now);
+            for slot in this.inbox.values() {
                 slot.wake();
             }
         }
-        match self.take(tag) {
+        match this.take(tag) {
             Some(msg) => Poll::Ready(Ok(msg)),
-            None if self.dead => Poll::Ready(Err(dead())),
+            None if this.dead => Poll::Ready(Err(dead())),
             None => Poll::Pending,
         }
     }
 
-    /// Drain the socket until `WouldBlock`, routing each datagram by tag into
-    /// `inbox` (unknown tags dropped); returns `false` if the socket died.
-    fn recv_and_route(&mut self) -> bool {
-        let sock = self.sock.clone();
-        let drain = sock.get_ref().drain_safe();
-        loop {
-            match sock.read(|s, scratch| recv_datagram(s, scratch)) {
-                Poll::Ready(Ok(frame)) => {
-                    if let Some(tag) = dns_tag(&frame) {
-                        if let Some(slot) = self.inbox.get_mut(&tag) {
-                            slot.deliver(frame);
-                        }
-                    } else if let Some(slot) = self.inbox.values_mut().find(|s| s.reply.is_none()) {
-                        // Untaggable datagram: hand it to an awaiting waiter so
-                        // the application sees (and rejects) it.
-                        slot.deliver(frame);
-                    }
-                    // A caller-supplied socket may be blocking: one datagram per
-                    // readiness cycle is safe; the next cycle drains the rest.
-                    if !drain {
-                        return true;
-                    }
-                }
-                Poll::Ready(Err(_)) => return false,
-                Poll::Pending => return true,
+    /// Route one datagram by tag into `inbox` (unknown tags dropped).
+    fn route(&mut self, frame: Vec<u8>) {
+        if let Some(tag) = dns_tag(&frame) {
+            if let Some(slot) = self.inbox.get_mut(&tag) {
+                slot.deliver(frame);
             }
+        } else if let Some(slot) = self.inbox.values_mut().find(|s| s.reply.is_none()) {
+            // Untaggable datagram: hand it to an awaiting waiter so the
+            // application sees (and rejects) it.
+            slot.deliver(frame);
         }
     }
 
@@ -201,6 +197,27 @@ impl UdpConn {
     /// The per-conn cap is spent (`max_queries == 0` means unlimited).
     fn exhausted(&self, max_queries: usize) -> bool {
         max_queries != 0 && self.total_queries >= max_queries
+    }
+}
+
+/// Read the datagrams waiting on `sock` until `WouldBlock`; `false` if the
+/// socket died (frames read before the error are still returned).
+fn read_datagrams(sock: &Async) -> (Vec<Vec<u8>>, bool) {
+    let drain = sock.get_ref().drain_safe();
+    let mut frames = Vec::new();
+    loop {
+        match sock.read(|s, scratch| recv_datagram(s, scratch)) {
+            Poll::Ready(Ok(frame)) => {
+                frames.push(frame);
+                // A caller-supplied socket may be blocking: one datagram per
+                // readiness cycle is safe; the next cycle drains the rest.
+                if !drain {
+                    return (frames, true);
+                }
+            }
+            Poll::Ready(Err(_)) => return (frames, false),
+            Poll::Pending => return (frames, true),
+        }
     }
 }
 
@@ -469,7 +486,7 @@ mod tests {
 
         // A drains: the datagram belongs to B, so it goes into B's slot and
         // wakes B (A gets Pending for its own tag).
-        assert!(matches!(uc.borrow_mut().poll_read(0x1111), Poll::Pending));
+        assert!(matches!(UdpConn::poll_read(&uc, 0x1111), Poll::Pending));
         assert!(b.fired());
         assert!(uc.borrow_mut().take(0x1234).is_some());
     }

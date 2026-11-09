@@ -126,8 +126,8 @@ impl Conn {
     fn read(&mut self) -> Poll<io::Result<Vec<u8>>> {
         // The shared conn owns the drain, route, and per-tag demux.
         match &mut self.wire {
-            Wire::Shared(c, tag) => c.borrow_mut().poll_read(*tag),
-            Wire::SharedUdp(c, tag) => c.borrow_mut().poll_read(*tag),
+            Wire::Shared(c, tag) => TcpConn::poll_read(c, *tag),
+            Wire::SharedUdp(c, tag) => UdpConn::poll_read(c, *tag),
         }
     }
 

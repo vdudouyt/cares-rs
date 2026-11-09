@@ -105,21 +105,27 @@ impl TcpConn {
 
     /// Drain + route this cycle, then resolve `tag`: `Ready(Ok)` if a frame is now
     /// in its slot, `Ready(Err(UnexpectedEof))` if the connection died, else `Pending`.
-    pub(crate) fn poll_read(&mut self, tag: u16) -> Poll<io::Result<Vec<u8>>> {
-        let alive = self.recv_and_route();
-        match self.take(tag) {
+    ///
+    /// Takes the cell rather than `&mut self`: the socket is read with `conn`
+    /// unborrowed, since a custom `arecvfrom` may re-enter the channel (and touch
+    /// this conn, e.g. a cancel releasing its slots).
+    pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<Vec<u8>>> {
+        let sock = conn.borrow().sock.clone();
+        let mut bytes = Vec::new();
+        let alive = sock.read(|s, scratch| recv_stream(s, &mut bytes, scratch));
+        let mut this = conn.borrow_mut();
+        this.rbuf.extend_from_slice(&bytes);
+        this.route();
+        match this.take(tag) {
             Some(msg) => Poll::Ready(Ok(msg)),
             None if !alive => Poll::Ready(Err(dead())),
             None => Poll::Pending,
         }
     }
 
-    /// Drain the socket, reassemble frames, and route each by tag into `inbox`
-    /// (unknown tags dropped); returns `false` if the connection died.
-    fn recv_and_route(&mut self) -> bool {
-        let sock = self.sock.clone();
-        let rbuf = &mut self.rbuf;
-        let alive = sock.read(|s, scratch| recv_stream(s, rbuf, scratch));
+    /// Reassemble frames from `rbuf` and route each by tag into `inbox`
+    /// (unknown tags dropped).
+    fn route(&mut self) {
         while let Some(frame) = dns_frame(&mut self.rbuf) {
             if let Some(tag) = dns_tag(&frame) {
                 if let Some(slot) = self.inbox.get_mut(&tag) {
@@ -131,7 +137,6 @@ impl TcpConn {
                 slot.deliver(frame);
             }
         }
-        alive
     }
 }
 

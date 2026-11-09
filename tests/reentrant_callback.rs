@@ -3,6 +3,7 @@
 //! `BorrowMutError`, so this primes the cache and re-enters from the callback.
 
 use std::ffi::{c_int, c_void, CString};
+use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ use cares_rs::ares_options::{
     ares_init_options, ares_options, ARES_FLAG_USEVC, ARES_OPT_FLAGS, ARES_OPT_QUERY_CACHE,
     ARES_OPT_SOCK_STATE_CB, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES,
 };
+use cares_rs::ares_socket::{ares_set_socket_functions, AresSocketFunctions};
 use cares_rs::dns_record::ares_dns_record_t;
 use cares_rs::*;
 
@@ -428,4 +430,188 @@ fn sock_state_callback_may_cancel_on_tcp_close() {
         ares_destroy(st.channel);
         drop(listener);
     }
+}
+
+// --- Custom socket function re-entry ---------------------------------------
+//
+// A custom `arecvfrom` runs inside the receive path. It once ran while the
+// shared conn's `RefCell` was borrowed, so re-entering the channel from it
+// (a cancel releasing slots, a new query joining the conn) panicked with
+// "already borrowed", aborting the host.
+
+#[derive(Clone, Copy, PartialEq)]
+enum Reenter {
+    Cancel,
+    Query,
+}
+
+struct RecvHook {
+    channel: Channel,
+    action: Reenter,
+    fired: bool,
+    results: Vec<(u8, c_int)>,
+    /// Callback arg for query `c`, started from inside `arecvfrom`.
+    third: (*mut RecvHook, u8),
+}
+
+unsafe extern "C" fn hook_query_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
+    // `arg` points at a (hook state, query letter) pair.
+    let (st, name) = &mut *(arg as *mut (*mut RecvHook, u8));
+    (**st).results.push((*name, status));
+}
+
+unsafe extern "C" fn hook_asocket(domain: c_int, ty: c_int, proto: c_int, _ud: *mut c_void) -> c_int {
+    let fd = libc::socket(domain, ty, proto);
+    let flags = libc::fcntl(fd, libc::F_GETFL);
+    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    fd
+}
+
+unsafe extern "C" fn hook_aclose(fd: c_int, _ud: *mut c_void) -> c_int {
+    libc::close(fd)
+}
+
+unsafe extern "C" fn hook_aconnect(fd: c_int, addr: *const libc::sockaddr, len: libc::socklen_t, _ud: *mut c_void) -> c_int {
+    libc::connect(fd, addr, len)
+}
+
+unsafe extern "C" fn hook_asendv(fd: c_int, iov: *const libc::iovec, cnt: c_int, _ud: *mut c_void) -> isize {
+    libc::writev(fd, iov, cnt)
+}
+
+unsafe extern "C" fn hook_arecvfrom(
+    fd: c_int,
+    buf: *mut c_void,
+    len: usize,
+    flags: c_int,
+    from: *mut libc::sockaddr,
+    from_len: *mut libc::socklen_t,
+    ud: *mut c_void,
+) -> isize {
+    let n = libc::recvfrom(fd, buf, len, flags, from, from_len);
+    let errno = *libc::__errno_location();
+    let st = &mut *(ud as *mut RecvHook);
+    if n > 0 && !st.fired {
+        st.fired = true;
+        match st.action {
+            Reenter::Cancel => ares_cancel(st.channel),
+            Reenter::Query => {
+                let name = CString::new("c.example").unwrap();
+                st.third = (st as *mut RecvHook, b'c');
+                let third = ptr::addr_of_mut!(st.third) as *mut c_void;
+                ares_query_dnsrec(st.channel, name.as_ptr(), C_IN, T_A, Some(hook_query_cb), third, ptr::null_mut());
+            }
+        }
+    }
+    *libc::__errno_location() = errno;
+    n
+}
+
+/// A UDP and a TCP DNS responder on one port, answering every A query with 127.1.2.3.
+fn threaded_responders() -> u16 {
+    let udp = UdpSocket::bind("127.0.0.1:0").expect("bind udp");
+    let port = udp.local_addr().unwrap().port();
+    let tcp = TcpListener::bind(("127.0.0.1", port)).expect("bind tcp");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            let _ = udp.send_to(&craft_reply(&buf[..n]), from);
+        }
+    });
+    std::thread::spawn(move || {
+        for stream in tcp.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || loop {
+                let mut len = [0u8; 2];
+                if s.read_exact(&mut len).is_err() {
+                    return;
+                }
+                let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+                if s.read_exact(&mut q).is_err() {
+                    return;
+                }
+                let r = craft_reply(&q);
+                let mut out = (r.len() as u16).to_be_bytes().to_vec();
+                out.extend_from_slice(&r);
+                if s.write_all(&out).is_err() {
+                    return;
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Queries `a` and `b` share one conn; the first non-empty `arecvfrom` re-enters.
+unsafe fn run_recv_hook(action: Reenter, tcp: bool) -> Vec<(u8, c_int)> {
+    let port = threaded_responders();
+    let mut st = RecvHook { channel: ptr::null_mut(), action, fired: false, results: vec![], third: (ptr::null_mut(), b'c') };
+    let mut opts: ares_options = std::mem::zeroed();
+    opts.flags = if tcp { ARES_FLAG_USEVC } else { 0 };
+    assert_eq!(ares_init_options(&mut st.channel, &opts, ARES_OPT_FLAGS), ARES_SUCCESS);
+    let csv = CString::new(format!("127.0.0.1:{port}")).unwrap();
+    assert_eq!(ares_set_servers_ports_csv(st.channel, csv.as_ptr()), ARES_SUCCESS);
+    let funcs = AresSocketFunctions {
+        asocket: Some(hook_asocket),
+        aclose: Some(hook_aclose),
+        aconnect: Some(hook_aconnect),
+        arecvfrom: Some(hook_arecvfrom),
+        asendv: Some(hook_asendv),
+    };
+    let stp: *mut RecvHook = &mut st;
+    ares_set_socket_functions(st.channel, &funcs, stp as *mut c_void);
+
+    let mut args = [(stp, b'a'), (stp, b'b')];
+    for arg in args.iter_mut() {
+        let name = CString::new(format!("{}.example", arg.1 as char)).unwrap();
+        let argp = arg as *mut _ as *mut c_void;
+        ares_query_dnsrec(st.channel, name.as_ptr(), C_IN, T_A, Some(hook_query_cb), argp, ptr::null_mut());
+    }
+    let want = if action == Reenter::Query { 3 } else { 2 };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (*stp).results.len() < want && Instant::now() < deadline {
+        let mut socks = [ARES_SOCKET_BAD; ARES_GETSOCK_MAXNUM];
+        let mask = ares_getsock(st.channel, socks.as_mut_ptr(), ARES_GETSOCK_MAXNUM as c_int);
+        if mask == 0 {
+            ares_process_fd(st.channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD);
+        }
+        for &sock in socks.iter().filter(|&&s| s != ARES_SOCKET_BAD) {
+            ares_process_fd(st.channel, sock, sock);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    ares_destroy(st.channel);
+    let mut results = (*stp).results.clone();
+    results.sort();
+    results
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: sockets + syscalls; Miri can't run them")]
+fn arecvfrom_may_cancel_udp() {
+    let r = unsafe { run_recv_hook(Reenter::Cancel, false) };
+    assert_eq!(r.len(), 2, "each query is delivered exactly once: {r:?}");
+    assert!(r.iter().any(|&(_, s)| s == ARES_ECANCELLED), "the cancel took effect: {r:?}");
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: sockets + syscalls; Miri can't run them")]
+fn arecvfrom_may_cancel_tcp() {
+    let r = unsafe { run_recv_hook(Reenter::Cancel, true) };
+    assert_eq!(r.len(), 2, "each query is delivered exactly once: {r:?}");
+    assert!(r.iter().any(|&(_, s)| s == ARES_ECANCELLED), "the cancel took effect: {r:?}");
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: sockets + syscalls; Miri can't run them")]
+fn arecvfrom_may_start_query_udp() {
+    let r = unsafe { run_recv_hook(Reenter::Query, false) };
+    assert_eq!(r, vec![(b'a', ARES_SUCCESS), (b'b', ARES_SUCCESS), (b'c', ARES_SUCCESS)]);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: sockets + syscalls; Miri can't run them")]
+fn arecvfrom_may_start_query_tcp() {
+    let r = unsafe { run_recv_hook(Reenter::Query, true) };
+    assert_eq!(r, vec![(b'a', ARES_SUCCESS), (b'b', ARES_SUCCESS), (b'c', ARES_SUCCESS)]);
 }
