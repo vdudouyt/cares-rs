@@ -185,9 +185,12 @@ impl ChannelData {
             self.executor.deliver(id, Some(status));
         }
         drop(self.state.rt.take_spawned());
-        self.state.shared.tcp_pool.borrow_mut().clear();
-        let retired = self.state.shared.udp_pool.borrow_mut().clear();
-        drop(retired);
+        // Conns are dropped after each pool borrow ends: closing one fires the
+        // socket-state callback, which may re-enter (e.g. ares_cancel → here).
+        let tcp = self.state.shared.tcp_pool.borrow_mut().clear();
+        drop(tcp);
+        let udp = self.state.shared.udp_pool.borrow_mut().clear();
+        drop(udp);
     }
 
     pub(crate) fn all_poll_fds(&self) -> Vec<(i32, bool)> {

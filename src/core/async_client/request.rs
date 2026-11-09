@@ -223,7 +223,8 @@ impl AsyncClient {
     /// conn is retired.
     fn discard_conn(&self, q: &QueryState, conn: &Conn) {
         if q.use_tcp {
-            self.shared.tcp_pool.borrow_mut().remove(q.server);
+            let evicted = self.shared.tcp_pool.borrow_mut().remove(q.server);
+            drop(evicted); // after the borrow: closing may fire C callbacks
         } else if self.optmask & ARES_OPT_EVENT_THREAD != 0 {
             conn.mark_dead();
         } else {
@@ -459,7 +460,8 @@ impl AsyncClient {
                     let sock = self.rt.tcp(ep.bind).ok()?;
                     let _ = sock.get_ref().connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
                     let c = TcpConn::new(sock);
-                    self.shared.tcp_pool.borrow_mut().insert(s, c.clone());
+                    let replaced = self.shared.tcp_pool.borrow_mut().insert(s, c.clone());
+                    drop(replaced); // after the borrow: closing may fire C callbacks
                     Some(c)
                 });
                 checked_out.map(|c| Conn::shared(c, qid))

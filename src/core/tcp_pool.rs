@@ -137,6 +137,11 @@ impl TcpConn {
 
 /// Shared stream connections per server (upstream: one `server->tcp_conn`, all
 /// queries pipelined on it).
+///
+/// Methods that drop connections hand them back instead (`#[must_use]`): the
+/// last reference closing fires the C socket-state callback, which may re-enter
+/// the channel and borrow this pool, so callers drop them after releasing the
+/// pool borrow (as `UdpPool::clear` does).
 pub(crate) struct TcpPool {
     conns: HashMap<ServerId, Rc<RefCell<TcpConn>>>,
 }
@@ -146,12 +151,14 @@ impl TcpPool {
         TcpPool { conns: HashMap::new() }
     }
 
-    pub fn clear(&mut self) {
-        self.conns.clear();
+    #[must_use = "drop the evicted conns after releasing the pool borrow"]
+    pub fn clear(&mut self) -> Vec<Rc<RefCell<TcpConn>>> {
+        self.conns.drain().map(|(_, conn)| conn).collect()
     }
 
-    pub fn remove(&mut self, key: ServerId) {
-        self.conns.remove(&key);
+    #[must_use = "drop the evicted conn after releasing the pool borrow"]
+    pub fn remove(&mut self, key: ServerId) -> Option<Rc<RefCell<TcpConn>>> {
+        self.conns.remove(&key)
     }
 
     /// The live connection to `key`. Callers clone the `Rc` so no pool borrow
@@ -160,8 +167,10 @@ impl TcpPool {
         self.conns.get(&key).cloned()
     }
 
-    pub fn insert(&mut self, key: ServerId, conn: Rc<RefCell<TcpConn>>) {
-        self.conns.insert(key, conn);
+    /// Returns the conn previously pooled for `key`, if any.
+    #[must_use = "drop the replaced conn after releasing the pool borrow"]
+    pub fn insert(&mut self, key: ServerId, conn: Rc<RefCell<TcpConn>>) -> Option<Rc<RefCell<TcpConn>>> {
+        self.conns.insert(key, conn)
     }
 }
 

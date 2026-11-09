@@ -3,12 +3,13 @@
 //! `BorrowMutError`, so this primes the cache and re-enters from the callback.
 
 use std::ffi::{c_int, c_void, CString};
-use std::net::UdpSocket;
+use std::net::{TcpListener, UdpSocket};
 use std::ptr;
 use std::time::{Duration, Instant};
 
 use cares_rs::ares_options::{
-    ares_init_options, ares_options, ARES_OPT_QUERY_CACHE, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES,
+    ares_init_options, ares_options, ARES_FLAG_USEVC, ARES_OPT_FLAGS, ARES_OPT_QUERY_CACHE,
+    ARES_OPT_SOCK_STATE_CB, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES,
 };
 use cares_rs::dns_record::ares_dns_record_t;
 use cares_rs::*;
@@ -363,4 +364,68 @@ fn server_state_callback_may_spawn_queries() {
     assert_eq!(st.outer_status, ARES_SUCCESS);
     assert_eq!(st.inner_calls, 64, "every spawned query completes");
     assert_eq!(st.inner_ok, 64);
+}
+
+// --- Socket-state callback re-entry ---------------------------------------
+//
+// Closing a pooled TCP conn fires the socket-state callback with (fd, 0, 0).
+// When that close happens inside `abort_all` and the callback calls
+// ares_cancel, the nested abort must not find the TCP pool still borrowed
+// (it once panicked with "already borrowed", aborting the host).
+
+struct SockClose {
+    channel: Channel,
+    closes: usize,
+    calls: usize,
+    status: c_int,
+}
+
+extern "C" fn cancel_on_close(data: *mut c_void, _fd: ares_socket_t, readable: c_int, writable: c_int) {
+    let st = unsafe { &mut *(data as *mut SockClose) };
+    if readable == 0 && writable == 0 {
+        st.closes += 1;
+        unsafe { ares_cancel(st.channel) };
+    }
+}
+
+unsafe extern "C" fn sockclose_query_cb(arg: *mut c_void, status: c_int, _timeouts: usize, _rec: *const ares_dns_record_t) {
+    let st = &mut *(arg as *mut SockClose);
+    st.calls += 1;
+    st.status = status;
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: TCP sockets + syscalls; Miri can't run them")]
+fn sock_state_callback_may_cancel_on_tcp_close() {
+    unsafe {
+        // Accepts via the backlog but never answers, so the query stays in flight.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let mut st = SockClose { channel: ptr::null_mut(), closes: 0, calls: 0, status: -1 };
+        let arg = &mut st as *mut _ as *mut c_void;
+        let mut opts: ares_options = std::mem::zeroed();
+        opts.flags = ARES_FLAG_USEVC;
+        opts.sock_state_cb = Some(cancel_on_close);
+        opts.sock_state_cb_data = arg;
+        assert_eq!(
+            ares_init_options(&mut st.channel, &opts, ARES_OPT_FLAGS | ARES_OPT_SOCK_STATE_CB),
+            ARES_SUCCESS
+        );
+        let csv = CString::new(format!("127.0.0.1:{port}")).unwrap();
+        assert_eq!(ares_set_servers_ports_csv(st.channel, csv.as_ptr()), ARES_SUCCESS);
+
+        let name = CString::new("tcpclose.example").unwrap();
+        ares_query_dnsrec(st.channel, name.as_ptr(), C_IN, T_A, Some(sockclose_query_cb), arg, ptr::null_mut());
+        assert_eq!(st.calls, 0, "query is in flight on a pooled TCP conn");
+
+        // Closes the pooled conn → callback → nested ares_cancel.
+        ares_cancel(st.channel);
+        assert_eq!(st.closes, 1, "the TCP conn was closed once");
+        assert_eq!(st.calls, 1, "the query is delivered exactly once");
+        assert_eq!(st.status, ARES_ECANCELLED);
+
+        ares_destroy(st.channel);
+        drop(listener);
+    }
 }
