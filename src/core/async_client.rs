@@ -22,7 +22,7 @@ pub(crate) use addrinfo::*;
 pub(crate) use config::*;
 pub(crate) use lookups::*;
 pub(crate) use packet::*;
-pub(crate) use request::{Probe, ServerEndpoint};
+pub(crate) use request::ServerEndpoint;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, CString};
@@ -167,11 +167,18 @@ impl AsyncClient {
     /// Mint the per-lookup copy every entry shim runs on: clone config and
     /// shared `Rc`s, and snapshot endpoints.
     pub(crate) fn derive(&mut self) -> Self {
-        let hosts = self.hosts();
+        self.hosts();
+        self.copy()
+    }
+
+    /// The per-lookup copy without the lazy hosts load: `derive` minus `&mut`,
+    /// for a lookup copy (hosts already loaded) that needs a copy of its own,
+    /// e.g. to spawn a failover probe.
+    fn copy(&self) -> Self {
         AsyncClient {
             config: self.config.clone(),
             rt: self.rt.clone(),
-            hosts: Some(hosts),
+            hosts: Some(self.hostsfile()),
             default_udp_port: self.default_udp_port,
             default_tcp_port: self.default_tcp_port,
             socket_send_buffer_size: self.socket_send_buffer_size,
@@ -242,9 +249,6 @@ impl AsyncClient {
 /// A fire-and-forget side effect the ffi applies after a poll.
 pub(crate) enum Effect {
     NotifyServerState { server: ServerId, ok: bool, tcp: bool },
-    /// Spawn this failover probe as its own task (no callback), so the lookup
-    /// that raised it never waits for it.
-    Probe(Probe),
 }
 
 /// A hostent lifecycle's result plus its timeout count, for `ares_host_callback`.

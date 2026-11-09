@@ -331,17 +331,37 @@ impl Drop for Timer {
     }
 }
 
+/// A detached task waiting for the host to move it into the executor.
+pub(crate) type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
+
 /// A channel's runtime handle — smol's implicit global reactor made explicit:
-/// creates [`Async`](crate::async_runtime::io::Async) sockets and [`Timer`]s.
+/// creates [`Async`](crate::async_runtime::io::Async) sockets and [`Timer`]s,
+/// and spawns detached tasks.
 #[derive(Clone)]
 pub(crate) struct Runtime {
     reactor: Rc<Reactor>,
     factory: Rc<dyn SocketFactory>,
+    /// Tasks from [`Runtime::spawn`], not yet taken by the host.
+    spawned: Rc<RefCell<Vec<SpawnedTask>>>,
 }
 
 impl Runtime {
     pub(crate) fn new(factory: Rc<dyn SocketFactory>) -> Self {
-        Runtime { reactor: Reactor::new(), factory }
+        Runtime { reactor: Reactor::new(), factory, spawned: Rc::default() }
+    }
+
+    /// Spawn a detached task (≈ `tokio::spawn`): fire-and-forget, with no
+    /// output, so the spawning task never waits for it. It runs until it
+    /// completes or the channel aborts its tasks. The executor is busy polling
+    /// the caller, so the task is queued here and the host moves it into the
+    /// executor (see [`Runtime::take_spawned`]) once that poll returns.
+    pub(crate) fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
+        self.spawned.borrow_mut().push(Box::pin(fut));
+    }
+
+    /// Take every task queued by [`Runtime::spawn`] since the last call.
+    pub(crate) fn take_spawned(&self) -> Vec<SpawnedTask> {
+        std::mem::take(&mut *self.spawned.borrow_mut())
     }
 
     pub(crate) fn reactor(&self) -> &Rc<Reactor> {

@@ -140,13 +140,12 @@ impl ChannelData {
                 Effect::NotifyServerState { server, ok, tcp } => {
                     self.invoke_server_state_callback(server, ok, tcp)
                 }
-                // A probe is its own task with no C callback (upstream sends it
-                // with a NULL callback).
-                Effect::Probe(probe) => {
-                    let client = self.state.derive();
-                    self.spawn(client.probe(probe), |_| {});
-                }
             }
+        }
+        // Detached tasks the poll spawned (e.g. failover probes) become their own
+        // executor tasks with no C callback.
+        for task in self.state.rt.take_spawned() {
+            self.spawn(task, |_| {});
         }
         if done {
             self.executor.deliver(id, None);
@@ -192,6 +191,7 @@ impl ChannelData {
         for id in self.executor.ids() {
             self.executor.deliver(id, Some(status));
         }
+        drop(self.state.rt.take_spawned());
         self.state.shared.tcp_pool.borrow_mut().clear();
         let retired = self.state.shared.udp_pool.borrow_mut().clear();
         drop(retired);

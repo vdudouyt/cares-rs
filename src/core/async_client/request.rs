@@ -28,7 +28,7 @@ impl AsyncClient {
     /// Upstream `ares_probe_failed_server`, on a query's first send: with
     /// probability 1/`retry_chance`, duplicate it (fresh qid) to a failed server
     /// past its retry delay that has no probe in flight. The probe runs as its
-    /// own task (`Effect::Probe`), so this query never waits for it.
+    /// detached task, so this query never waits for it.
     fn maybe_probe(&self, q: &QueryState) {
         let chance = q.opts.failover_chance;
         if chance == 0 || !rand::thread_rng().r#gen::<u16>().is_multiple_of(chance) {
@@ -38,14 +38,14 @@ impl AsyncClient {
         let Ok(query) = self.reserve(BytesMut::from(&q.payload[..])) else { return };
         self.shared.health.borrow_mut().set_probing(server, true);
         let probe = Probe { query: Some(query), server, shared: self.shared.clone() };
-        self.shared.effects.borrow_mut().push(Effect::Probe(probe));
+        self.rt.spawn(self.copy().probe(probe));
     }
 
     /// Run a failover probe: one no-retry attempt to its server, whose outcome
     /// only feeds `ServerHealth` and the server-state callback (upstream sends it
     /// with `ARES_SEND_FLAG_NORETRY`). Dropping it clears the server's
     /// probe-in-flight mark.
-    pub(crate) async fn probe(self, mut probe: Probe) {
+    async fn probe(self, mut probe: Probe) {
         let Some(query) = probe.query.take() else { return };
         let mut q = self.start_query(query);
         q.server = probe.server;
@@ -283,7 +283,7 @@ struct QueryState {
 /// A pending failover probe (see [`AsyncClient::maybe_probe`]): its packet,
 /// target server, and the probe-in-flight mark it clears when dropped, whether
 /// it ran to completion or was aborted with the channel.
-pub(crate) struct Probe {
+struct Probe {
     query: Option<ReservedQuery>,
     server: ServerId,
     shared: Rc<ChannelShared>,
