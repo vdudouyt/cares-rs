@@ -124,7 +124,7 @@ pub(crate) const RTYPE_AAAA: u16 = 0x1c;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServerId(pub usize);
 
-/// Reactor-level side effect (executed by ares_process).
+/// A server-state event for the application's callback (fired by `AsyncClient::notify`).
 #[derive(Debug, PartialEq)]
 pub enum ReactorAction {
     NotifyServerState { server: ServerId, ok: bool, tcp: bool },

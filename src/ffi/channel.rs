@@ -5,8 +5,7 @@
 use super::*;
 use crate::core::async_client::{normalize_port, AsyncClient, ServerSpec};
 use crate::core::fds::{clamp_timeout, getsock_mask, nfds, TimeoutChoice};
-use crate::core::async_client::Effect;
-use crate::core::lookup::ServerId;
+use crate::core::async_client::ServerStateHook;
 use crate::async_runtime::executor::Executor;
 use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
@@ -58,7 +57,7 @@ impl ChannelData {
         let socket_factory = std::rc::Rc::new((*self.socket_factory).clone());
         let mut state = self.state.duplicate();
         state.rt.set_factory(socket_factory.clone());
-        ChannelData {
+        let dup = ChannelData {
             state,
             socket_factory,
             server_state_callback: self.server_state_callback,
@@ -71,7 +70,11 @@ impl ChannelData {
             event_mode: self.event_mode,
             event: None,
             lock: Arc::new(ReentrantMutex::new()),
-        }
+        };
+        // The duplicate has fresh core state: rebuild its hook (not an `Rc`
+        // clone — a duplicated event channel runs on its own thread).
+        dup.install_server_state_hook();
+        dup
     }
 
     /// Wake the event thread; a full pipe means it is already awake.
@@ -132,16 +135,6 @@ impl ChannelData {
     /// Advance one task; on `Pending` it has registered its interest with the reactor.
     fn advance(&mut self, id: usize) {
         let done = self.executor.poll(id);
-        // Effects are drained before delivery so the callbacks fire first; taken
-        // out so no `RefCell` borrow is live while they run.
-        let effects = std::mem::take(&mut *self.state.shared.effects.borrow_mut());
-        for effect in effects {
-            match effect {
-                Effect::NotifyServerState { server, ok, tcp } => {
-                    self.invoke_server_state_callback(server, ok, tcp)
-                }
-            }
-        }
         // Detached tasks the poll spawned (e.g. failover probes) become their own
         // executor tasks with no C callback.
         for task in self.state.rt.take_spawned() {
@@ -244,16 +237,28 @@ impl ChannelData {
     }
 
     /// Fire the server-state callback if installed; a stale index is skipped.
-    pub(crate) fn invoke_server_state_callback(&self, server: ServerId, success: bool, is_tcp: bool) {
-        if let Some(cb) = self.server_state_callback {
-            let Some(server_str) = self.state.server_state_string(server, is_tcp) else {
-                return;
-            };
-            let c_server_str = CString::new(server_str).unwrap_or_default();
-            let success_int: c_int = if success { 1 } else { 0 };
-            let flags: c_int = if is_tcp { 1 << 1 } else { 1 << 0 }; // ARES_SERV_STATE_TCP=2, UDP=1
-            unsafe { cb(c_server_str.as_ptr(), success_int, flags, self.server_state_callback_arg) };
-        }
+    /// ares_set_server_state_callback: store the C callback and hand it to core.
+    fn set_server_state_callback(&mut self, callback: ares_server_state_callback, arg: *mut libc::c_void) {
+        self.server_state_callback = callback;
+        self.server_state_callback_arg = arg;
+        self.install_server_state_hook();
+    }
+
+    /// Give core the C server-state callback as a closure. Core calls it
+    /// synchronously from inside a task's poll whenever a query to a server
+    /// succeeds or fails; the callback must not re-enter the channel.
+    fn install_server_state_hook(&self) {
+        let arg = self.server_state_callback_arg;
+        let hook = self.server_state_callback.map(|cb| -> ServerStateHook {
+            std::rc::Rc::new(move |server: &str, ok: bool, tcp: bool| {
+                let server = CString::new(server).unwrap_or_default();
+                let flags = if tcp { ARES_SERV_STATE_TCP } else { ARES_SERV_STATE_UDP };
+                // SAFETY: `cb` and `arg` are what the application registered via
+                // ares_set_server_state_callback; `server` outlives the call.
+                unsafe { cb(server.as_ptr(), c_int::from(ok), flags, arg) };
+            })
+        });
+        *self.state.shared.server_state_hook.borrow_mut() = hook;
     }
 }
 
@@ -745,8 +750,7 @@ pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, ca
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callback: ares_server_state_callback, arg: *mut c_void) {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
-    channeldata.server_state_callback = callback;
-    channeldata.server_state_callback_arg = arg;
+    channeldata.set_server_state_callback(callback, arg);
 }
 
 /// In-flight executor tasks. One host lookup is one task even when it races

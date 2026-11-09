@@ -2,7 +2,7 @@
 //! lookup runs on a [`AsyncClient::derive`]d copy (same runtime handle, the
 //! same [`ChannelShared`], endpoints snapshotted).
 //!
-//! This file holds the struct, `derive`, the shared result/effect types and the
+//! This file holds the struct, `derive`, the shared result types and the
 //! hosts-file helpers. The rest lives in child modules (which see the private
 //! fields through `use super::*`):
 //! - `config`   — construction, `ares_reinit`, defaults, `ares_dup`, the
@@ -142,9 +142,9 @@ pub(crate) struct ChannelShared {
     /// Shared UDP sockets (parallel lookups to one server share a socket, split
     /// across several once [`udp_max_queries`](AsyncClient::udp_max_queries) is reached).
     pub udp_pool: RefCell<UdpPool>,
-    /// Effects raised by in-flight lookups (server-state notifications, probe
-    /// spawns), drained by the ffi after each task poll.
-    pub effects: RefCell<Vec<Effect>>,
+    /// The application's server-state callback (`ares_set_server_state_callback`),
+    /// installed by the ffi; [`AsyncClient::notify`] calls it directly.
+    pub server_state_hook: RefCell<Option<ServerStateHook>>,
     /// The channel's in-flight transaction ids.
     pub qids: RefCell<QidRegistry>,
 }
@@ -157,7 +157,7 @@ impl ChannelShared {
             cache: RefCell::new(QueryCache::default()),
             tcp_pool: RefCell::new(TcpPool::new()),
             udp_pool: RefCell::new(UdpPool::new()),
-            effects: RefCell::new(Vec::new()),
+            server_state_hook: RefCell::new(None),
             qids: RefCell::new(QidRegistry::default()),
         })
     }
@@ -233,23 +233,27 @@ impl AsyncClient {
         self.flags & ARES_FLAG_NORECURSE == 0
     }
 
-    /// Queue server-state notifications for the ffi to fire after this poll.
+    /// Report server successes/failures to the server-state callback, right
+    /// now: it runs inside the task's poll, so callers must not hold a
+    /// `RefCell` borrow across this call. The hook is cloned out of its cell
+    /// first, so even a callback that replaces itself cannot hit a live borrow.
     fn notify(&self, actions: Vec<ReactorAction>) {
-        let mut effects = self.shared.effects.borrow_mut();
+        let hook = self.shared.server_state_hook.borrow().clone();
+        let Some(hook) = hook else { return };
         for a in actions {
             match a {
                 ReactorAction::NotifyServerState { server, ok, tcp } => {
-                    effects.push(Effect::NotifyServerState { server, ok, tcp })
+                    if let Some(server) = self.server_state_string(server, tcp) {
+                        hook(&server, ok, tcp);
+                    }
                 }
             }
         }
     }
 }
 
-/// A fire-and-forget side effect the ffi applies after a poll.
-pub(crate) enum Effect {
-    NotifyServerState { server: ServerId, ok: bool, tcp: bool },
-}
+/// The server-state callback as core sees it: `(server "ip:port", ok, tcp)`.
+pub(crate) type ServerStateHook = Rc<dyn Fn(&str, bool, bool)>;
 
 /// A hostent lifecycle's result plus its timeout count, for `ares_host_callback`.
 pub(crate) type HostReply = (Result<Hostent, AresError>, c_int);
