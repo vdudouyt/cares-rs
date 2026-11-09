@@ -7,7 +7,9 @@ use std::net::UdpSocket;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use cares_rs::ares_options::{ares_init_options, ares_options, ARES_OPT_QUERY_CACHE};
+use cares_rs::ares_options::{
+    ares_init_options, ares_options, ARES_OPT_QUERY_CACHE, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES,
+};
 use cares_rs::dns_record::ares_dns_record_t;
 use cares_rs::*;
 
@@ -30,12 +32,45 @@ fn craft_reply(req: &[u8]) -> Vec<u8> {
 }
 
 unsafe fn drive(channel: Channel, server: &UdpSocket, done: &dyn Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    drive_with(channel, server, done, answer, Duration::from_secs(5));
+}
+
+/// The mock server's behavior: the reply to send for a query, or `None` to stay silent.
+type Responder = fn(&[u8]) -> Option<Vec<u8>>;
+
+fn answer(req: &[u8]) -> Option<Vec<u8>> {
+    Some(craft_reply(req))
+}
+
+/// SERVFAIL echoing the question (no answer records).
+fn servfail(req: &[u8]) -> Option<Vec<u8>> {
+    let mut r = req.to_vec();
+    r[2] = 0x81;
+    r[3] = 0x82;
+    Some(r)
+}
+
+fn silent(_req: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
+/// Run the channel until `done` or `limit`; returns how many queries the mock server received.
+unsafe fn drive_with(
+    channel: Channel,
+    server: &UdpSocket,
+    done: &dyn Fn() -> bool,
+    reply: Responder,
+    limit: Duration,
+) -> usize {
+    let deadline = Instant::now() + limit;
     let mut buf = [0u8; 512];
+    let mut received = 0;
     while !done() && Instant::now() < deadline {
-        if let Ok((n, from)) = server.recv_from(&mut buf) {
-            let reply = craft_reply(&buf[..n]);
-            let _ = server.send_to(&reply, from);
+        while let Ok((n, from)) = server.recv_from(&mut buf) {
+            received += 1;
+            if let Some(reply) = reply(&buf[..n]) {
+                let _ = server.send_to(&reply, from);
+            }
         }
         let mut socks = [ARES_SOCKET_BAD; ARES_GETSOCK_MAXNUM];
         let bitmask = ares_getsock(channel, socks.as_mut_ptr(), ARES_GETSOCK_MAXNUM as c_int);
@@ -47,6 +82,7 @@ unsafe fn drive(channel: Channel, server: &UdpSocket, done: &dyn Fn() -> bool) {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    received
 }
 
 struct Reentrant {
@@ -244,13 +280,22 @@ unsafe extern "C" fn servstate_cb(_server: *const libc::c_char, _success: c_int,
     }
 }
 
-unsafe fn run_servstate(spawn: usize, cancel: bool) -> ServState {
+/// One query against a mock server that behaves per `reply`, with the
+/// server-state callback re-entering per `spawn`/`cancel`. Returns the final
+/// state and how many queries the server received in total, including a
+/// settle period after the query was delivered (to catch stray retries).
+unsafe fn run_servstate(spawn: usize, cancel: bool, reply: Responder) -> (ServState, usize) {
     let server = UdpSocket::bind("127.0.0.1:0").expect("bind mini server");
     server.set_nonblocking(true).expect("nonblocking");
     let port = server.local_addr().unwrap().port();
 
+    // Short timeouts and 2 tries, so a timeout path is hit quickly and a retry
+    // after the cancel would show up within the settle period.
     let mut channel: Channel = ptr::null_mut();
-    assert_eq!(ares_init(&mut channel), ARES_SUCCESS);
+    let mut opts: ares_options = std::mem::zeroed();
+    opts.timeout = 100;
+    opts.tries = 2;
+    assert_eq!(ares_init_options(&mut channel, &opts, ARES_OPT_TIMEOUTMS | ARES_OPT_TRIES), ARES_SUCCESS);
     let csv = CString::new(format!("127.0.0.1:{port}")).unwrap();
     assert_eq!(ares_set_servers_ports_csv(channel, csv.as_ptr()), ARES_SUCCESS);
 
@@ -269,24 +314,51 @@ unsafe fn run_servstate(spawn: usize, cancel: bool) -> ServState {
     let arg = &mut st as *mut _ as *mut c_void;
     ares_set_server_state_callback(channel, Some(servstate_cb), arg);
     ares_query_dnsrec(channel, name.as_ptr(), C_IN, T_A, Some(servstate_outer_cb), arg, ptr::null_mut());
-    drive(channel, &server, &|| st.outer_calls > 0 && st.inner_calls == st.spawn);
+    let done = || st.outer_calls > 0 && st.inner_calls == st.spawn;
+    let mut received = drive_with(channel, &server, &done, reply, Duration::from_secs(5));
+    received += drive_with(channel, &server, &|| false, reply, Duration::from_millis(500));
     ares_destroy(channel);
-    st
+    (st, received)
 }
 
 #[test]
 #[cfg_attr(miri, ignore = "real reactor: UDP sockets + syscalls; Miri can't run them")]
 fn server_state_callback_may_cancel_the_polled_query() {
-    let st = unsafe { run_servstate(0, true) };
+    let (st, _) = unsafe { run_servstate(0, true, answer) };
     assert_eq!(st.outer_calls, 1, "the polled query is delivered exactly once");
     assert_eq!(st.outer_status, ARES_ECANCELLED, "a cancel during its poll wins");
+}
+
+/// The failure callback on a timeout (upstream's `process_timeouts` →
+/// `server_increment_failures` → `ares_requeue_query` shape): the query keeps
+/// running after the callback, so a cancel from it must not free it.
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: UDP sockets + syscalls; Miri can't run them")]
+fn server_state_callback_may_cancel_on_timeout() {
+    let (st, received) = unsafe { run_servstate(0, true, silent) };
+    assert_eq!(st.state_calls, 1, "one failure report, none after the cancel");
+    assert_eq!(st.outer_calls, 1, "the timed-out query is delivered exactly once");
+    assert_eq!(st.outer_status, ARES_ECANCELLED);
+    assert_eq!(received, 1, "no retry is sent after the cancel");
+}
+
+/// The failure callback on a SERVFAIL reply (upstream's `process_answer`
+/// failure branch → `ares_requeue_query`).
+#[test]
+#[cfg_attr(miri, ignore = "real reactor: UDP sockets + syscalls; Miri can't run them")]
+fn server_state_callback_may_cancel_on_servfail() {
+    let (st, received) = unsafe { run_servstate(0, true, servfail) };
+    assert_eq!(st.state_calls, 1, "one failure report, none after the cancel");
+    assert_eq!(st.outer_calls, 1, "the failed query is delivered exactly once");
+    assert_eq!(st.outer_status, ARES_ECANCELLED);
+    assert_eq!(received, 1, "no retry is sent after the cancel");
 }
 
 #[test]
 #[cfg_attr(miri, ignore = "real reactor: UDP sockets + syscalls; Miri can't run them")]
 fn server_state_callback_may_spawn_queries() {
     // Enough spawns to reallocate the executor's slot table mid-poll.
-    let st = unsafe { run_servstate(64, false) };
+    let (st, _) = unsafe { run_servstate(64, false, answer) };
     assert_eq!(st.outer_calls, 1);
     assert_eq!(st.outer_status, ARES_SUCCESS);
     assert_eq!(st.inner_calls, 64, "every spawned query completes");
