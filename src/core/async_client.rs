@@ -7,13 +7,15 @@
 //! fields through `use super::*`):
 //! - `config`   — construction, `ares_reinit`, defaults, `ares_dup`, the
 //!   `ares_options` mapping, server-list exports;
-//! - `packet`   — query packet builders, EDNS, qid reservation;
+//! - `packet`   — query packet builders, qid reservation;
+//! - `edns`     — EDNS(0) OPT synthesis and the per-server DNS cookie exchange;
 //! - `lookups`  — `query_raw`, `gethostbyaddr`, `getnameinfo`, `search*`;
 //! - `addrinfo` — `gethostbyname` / `getaddrinfo` over `resolve_addrinfo`;
 //! - `request`  — the single-query engine, failover probes, transport helpers.
 
 mod addrinfo;
 mod config;
+mod edns;
 mod lookups;
 mod packet;
 mod request;
@@ -50,7 +52,7 @@ use crate::core::lookup::{
     TimeoutVerdict, AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
-use crate::core::edns::{self, CookieVerdict, EDNS_PACKETSZ, ServerCookie};
+use crate::core::edns::{self as edns_wire, CookieVerdict, EDNS_PACKETSZ, ServerCookie};
 use crate::core::packets::AddrRecord;
 use crate::core::nameinfo::{assemble_nameinfo, format_ip_with_scope, get_service_string, AddrInfo, NameinfoReply};
 use crate::core::qid::{QidLease, QidRegistry, ReservedQuery};

@@ -63,7 +63,7 @@ impl AsyncClient {
         let use_tcp = self.config.options.use_vc;
         let mut payload = query.payload.to_vec();
         let dns0x20 = if self.flags & ARES_FLAG_DNS0x20 != 0 && !use_tcp {
-            edns::randomize_question_name(&mut payload)
+            edns_wire::randomize_question_name(&mut payload)
         } else {
             None
         };
@@ -127,7 +127,7 @@ impl AsyncClient {
             return None;
         }
         let summary = summarize(&buf, 0);
-        let full_rcode = edns::extended_rcode(&buf, summary.rcode);
+        let full_rcode = edns_wire::extended_rcode(&buf, summary.rcode);
         match self.validate_cookie(&buf, sent_cookie, q.server, full_rcode) {
             CookieVerdict::Drop => return None,
             CookieVerdict::BadCookie => {
@@ -144,7 +144,7 @@ impl AsyncClient {
         // FORMERR fallback: a server that does not understand EDNS answers the
         // OPT-bearing query with FORMERR. Strip the OPT (and cookie) and retry
         // the same server uncounted.
-        if summary.rcode == 1 && edns::has_opt(&q.payload) && edns::strip_opt(&mut q.payload) {
+        if summary.rcode == 1 && edns_wire::has_opt(&q.payload) && edns_wire::strip_opt(&mut q.payload) {
             return Some(Step::Retry);
         }
         let policy = ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
@@ -304,7 +304,7 @@ impl QueryState {
             return false;
         }
         match self.dns0x20.as_deref() {
-            Some(expected) if !self.use_tcp => edns::question_matches_case(buf, expected),
+            Some(expected) if !self.use_tcp => edns_wire::question_matches_case(buf, expected),
             _ => true,
         }
     }
@@ -329,7 +329,7 @@ async fn recv_reply(conn: &mut Conn, deadline: Instant) -> io::Result<Vec<u8>> {
     }
 }
 
-// ---- Transport helpers: connection checkout, cookies, timeouts ----
+// ---- Transport helpers: connection checkout, timeouts ----
 
 impl AsyncClient {
     /// The retry/timeout knobs an async lifecycle needs.
@@ -352,69 +352,6 @@ impl AsyncClient {
         let Some(c) = conn.shared_udp_handle() else { return };
         let retired = self.shared.udp_pool.borrow_mut().remove(server, &c);
         drop(retired);
-    }
-
-    /// Pass `server`'s cookie state to `f`; `None` once the server has left the
-    /// list (a lookup from before a server-list change).
-    fn with_cookie<R>(&self, server: ServerId, f: impl FnOnce(&mut ServerCookie) -> R) -> Option<R> {
-        if !self.shared.health.borrow().contains(server) {
-            return None;
-        }
-        let mut cookies = self.shared.cookies.borrow_mut();
-        Some(f(cookies.entry(server).or_default()))
-    }
-
-    /// Attach the COOKIE option for this send (UDP only; removed on TCP). Returns
-    /// the 8-byte client cookie placed on the wire, which the response must echo.
-    /// `ARES_EFORMERR` means the rewrite would exceed the 16-bit DNS limit.
-    fn apply_cookie(
-        &self,
-        payload: &mut Vec<u8>,
-        server: ServerId,
-        use_tcp: bool,
-    ) -> Result<Option<[u8; 8]>, AresError> {
-        if !edns::has_opt(payload) {
-            return Ok(None);
-        }
-        if use_tcp {
-            // Cookies are deliberately not used over TCP; strip a stale one
-            // (e.g. after a BADCOOKIE-driven upgrade).
-            if !edns::set_cookie_option(payload, None) {
-                return Err(ARES_EFORMERR.into());
-            }
-            return Ok(None);
-        }
-        let cookie = self.with_cookie(server, ServerCookie::cookie_for_query).flatten();
-        let Some(cookie) = cookie else {
-            // Server is known to be unsupported: no cookie.
-            if !edns::set_cookie_option(payload, None) {
-                return Err(ARES_EFORMERR.into());
-            }
-            return Ok(None);
-        };
-        if cookie.len() < 8 {
-            return Ok(None);
-        }
-        let mut client = [0u8; 8];
-        client.copy_from_slice(&cookie[..8]);
-        if !edns::set_cookie_option(payload, Some(&cookie)) {
-            return Err(ARES_EFORMERR.into());
-        }
-        Ok(Some(client))
-    }
-
-    /// Validate a response's COOKIE option against this server's state.
-    fn validate_cookie(
-        &self,
-        resp: &[u8],
-        sent_client: Option<&[u8; 8]>,
-        server: ServerId,
-        rcode: u16,
-    ) -> CookieVerdict {
-        self.with_cookie(server, |cookie| {
-            cookie.validate_response(resp, sent_client, rcode)
-        })
-        .unwrap_or(CookieVerdict::Accept)
     }
 
     /// Check out a pooled conn (or open one) to the `preferred` server, failing

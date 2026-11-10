@@ -1,6 +1,6 @@
 //! Building outgoing query packets: the wire builders (`build_query`,
-//! `dns_query_payload`, template rewrite, TCP framing, reverse names), EDNS
-//! synthesis, and `reserve` — stamping a channel-unique transaction id.
+//! `dns_query_payload`, template rewrite, TCP framing, reverse names) and
+//! `reserve` — stamping a channel-unique transaction id.
 
 use super::*;
 
@@ -45,34 +45,6 @@ impl AsyncClient {
         let lease = QidLease::reserve(&self.shared).ok_or(AresError::from(ARES_ENOMEM))?;
         payload[0..2].copy_from_slice(&lease.id().to_be_bytes());
         Ok(ReservedQuery { payload, lease })
-    }
-
-    /// The OPT UDP payload size for constructed queries: `None` when EDNS is
-    /// disabled, `Some(EDNS_PACKETSZ)` for zero, and `ARES_EFORMERR` when the
-    /// value does not fit the 16-bit OPT CLASS field.
-    pub(crate) fn edns_udp_size(&self) -> Result<Option<u16>, AresError> {
-        if self.flags & ARES_FLAG_EDNS == 0 {
-            return Ok(None);
-        }
-        let size = if self.ednspsz == 0 { EDNS_PACKETSZ as i32 } else { self.ednspsz };
-        if !(1..=u16::MAX as i32).contains(&size) {
-            return Err(ARES_EFORMERR.into());
-        }
-        Ok(Some(size as u16))
-    }
-
-    /// Append the channel's EDNS OPT (ARES_FLAG_EDNS) unless the query has one.
-    pub(super) fn with_edns(&self, payload: BytesMut) -> Result<BytesMut, AresError> {
-        if edns::has_opt(&payload) {
-            return Ok(payload);
-        }
-        // EDNSPSZ wider than the 16-bit OPT CLASS: rejected before any send.
-        let Some(size) = self.edns_udp_size()? else { return Ok(payload) };
-        let mut buf = payload.to_vec();
-        if !edns::append_opt(&mut buf, size) {
-            return Err(ARES_EFORMERR.into());
-        }
-        Ok(BytesMut::from(buf.as_slice()))
     }
 }
 
