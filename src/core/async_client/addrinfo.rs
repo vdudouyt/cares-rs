@@ -82,7 +82,7 @@ impl AsyncClient {
                         Err(status) => return Err(status.into()),
                     };
 
-                    if self.endpoints.is_empty() {
+                    if self.servers.is_empty() {
                         last_error = ARES_ENOSERVER.into();
                         continue;
                     }
@@ -385,7 +385,7 @@ impl AsyncClient {
                     if is_localhost(hostname) {
                         continue;
                     }
-                    if self.endpoints.is_empty() {
+                    if self.servers.is_empty() {
                         last_error = ARES_ENOSERVER.into();
                         continue;
                     }

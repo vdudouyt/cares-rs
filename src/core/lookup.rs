@@ -2,6 +2,7 @@
 //! no I/O: reply classification, search plans, server health, and verdicts.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 /// Header-level summary of a DNS reply buffer.
@@ -119,14 +120,54 @@ pub use libc::{AF_INET, AF_INET6};
 pub(crate) const RTYPE_A: u16 = 0x01;
 pub(crate) const RTYPE_AAAA: u16 = 0x1c;
 
-/// A server's stable identity on its channel: minted when the server enters the
-/// server list and kept across server-list changes for as long as its address
-/// and ports stay configured (upstream keeps the `ares_server_t`). It keys the
-/// per-server state (`ServerHealth`, cookies, pools) and the channel's
-/// endpoints. A distinct type so it cannot be swapped with the try counters and
-/// ids it travels beside.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ServerId(pub usize);
+/// A server's identity: its address and both ports, the fields upstream's
+/// `ares_server_find` matches on, so a server keeps its identity (and its
+/// per-server state) across server-list changes for as long as it stays
+/// configured. It keys `ServerHealth`, cookies and the pools, and is all a
+/// lookup needs to connect. A distinct type so it cannot be swapped with the try
+/// counters and ids it travels beside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServerId {
+    pub addr: IpAddr,
+    pub udp_port: u16,
+    pub tcp_port: u16,
+}
+
+/// A placeholder that matches no configured server (`0.0.0.0`, ports 0), for
+/// selection on an empty server list: connecting to it simply finds no server.
+impl Default for ServerId {
+    fn default() -> Self {
+        ServerId { addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED), udp_port: 0, tcp_port: 0 }
+    }
+}
+
+impl ServerId {
+    pub fn udp_addr(&self) -> SocketAddr {
+        SocketAddr::from((self.addr, self.udp_port))
+    }
+
+    pub fn tcp_addr(&self) -> SocketAddr {
+        SocketAddr::from((self.addr, self.tcp_port))
+    }
+
+    /// The wildcard local address of the server's family; local-address
+    /// options are applied by the socket factory.
+    pub fn bind_addr(&self) -> SocketAddr {
+        if self.addr.is_ipv6() {
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+        } else {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        }
+    }
+}
+
+#[cfg(test)]
+impl ServerId {
+    /// Test server `n`: `127.0.0.(n + 1)`, port 53 for both transports.
+    pub fn test(n: usize) -> Self {
+        ServerId { addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, n as u8 + 1)), udp_port: 53, tcp_port: 53 }
+    }
+}
 
 /// A server-state event for the application's callback (fired by `AsyncClient::notify`).
 #[derive(Debug, PartialEq)]
@@ -341,9 +382,9 @@ impl ServerHealth {
 
 #[cfg(test)]
 impl ServerHealth {
-    /// A fresh healthy list `ServerId(0)..ServerId(n)`.
+    /// A fresh healthy list `ServerId::test(0)..ServerId::test(n)`.
     pub fn reset(&mut self, n: usize) {
-        self.sync(&(0..n).map(ServerId).collect::<Vec<_>>());
+        self.sync(&(0..n).map(ServerId::test).collect::<Vec<_>>());
     }
 
     pub fn failure_counts(&self) -> Vec<u32> {
@@ -429,44 +470,44 @@ mod tests {
     #[test]
     fn pick_next_lowest_failures_then_index() {
         let mut h = ServerHealth::default();
-        assert_eq!(h.pick_next(), ServerId(0)); // empty -> 0
+        assert_eq!(h.pick_next(), ServerId::default()); // empty -> placeholder
         h.reset(3);
-        assert_eq!(h.pick_next(), ServerId(0));
-        h.record_failure(ServerId(0));
-        assert_eq!(h.pick_next(), ServerId(1));
-        h.record_failure(ServerId(1));
-        h.record_failure(ServerId(1));
-        assert_eq!(h.pick_next(), ServerId(2));
-        h.record_success(ServerId(0));
-        assert_eq!(h.pick_next(), ServerId(0));
+        assert_eq!(h.pick_next(), ServerId::test(0));
+        h.record_failure(ServerId::test(0));
+        assert_eq!(h.pick_next(), ServerId::test(1));
+        h.record_failure(ServerId::test(1));
+        h.record_failure(ServerId::test(1));
+        assert_eq!(h.pick_next(), ServerId::test(2));
+        h.record_success(ServerId::test(0));
+        assert_eq!(h.pick_next(), ServerId::test(0));
     }
 
     #[test]
     fn pick_probe_requires_expired_failure() {
         let mut h = ServerHealth::default();
         h.reset(3);
-        assert_eq!(h.pick_probe(0, ServerId(0)), None); // no failures anywhere
-        h.record_failure(ServerId(1));
+        assert_eq!(h.pick_probe(0, ServerId::test(0)), None); // no failures anywhere
+        h.record_failure(ServerId::test(1));
         // failure recorded just now: not yet expired for a long delay
-        assert_eq!(h.pick_probe(60_000, ServerId(0)), None);
+        assert_eq!(h.pick_probe(60_000, ServerId::test(0)), None);
         // zero delay: immediately eligible
-        assert_eq!(h.pick_probe(0, ServerId(0)), Some(ServerId(1)));
+        assert_eq!(h.pick_probe(0, ServerId::test(0)), Some(ServerId::test(1)));
         // the primary server is excluded
-        assert_eq!(h.pick_probe(0, ServerId(1)), None);
+        assert_eq!(h.pick_probe(0, ServerId::test(1)), None);
         // a server with a probe already in flight is not probed twice
-        h.set_probing(ServerId(1), true);
-        assert_eq!(h.pick_probe(0, ServerId(0)), None);
-        h.set_probing(ServerId(1), false);
-        assert_eq!(h.pick_probe(0, ServerId(0)), Some(ServerId(1)));
+        h.set_probing(ServerId::test(1), true);
+        assert_eq!(h.pick_probe(0, ServerId::test(0)), None);
+        h.set_probing(ServerId::test(1), false);
+        assert_eq!(h.pick_probe(0, ServerId::test(0)), Some(ServerId::test(1)));
     }
 
     #[test]
     fn record_out_of_bounds_is_noop() {
         let mut h = ServerHealth::default();
         h.reset(1);
-        assert!(!h.record_failure(ServerId(5)));
-        assert!(!h.record_success(ServerId(5)));
-        h.set_probing(ServerId(5), true); // no panic
+        assert!(!h.record_failure(ServerId::test(5)));
+        assert!(!h.record_success(ServerId::test(5)));
+        h.set_probing(ServerId::test(5), true); // no panic
         assert_eq!(h.failure_counts(), vec![0]);
     }
 
@@ -478,42 +519,42 @@ mod tests {
         // success rcode: notify-ok, reset failures, Deliver
         let mut h = ServerHealth::default();
         h.reset(2);
-        h.record_failure(ServerId(0));
-        let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
+        h.record_failure(ServerId::test(0));
+        let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), ServerId::test(0), false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
-        assert_eq!(a, vec![notify_ok(ServerId(0))]);
+        assert_eq!(a, vec![notify_ok(ServerId::test(0))]);
         assert_eq!(h.failure_counts()[0], 0, "success resets failures");
 
         // SERVFAIL, 2 servers: fail over to the next server, notify fail.
         let mut h = ServerHealth::default();
         h.reset(2);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId(1), tries: 1 });
-        assert_eq!(a, vec![notify_fail(ServerId(0))]);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId::test(0), false, 2, 0, ReplyPolicy::default(), &mut h);
+        assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId::test(1), tries: 1 });
+        assert_eq!(a, vec![notify_fail(ServerId::test(0))]);
         assert_eq!(h.failure_counts()[0], 1);
 
         // SERVFAIL, single server: retried in place (pick_next returns the same
         // server), failure recorded, still notified.
         let mut h = ServerHealth::default();
         h.reset(1);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId(0), tries: 1 });
-        assert_eq!(a, vec![notify_fail(ServerId(0))]);
+        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId::test(0), false, 2, 0, ReplyPolicy::default(), &mut h);
+        assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId::test(0), tries: 1 });
+        assert_eq!(a, vec![notify_fail(ServerId::test(0))]);
         assert_eq!(h.failure_counts()[0], 1);
 
         // budget exhausted: tries+1 >= nservers*attempts falls through to Deliver
         let mut h = ServerHealth::default();
         h.reset(2);
-        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId(0), false, 2, 3, ReplyPolicy::default(), &mut h);
+        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId::test(0), false, 2, 3, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
 
         // TC flag on UDP: RetryTcp; already-TCP never TC-retries.
         let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
         let mut h = ServerHealth::default();
         h.reset(1);
-        let (_, v) = on_datagram(&summarize(&tc, 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
+        let (_, v) = on_datagram(&summarize(&tc, 0), ServerId::test(0), false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::RetryTcp);
-        let (_, v) = on_datagram(&summarize(&tc, 0), ServerId(0), true, 2, 0, ReplyPolicy::default(), &mut h);
+        let (_, v) = on_datagram(&summarize(&tc, 0), ServerId::test(0), true, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
     }
 
@@ -526,7 +567,7 @@ mod tests {
         h.reset(1);
         let (_, v) = on_datagram(
             &summarize(&tc, 0),
-            ServerId(0),
+            ServerId::test(0),
             false,
             2,
             0,
@@ -542,7 +583,7 @@ mod tests {
         h.reset(1);
         let (a, v) = on_datagram(
             &summarize(&tc_servfail, 0),
-            ServerId(0),
+            ServerId::test(0),
             false,
             2,
             0,
@@ -552,7 +593,7 @@ mod tests {
         assert_eq!(v, TaskVerdict::RetryTcp);
         assert!(a.is_empty());
         assert_eq!(h.failure_counts()[0], 0);
-        assert_eq!(h.last_failure_of(ServerId(0)), None);
+        assert_eq!(h.last_failure_of(ServerId::test(0)), None);
 
         // NOCHECKRESP: deliver SERVFAIL/NOTIMP/REFUSED, notifying success
         // (upstream's pass-through path marks the server good).
@@ -561,7 +602,7 @@ mod tests {
             h.reset(2);
             let (a, v) = on_datagram(
                 &summarize(&reply(rcode, 0), 0),
-                ServerId(0),
+                ServerId::test(0),
                 false,
                 2,
                 0,
@@ -571,7 +612,7 @@ mod tests {
             assert_eq!(v, TaskVerdict::Deliver);
             assert_eq!(
                 a,
-                vec![ReactorAction::NotifyServerState { server: ServerId(0), ok: true, tcp: false }]
+                vec![ReactorAction::NotifyServerState { server: ServerId::test(0), ok: true, tcp: false }]
             );
             assert_eq!(h.failure_counts()[0], 0);
         }
@@ -582,15 +623,15 @@ mod tests {
         // retries left, multiple servers: count a failure, move on
         let mut h = ServerHealth::default();
         h.reset(2);
-        assert_eq!(on_timeout(1, 3, ServerId(0), &mut h), TimeoutVerdict::Retry { server: ServerId(1) });
+        assert_eq!(on_timeout(1, 3, ServerId::test(0), &mut h), TimeoutVerdict::Retry { server: ServerId::test(1) });
         assert_eq!(h.failure_counts()[0], 1);
         // retries left, single server: same server, no failure counted
         let mut h = ServerHealth::default();
         h.reset(1);
-        assert_eq!(on_timeout(1, 3, ServerId(0), &mut h), TimeoutVerdict::Retry { server: ServerId(0) });
+        assert_eq!(on_timeout(1, 3, ServerId::test(0), &mut h), TimeoutVerdict::Retry { server: ServerId::test(0) });
         assert_eq!(h.failure_counts()[0], 0);
         // out of attempts
-        assert_eq!(on_timeout(3, 3, ServerId(0), &mut h), TimeoutVerdict::Expire);
+        assert_eq!(on_timeout(3, 3, ServerId::test(0), &mut h), TimeoutVerdict::Expire);
     }
 
     #[test]

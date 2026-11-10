@@ -94,53 +94,42 @@ impl AsyncClient {
     }
 
     /// The server list or its default ports were set or changed: resolve each
-    /// server's endpoints once (every lookup copy shares them through the `Rc`)
-    /// and diff against the old list, like upstream `ares_servers_update`. A
-    /// server whose addresses and ports are unchanged keeps its [`ServerId`],
-    /// and with it its health, cookie and pooled conns; new servers get a fresh
-    /// ID and removed ones lose their state. A real change also flushes the
-    /// query cache.
+    /// server's identity (address + both ports) once — every lookup copy shares
+    /// the list through the `Rc` — and sync per-server state to it, like
+    /// upstream `ares_servers_update`: servers still configured keep their
+    /// health, cookie and pooled conns; removed ones lose them. Duplicate
+    /// entries are skipped (upstream `ares_server_isdup`). A real change also
+    /// flushes the query cache.
     pub(super) fn servers_changed(&mut self) {
-        let old = self.endpoints.clone();
-        let mut endpoints: Vec<ServerEndpoint> = Vec::with_capacity(self.config.nameservers.len());
-        for (i, &(ip, udp_port)) in self.config.nameservers.iter().enumerate() {
-            let udp_port = udp_port.unwrap_or(self.default_udp_port);
-            let tcp_port = self.config.tcp_ports.get(i).copied().flatten().unwrap_or(self.default_tcp_port);
-            let udp_addr = SocketAddr::from((ip, udp_port));
-            let tcp_addr = SocketAddr::from((ip, tcp_port));
-            // A duplicate entry in the new list gets its own ID.
-            let kept = old
-                .iter()
-                .find(|e| e.udp_addr == udp_addr && e.tcp_addr == tcp_addr)
-                .map(|e| e.id)
-                .filter(|id| !endpoints.iter().any(|e| e.id == *id));
-            let id = kept.unwrap_or_else(|| {
-                let id = ServerId(self.next_server_id);
-                self.next_server_id += 1;
-                id
-            });
-            // The socket's address family; local-address options are applied
-            // by the socket factory.
-            let bind = if ip.is_ipv6() {
-                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-            } else {
-                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-            };
-            endpoints.push(ServerEndpoint { id, udp_addr, tcp_addr, bind });
+        let mut servers: Vec<ServerId> = Vec::with_capacity(self.config.nameservers.len());
+        for id in (0..self.config.nameservers.len()).filter_map(|i| self.server_id_at(i)) {
+            if !servers.contains(&id) {
+                servers.push(id);
+            }
         }
-        if endpoints != *old {
+        if servers != *self.servers {
             self.shared.cache.borrow_mut().flush();
         }
-        let ids: Vec<ServerId> = endpoints.iter().map(|e| e.id).collect();
-        self.shared.health.borrow_mut().sync(&ids);
-        self.shared.cookies.borrow_mut().retain(|id, _| ids.contains(id));
+        self.shared.health.borrow_mut().sync(&servers);
+        self.shared.cookies.borrow_mut().retain(|id, _| servers.contains(id));
         // Evicted conns are dropped after each pool borrow ends (closing fires
         // C callbacks).
-        let tcp = self.shared.tcp_pool.borrow_mut().retain_servers(&ids);
+        let tcp = self.shared.tcp_pool.borrow_mut().retain_servers(&servers);
         drop(tcp);
-        let udp = self.shared.udp_pool.borrow_mut().retain_servers(&ids);
+        let udp = self.shared.udp_pool.borrow_mut().retain_servers(&servers);
         drop(udp);
-        self.endpoints = Rc::new(endpoints);
+        self.servers = Rc::new(servers);
+    }
+
+    /// The identity of `config.nameservers[i]`, with its ports defaulted.
+    fn server_id_at(&self, i: usize) -> Option<ServerId> {
+        let &(addr, udp_port) = self.config.nameservers.get(i)?;
+        let tcp_port = self.config.tcp_ports.get(i).copied().flatten();
+        Some(ServerId {
+            addr,
+            udp_port: udp_port.unwrap_or(self.default_udp_port),
+            tcp_port: tcp_port.unwrap_or(self.default_tcp_port),
+        })
     }
 
     pub(super) fn build(
@@ -170,8 +159,7 @@ impl AsyncClient {
             resolvconf_path: String::new(),
             hosts_path: String::new(),
             udp_max_queries: 0,
-            endpoints: Rc::new(Vec::new()),
-            next_server_id: 0,
+            servers: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
         };
@@ -496,13 +484,12 @@ impl AsyncClient {
     }
 
     /// The `ip:port` string reported to the server-state callback (IPv6
-    /// bracketed); None when `server` is not in this client's endpoints. The
+    /// bracketed); None when `server` is not in this client's config. The
     /// port is the server's own (UDP) port, as `ares_get_servers_csv` reports
     /// it, for either transport; without one, the transport's default.
     pub fn server_state_string(&self, server: ServerId, is_tcp: bool) -> Option<String> {
-        // `endpoints` and `config.nameservers` are in the same order.
-        let pos = self.endpoints.iter().position(|e| e.id == server)?;
-        let (ip, port) = self.config.nameservers.get(pos)?;
+        let i = (0..self.config.nameservers.len()).find(|&i| self.server_id_at(i) == Some(server))?;
+        let (ip, port) = self.config.nameservers.get(i)?;
         let port_val = port.unwrap_or(if is_tcp {
             self.default_tcp_port
         } else {
@@ -589,6 +576,7 @@ pub(crate) struct SavedOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     struct NoopFactory;
     impl SocketFactory for NoopFactory {
@@ -623,43 +611,40 @@ mod tests {
         ServerSpec { ip: IpAddr::from([10, 0, 0, last]), udp_port: None, tcp_port: None }
     }
 
-    /// Endpoints are resolved once per change and shared by lookup copies.
+    /// The server list is resolved once per change and shared by lookup copies.
     #[test]
-    fn endpoints_resolved_per_server_change_and_shared() {
+    fn servers_resolved_per_server_change_and_shared() {
         let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
         client.set_servers(vec![spec(1)]);
         let copy = client.derive();
-        assert!(Rc::ptr_eq(&copy.endpoints, &client.endpoints), "derive shares, not recomputes");
-        assert_eq!(client.endpoints[0].udp_addr, SocketAddr::from(([10, 0, 0, 1], 53)));
+        assert!(Rc::ptr_eq(&copy.servers, &client.servers), "derive shares, not recomputes");
+        assert_eq!(client.servers[0].udp_addr(), SocketAddr::from(([10, 0, 0, 1], 53)));
 
         client.set_servers(vec![spec(2)]);
-        assert_eq!(client.endpoints[0].udp_addr, SocketAddr::from(([10, 0, 0, 2], 53)));
-        assert_eq!(copy.endpoints[0].udp_addr, SocketAddr::from(([10, 0, 0, 1], 53)), "copies keep theirs");
+        assert_eq!(client.servers[0].udp_addr(), SocketAddr::from(([10, 0, 0, 2], 53)));
+        assert_eq!(copy.servers[0].udp_addr(), SocketAddr::from(([10, 0, 0, 1], 53)), "copies keep theirs");
 
         client.default_udp_port = 5353;
         client.servers_changed();
-        assert_eq!(client.endpoints[0].udp_addr, SocketAddr::from(([10, 0, 0, 2], 5353)));
+        assert_eq!(client.servers[0].udp_addr(), SocketAddr::from(([10, 0, 0, 2], 5353)));
     }
 
-    /// A server keeps its ID across a server-list change while its addresses
-    /// and ports stay; new and duplicate entries get fresh IDs; removed ones
-    /// lose their health entry.
+    /// A server keeps its state across a server-list change while it stays
+    /// configured; duplicates are skipped; removed servers lose their state.
     #[test]
-    fn server_ids_survive_server_list_changes() {
+    fn server_state_survives_server_list_changes() {
         let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
         client.set_servers(vec![spec(1), spec(2)]);
-        let ids = |c: &AsyncClient| c.endpoints.iter().map(|e| e.id).collect::<Vec<_>>();
-        let first = ids(&client);
+        let first = client.servers.to_vec();
         client.shared.health.borrow_mut().record_failure(first[1]);
 
         client.set_servers(vec![spec(2), spec(3), spec(2)]);
-        let second = ids(&client);
-        assert_eq!(second[0], first[1], "10.0.0.2 keeps its ID");
-        assert!(!first.contains(&second[1]), "10.0.0.3 is new");
-        assert!(second[2] != second[0] && !first.contains(&second[2]), "a duplicate gets its own ID");
+        let second = client.servers.to_vec();
+        assert_eq!(second.len(), 2, "the duplicate 10.0.0.2 is skipped");
+        assert_eq!(second[0], first[1], "10.0.0.2 is the same server");
         let health = client.shared.health.borrow();
         assert!(!health.contains(first[0]), "10.0.0.1 left the list");
-        assert_eq!(health.failure_counts(), vec![1, 0, 0], "10.0.0.2 keeps its failure");
+        assert_eq!(health.failure_counts(), vec![1, 0], "10.0.0.2 keeps its failure");
     }
 
     /// The query cache is flushed only when the server list really changes.

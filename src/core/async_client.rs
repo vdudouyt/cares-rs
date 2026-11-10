@@ -1,6 +1,6 @@
 //! `AsyncClient` is both the ffi channel state and the resolver client; every
 //! lookup runs on a [`AsyncClient::derive`]d copy (same runtime handle, the
-//! same [`ChannelShared`], endpoints snapshotted).
+//! same [`ChannelShared`], the same server list).
 //!
 //! This file holds the struct, `derive`, the shared result types and the
 //! hosts-file helpers. The rest lives in child modules (which see the private
@@ -22,13 +22,12 @@ pub(crate) use addrinfo::*;
 pub(crate) use config::*;
 pub(crate) use lookups::*;
 pub(crate) use packet::*;
-pub(crate) use request::ServerEndpoint;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_int, CString};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::pin;
 use std::task::Poll;
 use std::rc::Rc;
@@ -118,12 +117,10 @@ pub(crate) struct AsyncClient {
     /// `ARES_OPT_UDP_MAX_QUERIES`: max in-flight queries per UDP socket; 0 =
     /// unlimited (upstream default).
     pub udp_max_queries: usize,
-    /// Per-server connect endpoints, in config order: resolved once per
-    /// server-list change (`servers_changed`) and shared by every lookup copy,
-    /// which keeps the list it started with.
-    pub endpoints: Rc<Vec<ServerEndpoint>>,
-    /// The next [`ServerId`] to mint for a server entering the list.
-    next_server_id: usize,
+    /// The configured servers, in config order, duplicates skipped: resolved
+    /// once per server-list change (`servers_changed`) and shared by every
+    /// lookup copy, which keeps the list it started with.
+    pub servers: Rc<Vec<ServerId>>,
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
 }
@@ -169,7 +166,7 @@ impl ChannelShared {
 
 impl AsyncClient {
     /// Mint the per-lookup copy every entry shim runs on: clone config and
-    /// shared `Rc`s (endpoints included).
+    /// shared `Rc`s (the server list included).
     pub(crate) fn derive(&mut self) -> Self {
         self.hosts();
         self.copy()
@@ -200,8 +197,7 @@ impl AsyncClient {
             resolvconf_path: self.resolvconf_path.clone(),
             hosts_path: self.hosts_path.clone(),
             udp_max_queries: self.udp_max_queries,
-            endpoints: self.endpoints.clone(),
-            next_server_id: self.next_server_id,
+            servers: self.servers.clone(),
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
         }

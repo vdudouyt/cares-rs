@@ -19,7 +19,7 @@ impl AsyncClient {
             return (Ok(Hostent::from_lookup(lookup)), 0);
         }
 
-        if self.endpoints.is_empty() {
+        if self.servers.is_empty() {
             return (Err(ARES_ENOSERVER.into()), 0);
         }
 
@@ -78,7 +78,7 @@ impl AsyncClient {
             return NameinfoReply { status: ARES_SUCCESS.into(), node: Some(node), service, timeouts: 0 };
         }
 
-        if self.endpoints.is_empty() {
+        if self.servers.is_empty() {
             return NameinfoReply { status: ARES_ENOSERVER.into(), node: None, service: None, timeouts: 0 };
         }
 
@@ -165,7 +165,7 @@ impl AsyncClient {
     where
         F: Fn(&str) -> Result<BytesMut, AresError>,
     {
-        if self.endpoints.is_empty() {
+        if self.servers.is_empty() {
             return Delivery::Raw { result: Err(ARES_ENOSERVER), timeouts: 0 };
         }
 

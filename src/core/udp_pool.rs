@@ -445,22 +445,22 @@ mod tests {
     fn pool_respects_total_queries_not_just_waiters() {
         let mut pool = UdpPool::new();
         let conn = UdpConn::new(sock(DummySock), false);
-        pool.insert(ServerId(0), conn.clone());
+        pool.insert(ServerId::test(0), conn.clone());
 
-        let (picked, retired) = pool.pick_or_none(ServerId(0), 2, true);
+        let (picked, retired) = pool.pick_or_none(ServerId::test(0), 2, true);
         assert!(picked.is_some() && retired.is_empty());
         conn.borrow_mut().register_query(1);
         conn.borrow_mut().release(1);
         assert_eq!(conn.borrow().total_queries(), 1);
 
-        let (picked, retired) = pool.pick_or_none(ServerId(0), 2, true);
+        let (picked, retired) = pool.pick_or_none(ServerId::test(0), 2, true);
         assert!(picked.is_some() && retired.is_empty());
         conn.borrow_mut().register_query(2);
         conn.borrow_mut().release(2);
         assert_eq!(conn.borrow().total_queries(), 2);
 
         // Exhausted even with STAYOPEN: pruned; caller must create a new conn.
-        let (picked, retired) = pool.pick_or_none(ServerId(0), 2, true);
+        let (picked, retired) = pool.pick_or_none(ServerId::test(0), 2, true);
         assert!(picked.is_none());
         assert_eq!(retired.len(), 1);
     }
@@ -469,11 +469,11 @@ mod tests {
     fn release_retires_exhausted_conn_even_when_stayopen() {
         let mut pool = UdpPool::new();
         let conn = UdpConn::new(sock(DummySock), false);
-        pool.insert(ServerId(0), conn.clone());
+        pool.insert(ServerId::test(0), conn.clone());
         conn.borrow_mut().register_query(3);
         conn.borrow_mut().release(3);
 
-        let retired = pool.release_if_done(ServerId(0), &conn, true, 1);
+        let retired = pool.release_if_done(ServerId::test(0), &conn, true, 1);
         assert_eq!(retired.len(), 1);
     }
 

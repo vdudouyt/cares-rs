@@ -99,7 +99,7 @@ impl AsyncClient {
             Err(e) => return Step::Done(Err(e.code())),
         };
         let deadline = Instant::now()
-            + calc_query_timeout(q.opts.timeout, q.try_count, self.endpoints.len(), q.opts.maxtimeout);
+            + calc_query_timeout(q.opts.timeout, q.try_count, self.servers.len(), q.opts.maxtimeout);
         let sent = if q.use_tcp {
             conn.send(&frame_tcp(&q.payload), deadline).await
         } else {
@@ -426,7 +426,9 @@ impl AsyncClient {
         let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
         let mut s = preferred;
         for _ in 0..tries.max(1) {
-            let Some(ep) = self.endpoints.iter().find(|e| e.id == s) else { break };
+            if !self.servers.contains(&s) {
+                break;
+            }
             // A lookup from before a server-list change may still reach a server
             // that left the list: use its conn unpooled, so none lingers there.
             let current = self.shared.health.borrow().contains(s);
@@ -435,8 +437,8 @@ impl AsyncClient {
                 // callbacks fire during creation, nor while `Conn::shared` borrows.
                 let pooled = self.shared.tcp_pool.borrow().get(s);
                 let checked_out = pooled.or_else(|| {
-                    let sock = self.rt.tcp(ep.bind).ok()?;
-                    let _ = sock.get_ref().connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
+                    let sock = self.rt.tcp(s.bind_addr()).ok()?;
+                    let _ = sock.get_ref().connect(s.tcp_addr()); // optimistic (EINPROGRESS → Ok)
                     let c = TcpConn::new(sock);
                     if current {
                         let replaced = self.shared.tcp_pool.borrow_mut().insert(s, c.clone());
@@ -455,8 +457,8 @@ impl AsyncClient {
                 };
                 drop(retired);
                 let checked_out = pooled.or_else(|| {
-                    let sk = self.rt.udp(ep.bind).ok()?;
-                    let _ = sk.get_ref().connect(ep.udp_addr);
+                    let sk = self.rt.udp(s.bind_addr()).ok()?;
+                    let _ = sk.get_ref().connect(s.udp_addr());
                     let c = UdpConn::new(sk, event_driven);
                     if current {
                         self.shared.udp_pool.borrow_mut().insert(s, c.clone());
@@ -482,15 +484,6 @@ impl AsyncClient {
         }
         None
     }
-}
-
-/// A server's precomputed connect targets.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ServerEndpoint {
-    pub id: ServerId,
-    pub udp_addr: SocketAddr,
-    pub tcp_addr: SocketAddr,
-    pub bind: SocketAddr,
 }
 
 /// The retry/timeout knobs a query needs, snapshotted at launch.
@@ -540,6 +533,7 @@ fn calc_query_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     fn qid_of(payload: &[u8]) -> u16 {
         u16::from_be_bytes([payload[0], payload[1]])
@@ -588,8 +582,8 @@ mod tests {
         assert_eq!(qid_of(&first.payload), first.qid(), "the reserved id is stamped");
         assert_eq!(qid_of(&second.payload), second.qid());
 
-        let (conn_a, _) = client.connect_with_failover(first.qid(), ServerId(0), false, 1).expect("first checkout");
-        let (conn_b, _) = client.connect_with_failover(second.qid(), ServerId(0), false, 1).expect("second checkout");
+        let (conn_a, _) = client.connect_with_failover(first.qid(), ServerId::test(0), false, 1).expect("first checkout");
+        let (conn_b, _) = client.connect_with_failover(second.qid(), ServerId::test(0), false, 1).expect("second checkout");
         let shared = conn_a.shared_udp_handle().expect("pooled UDP");
         assert!(Rc::ptr_eq(&shared, &conn_b.shared_udp_handle().expect("pooled UDP")), "one shared socket");
         assert!(shared.borrow().has_waiter(first.qid()) && shared.borrow().has_waiter(second.qid()));
