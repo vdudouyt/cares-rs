@@ -478,14 +478,6 @@ impl AsyncClient {
             .collect::<Vec<_>>()
             .join(",")
     }
-
-    /// The string reported to the server-state callback: `ip:port` (IPv6
-    /// bracketed) with the server's UDP port for either transport, as upstream
-    /// `ares_get_server_addr` writes it (the transport travels in the callback's
-    /// flags). `None` when `server` is not in this client's server list.
-    pub fn server_state_string(&self, server: ServerId) -> Option<String> {
-        self.servers.contains(&server).then(|| server.udp_addr().to_string())
-    }
 }
 
 fn build_sysconfig(path: Option<&str>) -> SysConfig {

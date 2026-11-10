@@ -253,12 +253,23 @@ impl ChannelData {
     fn install_server_state_hook(&self) {
         let arg = self.server_state_callback_arg;
         let hook = self.server_state_callback.map(|cb| -> ServerStateHook {
-            std::rc::Rc::new(move |server: &str, ok: bool, tcp: bool| {
-                let server = CString::new(server).unwrap_or_default();
+            std::rc::Rc::new(move |server: std::net::SocketAddr, ok: bool, tcp: bool| {
+                // `ip:port` / `[ip6%scope]:port` is at most 64 bytes: format it
+                // on the stack (no allocation per callback). The buffer starts
+                // zeroed and the last byte is never written, so the text is
+                // always NUL-terminated.
+                let mut buf = [0u8; 80];
+                {
+                    let mut text = &mut buf[..79];
+                    if std::io::Write::write_fmt(&mut text, format_args!("{server}")).is_err() {
+                        return;
+                    }
+                }
                 let flags = if tcp { ARES_SERV_STATE_TCP } else { ARES_SERV_STATE_UDP };
                 // SAFETY: `cb` and `arg` are what the application registered via
-                // ares_set_server_state_callback; `server` outlives the call.
-                unsafe { cb(server.as_ptr(), c_int::from(ok), flags, arg) };
+                // ares_set_server_state_callback; `buf` is a NUL-terminated
+                // string that outlives the call.
+                unsafe { cb(buf.as_ptr().cast(), c_int::from(ok), flags, arg) };
             })
         });
         *self.state.shared.server_state_hook.borrow_mut() = hook;

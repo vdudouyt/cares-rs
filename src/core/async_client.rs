@@ -27,7 +27,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_int, CString};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::pin;
 use std::task::Poll;
 use std::rc::Rc;
@@ -243,9 +243,11 @@ impl AsyncClient {
         let Some(hook) = hook else { return };
         for a in actions {
             match a {
+                // Upstream reports the server's UDP address for either
+                // transport (`ares_get_server_addr`); the transport is `tcp`.
                 ReactorAction::NotifyServerState { server, ok, tcp } => {
-                    if let Some(server) = self.server_state_string(server) {
-                        hook(&server, ok, tcp);
+                    if self.servers.contains(&server) {
+                        hook(server.udp_addr(), ok, tcp);
                     }
                 }
             }
@@ -253,8 +255,8 @@ impl AsyncClient {
     }
 }
 
-/// The server-state callback as core sees it: `(server "ip:port", ok, tcp)`.
-pub(crate) type ServerStateHook = Rc<dyn Fn(&str, bool, bool)>;
+/// The server-state callback as core sees it: `(server address, ok, tcp)`.
+pub(crate) type ServerStateHook = Rc<dyn Fn(SocketAddr, bool, bool)>;
 
 /// A hostent lifecycle's result plus its timeout count, for `ares_host_callback`.
 pub(crate) type HostReply = (Result<Hostent, AresError>, c_int);
