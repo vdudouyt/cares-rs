@@ -244,7 +244,7 @@ impl AsyncClient {
         for a in actions {
             match a {
                 ReactorAction::NotifyServerState { server, ok, tcp } => {
-                    if let Some(server) = self.server_state_string(server, tcp) {
+                    if let Some(server) = self.server_state_string(server) {
                         hook(&server, ok, tcp);
                     }
                 }

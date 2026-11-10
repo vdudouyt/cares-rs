@@ -102,7 +102,13 @@ impl AsyncClient {
     /// flushes the query cache.
     pub(super) fn servers_changed(&mut self) {
         let mut servers: Vec<ServerId> = Vec::with_capacity(self.config.nameservers.len());
-        for id in (0..self.config.nameservers.len()).filter_map(|i| self.server_id_at(i)) {
+        for (i, &(addr, udp_port)) in self.config.nameservers.iter().enumerate() {
+            let tcp_port = self.config.tcp_ports.get(i).copied().flatten();
+            let id = ServerId {
+                addr,
+                udp_port: udp_port.unwrap_or(self.default_udp_port),
+                tcp_port: tcp_port.unwrap_or(self.default_tcp_port),
+            };
             if !servers.contains(&id) {
                 servers.push(id);
             }
@@ -121,16 +127,6 @@ impl AsyncClient {
         self.servers = Rc::new(servers);
     }
 
-    /// The identity of `config.nameservers[i]`, with its ports defaulted.
-    fn server_id_at(&self, i: usize) -> Option<ServerId> {
-        let &(addr, udp_port) = self.config.nameservers.get(i)?;
-        let tcp_port = self.config.tcp_ports.get(i).copied().flatten();
-        Some(ServerId {
-            addr,
-            udp_port: udp_port.unwrap_or(self.default_udp_port),
-            tcp_port: tcp_port.unwrap_or(self.default_tcp_port),
-        })
-    }
 
     pub(super) fn build(
         config: SysConfig,
@@ -483,22 +479,12 @@ impl AsyncClient {
             .join(",")
     }
 
-    /// The `ip:port` string reported to the server-state callback (IPv6
-    /// bracketed); None when `server` is not in this client's config. The
-    /// port is the server's own (UDP) port, as `ares_get_servers_csv` reports
-    /// it, for either transport; without one, the transport's default.
-    pub fn server_state_string(&self, server: ServerId, is_tcp: bool) -> Option<String> {
-        let i = (0..self.config.nameservers.len()).find(|&i| self.server_id_at(i) == Some(server))?;
-        let (ip, port) = self.config.nameservers.get(i)?;
-        let port_val = port.unwrap_or(if is_tcp {
-            self.default_tcp_port
-        } else {
-            self.default_udp_port
-        });
-        Some(match ip {
-            IpAddr::V4(v4) => format!("{}:{}", v4, port_val),
-            IpAddr::V6(v6) => format!("[{}]:{}", v6, port_val),
-        })
+    /// The string reported to the server-state callback: `ip:port` (IPv6
+    /// bracketed) with the server's UDP port for either transport, as upstream
+    /// `ares_get_server_addr` writes it (the transport travels in the callback's
+    /// flags). `None` when `server` is not in this client's server list.
+    pub fn server_state_string(&self, server: ServerId) -> Option<String> {
+        self.servers.contains(&server).then(|| server.udp_addr().to_string())
     }
 }
 
