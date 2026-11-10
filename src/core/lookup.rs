@@ -242,12 +242,6 @@ impl ServerHealth {
         self.probing = vec![false; n];
     }
 
-    pub fn clear(&mut self) {
-        self.failures.clear();
-        self.last_failure.clear();
-        self.probing.clear();
-    }
-
     /// Lowest failure count, tie broken by index; server 0 when empty.
     pub fn pick_next(&self) -> ServerId {
         let mut best: Option<(u32, usize)> = None;

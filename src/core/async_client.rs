@@ -117,8 +117,9 @@ pub(crate) struct AsyncClient {
     /// `ARES_OPT_UDP_MAX_QUERIES`: max in-flight queries per UDP socket; 0 =
     /// unlimited (upstream default).
     pub udp_max_queries: usize,
-    /// Per-server endpoints snapshotted by `derive` so lookup futures never
-    /// re-read the config.
+    /// Per-server connect endpoints, in config order: resolved once per
+    /// server-list change (`servers_changed`) and shared by every lookup copy,
+    /// which keeps the list it started with.
     pub endpoints: Rc<Vec<ServerEndpoint>>,
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
@@ -165,7 +166,7 @@ impl ChannelShared {
 
 impl AsyncClient {
     /// Mint the per-lookup copy every entry shim runs on: clone config and
-    /// shared `Rc`s, and snapshot endpoints.
+    /// shared `Rc`s (endpoints included).
     pub(crate) fn derive(&mut self) -> Self {
         self.hosts();
         self.copy()
@@ -196,7 +197,7 @@ impl AsyncClient {
             resolvconf_path: self.resolvconf_path.clone(),
             hosts_path: self.hosts_path.clone(),
             udp_max_queries: self.udp_max_queries,
-            endpoints: Rc::new(self.endpoint_snapshot()),
+            endpoints: self.endpoints.clone(),
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
         }

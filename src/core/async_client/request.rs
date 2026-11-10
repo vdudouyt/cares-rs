@@ -332,31 +332,6 @@ async fn recv_reply(conn: &mut Conn, deadline: Instant) -> io::Result<Vec<u8>> {
 // ---- Transport helpers: connection checkout, cookies, timeouts ----
 
 impl AsyncClient {
-    /// Snapshot per-server connect endpoints so a lookup never re-reads config.
-    pub(super) fn endpoint_snapshot(&self) -> Vec<ServerEndpoint> {
-        let default_udp = self.default_udp_port;
-        let default_tcp = self.default_tcp_port;
-        self.config
-            .nameservers
-            .iter()
-            .enumerate()
-            .map(|(i, &(ip, udp_override))| {
-                let udp_port = udp_override.unwrap_or(default_udp);
-                let tcp_port = self.config.tcp_ports.get(i).copied().flatten().unwrap_or(default_tcp);
-                let bind = if ip.is_ipv6() {
-                    SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
-                } else {
-                    SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
-                };
-                ServerEndpoint {
-                    udp_addr: SocketAddr::from((ip, udp_port)),
-                    tcp_addr: SocketAddr::from((ip, tcp_port)),
-                    bind,
-                }
-            })
-            .collect()
-    }
-
     /// The retry/timeout knobs an async lifecycle needs.
     pub(super) fn opts(&self) -> QueryOpts {
         QueryOpts {
@@ -498,7 +473,7 @@ impl AsyncClient {
 }
 
 /// A server's precomputed connect targets.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServerEndpoint {
     pub udp_addr: SocketAddr,
     pub tcp_addr: SocketAddr,
@@ -591,8 +566,7 @@ mod tests {
             nameservers: vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)],
             ..SysConfig::default()
         };
-        let mut client = AsyncClient::build(config, Rc::new(TestFactory), 53, 53);
-        client.endpoints = Rc::new(client.endpoint_snapshot());
+        let client = AsyncClient::build(config, Rc::new(TestFactory), 53, 53);
 
         let payload = || BytesMut::from(&[0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]);
         let first = client.reserve(payload()).expect("first reserve");

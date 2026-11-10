@@ -9,8 +9,6 @@ impl AsyncClient {
     /// Defaults are applied separately so options/flags set afterwards win.
     pub fn from_sysconfig_path(factory: Rc<dyn SocketFactory>, path: Option<&str>) -> Self {
         let mut client = AsyncClient::build(build_sysconfig(path), factory, 53, 53);
-        let n = client.config.nameservers.len();
-        client.shared.health.borrow_mut().reset(n);
         // Upstream init_by_defaults: hosts file first, then DNS.
         client.lookups = "fb".to_string();
         if let Some(lookups) = client.config.lookups.clone() {
@@ -29,14 +27,14 @@ impl AsyncClient {
         let path = (!self.resolvconf_path.is_empty()).then_some(self.resolvconf_path.as_str());
         let sys = build_sysconfig(path);
 
-        let mut servers_changed = false;
+        let mut servers_updated = false;
         if self.optmask & ARES_OPT_SERVERS == 0
             && !sys.nameservers.is_empty()
             && sys.nameservers != self.config.nameservers
         {
             self.config.nameservers = sys.nameservers;
             self.config.tcp_ports = sys.tcp_ports;
-            servers_changed = true;
+            servers_updated = true;
         }
         if self.optmask & ARES_OPT_DOMAINS == 0 && !sys.search.is_empty() {
             self.config.search = sys.search;
@@ -69,11 +67,8 @@ impl AsyncClient {
             self.flags |= ARES_FLAG_USEVC;
             self.config.options.use_vc = true;
         }
-        if servers_changed {
-            self.shared.health.borrow_mut().reset(self.config.nameservers.len());
-            self.shared.cookies.borrow_mut().clear();
-            let retired = self.shared.udp_pool.borrow_mut().clear();
-            drop(retired);
+        if servers_updated {
+            self.servers_changed();
         }
         self.shared.cache.borrow_mut().flush();
         Ok(())
@@ -93,8 +88,49 @@ impl AsyncClient {
             self.config.nameservers.push((IpAddr::V4(Ipv4Addr::LOCALHOST), None));
             self.config.tcp_ports.push(None);
         }
-        self.shared.health.borrow_mut().reset(self.config.nameservers.len());
+        // The end of every init path: options may have changed the servers or
+        // their default ports.
+        self.servers_changed();
+    }
+
+    /// The server list or its default ports were set or changed: resolve each
+    /// server's endpoints once (every lookup copy shares them through the `Rc`)
+    /// and reset per-server state. A real change also flushes the query cache,
+    /// as upstream `ares_servers_update` does.
+    pub(super) fn servers_changed(&mut self) {
+        let endpoints: Vec<ServerEndpoint> = self
+            .config
+            .nameservers
+            .iter()
+            .enumerate()
+            .map(|(i, &(ip, udp_port))| {
+                let udp_port = udp_port.unwrap_or(self.default_udp_port);
+                let tcp_port = self.config.tcp_ports.get(i).copied().flatten().unwrap_or(self.default_tcp_port);
+                // The socket's address family; local-address options are
+                // applied by the socket factory.
+                let bind = if ip.is_ipv6() {
+                    SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+                } else {
+                    SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+                };
+                ServerEndpoint {
+                    udp_addr: SocketAddr::from((ip, udp_port)),
+                    tcp_addr: SocketAddr::from((ip, tcp_port)),
+                    bind,
+                }
+            })
+            .collect();
+        if endpoints != *self.endpoints {
+            self.shared.cache.borrow_mut().flush();
+        }
+        self.shared.health.borrow_mut().reset(endpoints.len());
         self.shared.cookies.borrow_mut().clear();
+        // Conns are dropped after each pool borrow ends (closing fires C callbacks).
+        let tcp = self.shared.tcp_pool.borrow_mut().clear();
+        drop(tcp);
+        let udp = self.shared.udp_pool.borrow_mut().clear();
+        drop(udp);
+        self.endpoints = Rc::new(endpoints);
     }
 
     pub(super) fn build(
@@ -103,7 +139,7 @@ impl AsyncClient {
         default_udp_port: u16,
         default_tcp_port: u16,
     ) -> Self {
-        AsyncClient {
+        let mut client = AsyncClient {
             config,
             rt: Runtime::new(factory),
             hosts: None,
@@ -127,7 +163,9 @@ impl AsyncClient {
             endpoints: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
-        }
+        };
+        client.servers_changed();
+        client
     }
 
     /// The hosts table as a shared `Rc`, lazily loaded once. An empty
@@ -400,10 +438,7 @@ impl AsyncClient {
             self.config.tcp_ports.push(server.tcp_port);
         }
         self.optmask |= ARES_OPT_SERVERS;
-        self.shared.health.borrow_mut().reset(self.config.nameservers.len());
-        self.shared.cookies.borrow_mut().clear();
-        let retired = self.shared.udp_pool.borrow_mut().clear();
-        drop(retired);
+        self.servers_changed();
     }
 
     /// NULL/empty CSV clears every configured server (ares_set_servers*_csv).
@@ -411,22 +446,16 @@ impl AsyncClient {
         self.config.nameservers.clear();
         self.config.tcp_ports.clear();
         self.optmask |= ARES_OPT_SERVERS;
-        self.shared.health.borrow_mut().clear();
-        self.shared.cookies.borrow_mut().clear();
-        let retired = self.shared.udp_pool.borrow_mut().clear();
-        drop(retired);
+        self.servers_changed();
     }
 
     /// Install a parsed CSV server list (ares_set_servers_ports_csv). A CSV
     /// `ip:port` sets both transports; the ports variant can still override TCP.
     pub fn install_csv_servers(&mut self, ns: Vec<(IpAddr, Option<u16>)>) {
         self.config.tcp_ports = ns.iter().map(|&(_, port)| port).collect();
-        self.shared.health.borrow_mut().reset(ns.len());
         self.config.nameservers = ns;
         self.optmask |= ARES_OPT_SERVERS;
-        self.shared.cookies.borrow_mut().clear();
-        let retired = self.shared.udp_pool.borrow_mut().clear();
-        drop(retired);
+        self.servers_changed();
     }
 
     /// The configured servers with per-entry defaults, in order.
@@ -579,6 +608,47 @@ mod tests {
         client.flags = ARES_FLAG_NO_DFLT_SVR;
         client.apply_defaults();
         assert!(client.config.nameservers.is_empty());
+    }
+
+    fn spec(last: u8) -> ServerSpec {
+        ServerSpec { ip: IpAddr::from([10, 0, 0, last]), udp_port: None, tcp_port: None }
+    }
+
+    /// Endpoints are resolved once per change and shared by lookup copies.
+    #[test]
+    fn endpoints_resolved_per_server_change_and_shared() {
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        client.set_servers(vec![spec(1)]);
+        let copy = client.derive();
+        assert!(Rc::ptr_eq(&copy.endpoints, &client.endpoints), "derive shares, not recomputes");
+        assert_eq!(client.endpoints[0].udp_addr, SocketAddr::from(([10, 0, 0, 1], 53)));
+
+        client.set_servers(vec![spec(2)]);
+        assert_eq!(client.endpoints[0].udp_addr, SocketAddr::from(([10, 0, 0, 2], 53)));
+        assert_eq!(copy.endpoints[0].udp_addr, SocketAddr::from(([10, 0, 0, 1], 53)), "copies keep theirs");
+
+        client.default_udp_port = 5353;
+        client.servers_changed();
+        assert_eq!(client.endpoints[0].udp_addr, SocketAddr::from(([10, 0, 0, 2], 5353)));
+    }
+
+    /// The query cache is flushed only when the server list really changes.
+    #[test]
+    fn cache_flushed_only_on_real_server_change() {
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        client.set_servers(vec![spec(1)]);
+        client.shared.cache.borrow_mut().set_max_ttl(3600);
+        let key = CacheKey::new("cached.test", 1, ARES_CLASS_IN, 0, true, false);
+        let store = |c: &AsyncClient| {
+            c.shared.cache.borrow_mut().store_names(vec![key.name.clone()], &key, 60, &[0u8; 12], Instant::now())
+        };
+        let cached = |c: &AsyncClient| c.shared.cache.borrow_mut().get(&key, Instant::now()).is_some();
+
+        store(&client);
+        client.set_servers(vec![spec(1)]);
+        assert!(cached(&client), "same list: cache kept");
+        client.set_servers(vec![spec(2)]);
+        assert!(!cached(&client), "different list: cache flushed");
     }
 }
 
