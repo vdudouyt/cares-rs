@@ -1,4 +1,4 @@
-//! The single-query engine behind every lookup: `AsyncClient::request()` runs
+//! The single-query engine behind every lookup: `AsyncClient::run_reserved_query()` runs
 //! attempts (connect with failover, send, listen) over a [`QueryState`] until a
 //! named step reaches a verdict. A child of `async_client`, so it uses the
 //! client's private fields and helpers directly.
@@ -10,7 +10,7 @@ impl AsyncClient {
     /// failover, send, listen) until one reaches a verdict. Starts on TCP iff
     /// ARES_FLAG_USEVC; `cancelled` (A-cancels-AAAA) stops retries but still
     /// delivers an in-flight reply. The query's id stays reserved until it ends.
-    pub(super) async fn request(&self, query: ReservedQuery, cancelled: &Cell<bool>) -> QueryOutcome {
+    pub(super) async fn run_reserved_query(&self, query: ReservedQuery, cancelled: &Cell<bool>) -> QueryOutcome {
         // A packet over the 16-bit wire length cannot be framed; upstream's TCP
         // writer reports EBADQUERY rather than truncating the length prefix.
         if query.payload.len() > u16::MAX as usize {
@@ -257,7 +257,7 @@ impl AsyncClient {
     }
 }
 
-/// Mutable state of one `request()` across its attempts (upstream `ares_query_t`).
+/// Mutable state of one `run_reserved_query()` across its attempts (upstream `ares_query_t`).
 struct QueryState {
     opts: QueryOpts,
     /// The channel-unique transaction id, reserved for the query's whole life.

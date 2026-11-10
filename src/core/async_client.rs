@@ -277,5 +277,5 @@ fn no_servers(st: &AsyncClient) -> bool {
     st.config.nameservers.is_empty()
 }
 
-/// One `request()`'s result plus its timed-out attempt count.
+/// One `run_reserved_query()`'s result plus its timed-out attempt count.
 type QueryOutcome = (Result<Vec<u8>, c_int>, c_int);
