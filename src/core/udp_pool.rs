@@ -242,6 +242,14 @@ impl UdpPool {
         retired
     }
 
+    /// Return the conns of servers no longer in `keep` (a server-list change),
+    /// for dropping after the pool borrow ends.
+    #[must_use = "drop the evicted conns after releasing the pool borrow"]
+    pub fn retain_servers(&mut self, keep: &[ServerId]) -> Vec<Conn> {
+        let gone: Vec<ServerId> = self.conns.keys().filter(|id| !keep.contains(id)).copied().collect();
+        gone.into_iter().filter_map(|id| self.conns.remove(&id)).flatten().collect()
+    }
+
     pub fn insert(&mut self, server: ServerId, conn: Conn) {
         self.conns.entry(server).or_default().push(conn);
     }

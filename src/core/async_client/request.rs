@@ -354,14 +354,14 @@ impl AsyncClient {
         drop(retired);
     }
 
-    /// Grow the per-server cookie table to cover `server` and pass it to `f`.
+    /// Pass `server`'s cookie state to `f`; `None` once the server has left the
+    /// list (a lookup from before a server-list change).
     fn with_cookie<R>(&self, server: ServerId, f: impl FnOnce(&mut ServerCookie) -> R) -> Option<R> {
-        let mut cookies = self.shared.cookies.borrow_mut();
-        let needed = self.endpoints.len().max(server.0 + 1);
-        if cookies.len() < needed {
-            cookies.resize_with(needed, ServerCookie::default);
+        if !self.shared.health.borrow().contains(server) {
+            return None;
         }
-        cookies.get_mut(server.0).map(f)
+        let mut cookies = self.shared.cookies.borrow_mut();
+        Some(f(cookies.entry(server).or_default()))
     }
 
     /// Attach the COOKIE option for this send (UDP only; removed on TCP). Returns
@@ -426,7 +426,10 @@ impl AsyncClient {
         let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
         let mut s = preferred;
         for _ in 0..tries.max(1) {
-            let Some(ep) = self.endpoints.get(s.0) else { break };
+            let Some(ep) = self.endpoints.iter().find(|e| e.id == s) else { break };
+            // A lookup from before a server-list change may still reach a server
+            // that left the list: use its conn unpooled, so none lingers there.
+            let current = self.shared.health.borrow().contains(s);
             let conn = if use_tcp {
                 // Checkout-then-release: no pool guard is live while the C socket
                 // callbacks fire during creation, nor while `Conn::shared` borrows.
@@ -435,8 +438,10 @@ impl AsyncClient {
                     let sock = self.rt.tcp(ep.bind).ok()?;
                     let _ = sock.get_ref().connect(ep.tcp_addr); // optimistic (EINPROGRESS → Ok)
                     let c = TcpConn::new(sock);
-                    let replaced = self.shared.tcp_pool.borrow_mut().insert(s, c.clone());
-                    drop(replaced); // after the borrow: closing may fire C callbacks
+                    if current {
+                        let replaced = self.shared.tcp_pool.borrow_mut().insert(s, c.clone());
+                        drop(replaced); // after the borrow: closing may fire C callbacks
+                    }
                     Some(c)
                 });
                 checked_out.map(|c| Conn::shared(c, qid))
@@ -453,11 +458,18 @@ impl AsyncClient {
                     let sk = self.rt.udp(ep.bind).ok()?;
                     let _ = sk.get_ref().connect(ep.udp_addr);
                     let c = UdpConn::new(sk, event_driven);
-                    self.shared.udp_pool.borrow_mut().insert(s, c.clone());
+                    if current {
+                        self.shared.udp_pool.borrow_mut().insert(s, c.clone());
+                    }
                     Some(c)
                 });
                 checked_out.map(|c| {
-                    Conn::shared_udp(c, qid).with_udp_lease(self.shared.clone(), s, stayopen, self.udp_max_queries)
+                    let conn = Conn::shared_udp(c, qid);
+                    if current {
+                        conn.with_udp_lease(self.shared.clone(), s, stayopen, self.udp_max_queries)
+                    } else {
+                        conn
+                    }
                 })
             };
             if let Some(conn) = conn {
@@ -475,6 +487,7 @@ impl AsyncClient {
 /// A server's precomputed connect targets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServerEndpoint {
+    pub id: ServerId,
     pub udp_addr: SocketAddr,
     pub tcp_addr: SocketAddr,
     pub bind: SocketAddr,

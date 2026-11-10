@@ -161,6 +161,13 @@ impl TcpPool {
         self.conns.drain().map(|(_, conn)| conn).collect()
     }
 
+    /// Evict the conns of servers no longer in `keep` (a server-list change).
+    #[must_use = "drop the evicted conns after releasing the pool borrow"]
+    pub fn retain_servers(&mut self, keep: &[ServerId]) -> Vec<Rc<RefCell<TcpConn>>> {
+        let gone: Vec<ServerId> = self.conns.keys().filter(|id| !keep.contains(id)).copied().collect();
+        gone.into_iter().filter_map(|id| self.conns.remove(&id)).collect()
+    }
+
     #[must_use = "drop the evicted conn after releasing the pool borrow"]
     pub fn remove(&mut self, key: ServerId) -> Option<Rc<RefCell<TcpConn>>> {
         self.conns.remove(&key)

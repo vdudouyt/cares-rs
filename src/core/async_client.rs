@@ -25,6 +25,7 @@ pub(crate) use packet::*;
 pub(crate) use request::ServerEndpoint;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{c_int, CString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -121,6 +122,8 @@ pub(crate) struct AsyncClient {
     /// server-list change (`servers_changed`) and shared by every lookup copy,
     /// which keeps the list it started with.
     pub endpoints: Rc<Vec<ServerEndpoint>>,
+    /// The next [`ServerId`] to mint for a server entering the list.
+    next_server_id: usize,
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
 }
@@ -135,7 +138,7 @@ pub(crate) struct ChannelShared {
     /// and probes all read and update the same view.
     pub health: RefCell<ServerHealth>,
     /// Per-server DNS cookie state; reset by `duplicate`.
-    pub cookies: RefCell<Vec<ServerCookie>>,
+    pub cookies: RefCell<HashMap<ServerId, ServerCookie>>,
     /// The answer cache (`ARES_OPT_QUERY_CACHE`).
     pub cache: RefCell<QueryCache>,
     /// Shared TCP sockets (parallel lookups to one server share a connection).
@@ -154,7 +157,7 @@ impl ChannelShared {
     pub(crate) fn new() -> Rc<Self> {
         Rc::new(ChannelShared {
             health: RefCell::new(ServerHealth::default()),
-            cookies: RefCell::new(Vec::new()),
+            cookies: RefCell::new(HashMap::new()),
             cache: RefCell::new(QueryCache::default()),
             tcp_pool: RefCell::new(TcpPool::new()),
             udp_pool: RefCell::new(UdpPool::new()),
@@ -198,6 +201,7 @@ impl AsyncClient {
             hosts_path: self.hosts_path.clone(),
             udp_max_queries: self.udp_max_queries,
             endpoints: self.endpoints.clone(),
+            next_server_id: self.next_server_id,
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
         }

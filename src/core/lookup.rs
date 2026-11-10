@@ -1,6 +1,7 @@
 //! Pure, safe DNS reply/reactor truth tables reused by the async engine, with
 //! no I/O: reply classification, search plans, server health, and verdicts.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Header-level summary of a DNS reply buffer.
@@ -118,9 +119,12 @@ pub use libc::{AF_INET, AF_INET6};
 pub(crate) const RTYPE_A: u16 = 0x01;
 pub(crate) const RTYPE_AAAA: u16 = 0x1c;
 
-/// A server's position in the channel's server list (`config.nameservers`,
-/// and the parallel `ServerHealth`/endpoint/cookie vectors). A distinct type so
-/// it cannot be swapped with the try counters and ids it travels beside.
+/// A server's stable identity on its channel: minted when the server enters the
+/// server list and kept across server-list changes for as long as its address
+/// and ports stay configured (upstream keeps the `ares_server_t`). It keys the
+/// per-server state (`ServerHealth`, cookies, pools) and the channel's
+/// endpoints. A distinct type so it cannot be swapped with the try counters and
+/// ids it travels beside.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServerId(pub usize);
 
@@ -214,48 +218,78 @@ pub fn on_timeout(tries_done: u32, attempts: u32, server: ServerId, health: &mut
     }
 }
 
-/// Per-server failure bookkeeping and selection for failover/probing. Indices
-/// track `config.nameservers`; mutators are bounds-checked so a shrinking server
-/// list under an in-flight query cannot panic.
+/// One server's failure bookkeeping.
+#[derive(Clone, Copy, Debug, Default)]
+struct ServerStats {
+    failures: u32,
+    last_failure: Option<Instant>,
+    /// A probe to this server is in flight (upstream `probe_pending`).
+    probing: bool,
+}
+
+/// Per-server failure bookkeeping and selection for failover/probing, keyed by
+/// stable [`ServerId`] (like upstream's per-`ares_server_t` state): a server
+/// that survives a server-list change keeps its stats. `order` is the current
+/// list in config order; mutators on an ID that is no longer current (a lookup
+/// from before a change) are no-ops.
 #[derive(Default)]
 pub struct ServerHealth {
-    pub failures: Vec<u32>,
-    pub last_failure: Vec<Option<Instant>>,
-    /// A probe to this server is in flight (upstream `probe_pending`).
-    probing: Vec<bool>,
+    order: Vec<ServerId>,
+    stats: HashMap<ServerId, ServerStats>,
 }
 
 impl ServerHealth {
     pub fn len(&self) -> usize {
-        self.failures.len()
+        self.order.len()
     }
 
     #[allow(dead_code)] // clippy: len() without is_empty()
     pub fn is_empty(&self) -> bool {
-        self.failures.is_empty()
+        self.order.is_empty()
     }
 
-    /// Re-size for a fresh server list of `n` entries, all healthy.
-    pub fn reset(&mut self, n: usize) {
-        self.failures = vec![0; n];
-        self.last_failure = vec![None; n];
-        self.probing = vec![false; n];
+    /// Whether `server` is in the current server list.
+    pub fn contains(&self, server: ServerId) -> bool {
+        self.stats.contains_key(&server)
     }
 
-    /// Lowest failure count, tie broken by index; server 0 when empty.
-    pub fn pick_next(&self) -> ServerId {
-        let mut best: Option<(u32, usize)> = None;
-        for (i, &failures) in self.failures.iter().enumerate() {
-            match best {
-                None => best = Some((failures, i)),
-                Some((best_f, best_i)) => {
-                    if failures < best_f || (failures == best_f && i < best_i) {
-                        best = Some((failures, i));
-                    }
-                }
+    /// Adopt a new server list: kept IDs keep their stats, new ones start
+    /// healthy, removed ones are dropped.
+    pub fn sync(&mut self, order: &[ServerId]) {
+        let mut stats = HashMap::with_capacity(order.len());
+        for &id in order {
+            stats.insert(id, self.stats.get(&id).copied().unwrap_or_default());
+        }
+        self.order = order.to_vec();
+        self.stats = stats;
+    }
+
+    /// `ares_dup`: take `src`'s failure counts position by position (the copy
+    /// has the same server list); timestamps and probe marks start cleared.
+    pub fn copy_failures_from(&mut self, src: &ServerHealth) {
+        for (id, src_id) in self.order.iter().zip(&src.order) {
+            let failures = src.stats.get(src_id).map_or(0, |s| s.failures);
+            if let Some(s) = self.stats.get_mut(id) {
+                s.failures = failures;
             }
         }
-        ServerId(best.map(|(_, i)| i).unwrap_or(0))
+    }
+
+    fn failures(&self, server: ServerId) -> u32 {
+        self.stats.get(&server).map_or(0, |s| s.failures)
+    }
+
+    /// Lowest failure count, tie broken by config order; the first server
+    /// (or `ServerId::default()`) when empty.
+    pub fn pick_next(&self) -> ServerId {
+        let mut best: Option<(u32, ServerId)> = None;
+        for &id in &self.order {
+            let failures = self.failures(id);
+            if best.is_none_or(|(best_f, _)| failures < best_f) {
+                best = Some((failures, id));
+            }
+        }
+        best.map(|(_, id)| id).unwrap_or_default()
     }
 
     /// Lowest-failure server whose failure timestamp expired past `retry_delay`,
@@ -263,59 +297,61 @@ impl ServerHealth {
     pub fn pick_probe(&self, retry_delay_ms: u64, exclude: ServerId) -> Option<ServerId> {
         let now = Instant::now();
         let retry_delay = Duration::from_millis(retry_delay_ms);
-        let mut best: Option<(u32, usize)> = None;
-        for (i, &failures) in self.failures.iter().enumerate() {
-            if failures == 0 || i == exclude.0 || self.probing.get(i) == Some(&true) {
+        let mut best: Option<(u32, ServerId)> = None;
+        for &id in &self.order {
+            let Some(s) = self.stats.get(&id) else { continue };
+            if s.failures == 0 || id == exclude || s.probing {
                 continue;
             }
-            let Some(Some(last_fail)) = self.last_failure.get(i) else { continue };
-            if now.duration_since(*last_fail) < retry_delay {
+            let Some(last_fail) = s.last_failure else { continue };
+            if now.duration_since(last_fail) < retry_delay {
                 continue; // Not yet expired
             }
-            match best {
-                None => best = Some((failures, i)),
-                Some((bf, bi)) => {
-                    if failures < bf || (failures == bf && i < bi) {
-                        best = Some((failures, i));
-                    }
-                }
+            if best.is_none_or(|(best_f, _)| s.failures < best_f) {
+                best = Some((s.failures, id));
             }
         }
-        best.map(|(_, i)| ServerId(i))
+        best.map(|(_, id)| id)
     }
 
-    /// Count a failure against `server`; `false` when out of bounds (server list
-    /// changed under the query).
+    /// Count a failure against `server`; `false` when it is no longer current
+    /// (server list changed under the query).
     pub fn record_failure(&mut self, server: ServerId) -> bool {
-        let idx = server.0;
-        if idx >= self.failures.len() {
-            return false;
-        }
-        self.failures[idx] += 1;
-        if idx < self.last_failure.len() {
-            self.last_failure[idx] = Some(Instant::now());
-        }
+        let Some(s) = self.stats.get_mut(&server) else { return false };
+        s.failures += 1;
+        s.last_failure = Some(Instant::now());
         true
     }
 
-    /// Mark a probe to `server` as in flight (or finished); out of bounds is a no-op.
+    /// Mark a probe to `server` as in flight (or finished); unknown IDs are a no-op.
     pub fn set_probing(&mut self, server: ServerId, on: bool) {
-        if let Some(p) = self.probing.get_mut(server.0) {
-            *p = on;
+        if let Some(s) = self.stats.get_mut(&server) {
+            s.probing = on;
         }
     }
 
-    /// Mark `server` healthy; `false` when out of bounds.
+    /// Mark `server` healthy; `false` when it is no longer current.
     pub fn record_success(&mut self, server: ServerId) -> bool {
-        let idx = server.0;
-        if idx >= self.failures.len() {
-            return false;
-        }
-        self.failures[idx] = 0;
-        if idx < self.last_failure.len() {
-            self.last_failure[idx] = None;
-        }
+        let Some(s) = self.stats.get_mut(&server) else { return false };
+        s.failures = 0;
+        s.last_failure = None;
         true
+    }
+}
+
+#[cfg(test)]
+impl ServerHealth {
+    /// A fresh healthy list `ServerId(0)..ServerId(n)`.
+    pub fn reset(&mut self, n: usize) {
+        self.sync(&(0..n).map(ServerId).collect::<Vec<_>>());
+    }
+
+    pub fn failure_counts(&self) -> Vec<u32> {
+        self.order.iter().map(|&id| self.failures(id)).collect()
+    }
+
+    pub fn last_failure_of(&self, server: ServerId) -> Option<Instant> {
+        self.stats.get(&server).and_then(|s| s.last_failure)
     }
 }
 
@@ -431,7 +467,7 @@ mod tests {
         assert!(!h.record_failure(ServerId(5)));
         assert!(!h.record_success(ServerId(5)));
         h.set_probing(ServerId(5), true); // no panic
-        assert_eq!(h.failures, vec![0]);
+        assert_eq!(h.failure_counts(), vec![0]);
     }
 
     #[test]
@@ -446,7 +482,7 @@ mod tests {
         let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::Deliver);
         assert_eq!(a, vec![notify_ok(ServerId(0))]);
-        assert_eq!(h.failures[0], 0, "success resets failures");
+        assert_eq!(h.failure_counts()[0], 0, "success resets failures");
 
         // SERVFAIL, 2 servers: fail over to the next server, notify fail.
         let mut h = ServerHealth::default();
@@ -454,7 +490,7 @@ mod tests {
         let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId(1), tries: 1 });
         assert_eq!(a, vec![notify_fail(ServerId(0))]);
-        assert_eq!(h.failures[0], 1);
+        assert_eq!(h.failure_counts()[0], 1);
 
         // SERVFAIL, single server: retried in place (pick_next returns the same
         // server), failure recorded, still notified.
@@ -463,7 +499,7 @@ mod tests {
         let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId(0), false, 2, 0, ReplyPolicy::default(), &mut h);
         assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId(0), tries: 1 });
         assert_eq!(a, vec![notify_fail(ServerId(0))]);
-        assert_eq!(h.failures[0], 1);
+        assert_eq!(h.failure_counts()[0], 1);
 
         // budget exhausted: tries+1 >= nservers*attempts falls through to Deliver
         let mut h = ServerHealth::default();
@@ -515,8 +551,8 @@ mod tests {
         );
         assert_eq!(v, TaskVerdict::RetryTcp);
         assert!(a.is_empty());
-        assert_eq!(h.failures[0], 0);
-        assert_eq!(h.last_failure[0], None);
+        assert_eq!(h.failure_counts()[0], 0);
+        assert_eq!(h.last_failure_of(ServerId(0)), None);
 
         // NOCHECKRESP: deliver SERVFAIL/NOTIMP/REFUSED, notifying success
         // (upstream's pass-through path marks the server good).
@@ -537,7 +573,7 @@ mod tests {
                 a,
                 vec![ReactorAction::NotifyServerState { server: ServerId(0), ok: true, tcp: false }]
             );
-            assert_eq!(h.failures[0], 0);
+            assert_eq!(h.failure_counts()[0], 0);
         }
     }
 
@@ -547,12 +583,12 @@ mod tests {
         let mut h = ServerHealth::default();
         h.reset(2);
         assert_eq!(on_timeout(1, 3, ServerId(0), &mut h), TimeoutVerdict::Retry { server: ServerId(1) });
-        assert_eq!(h.failures[0], 1);
+        assert_eq!(h.failure_counts()[0], 1);
         // retries left, single server: same server, no failure counted
         let mut h = ServerHealth::default();
         h.reset(1);
         assert_eq!(on_timeout(1, 3, ServerId(0), &mut h), TimeoutVerdict::Retry { server: ServerId(0) });
-        assert_eq!(h.failures[0], 0);
+        assert_eq!(h.failure_counts()[0], 0);
         // out of attempts
         assert_eq!(on_timeout(3, 3, ServerId(0), &mut h), TimeoutVerdict::Expire);
     }
