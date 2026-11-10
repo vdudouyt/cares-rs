@@ -19,8 +19,11 @@ impl AsyncClient {
         let mut q = self.start_query(query);
         self.maybe_probe(&q);
         loop {
-            if let Step::Done(result) = self.attempt(&mut q, cancelled).await {
-                return (result, q.timeouts);
+            match self.attempt(&mut q).await {
+                Step::Done(result) => return (result, q.timeouts),
+                // A-cancels-AAAA: the sibling answered, so don't try again.
+                Step::Retry if cancelled.get() => return (Err(ARES_ETIMEOUT), q.timeouts),
+                Step::Retry => {}
             }
         }
     }
@@ -50,7 +53,7 @@ impl AsyncClient {
         let mut q = self.start_query(query);
         q.server = probe.server;
         q.no_retry = true;
-        while let Step::Retry = self.attempt(&mut q, &Cell::new(false)).await {}
+        while let Step::Retry = self.attempt(&mut q).await {}
     }
 
     /// Per-query state before the first attempt: starting transport, DNS 0x20
@@ -82,7 +85,7 @@ impl AsyncClient {
 
     /// One attempt: check out a conn (failing over past unreachable servers),
     /// send once, then listen until a reply, timeout or dead socket decides.
-    async fn attempt(&self, q: &mut QueryState, cancelled: &Cell<bool>) -> Step {
+    async fn attempt(&self, q: &mut QueryState) -> Step {
         let tries = if q.no_retry { 1 } else { q.opts.attempts };
         let Some((mut conn, server)) = self.connect_with_failover(q.qid.id(), q.server, q.use_tcp, tries) else {
             return Step::Done(Err(ARES_ECONNREFUSED));
@@ -108,8 +111,8 @@ impl AsyncClient {
         loop {
             let step = match recv_reply(&mut conn, deadline).await {
                 Ok(buf) => self.on_reply(q, buf, sent_cookie.as_ref()),
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(self.on_timed_out(q, &conn, cancelled)),
-                Err(_) => Some(self.on_dead_socket(q, &conn, cancelled)),
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(self.on_timed_out(q, &conn)),
+                Err(_) => Some(self.on_dead_socket(q, &conn)),
             };
             if let Some(step) = step {
                 return step;
@@ -189,16 +192,16 @@ impl AsyncClient {
     }
 
     /// No reply before the deadline.
-    fn on_timed_out(&self, q: &mut QueryState, conn: &Conn, cancelled: &Cell<bool>) -> Step {
+    fn on_timed_out(&self, q: &mut QueryState, conn: &Conn) -> Step {
         // If any UDP socket to this server already died, a timeout is the same
         // unreachable condition (the kernel may rate-limit ICMP across parallel
         // sockets): mark dead and retry uncounted.
         if !q.use_tcp && self.optmask & ARES_OPT_EVENT_THREAD != 0 && self.shared.udp_pool.borrow().has_dead(q.server) {
             conn.mark_dead();
-            return self.fail_over(q, cancelled, false, ARES_ECONNREFUSED);
+            return self.fail_over(q, false, ARES_ECONNREFUSED);
         }
         let server = q.server;
-        let step = self.fail_over(q, cancelled, true, ARES_ETIMEOUT);
+        let step = self.fail_over(q, true, ARES_ETIMEOUT);
         if matches!(step, Step::Retry) && !q.use_tcp {
             self.retire_udp(server, conn);
         }
@@ -208,12 +211,12 @@ impl AsyncClient {
     /// Dead socket (EOF/hard error). For UDP this is ICMP port-unreachable
     /// (upstream issue #819): a critical failure, not a timeout, so the retry is
     /// uncounted and expiry reports ECONNREFUSED.
-    fn on_dead_socket(&self, q: &mut QueryState, conn: &Conn, cancelled: &Cell<bool>) -> Step {
+    fn on_dead_socket(&self, q: &mut QueryState, conn: &Conn) -> Step {
         self.discard_conn(q, conn);
         if q.use_tcp {
-            self.fail_over(q, cancelled, true, ARES_ETIMEOUT)
+            self.fail_over(q, true, ARES_ETIMEOUT)
         } else {
-            self.fail_over(q, cancelled, false, ARES_ECONNREFUSED)
+            self.fail_over(q, false, ARES_ECONNREFUSED)
         }
     }
 
@@ -232,13 +235,10 @@ impl AsyncClient {
         }
     }
 
-    /// Shared tail of the failure paths: stop if cancelled, report the server
-    /// down, then retry on the next server or expire with `expire`.
-    /// `counts_timeout` decides whether this failure is reported in `timeouts`.
-    fn fail_over(&self, q: &mut QueryState, cancelled: &Cell<bool>, counts_timeout: bool, expire: c_int) -> Step {
-        if cancelled.get() {
-            return Step::Done(Err(ARES_ETIMEOUT));
-        }
+    /// Shared tail of the failure paths: report the server down, then retry on
+    /// the next server or expire with `expire`. `counts_timeout` decides whether
+    /// this failure is reported in `timeouts`.
+    fn fail_over(&self, q: &mut QueryState, counts_timeout: bool, expire: c_int) -> Step {
         self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
         match on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut()) {
             // A probe's failure is recorded (by `on_timeout`); it is not retried.
