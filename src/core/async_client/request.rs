@@ -16,10 +16,10 @@ impl AsyncClient {
         if query.payload.len() > u16::MAX as usize {
             return (Err(ARES_EBADQUERY), 0);
         }
-        let mut q = self.start_query(query);
-        self.maybe_probe(&q);
+        let mut q = self.create_query_state(query);
+        self.maybe_spawn_probe(&q);
         loop {
-            match self.attempt(&mut q).await {
+            match self.request(&mut q).await {
                 Step::Done(result) => return (result, q.timeouts),
                 // A-cancels-AAAA: the sibling answered, so don't try again.
                 Step::Retry if cancelled.get() => return (Err(ARES_ETIMEOUT), q.timeouts),
@@ -32,7 +32,7 @@ impl AsyncClient {
     /// probability 1/`retry_chance`, duplicate it (fresh qid) to a failed server
     /// past its retry delay that has no probe in flight. The probe runs as its
     /// detached task, so this query never waits for it.
-    fn maybe_probe(&self, q: &QueryState) {
+    fn maybe_spawn_probe(&self, q: &QueryState) {
         let chance = q.opts.failover_chance;
         if chance == 0 || !rand::thread_rng().r#gen::<u16>().is_multiple_of(chance) {
             return;
@@ -50,16 +50,16 @@ impl AsyncClient {
     /// probe-in-flight mark.
     async fn probe(self, mut probe: Probe) {
         let Some(query) = probe.query.take() else { return };
-        let mut q = self.start_query(query);
+        let mut q = self.create_query_state(query);
         q.server = probe.server;
         q.no_retry = true;
-        while let Step::Retry = self.attempt(&mut q).await {}
+        while let Step::Retry = self.request(&mut q).await {}
     }
 
     /// Per-query state before the first attempt: starting transport, DNS 0x20
     /// case randomization (once per UDP query, kept for retries and enforced on
     /// replies) and the first server.
-    fn start_query(&self, query: ReservedQuery) -> QueryState {
+    fn create_query_state(&self, query: ReservedQuery) -> QueryState {
         let use_tcp = self.config.options.use_vc;
         let mut payload = query.payload.to_vec();
         let dns0x20 = if self.flags & ARES_FLAG_DNS0x20 != 0 && !use_tcp {
@@ -85,7 +85,7 @@ impl AsyncClient {
 
     /// One attempt: check out a conn (failing over past unreachable servers),
     /// send once, then listen until a reply, timeout or dead socket decides.
-    async fn attempt(&self, q: &mut QueryState) -> Step {
+    async fn request(&self, q: &mut QueryState) -> Step {
         let tries = if q.no_retry { 1 } else { q.opts.attempts };
         let Some((mut conn, server)) = self.connect_with_failover(q.qid.id(), q.server, q.use_tcp, tries) else {
             return Step::Done(Err(ARES_ECONNREFUSED));
@@ -281,7 +281,7 @@ struct QueryState {
     no_retry: bool,
 }
 
-/// A pending failover probe (see [`AsyncClient::maybe_probe`]): its packet,
+/// A pending failover probe (see [`AsyncClient::maybe_spawn_probe`]): its packet,
 /// target server, and the probe-in-flight mark it clears when dropped, whether
 /// it ran to completion or was aborted with the channel.
 struct Probe {
