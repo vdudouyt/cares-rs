@@ -1,11 +1,13 @@
 //! The single-query engine behind every lookup: `AsyncClient::run_reserved_query()`
 //! runs attempts over a [`QueryState`] until one reaches a verdict. Each attempt
-//! is a `request()` (connect with failover, send once, listen), which only reads
-//! the state and returns its decision as a [`Next`]; `run_reserved_query()`
-//! applies it, so every change to a query's state happens there, in order. (A
-//! failover probe runs the same attempts and applies the same decisions in
-//! `probe()`.) A child of `async_client`, so it uses the client's private fields
-//! and helpers directly.
+//! is a `request()` — connect with failover, send once, wait for this query's
+//! response — which reports what happened on the wire as an [`Exchange`] and
+//! decides nothing. `run_reserved_query()` makes every decision (retry, fail
+//! over, deliver), performs its channel side effects (health, server-state
+//! callback, conn eviction) and makes every change to the query state, in one
+//! place. A failover probe runs the same attempts with its own copy of the
+//! (no-retry) decisions in `probe()`. A child of `async_client`, so it uses the
+//! client's private fields and helpers directly.
 
 use super::*;
 
@@ -22,39 +24,134 @@ impl AsyncClient {
         }
         let mut q = self.create_query_state(query);
         self.maybe_spawn_probe(&q);
+        let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
+
         loop {
-            let (reached, change) = match self.request(&q).await {
-                Next::Done(result) => return (result, q.timeouts),
-                // A-cancels-AAAA: the sibling answered, so don't try again.
-                Next::Retry { .. } if cancelled.get() => return (Err(ARES_ETIMEOUT), q.timeouts),
-                Next::Retry { reached, change } => (reached, change),
-            };
-            // The state changes between attempts — all of them.
-            q.server = reached;
-            match change {
-                Change::BadCookie => {
-                    q.cookie_tries += 1;
-                    // Persistent BADCOOKIE (e.g. AnyCast rotation): upgrade to
-                    // TCP, where cookies are not used.
-                    if q.cookie_tries >= 3 {
-                        q.use_tcp = true;
+            // One attempt. Every path either returns the verdict or breaks out
+            // of this block to retry with the updated state.
+            'attempt: {
+                let Exchange { server, conn, response } = match self.request(&q).await {
+                    Ok(exchange) => exchange,
+                    Err(e) => return (Err(e), q.timeouts),
+                };
+                q.server = server;
+
+                // Decide. A failure yields (counts as a timeout, error on
+                // expiry, retire the UDP conn on retry) for the shared failover
+                // below; everything else returns or retries right here.
+                let (counts_timeout, expire, retire_udp) = match response {
+                    Response::Reply(_, CookieVerdict::BadCookie) => {
+                        q.cookie_tries += 1;
+                        // Persistent BADCOOKIE (e.g. AnyCast rotation): upgrade
+                        // to TCP, where cookies are not used.
+                        if q.cookie_tries >= 3 {
+                            q.use_tcp = true;
+                        }
+                        break 'attempt;
                     }
-                }
-                Change::StripOpt(payload) => q.payload = payload,
-                Change::UpgradeTcp => q.use_tcp = true,
-                Change::Failover { server, failover_tries } => {
-                    q.server = server;
-                    q.failover_tries = failover_tries;
-                    q.try_count += 1;
-                }
-                Change::NextTry { server, timed_out } => {
-                    q.server = server;
-                    q.tries += 1;
-                    q.try_count += 1;
-                    if timed_out {
-                        q.timeouts += 1;
+                    Response::Reply(buf, _) => {
+                        let summary = summarize(&buf, 0);
+                        // FORMERR fallback: a server that does not understand
+                        // EDNS answers the OPT-bearing query with FORMERR. Strip
+                        // the OPT (and cookie) and retry the same server
+                        // uncounted.
+                        if summary.rcode == 1
+                            && edns_wire::has_opt(&q.payload)
+                            && edns_wire::strip_opt(&mut q.payload)
+                        {
+                            break 'attempt;
+                        }
+                        let policy =
+                            ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
+                        let (actions, verdict) = on_datagram(
+                            &summary,
+                            q.server,
+                            q.use_tcp,
+                            q.opts.attempts,
+                            q.failover_tries,
+                            policy,
+                            &mut self.shared.health.borrow_mut(),
+                        );
+                        self.notify(actions);
+                        match verdict {
+                            TaskVerdict::RetryNextServer { server, tries } => {
+                                q.server = server;
+                                q.failover_tries = tries;
+                                q.try_count += 1;
+                                break 'attempt;
+                            }
+                            TaskVerdict::RetryTcp => {
+                                q.use_tcp = true;
+                                break 'attempt;
+                            }
+                            TaskVerdict::Deliver => return (Ok(buf), q.timeouts),
+                        }
                     }
+                    // The send itself failed: drop the conn and retry on the
+                    // next server while the attempt budget lasts.
+                    Response::SendFailed => {
+                        self.discard_conn(&q, &conn);
+                        if q.tries + 1 >= q.opts.attempts.max(1) {
+                            return (Err(ARES_ECONNREFUSED), q.timeouts);
+                        }
+                        q.tries += 1;
+                        q.try_count += 1;
+                        if self.shared.health.borrow().len() > 1 {
+                            self.shared.health.borrow_mut().record_failure(q.server);
+                            q.server = self.shared.health.borrow().pick_next();
+                        }
+                        break 'attempt;
+                    }
+                    // No reply before the deadline.
+                    Response::TimedOut => {
+                        // If any UDP socket to this server already died, a
+                        // timeout is the same unreachable condition (the kernel
+                        // may rate-limit ICMP across parallel sockets): mark
+                        // dead and retry uncounted.
+                        if !q.use_tcp && event_driven && self.shared.udp_pool.borrow().has_dead(q.server) {
+                            conn.mark_dead();
+                            (false, ARES_ECONNREFUSED, false)
+                        } else {
+                            (true, ARES_ETIMEOUT, !q.use_tcp)
+                        }
+                    }
+                    // Dead socket (EOF/hard error). For UDP this is ICMP
+                    // port-unreachable (upstream issue #819): a critical
+                    // failure, not a timeout, so the retry is uncounted and
+                    // expiry reports ECONNREFUSED.
+                    Response::Dead => {
+                        self.discard_conn(&q, &conn);
+                        if q.use_tcp {
+                            (true, ARES_ETIMEOUT, false)
+                        } else {
+                            (false, ARES_ECONNREFUSED, false)
+                        }
+                    }
+                };
+
+                // Shared failover: report the server down, then retry on the
+                // next server or expire with `expire`.
+                let failed = q.server;
+                self.notify(vec![ReactorAction::NotifyServerState { server: failed, ok: false, tcp: q.use_tcp }]);
+                let verdict = on_timeout(q.tries, q.opts.attempts, failed, &mut self.shared.health.borrow_mut());
+                match verdict {
+                    TimeoutVerdict::Retry { server } => {
+                        q.tries += 1;
+                        q.try_count += 1;
+                        if counts_timeout {
+                            q.timeouts += 1;
+                        }
+                        q.server = server;
+                        if retire_udp {
+                            self.retire_udp(failed, &conn);
+                        }
+                    }
+                    TimeoutVerdict::Expire => return (Err(expire), q.timeouts),
                 }
+            }
+            // Retrying. A-cancels-AAAA: the sibling answered, so don't.
+            if cancelled.get() {
+                return (Err(ARES_ETIMEOUT), q.timeouts);
             }
         }
     }
@@ -77,28 +174,63 @@ impl AsyncClient {
 
     /// Run a failover probe: one no-retry attempt to its server, whose outcome
     /// only feeds `ServerHealth` and the server-state callback (upstream sends it
-    /// with `ARES_SEND_FLAG_NORETRY`). `request()` never fails a probe over or
-    /// counts a retry, but it still re-sends on BADCOOKIE, the FORMERR fallback
-    /// and a TC upgrade; those changes are applied here. Dropping it clears the
-    /// server's probe-in-flight mark.
+    /// with `ARES_SEND_FLAG_NORETRY`). The same decisions as
+    /// `run_reserved_query()`, minus everything that moves on: no failover, no
+    /// counted retry. It still re-sends on BADCOOKIE, the FORMERR fallback and a
+    /// TC upgrade. Dropping it clears the server's probe-in-flight mark.
     async fn probe(self, mut probe: Probe) {
         let Some(query) = probe.query.take() else { return };
         let mut q = self.create_query_state(query);
         q.server = probe.server;
         q.no_retry = true;
-        while let Next::Retry { reached, change } = self.request(&q).await {
-            q.server = reached;
-            match change {
-                Change::BadCookie => {
+        let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
+        loop {
+            let Ok(Exchange { server, conn, response }) = self.request(&q).await else { return };
+            q.server = server;
+            match response {
+                Response::Reply(_, CookieVerdict::BadCookie) => {
                     q.cookie_tries += 1;
                     if q.cookie_tries >= 3 {
                         q.use_tcp = true;
                     }
                 }
-                Change::StripOpt(payload) => q.payload = payload,
-                Change::UpgradeTcp => q.use_tcp = true,
-                // Never decided for a probe (`no_retry`); stop if it ever is.
-                Change::Failover { .. } | Change::NextTry { .. } => return,
+                Response::Reply(buf, _) => {
+                    let summary = summarize(&buf, 0);
+                    if summary.rcode == 1 && edns_wire::has_opt(&q.payload) && edns_wire::strip_opt(&mut q.payload) {
+                        continue;
+                    }
+                    let policy = ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
+                    let (actions, verdict) = on_datagram(
+                        &summary,
+                        q.server,
+                        q.use_tcp,
+                        q.opts.attempts,
+                        q.failover_tries,
+                        policy,
+                        &mut self.shared.health.borrow_mut(),
+                    );
+                    self.notify(actions);
+                    // The verdict is recorded in health; only a TC upgrade re-sends.
+                    match verdict {
+                        TaskVerdict::RetryTcp => q.use_tcp = true,
+                        TaskVerdict::RetryNextServer { .. } | TaskVerdict::Deliver => return,
+                    }
+                }
+                Response::SendFailed => {
+                    self.discard_conn(&q, &conn);
+                    return;
+                }
+                // A failure is reported and recorded (by `on_timeout`), never retried.
+                Response::TimedOut | Response::Dead => {
+                    if matches!(response, Response::Dead) {
+                        self.discard_conn(&q, &conn);
+                    } else if !q.use_tcp && event_driven && self.shared.udp_pool.borrow().has_dead(q.server) {
+                        conn.mark_dead();
+                    }
+                    self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
+                    let _ = on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut());
+                    return;
+                }
             }
         }
     }
@@ -130,42 +262,22 @@ impl AsyncClient {
         }
     }
 
-    /// One attempt: check out a conn (failing over past unreachable servers),
-    /// send once, then listen until a reply, timeout or dead socket decides.
-    /// Reads `q` only: the decision, with the server the attempt reached, comes
-    /// back as a [`Next`] for the caller to apply. Side effects on the channel
-    /// (health, server-state callback, pools) happen here, in upstream order.
-    async fn request(&self, q: &QueryState) -> Next {
+    /// One exchange: check out a conn (failing over past unreachable servers),
+    /// send the query once, and wait for the first message that is really this
+    /// query's response. Decides nothing and leaves `q` untouched; what happened
+    /// comes back as an [`Exchange`]. `Err` means nothing could be sent: no
+    /// server was reachable, or the packet could not take its cookie.
+    async fn request(&self, q: &QueryState) -> Result<Exchange, c_int> {
         let tries = if q.no_retry { 1 } else { q.opts.attempts };
-        let Some((mut conn, server)) = self.connect_with_failover(q.qid.id(), q.server, q.use_tcp, tries) else {
-            return Next::Done(Err(ARES_ECONNREFUSED));
-        };
-        let retry = |change| Next::Retry { reached: server, change };
-        let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
-        // Take a failed conn out of service: TCP leaves the pool; an
-        // event-thread UDP conn stays pooled but marked dead (so a burst of
-        // retries fails fast instead of each socket waiting for its own ICMP
-        // error); otherwise the UDP conn is retired.
-        let discard_conn = |conn: &Conn| {
-            if q.use_tcp {
-                let evicted = self.shared.tcp_pool.borrow_mut().remove(server);
-                drop(evicted); // after the borrow: closing may fire C callbacks
-            } else if event_driven {
-                conn.mark_dead();
-            } else {
-                self.retire_udp(server, conn);
-            }
-        };
+        let (mut conn, server) =
+            self.connect_with_failover(q.qid.id(), q.server, q.use_tcp, tries).ok_or(ARES_ECONNREFUSED)?;
 
         // Cookies are re-evaluated per server/transport before every send: a
         // BADCOOKIE retry must pick up the learned server cookie, a TCP upgrade
-        // must strip it. Applied to this attempt's copy of the packet; no OPT
-        // on the payload → untouched.
+        // must strip it. Applied to this send's copy of the packet; no OPT on
+        // the payload → untouched.
         let mut wire = q.payload.clone();
-        let sent_cookie = match self.apply_cookie(&mut wire, server, q.use_tcp) {
-            Ok(c) => c,
-            Err(e) => return Next::Done(Err(e.code())),
-        };
+        let sent_cookie = self.apply_cookie(&mut wire, server, q.use_tcp).map_err(|e| e.code())?;
         let deadline = Instant::now()
             + calc_query_timeout(q.opts.timeout, q.try_count, self.servers.len(), q.opts.maxtimeout);
         let sent = if q.use_tcp {
@@ -174,137 +286,75 @@ impl AsyncClient {
             conn.send(&wire, deadline).await
         };
 
-        // The send itself failed: drop the conn and retry on the next server
-        // while the attempt budget lasts.
-        if sent.is_err() {
-            discard_conn(&conn);
-            if q.no_retry || q.tries + 1 >= q.opts.attempts.max(1) {
-                return Next::Done(Err(ARES_ECONNREFUSED));
-            }
-            let mut next = server;
-            if self.shared.health.borrow().len() > 1 {
-                self.shared.health.borrow_mut().record_failure(server);
-                next = self.shared.health.borrow().pick_next();
-            }
-            return retry(Change::NextTry { server: next, timed_out: false });
-        }
-
-        // Listen until a reply decides, or the attempt fails. A failure yields
-        // (counts as a timeout, error on expiry, retire the UDP conn on retry)
-        // for the shared failover below.
-        let (counts_timeout, expire, retire_udp) = loop {
-            match recv_reply(&mut conn, deadline).await {
-                Ok(buf) => {
-                    // Not for us (stray or spoofed): keep listening.
-                    if !q.is_our_reply(&buf) {
-                        continue;
-                    }
-                    let summary = summarize(&buf, 0);
-                    let full_rcode = edns_wire::extended_rcode(&buf, summary.rcode);
-                    match self.validate_cookie(&buf, sent_cookie.as_ref(), server, full_rcode) {
-                        CookieVerdict::Drop => continue,
-                        CookieVerdict::BadCookie => return retry(Change::BadCookie),
-                        CookieVerdict::Accept => {}
-                    }
-                    // FORMERR fallback: a server that does not understand EDNS
-                    // answers the OPT-bearing query with FORMERR. Strip the OPT
-                    // (and cookie) and retry the same server uncounted.
-                    if summary.rcode == 1 && edns_wire::has_opt(&q.payload) {
-                        let mut stripped = q.payload.clone();
-                        if edns_wire::strip_opt(&mut stripped) {
-                            return retry(Change::StripOpt(stripped));
+        let response = if sent.is_err() {
+            Response::SendFailed
+        } else {
+            loop {
+                match recv_reply(&mut conn, deadline).await {
+                    Ok(buf) => {
+                        // Not this query's response — wrong id or 0x20 case, or
+                        // a cookie mismatch (RFC 7873 §5.3: discard as spoofed):
+                        // keep listening.
+                        if !q.is_our_reply(&buf) {
+                            continue;
+                        }
+                        let rcode = edns_wire::extended_rcode(&buf, summarize(&buf, 0).rcode);
+                        match self.validate_cookie(&buf, sent_cookie.as_ref(), server, rcode) {
+                            CookieVerdict::Drop => continue,
+                            cookie => break Response::Reply(buf, cookie),
                         }
                     }
-                    let policy = ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
-                    let (actions, verdict) = on_datagram(
-                        &summary,
-                        server,
-                        q.use_tcp,
-                        q.opts.attempts,
-                        q.failover_tries,
-                        policy,
-                        &mut self.shared.health.borrow_mut(),
-                    );
-                    self.notify(actions);
-                    return match verdict {
-                        // A probe never moves on: the verdict is already
-                        // recorded in health.
-                        TaskVerdict::RetryNextServer { .. } if q.no_retry => Next::Done(Ok(buf)),
-                        TaskVerdict::RetryNextServer { server, tries } => {
-                            retry(Change::Failover { server, failover_tries: tries })
-                        }
-                        TaskVerdict::RetryTcp => retry(Change::UpgradeTcp),
-                        TaskVerdict::Deliver => Next::Done(Ok(buf)),
-                    };
-                }
-                // No reply before the deadline.
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                    // If any UDP socket to this server already died, a timeout
-                    // is the same unreachable condition (the kernel may
-                    // rate-limit ICMP across parallel sockets): mark dead and
-                    // retry uncounted.
-                    if !q.use_tcp && event_driven && self.shared.udp_pool.borrow().has_dead(server) {
-                        conn.mark_dead();
-                        break (false, ARES_ECONNREFUSED, false);
-                    }
-                    break (true, ARES_ETIMEOUT, !q.use_tcp);
-                }
-                // Dead socket (EOF/hard error). For UDP this is ICMP
-                // port-unreachable (upstream issue #819): a critical failure,
-                // not a timeout, so the retry is uncounted and expiry reports
-                // ECONNREFUSED.
-                Err(_) => {
-                    discard_conn(&conn);
-                    break if q.use_tcp { (true, ARES_ETIMEOUT, false) } else { (false, ARES_ECONNREFUSED, false) };
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => break Response::TimedOut,
+                    Err(_) => break Response::Dead,
                 }
             }
         };
+        Ok(Exchange { server, conn, response })
+    }
 
-        // Shared failover: report the server down, then retry on the next
-        // server or expire with `expire`.
-        self.notify(vec![ReactorAction::NotifyServerState { server, ok: false, tcp: q.use_tcp }]);
-        let verdict = on_timeout(q.tries, q.opts.attempts, server, &mut self.shared.health.borrow_mut());
-        match verdict {
-            // A probe's failure is recorded (by `on_timeout`); it is not retried.
-            TimeoutVerdict::Retry { .. } if q.no_retry => Next::Done(Err(expire)),
-            TimeoutVerdict::Retry { server: next } => {
-                if retire_udp {
-                    self.retire_udp(server, &conn);
-                }
-                retry(Change::NextTry { server: next, timed_out: counts_timeout })
-            }
-            TimeoutVerdict::Expire => Next::Done(Err(expire)),
+    /// Take a failed conn out of service: TCP leaves the pool; an event-thread
+    /// UDP conn stays pooled but marked dead (so a burst of retries fails fast
+    /// instead of each socket waiting for its own ICMP error); otherwise the UDP
+    /// conn is retired.
+    fn discard_conn(&self, q: &QueryState, conn: &Conn) {
+        if q.use_tcp {
+            let evicted = self.shared.tcp_pool.borrow_mut().remove(q.server);
+            drop(evicted); // after the borrow: closing may fire C callbacks
+        } else if self.optmask & ARES_OPT_EVENT_THREAD != 0 {
+            conn.mark_dead();
+        } else {
+            self.retire_udp(q.server, conn);
         }
     }
 }
 
-/// What one `request()` decided.
-enum Next {
-    Done(Result<Vec<u8>, c_int>),
-    /// Try again: `reached` is the server this attempt used (it may differ from
-    /// `QueryState::server` after a connect failover); `change` says what else
-    /// moves before the next attempt.
-    Retry { reached: ServerId, change: Change },
+/// What one `request()` saw on the wire.
+struct Exchange {
+    /// The server the connect reached (it may differ from `QueryState::server`
+    /// after a connect failover).
+    server: ServerId,
+    /// The conn used, for the caller to discard, retire or mark dead; dropping
+    /// it releases the query's inbox slot.
+    conn: Conn,
+    response: Response,
 }
 
-/// The state change a retry needs, applied by `run_reserved_query()`.
-enum Change {
-    /// Server answered BADCOOKIE: count it; the third upgrades to TCP.
-    BadCookie,
-    /// FORMERR fallback: the payload with its OPT stripped. Uncounted.
-    StripOpt(Vec<u8>),
-    /// Truncated reply: retry over TCP. Uncounted.
-    UpgradeTcp,
-    /// The reply's rcode says try the next server (`on_datagram`).
-    Failover { server: ServerId, failover_tries: u32 },
-    /// Send failure, timeout or dead socket: a counted try on `server`;
-    /// `timed_out` also counts it in the reported timeouts.
-    NextTry { server: ServerId, timed_out: bool },
+/// How the exchange ended.
+enum Response {
+    /// This query's response, with its DNS cookie verdict (`Accept` or
+    /// `BadCookie`; dropped ones never come back).
+    Reply(Vec<u8>, CookieVerdict),
+    /// The send itself failed.
+    SendFailed,
+    /// No response before the deadline.
+    TimedOut,
+    /// The socket died: EOF or a hard error (for UDP, ICMP port-unreachable).
+    Dead,
 }
 
 /// State of one `run_reserved_query()` across its attempts (upstream
-/// `ares_query_t`). `request()` only reads it; the changes between attempts
-/// happen in `run_reserved_query()` (and, for a failover probe, `probe()`).
+/// `ares_query_t`). `request()` only reads it; `run_reserved_query()` (and,
+/// for a failover probe, `probe()`) changes it.
 struct QueryState {
     opts: QueryOpts,
     /// The channel-unique transaction id, reserved for the query's whole life.
