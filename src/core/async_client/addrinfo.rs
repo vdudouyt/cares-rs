@@ -182,7 +182,7 @@ impl AsyncClient {
                 .and_then(|p| self.reserve(p));
             async move {
                 match payload {
-                    Ok(q) => self.run_reserved_query(q, cancelled).await,
+                    Ok(q) => self.run_reserved_query(q, cancelled, None).await,
                     Err(e) => (Err(e.code()), 0),
                 }
             }

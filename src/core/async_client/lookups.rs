@@ -9,7 +9,7 @@ impl AsyncClient {
     /// The payload goes on the wire as given (`query_payload` already added EDNS;
     /// raw send APIs must not), under the id reserved with it.
     pub(crate) async fn query_raw(self, query: ReservedQuery) -> Delivery {
-        let (result, timeouts) = self.run_reserved_query(query, &Cell::new(false)).await;
+        let (result, timeouts) = self.run_reserved_query(query, &Cell::new(false), None).await;
         Delivery::Raw { result, timeouts }
     }
 
@@ -35,7 +35,7 @@ impl AsyncClient {
             Ok(q) => q,
             Err(e) => return (Err(e), 0),
         };
-        let (result, timeouts) = self.run_reserved_query(payload, &Cell::new(false)).await;
+        let (result, timeouts) = self.run_reserved_query(payload, &Cell::new(false), None).await;
         let result = match result {
             Ok(buf) => on_host_reply(Ok(&buf), RECORD_TYPE_PTR, family, Some(ip)),
             Err(status) => Err(AresError::from(status)),
@@ -101,7 +101,7 @@ impl AsyncClient {
                 }
             }
         };
-        let (result, io_timeouts) = self.run_reserved_query(payload, &Cell::new(false)).await;
+        let (result, io_timeouts) = self.run_reserved_query(payload, &Cell::new(false), None).await;
 
         let dns_result: Result<&[u8], AresError> = match result {
             Ok(ref buf) => Ok(&buf[..]),
@@ -192,7 +192,7 @@ impl AsyncClient {
                 Ok(q) => q,
                 Err(e) => return Delivery::Raw { result: Err(e.code()), timeouts },
             };
-            let (result, io_timeouts) = self.run_reserved_query(payload, &not_cancelled).await;
+            let (result, io_timeouts) = self.run_reserved_query(payload, &not_cancelled, None).await;
             timeouts += io_timeouts;
 
             let last_error: AresError = match result {
