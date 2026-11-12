@@ -27,131 +27,128 @@ impl AsyncClient {
         let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
 
         loop {
-            // One attempt. Every path either returns the verdict or breaks out
-            // of this block to retry with the updated state.
-            'attempt: {
-                let Exchange { server, conn, response } = match self.request(&q).await {
-                    Ok(exchange) => exchange,
-                    Err(e) => return (Err(e), q.timeouts),
-                };
-                q.server = server;
-
-                // Decide. A failure yields (counts as a timeout, error on
-                // expiry, retire the UDP conn on retry) for the shared failover
-                // below; everything else returns or retries right here.
-                let (counts_timeout, expire, retire_udp) = match response {
-                    Response::Reply(_, CookieVerdict::BadCookie) => {
-                        q.cookie_tries += 1;
-                        // Persistent BADCOOKIE (e.g. AnyCast rotation): upgrade
-                        // to TCP, where cookies are not used.
-                        if q.cookie_tries >= 3 {
-                            q.use_tcp = true;
-                        }
-                        break 'attempt;
-                    }
-                    Response::Reply(buf, _) => {
-                        let summary = summarize(&buf, 0);
-                        // FORMERR fallback: a server that does not understand
-                        // EDNS answers the OPT-bearing query with FORMERR. Strip
-                        // the OPT (and cookie) and retry the same server
-                        // uncounted.
-                        if summary.rcode == 1
-                            && edns_wire::has_opt(&q.payload)
-                            && edns_wire::strip_opt(&mut q.payload)
-                        {
-                            break 'attempt;
-                        }
-                        let policy =
-                            ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
-                        let (actions, verdict) = on_datagram(
-                            &summary,
-                            q.server,
-                            q.use_tcp,
-                            q.opts.attempts,
-                            q.failover_tries,
-                            policy,
-                            &mut self.shared.health.borrow_mut(),
-                        );
-                        self.notify(actions);
-                        match verdict {
-                            TaskVerdict::RetryNextServer { server, tries } => {
-                                q.server = server;
-                                q.failover_tries = tries;
-                                q.try_count += 1;
-                                break 'attempt;
-                            }
-                            TaskVerdict::RetryTcp => {
-                                q.use_tcp = true;
-                                break 'attempt;
-                            }
-                            TaskVerdict::Deliver => return (Ok(buf), q.timeouts),
-                        }
-                    }
-                    // The send itself failed: drop the conn and retry on the
-                    // next server while the attempt budget lasts.
-                    Response::SendFailed => {
-                        self.discard_conn(&q, &conn);
-                        if q.tries + 1 >= q.opts.attempts.max(1) {
-                            return (Err(ARES_ECONNREFUSED), q.timeouts);
-                        }
-                        q.tries += 1;
-                        q.try_count += 1;
-                        if self.shared.health.borrow().len() > 1 {
-                            self.shared.health.borrow_mut().record_failure(q.server);
-                            q.server = self.shared.health.borrow().pick_next();
-                        }
-                        break 'attempt;
-                    }
-                    // No reply before the deadline.
-                    Response::TimedOut => {
-                        // If any UDP socket to this server already died, a
-                        // timeout is the same unreachable condition (the kernel
-                        // may rate-limit ICMP across parallel sockets): mark
-                        // dead and retry uncounted.
-                        if !q.use_tcp && event_driven && self.shared.udp_pool.borrow().has_dead(q.server) {
-                            conn.mark_dead();
-                            (false, ARES_ECONNREFUSED, false)
-                        } else {
-                            (true, ARES_ETIMEOUT, !q.use_tcp)
-                        }
-                    }
-                    // Dead socket (EOF/hard error). For UDP this is ICMP
-                    // port-unreachable (upstream issue #819): a critical
-                    // failure, not a timeout, so the retry is uncounted and
-                    // expiry reports ECONNREFUSED.
-                    Response::Dead => {
-                        self.discard_conn(&q, &conn);
-                        if q.use_tcp {
-                            (true, ARES_ETIMEOUT, false)
-                        } else {
-                            (false, ARES_ECONNREFUSED, false)
-                        }
-                    }
-                };
-
-                // Shared failover: report the server down, then retry on the
-                // next server or expire with `expire`.
-                let failed = q.server;
-                self.notify(vec![ReactorAction::NotifyServerState { server: failed, ok: false, tcp: q.use_tcp }]);
-                let verdict = on_timeout(q.tries, q.opts.attempts, failed, &mut self.shared.health.borrow_mut());
-                match verdict {
-                    TimeoutVerdict::Retry { server } => {
-                        q.tries += 1;
-                        q.try_count += 1;
-                        if counts_timeout {
-                            q.timeouts += 1;
-                        }
-                        q.server = server;
-                        if retire_udp {
-                            self.retire_udp(failed, &conn);
-                        }
-                    }
-                    TimeoutVerdict::Expire => return (Err(expire), q.timeouts),
-                }
-            }
-            // Retrying. A-cancels-AAAA: the sibling answered, so don't.
+            // A-cancels-AAAA: the sibling answered, so don't (re)send. A reply
+            // already in flight is still delivered: this runs between attempts.
             if cancelled.get() {
                 return (Err(ARES_ETIMEOUT), q.timeouts);
+            }
+            let Exchange { server, conn, response } = match self.request(&q).await {
+                Ok(exchange) => exchange,
+                Err(e) => return (Err(e), q.timeouts),
+            };
+            q.server = server;
+
+            // Decide. A failure yields (counts as a timeout, error on
+            // expiry, retire the UDP conn on retry) for the shared failover
+            // below; everything else returns or retries right here.
+            let (counts_timeout, expire, retire_udp) = match response {
+                Response::Reply(_, CookieVerdict::BadCookie) => {
+                    q.cookie_tries += 1;
+                    // Persistent BADCOOKIE (e.g. AnyCast rotation): upgrade
+                    // to TCP, where cookies are not used.
+                    if q.cookie_tries >= 3 {
+                        q.use_tcp = true;
+                    }
+                    continue;
+                }
+                Response::Reply(buf, _) => {
+                    let summary = summarize(&buf, 0);
+                    // FORMERR fallback: a server that does not understand
+                    // EDNS answers the OPT-bearing query with FORMERR. Strip
+                    // the OPT (and cookie) and retry the same server
+                    // uncounted.
+                    if summary.rcode == 1
+                        && edns_wire::has_opt(&q.payload)
+                        && edns_wire::strip_opt(&mut q.payload)
+                    {
+                        continue;
+                    }
+                    let policy =
+                        ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
+                    let (actions, verdict) = on_datagram(
+                        &summary,
+                        q.server,
+                        q.use_tcp,
+                        q.opts.attempts,
+                        q.failover_tries,
+                        policy,
+                        &mut self.shared.health.borrow_mut(),
+                    );
+                    self.notify(actions);
+                    match verdict {
+                        TaskVerdict::RetryNextServer { server, tries } => {
+                            q.server = server;
+                            q.failover_tries = tries;
+                            q.try_count += 1;
+                            continue;
+                        }
+                        TaskVerdict::RetryTcp => {
+                            q.use_tcp = true;
+                            continue;
+                        }
+                        TaskVerdict::Deliver => return (Ok(buf), q.timeouts),
+                    }
+                }
+                // The send itself failed: drop the conn and retry on the
+                // next server while the attempt budget lasts.
+                Response::SendFailed => {
+                    self.discard_conn(&q, &conn);
+                    if q.tries + 1 >= q.opts.attempts.max(1) {
+                        return (Err(ARES_ECONNREFUSED), q.timeouts);
+                    }
+                    q.tries += 1;
+                    q.try_count += 1;
+                    if self.shared.health.borrow().len() > 1 {
+                        self.shared.health.borrow_mut().record_failure(q.server);
+                        q.server = self.shared.health.borrow().pick_next();
+                    }
+                    continue;
+                }
+                // No reply before the deadline.
+                Response::TimedOut => {
+                    // If any UDP socket to this server already died, a
+                    // timeout is the same unreachable condition (the kernel
+                    // may rate-limit ICMP across parallel sockets): mark
+                    // dead and retry uncounted.
+                    if !q.use_tcp && event_driven && self.shared.udp_pool.borrow().has_dead(q.server) {
+                        conn.mark_dead();
+                        (false, ARES_ECONNREFUSED, false)
+                    } else {
+                        (true, ARES_ETIMEOUT, !q.use_tcp)
+                    }
+                }
+                // Dead socket (EOF/hard error). For UDP this is ICMP
+                // port-unreachable (upstream issue #819): a critical
+                // failure, not a timeout, so the retry is uncounted and
+                // expiry reports ECONNREFUSED.
+                Response::Dead => {
+                    self.discard_conn(&q, &conn);
+                    if q.use_tcp {
+                        (true, ARES_ETIMEOUT, false)
+                    } else {
+                        (false, ARES_ECONNREFUSED, false)
+                    }
+                }
+            };
+
+            // Shared failover: report the server down, then retry on the
+            // next server or expire with `expire`.
+            let failed = q.server;
+            self.notify(vec![ReactorAction::NotifyServerState { server: failed, ok: false, tcp: q.use_tcp }]);
+            let verdict = on_timeout(q.tries, q.opts.attempts, failed, &mut self.shared.health.borrow_mut());
+            match verdict {
+                TimeoutVerdict::Retry { server } => {
+                    q.tries += 1;
+                    q.try_count += 1;
+                    if counts_timeout {
+                        q.timeouts += 1;
+                    }
+                    q.server = server;
+                    if retire_udp {
+                        self.retire_udp(failed, &conn);
+                    }
+                }
+                TimeoutVerdict::Expire => return (Err(expire), q.timeouts),
             }
         }
     }
