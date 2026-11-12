@@ -1,11 +1,11 @@
 //! The single-query engine behind every lookup: `AsyncClient::run_reserved_query()`
 //! runs attempts over a [`QueryState`] until one reaches a verdict. Each attempt
 //! is a `request()` — connect with failover, send once, wait for this query's
-//! response — which reports what happened on the wire as an [`Exchange`] and
-//! decides nothing. `run_reserved_query()` makes every decision (retry, fail
-//! over, deliver), performs its channel side effects (health, server-state
-//! callback, conn eviction) and makes every change to the query state, in one
-//! place. A failover probe runs the same attempts with its own copy of the
+//! response — which reports the server it reached and the [`Response`], takes a
+//! failed conn out of service, and decides nothing else. `run_reserved_query()`
+//! makes every decision (retry, fail over, deliver), performs its channel side
+//! effects (health, server-state callback) and makes every change to the query
+//! state, in one place. A failover probe runs the same attempts with its own copy of the
 //! (no-retry) decisions in `probe()`. A child of `async_client`, so it uses the
 //! client's private fields and helpers directly.
 
@@ -24,7 +24,6 @@ impl AsyncClient {
         }
         let mut q = self.create_query_state(query);
         self.maybe_spawn_probe(&q);
-        let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
 
         loop {
             // A-cancels-AAAA: the sibling answered, so don't (re)send. A reply
@@ -32,39 +31,34 @@ impl AsyncClient {
             if cancelled.get() {
                 return (Err(ARES_ETIMEOUT), q.timeouts);
             }
-            let Exchange { server, conn, response } = match self.request(&q).await {
+            let (server, response) = match self.request(&q).await {
                 Ok(exchange) => exchange,
                 Err(e) => return (Err(e), q.timeouts),
             };
             q.server = server;
 
-            // Decide. A failure yields (counts as a timeout, error on
-            // expiry, retire the UDP conn on retry) for the shared failover
-            // below; everything else returns or retries right here.
-            let (counts_timeout, expire, retire_udp) = match response {
-                Response::Reply(_, CookieVerdict::BadCookie) => {
+            // Decide. A failure yields (counts as a timeout, error on expiry)
+            // for the shared failover below; everything else returns or
+            // retries right here.
+            let (counts_timeout, expire) = match response {
+                Response::BadCookie => {
                     q.cookie_tries += 1;
-                    // Persistent BADCOOKIE (e.g. AnyCast rotation): upgrade
-                    // to TCP, where cookies are not used.
+                    // Persistent BADCOOKIE (e.g. AnyCast rotation): upgrade to
+                    // TCP, where cookies are not used.
                     if q.cookie_tries >= 3 {
                         q.use_tcp = true;
                     }
                     continue;
                 }
-                Response::Reply(buf, _) => {
+                Response::Answer(buf) => {
                     let summary = summarize(&buf, 0);
-                    // FORMERR fallback: a server that does not understand
-                    // EDNS answers the OPT-bearing query with FORMERR. Strip
-                    // the OPT (and cookie) and retry the same server
-                    // uncounted.
-                    if summary.rcode == 1
-                        && edns_wire::has_opt(&q.payload)
-                        && edns_wire::strip_opt(&mut q.payload)
-                    {
+                    // FORMERR fallback: a server that does not understand EDNS
+                    // answers the OPT-bearing query with FORMERR. Strip the OPT
+                    // (and cookie) and retry the same server uncounted.
+                    if summary.rcode == 1 && edns_wire::has_opt(&q.payload) && edns_wire::strip_opt(&mut q.payload) {
                         continue;
                     }
-                    let policy =
-                        ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
+                    let policy = ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
                     let (actions, verdict) = on_datagram(
                         &summary,
                         q.server,
@@ -89,10 +83,9 @@ impl AsyncClient {
                         TaskVerdict::Deliver => return (Ok(buf), q.timeouts),
                     }
                 }
-                // The send itself failed: drop the conn and retry on the
-                // next server while the attempt budget lasts.
+                // The send itself failed: retry on the next server while the
+                // attempt budget lasts.
                 Response::SendFailed => {
-                    self.discard_conn(&q, &conn);
                     if q.tries + 1 >= q.opts.attempts.max(1) {
                         return (Err(ARES_ECONNREFUSED), q.timeouts);
                     }
@@ -104,39 +97,19 @@ impl AsyncClient {
                     }
                     continue;
                 }
-                // No reply before the deadline.
-                Response::TimedOut => {
-                    // If any UDP socket to this server already died, a
-                    // timeout is the same unreachable condition (the kernel
-                    // may rate-limit ICMP across parallel sockets): mark
-                    // dead and retry uncounted.
-                    if !q.use_tcp && event_driven && self.shared.udp_pool.borrow().has_dead(q.server) {
-                        conn.mark_dead();
-                        (false, ARES_ECONNREFUSED, false)
-                    } else {
-                        (true, ARES_ETIMEOUT, !q.use_tcp)
-                    }
-                }
-                // Dead socket (EOF/hard error). For UDP this is ICMP
-                // port-unreachable (upstream issue #819): a critical
-                // failure, not a timeout, so the retry is uncounted and
-                // expiry reports ECONNREFUSED.
-                Response::Dead => {
-                    self.discard_conn(&q, &conn);
-                    if q.use_tcp {
-                        (true, ARES_ETIMEOUT, false)
-                    } else {
-                        (false, ARES_ECONNREFUSED, false)
-                    }
-                }
+                Response::TimedOut => (true, ARES_ETIMEOUT),
+                // A dead TCP conn is a counted timeout.
+                Response::Unreachable if q.use_tcp => (true, ARES_ETIMEOUT),
+                // UDP unreachable is ICMP port-unreachable (upstream issue
+                // #819): a critical failure, not a timeout, so the retry is
+                // uncounted and expiry reports ECONNREFUSED.
+                Response::Unreachable => (false, ARES_ECONNREFUSED),
             };
 
-            // Shared failover: report the server down, then retry on the
-            // next server or expire with `expire`.
-            let failed = q.server;
-            self.notify(vec![ReactorAction::NotifyServerState { server: failed, ok: false, tcp: q.use_tcp }]);
-            let verdict = on_timeout(q.tries, q.opts.attempts, failed, &mut self.shared.health.borrow_mut());
-            match verdict {
+            // Shared failover: report the server down, then retry on the next
+            // server or expire with `expire`.
+            self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
+            match on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut()) {
                 TimeoutVerdict::Retry { server } => {
                     q.tries += 1;
                     q.try_count += 1;
@@ -144,9 +117,6 @@ impl AsyncClient {
                         q.timeouts += 1;
                     }
                     q.server = server;
-                    if retire_udp {
-                        self.retire_udp(failed, &conn);
-                    }
                 }
                 TimeoutVerdict::Expire => return (Err(expire), q.timeouts),
             }
@@ -180,18 +150,17 @@ impl AsyncClient {
         let mut q = self.create_query_state(query);
         q.server = probe.server;
         q.no_retry = true;
-        let event_driven = self.optmask & ARES_OPT_EVENT_THREAD != 0;
         loop {
-            let Ok(Exchange { server, conn, response }) = self.request(&q).await else { return };
+            let Ok((server, response)) = self.request(&q).await else { return };
             q.server = server;
             match response {
-                Response::Reply(_, CookieVerdict::BadCookie) => {
+                Response::BadCookie => {
                     q.cookie_tries += 1;
                     if q.cookie_tries >= 3 {
                         q.use_tcp = true;
                     }
                 }
-                Response::Reply(buf, _) => {
+                Response::Answer(buf) => {
                     let summary = summarize(&buf, 0);
                     if summary.rcode == 1 && edns_wire::has_opt(&q.payload) && edns_wire::strip_opt(&mut q.payload) {
                         continue;
@@ -213,17 +182,9 @@ impl AsyncClient {
                         TaskVerdict::RetryNextServer { .. } | TaskVerdict::Deliver => return,
                     }
                 }
-                Response::SendFailed => {
-                    self.discard_conn(&q, &conn);
-                    return;
-                }
+                Response::SendFailed => return,
                 // A failure is reported and recorded (by `on_timeout`), never retried.
-                Response::TimedOut | Response::Dead => {
-                    if matches!(response, Response::Dead) {
-                        self.discard_conn(&q, &conn);
-                    } else if !q.use_tcp && event_driven && self.shared.udp_pool.borrow().has_dead(q.server) {
-                        conn.mark_dead();
-                    }
+                Response::TimedOut | Response::Unreachable => {
                     self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
                     let _ = on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut());
                     return;
@@ -259,12 +220,11 @@ impl AsyncClient {
         }
     }
 
-    /// One exchange: check out a conn (failing over past unreachable servers),
-    /// send the query once, and wait for the first message that is really this
-    /// query's response. Decides nothing and leaves `q` untouched; what happened
-    /// comes back as an [`Exchange`]. `Err` means nothing could be sent: no
-    /// server was reachable, or the packet could not take its cookie.
-    async fn request(&self, q: &QueryState) -> Result<Exchange, c_int> {
+    /// One attempt: connect (with failover) to `q.server`, send once and wait
+    /// for this query's response. Returns the server reached (it may differ from
+    /// `q.server` after a connect failover) and the [`Response`]; `Err` only when
+    /// no conn could be had. Reads the query state, never changes it.
+    async fn request(&self, q: &QueryState) -> Result<(ServerId, Response), c_int> {
         let tries = if q.no_retry { 1 } else { q.opts.attempts };
         let (mut conn, server) =
             self.connect_with_failover(q.qid.id(), q.server, q.use_tcp, tries).ok_or(ARES_ECONNREFUSED)?;
@@ -282,71 +242,79 @@ impl AsyncClient {
         } else {
             conn.send(&wire, deadline).await
         };
+        if sent.is_err() {
+            self.discard_conn(server, q.use_tcp, &conn);
+            return Ok((server, Response::SendFailed));
+        }
 
-        let response = if sent.is_err() {
-            Response::SendFailed
-        } else {
-            loop {
-                match recv_reply(&mut conn, deadline).await {
-                    Ok(buf) => {
-                        // Not this query's response — wrong id or 0x20 case, or
-                        // a cookie mismatch (RFC 7873 §5.3: discard as spoofed):
-                        // keep listening.
-                        if !q.is_our_reply(&buf) {
-                            continue;
-                        }
-                        let rcode = edns_wire::extended_rcode(&buf, summarize(&buf, 0).rcode);
-                        match self.validate_cookie(&buf, sent_cookie.as_ref(), server, rcode) {
-                            CookieVerdict::Drop => continue,
-                            cookie => break Response::Reply(buf, cookie),
-                        }
+        loop {
+            match recv_reply(&mut conn, deadline).await {
+                Ok(buf) => {
+                    // Not this query's response — wrong id or 0x20 case, or a
+                    // cookie mismatch (RFC 7873 §5.3: discard as spoofed): keep
+                    // listening.
+                    if !q.is_our_reply(&buf) {
+                        continue;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::TimedOut => break Response::TimedOut,
-                    Err(_) => break Response::Dead,
+                    let rcode = edns_wire::extended_rcode(&buf, summarize(&buf, 0).rcode);
+                    match self.validate_cookie(&buf, sent_cookie.as_ref(), server, rcode) {
+                        CookieVerdict::Drop => continue,
+                        CookieVerdict::BadCookie => return Ok((server, Response::BadCookie)),
+                        CookieVerdict::Accept => return Ok((server, Response::Answer(buf))),
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    if q.use_tcp {
+                        return Ok((server, Response::TimedOut));
+                    }
+                    // If any UDP socket to this server already died, a timeout
+                    // is the same unreachable condition (the kernel may
+                    // rate-limit ICMP across parallel sockets).
+                    if self.optmask & ARES_OPT_EVENT_THREAD != 0 && self.shared.udp_pool.borrow().has_dead(server) {
+                        self.discard_conn(server, q.use_tcp, &conn);
+                        return Ok((server, Response::Unreachable));
+                    }
+                    // A retry goes out on a fresh socket (new source port).
+                    self.retire_udp(server, &conn);
+                    return Ok((server, Response::TimedOut));
+                }
+                Err(_) => {
+                    self.discard_conn(server, q.use_tcp, &conn);
+                    return Ok((server, Response::Unreachable));
                 }
             }
-        };
-        Ok(Exchange { server, conn, response })
+        }
     }
 
     /// Take a failed conn out of service: TCP leaves the pool; an event-thread
     /// UDP conn stays pooled but marked dead (so a burst of retries fails fast
     /// instead of each socket waiting for its own ICMP error); otherwise the UDP
     /// conn is retired.
-    fn discard_conn(&self, q: &QueryState, conn: &Conn) {
-        if q.use_tcp {
-            let evicted = self.shared.tcp_pool.borrow_mut().remove(q.server);
+    fn discard_conn(&self, server: ServerId, use_tcp: bool, conn: &Conn) {
+        if use_tcp {
+            let evicted = self.shared.tcp_pool.borrow_mut().remove(server);
             drop(evicted); // after the borrow: closing may fire C callbacks
         } else if self.optmask & ARES_OPT_EVENT_THREAD != 0 {
             conn.mark_dead();
         } else {
-            self.retire_udp(q.server, conn);
+            self.retire_udp(server, conn);
         }
     }
 }
 
-/// What one `request()` saw on the wire.
-struct Exchange {
-    /// The server the connect reached (it may differ from `QueryState::server`
-    /// after a connect failover).
-    server: ServerId,
-    /// The conn used, for the caller to discard, retire or mark dead; dropping
-    /// it releases the query's inbox slot.
-    conn: Conn,
-    response: Response,
-}
-
-/// How the exchange ended.
+/// How one `request()` ended.
 enum Response {
-    /// This query's response, with its DNS cookie verdict (`Accept` or
-    /// `BadCookie`; dropped ones never come back).
-    Reply(Vec<u8>, CookieVerdict),
+    /// This query's answer (its DNS cookie, if any, accepted).
+    Answer(Vec<u8>),
+    /// BADCOOKIE: the server's cookie is now learned; re-send with it.
+    BadCookie,
     /// The send itself failed.
     SendFailed,
     /// No response before the deadline.
     TimedOut,
-    /// The socket died: EOF or a hard error (for UDP, ICMP port-unreachable).
-    Dead,
+    /// The socket died: EOF or a hard error (for UDP, ICMP port-unreachable,
+    /// also assumed on a timeout once a sibling socket to the server died).
+    Unreachable,
 }
 
 /// State of one `run_reserved_query()` across its attempts (upstream
