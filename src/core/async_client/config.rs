@@ -3,6 +3,8 @@
 //! directions, and the server-list exports.
 
 use super::*;
+use crate::plugins::dns0x20::Dns0x20Plugin;
+use crate::plugins::edns::EdnsPlugin;
 
 impl AsyncClient {
     /// A fresh channel from the system config (resolv.conf + env overrides).
@@ -97,7 +99,7 @@ impl AsyncClient {
     /// server's identity (address + both ports) once — every lookup copy shares
     /// the list through the `Rc` — and sync per-server state to it, like
     /// upstream `ares_servers_update`: servers still configured keep their
-    /// health, cookie and pooled conns; removed ones lose them. Duplicate
+    /// health, plugin state (DNS cookies) and pooled conns; removed ones lose them. Duplicate
     /// entries are skipped (upstream `ares_server_isdup`). A real change also
     /// flushes the query cache.
     pub(super) fn servers_changed(&mut self) {
@@ -117,7 +119,9 @@ impl AsyncClient {
             self.shared.cache.borrow_mut().flush();
         }
         self.shared.health.borrow_mut().sync(&servers);
-        self.shared.cookies.borrow_mut().retain(|id, _| servers.contains(id));
+        for plugin in &self.plugins {
+            plugin.servers_changed(&servers);
+        }
         // Evicted conns are dropped after each pool borrow ends (closing fires
         // C callbacks).
         let tcp = self.shared.tcp_pool.borrow_mut().retain_servers(&servers);
@@ -146,6 +150,7 @@ impl AsyncClient {
             local_ip6: [0; 16],
             local_dev: String::new(),
             shared: ChannelShared::new(),
+            plugins: Vec::new(),
             sortlist: vec![],
             flags: 0,
             ednspsz: EDNS_PACKETSZ as i32,
@@ -159,8 +164,17 @@ impl AsyncClient {
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
         };
+        // Run order matters: 0x20 drops case-mismatched replies before EDNS
+        // validates (and updates) the server's cookie state.
+        client.add_plugin(Dns0x20Plugin::new());
+        client.add_plugin(EdnsPlugin::new());
         client.servers_changed();
         client
+    }
+
+    /// Register a query plugin; plugins run in registration order.
+    pub(crate) fn add_plugin(&mut self, plugin: impl Plugin + 'static) {
+        self.plugins.push(Rc::new(plugin));
     }
 
     /// The hosts table as a shared `Rc`, lazily loaded once. An empty

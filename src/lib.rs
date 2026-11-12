@@ -15,5 +15,6 @@
 mod async_runtime;
 mod core;
 mod ffi;
+mod plugins;
 
 pub use crate::ffi::*;

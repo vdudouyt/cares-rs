@@ -1,4 +1,4 @@
-//! EDNS(0), DNS cookie and DNS 0x20 wire helpers over a serialized message.
+//! EDNS(0) and DNS cookie wire helpers over a serialized message.
 //! Unlike upstream `ares_cookie.c`, cookie rotation/regression timers are not enforced.
 
 use std::time::Instant;
@@ -247,74 +247,6 @@ pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) -> boo
     true
 }
 
-/// Question 0's label byte ranges, shared by the case-preserving reader and
-/// the DNS 0x20 randomizer. A compressed question name returns `None`.
-fn question_label_ranges(buf: &[u8]) -> Option<Vec<(usize, usize)>> {
-    if buf.len() < 12 || header_u16(buf, 4)? == 0 {
-        return None;
-    }
-    let mut pos = 12usize;
-    let mut ranges = Vec::new();
-    loop {
-        let len = *buf.get(pos)?;
-        pos += 1;
-        if len == 0 {
-            return Some(ranges);
-        }
-        if len & 0xc0 != 0 {
-            return None;
-        }
-        let end = pos.checked_add(len as usize)?;
-        if end > buf.len() {
-            return None;
-        }
-        ranges.push((pos, end));
-        pos = end;
-    }
-}
-
-fn join_question_name(buf: &[u8], ranges: &[(usize, usize)]) -> Option<Vec<u8>> {
-    let mut name = Vec::new();
-    for (i, &(start, end)) in ranges.iter().enumerate() {
-        if i > 0 {
-            name.push(b'.');
-        }
-        name.extend_from_slice(buf.get(start..end)?);
-    }
-    Some(name)
-}
-
-/// Randomize the case of each ASCII letter in question 0 (DNS 0x20,
-/// draft-vixie-dnsext-dns0x20) and return the presentation-form name for
-/// response validation.
-pub(crate) fn randomize_question_name(buf: &mut [u8]) -> Option<Vec<u8>> {
-    let ranges = question_label_ranges(buf)?;
-    let mut rng = rand::thread_rng();
-    for &(start, end) in &ranges {
-        for byte in buf.get_mut(start..end)? {
-            if byte.is_ascii_alphabetic() {
-                if rng.r#gen::<bool>() {
-                    *byte |= 0x20;
-                } else {
-                    *byte &= !0x20;
-                }
-            }
-        }
-    }
-    join_question_name(buf, &ranges)
-}
-
-/// Question 0's presentation-form name, preserving case.
-pub(crate) fn question_name(buf: &[u8]) -> Option<Vec<u8>> {
-    let ranges = question_label_ranges(buf)?;
-    join_question_name(buf, &ranges)
-}
-
-/// DNS 0x20 check: the response question must match the randomized query's case.
-pub(crate) fn question_matches_case(resp: &[u8], expected: &[u8]) -> bool {
-    question_name(resp).as_deref() == Some(expected)
-}
-
 /// Cookie support state for one server (upstream `ares_cookie_t`, minus timers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CookieState {
@@ -550,8 +482,6 @@ mod tests {
             let _ = has_opt(&buf);
             let _ = cookie_option(&buf);
             let _ = extended_rcode(&buf, 0);
-            let _ = question_name(&buf);
-            let _ = randomize_question_name(&mut buf);
             let _ = strip_opt(&mut buf);
             set_cookie_option(&mut buf, Some(&[1, 2, 3]));
         }
@@ -564,20 +494,6 @@ mod tests {
         q[opt.ttl_offset] = 1; // extended rcode 1 => BADCOOKIE with low 7
         assert_eq!(extended_rcode(&q, 7), 23);
         assert_eq!(extended_rcode(&q, 0), 16);
-    }
-
-    #[test]
-    fn question_name_case_and_randomization() {
-        let mut q = query();
-        assert_eq!(question_name(&q).as_deref(), Some(&b"example.com"[..]));
-        let randomized = randomize_question_name(&mut q).unwrap();
-        assert_eq!(randomized.len(), 11);
-        assert!(question_matches_case(&q, &randomized));
-        let mut lower = q.clone();
-        for b in lower.iter_mut().skip(12).take(13) {
-            *b = b.to_ascii_lowercase();
-        }
-        assert!(!question_matches_case(&lower, &randomized));
     }
 
     #[test]

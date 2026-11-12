@@ -8,14 +8,12 @@
 //! - `config`   — construction, `ares_reinit`, defaults, `ares_dup`, the
 //!   `ares_options` mapping, server-list exports;
 //! - `packet`   — query packet builders, qid reservation;
-//! - `edns`     — EDNS(0) OPT synthesis and the per-server DNS cookie exchange;
 //! - `lookups`  — `query_raw`, `gethostbyaddr`, `getnameinfo`, `search*`;
 //! - `addrinfo` — `gethostbyname` / `getaddrinfo` over `resolve_addrinfo`;
 //! - `request`  — the single-query engine, failover probes, transport helpers.
 
 mod addrinfo;
 mod config;
-mod edns;
 mod lookups;
 mod packet;
 mod request;
@@ -26,7 +24,6 @@ pub(crate) use lookups::*;
 pub(crate) use packet::*;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::ffi::{c_int, CString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -52,7 +49,8 @@ use crate::core::lookup::{
     TimeoutVerdict, AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
-use crate::core::edns::{self as edns_wire, CookieVerdict, EDNS_PACKETSZ, ServerCookie};
+use crate::plugins::edns::wire::EDNS_PACKETSZ;
+use crate::plugins::{Ctx, Plugin, Reply, Resend, Screen};
 use crate::core::packets::AddrRecord;
 use crate::core::nameinfo::{assemble_nameinfo, format_ip_with_scope, get_service_string, AddrInfo, NameinfoReply};
 use crate::core::qid::{QidLease, QidRegistry, ReservedQuery};
@@ -64,7 +62,7 @@ use crate::core::sysconfig::SysConfig;
 use crate::core::AresError;
 use crate::ffi::dns_record::ARES_CLASS_IN;
 use crate::ffi::ares_options::{
-    ARES_FLAG_DNS0x20, ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
+    ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
     ARES_FLAG_NOCHECKRESP, ARES_FLAG_NORECURSE, ARES_FLAG_NOSEARCH, ARES_FLAG_PRIMARY,
     ARES_FLAG_STAYOPEN, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_EDNSPSZ,
     ARES_OPT_EVENT_THREAD, ARES_OPT_FLAGS,
@@ -104,6 +102,9 @@ pub(crate) struct AsyncClient {
     pub local_dev: String,
     /// Channel-wide mutable state, shared by every lookup copy.
     pub shared: Rc<ChannelShared>,
+    /// The registered query plugins ([`AsyncClient::add_plugin`]), in run
+    /// order; shared by every lookup copy.
+    plugins: Vec<Rc<dyn Plugin>>,
     pub sortlist: Vec<SortlistEntry>,
     pub flags: i32,
     /// `ARES_OPT_EDNSPSZ` kept full-width until query construction, where
@@ -136,8 +137,6 @@ pub(crate) struct ChannelShared {
     /// Per-server failure counts and probe marks: server selection, failover
     /// and probes all read and update the same view.
     pub health: RefCell<ServerHealth>,
-    /// Per-server DNS cookie state; reset by `duplicate`.
-    pub cookies: RefCell<HashMap<ServerId, ServerCookie>>,
     /// The answer cache (`ARES_OPT_QUERY_CACHE`).
     pub cache: RefCell<QueryCache>,
     /// Shared TCP sockets (parallel lookups to one server share a connection).
@@ -156,7 +155,6 @@ impl ChannelShared {
     pub(crate) fn new() -> Rc<Self> {
         Rc::new(ChannelShared {
             health: RefCell::new(ServerHealth::default()),
-            cookies: RefCell::new(HashMap::new()),
             cache: RefCell::new(QueryCache::default()),
             tcp_pool: RefCell::new(TcpPool::new()),
             udp_pool: RefCell::new(UdpPool::new()),
@@ -190,6 +188,7 @@ impl AsyncClient {
             local_ip6: self.local_ip6,
             local_dev: self.local_dev.clone(),
             shared: self.shared.clone(),
+            plugins: self.plugins.clone(),
             sortlist: self.sortlist.clone(),
             flags: self.flags,
             ednspsz: self.ednspsz,

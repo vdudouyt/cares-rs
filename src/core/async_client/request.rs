@@ -6,8 +6,9 @@
 //! makes every decision (retry, fail over, deliver), performs its channel side
 //! effects (health, server-state callback) and makes every change to the query
 //! state, in one place. A failover probe runs the same attempts with its own copy of the
-//! (no-retry) decisions in `probe()`. A child of `async_client`, so it uses the
-//! client's private fields and helpers directly.
+//! (no-retry) decisions in `probe()`. Protocol extensions are not handled
+//! here: the registered [`Plugin`]s are run at each hook. A child of `async_client`, so it uses the client's private fields and
+//! helpers directly.
 
 use super::*;
 
@@ -37,27 +38,24 @@ impl AsyncClient {
             };
             q.server = server;
 
+            // A plugin may claim the reply as an uncounted re-send.
+            let resend = self.plugins_on_reply(&mut q, &response);
+            if matches!(response, Response::Rejected) {
+                q.rejections += 1;
+            }
+            if let Some(resend) = resend {
+                q.use_tcp |= resend == Resend::OverTcp;
+                continue;
+            }
+
             // Decide. A failure yields (counts as a timeout, error on expiry)
             // for the shared failover below; everything else returns or
             // retries right here.
             let (counts_timeout, expire) = match response {
-                Response::BadCookie => {
-                    q.cookie_tries += 1;
-                    // Persistent BADCOOKIE (e.g. AnyCast rotation): upgrade to
-                    // TCP, where cookies are not used.
-                    if q.cookie_tries >= 3 {
-                        q.use_tcp = true;
-                    }
-                    continue;
-                }
+                // Unclaimed: re-send uncounted.
+                Response::Rejected => continue,
                 Response::Answer(buf) => {
                     let summary = summarize(&buf, 0);
-                    // FORMERR fallback: a server that does not understand EDNS
-                    // answers the OPT-bearing query with FORMERR. Strip the OPT
-                    // (and cookie) and retry the same server uncounted.
-                    if summary.rcode == 1 && edns_wire::has_opt(&q.payload) && edns_wire::strip_opt(&mut q.payload) {
-                        continue;
-                    }
                     let policy = ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
                     let (actions, verdict) = on_datagram(
                         &summary,
@@ -143,8 +141,8 @@ impl AsyncClient {
     /// only feeds `ServerHealth` and the server-state callback (upstream sends it
     /// with `ARES_SEND_FLAG_NORETRY`). The same decisions as
     /// `run_reserved_query()`, minus everything that moves on: no failover, no
-    /// counted retry. It still re-sends on BADCOOKIE, the FORMERR fallback and a
-    /// TC upgrade. Dropping it clears the server's probe-in-flight mark.
+    /// counted retry. It still re-sends when a plugin asks to and on a TC
+    /// upgrade. Dropping it clears the server's probe-in-flight mark.
     async fn probe(self, mut probe: Probe) {
         let Some(query) = probe.query.take() else { return };
         let mut q = self.create_query_state(query);
@@ -153,18 +151,18 @@ impl AsyncClient {
         loop {
             let Ok((server, response)) = self.request(&q).await else { return };
             q.server = server;
+            let resend = self.plugins_on_reply(&mut q, &response);
+            if matches!(response, Response::Rejected) {
+                q.rejections += 1;
+            }
+            if let Some(resend) = resend {
+                q.use_tcp |= resend == Resend::OverTcp;
+                continue;
+            }
             match response {
-                Response::BadCookie => {
-                    q.cookie_tries += 1;
-                    if q.cookie_tries >= 3 {
-                        q.use_tcp = true;
-                    }
-                }
+                Response::Rejected => continue,
                 Response::Answer(buf) => {
                     let summary = summarize(&buf, 0);
-                    if summary.rcode == 1 && edns_wire::has_opt(&q.payload) && edns_wire::strip_opt(&mut q.payload) {
-                        continue;
-                    }
                     let policy = ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
                     let (actions, verdict) = on_datagram(
                         &summary,
@@ -193,31 +191,41 @@ impl AsyncClient {
         }
     }
 
-    /// Per-query state before the first attempt: starting transport, DNS 0x20
-    /// case randomization (once per UDP query, kept for retries and enforced on
-    /// replies) and the first server.
+    /// Per-query state before the first attempt: starting transport, first
+    /// server, and the packet as the plugins' `start` hooks leave it.
     fn create_query_state(&self, query: ReservedQuery) -> QueryState {
         let use_tcp = self.config.options.use_vc;
+        let server = self.shared.health.borrow().pick_next();
         let mut payload = query.payload.to_vec();
-        let dns0x20 = if self.flags & ARES_FLAG_DNS0x20 != 0 && !use_tcp {
-            edns_wire::randomize_question_name(&mut payload)
-        } else {
-            None
-        };
+        let cx = Ctx { client: self, server, use_tcp, rejections: 0 };
+        for plugin in &self.plugins {
+            plugin.start(&cx, &mut payload);
+        }
         QueryState {
             opts: self.opts(),
             qid: query.lease,
             payload,
             use_tcp,
-            server: self.shared.health.borrow().pick_next(),
-            dns0x20,
+            server,
             tries: 0,
             try_count: 0,
             failover_tries: 0,
-            cookie_tries: 0,
+            rejections: 0,
             timeouts: 0,
             no_retry: false,
         }
+    }
+
+    /// Offer an accepted or rejected reply to the plugins; the first to claim
+    /// it as a re-send wins (and may have rewritten the query packet).
+    fn plugins_on_reply(&self, q: &mut QueryState, response: &Response) -> Option<Resend> {
+        let reply = match response {
+            Response::Rejected => Reply::Rejected,
+            Response::Answer(buf) => Reply::Answer(buf),
+            _ => return None,
+        };
+        let cx = Ctx { client: self, server: q.server, use_tcp: q.use_tcp, rejections: q.rejections };
+        self.plugins.iter().find_map(|plugin| plugin.on_reply(&cx, reply, &mut q.payload))
     }
 
     /// One attempt: connect (with failover) to `q.server`, send once and wait
@@ -229,12 +237,12 @@ impl AsyncClient {
         let (mut conn, server) =
             self.connect_with_failover(q.qid.id(), q.server, q.use_tcp, tries).ok_or(ARES_ECONNREFUSED)?;
 
-        // Cookies are re-evaluated per server/transport before every send: a
-        // BADCOOKIE retry must pick up the learned server cookie, a TCP upgrade
-        // must strip it. Applied to this send's copy of the packet; no OPT on
-        // the payload → untouched.
+        // The plugins rewrite this send's copy of the packet.
+        let cx = Ctx { client: self, server, use_tcp: q.use_tcp, rejections: q.rejections };
         let mut wire = q.payload.clone();
-        let sent_cookie = self.apply_cookie(&mut wire, server, q.use_tcp).map_err(|e| e.code())?;
+        for plugin in &self.plugins {
+            plugin.prepare(&cx, &mut wire)?;
+        }
         let deadline = Instant::now()
             + calc_query_timeout(q.opts.timeout, q.try_count, self.servers.len(), q.opts.maxtimeout);
         let sent = if q.use_tcp {
@@ -250,17 +258,21 @@ impl AsyncClient {
         loop {
             match recv_reply(&mut conn, deadline).await {
                 Ok(buf) => {
-                    // Not this query's response — wrong id or 0x20 case, or a
-                    // cookie mismatch (RFC 7873 §5.3: discard as spoofed): keep
-                    // listening.
-                    if !q.is_our_reply(&buf) {
+                    // Not this query's response (wrong id), or a plugin drops
+                    // it as stray or spoofed: keep listening.
+                    if !qid_matches(&buf, &q.payload, false) {
                         continue;
                     }
-                    let rcode = edns_wire::extended_rcode(&buf, summarize(&buf, 0).rcode);
-                    match self.validate_cookie(&buf, sent_cookie.as_ref(), server, rcode) {
-                        CookieVerdict::Drop => continue,
-                        CookieVerdict::BadCookie => return Ok((server, Response::BadCookie)),
-                        CookieVerdict::Accept => return Ok((server, Response::Answer(buf))),
+                    let screen = self
+                        .plugins
+                        .iter()
+                        .map(|plugin| plugin.screen(&cx, &wire, &buf))
+                        .find(|&screen| screen != Screen::Accept)
+                        .unwrap_or(Screen::Accept);
+                    match screen {
+                        Screen::Drop => continue,
+                        Screen::Reject => return Ok((server, Response::Rejected)),
+                        Screen::Accept => return Ok((server, Response::Answer(buf))),
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => {
@@ -304,10 +316,10 @@ impl AsyncClient {
 
 /// How one `request()` ended.
 enum Response {
-    /// This query's answer (its DNS cookie, if any, accepted).
+    /// This query's answer, accepted by every plugin.
     Answer(Vec<u8>),
-    /// BADCOOKIE: the server's cookie is now learned; re-send with it.
-    BadCookie,
+    /// A genuine reply a plugin rejected: re-send.
+    Rejected,
     /// The send itself failed.
     SendFailed,
     /// No response before the deadline.
@@ -324,19 +336,18 @@ struct QueryState {
     opts: QueryOpts,
     /// The channel-unique transaction id, reserved for the query's whole life.
     qid: QidLease,
-    /// The query as sent; the FORMERR fallback may strip its OPT.
+    /// The query as sent; plugins may rewrite it (start / on_reply).
     payload: Vec<u8>,
-    /// Starts at ARES_FLAG_USEVC; a TC reply or persistent BADCOOKIE upgrades.
+    /// Starts at ARES_FLAG_USEVC; a TC reply or a plugin upgrades.
     use_tcp: bool,
     server: ServerId,
-    /// DNS 0x20: the randomized question name replies must echo (UDP only).
-    dns0x20: Option<Vec<u8>>,
     /// Retries counted against `opts.attempts`.
     tries: u32,
     /// Upstream `query->try_count`: every retry across servers; drives backoff.
     try_count: u32,
     failover_tries: u32,
-    cookie_tries: u32,
+    /// Replies a plugin rejected so far.
+    rejections: u32,
     /// Timed-out attempts, reported to the caller.
     timeouts: c_int,
     /// A failover probe: one server, no failover or retries.
@@ -355,20 +366,6 @@ struct Probe {
 impl Drop for Probe {
     fn drop(&mut self) {
         self.shared.health.borrow_mut().set_probing(self.server, false);
-    }
-}
-
-impl QueryState {
-    /// Same transaction id as the query, and (on UDP with 0x20) the exact
-    /// randomized question case; anything else is a stray or spoofed message.
-    fn is_our_reply(&self, buf: &[u8]) -> bool {
-        if !qid_matches(buf, &self.payload, false) {
-            return false;
-        }
-        match self.dns0x20.as_deref() {
-            Some(expected) if !self.use_tcp => edns_wire::question_matches_case(buf, expected),
-            _ => true,
-        }
     }
 }
 

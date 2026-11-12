@@ -4,7 +4,6 @@
 pub mod cache;
 pub mod conn;
 pub mod dns_record;
-pub mod edns;
 pub mod error;
 pub mod fds;
 pub mod async_client;

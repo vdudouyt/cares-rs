@@ -123,7 +123,7 @@ pub(crate) const RTYPE_AAAA: u16 = 0x1c;
 /// A server's identity: its address and both ports, the fields upstream's
 /// `ares_server_find` matches on, so a server keeps its identity (and its
 /// per-server state) across server-list changes for as long as it stays
-/// configured. It keys `ServerHealth`, cookies and the pools, and is all a
+/// configured. It keys `ServerHealth`, plugin state and the pools, and is all a
 /// lookup needs to connect. A distinct type so it cannot be swapped with the try
 /// counters and ids it travels beside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
