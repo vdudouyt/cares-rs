@@ -23,14 +23,14 @@ impl Dns0x20Plugin {
 
 impl Plugin for Dns0x20Plugin {
     /// Randomize once per UDP query; retries keep the same case.
-    fn start(&self, cx: &Ctx, payload: &mut Vec<u8>) {
+    fn on_start(&self, cx: &Ctx, payload: &mut Vec<u8>) {
         if Self::enabled(cx) {
             let _ = randomize_question_name(payload);
         }
     }
 
     /// On UDP, the reply's question must match the sent one's case exactly.
-    fn screen(&self, cx: &Ctx, sent: &[u8], reply: &[u8]) -> Screen {
+    fn on_receive(&self, cx: &Ctx, sent: &[u8], reply: &[u8]) -> Screen {
         if !Self::enabled(cx) {
             return Screen::Accept;
         }

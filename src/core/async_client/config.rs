@@ -120,7 +120,7 @@ impl AsyncClient {
         }
         self.shared.health.borrow_mut().sync(&servers);
         for plugin in &self.plugins {
-            plugin.servers_changed(&servers);
+            plugin.on_servers_changed(&servers);
         }
         // Evicted conns are dropped after each pool borrow ends (closing fires
         // C callbacks).

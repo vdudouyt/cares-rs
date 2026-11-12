@@ -3,13 +3,13 @@
 //! once per channel with [`AsyncClient::add_plugin`]; the engine runs every
 //! registered plugin, in registration order, at each hook:
 //!
-//! - [`Plugin::start`] — once, before the first attempt, on the query packet;
-//! - [`Plugin::prepare`] — before each send, on that send's copy of the packet;
-//! - [`Plugin::screen`] — on each reply carrying the query's id (the first
+//! - [`Plugin::on_start`] — once, before the first attempt, on the query packet;
+//! - [`Plugin::on_send`] — before each send, on that send's copy of the packet;
+//! - [`Plugin::on_receive`] — on each reply carrying the query's id (the first
 //!   verdict other than `Accept` wins);
 //! - [`Plugin::on_reply`] — the decision step: may rewrite the query packet and
 //!   claim the reply as an uncounted re-send (the first `Some` wins);
-//! - [`Plugin::servers_changed`] — the channel's server list changed.
+//! - [`Plugin::on_servers_changed`] — the channel's server list changed.
 //!
 //! Channel-level state lives inside the plugin (interior mutability: hooks take
 //! `&self`); per-query facts come in the [`Ctx`]. Plugins: `edns` (EDNS(0) OPT
@@ -48,7 +48,7 @@ pub(crate) enum Screen {
 /// The reply offered to [`Plugin::on_reply`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Reply<'a> {
-    /// A plugin rejected the reply in [`Plugin::screen`].
+    /// A plugin rejected the reply in [`Plugin::on_receive`].
     Rejected,
     /// An accepted answer.
     Answer(&'a [u8]),
@@ -65,16 +65,16 @@ pub(crate) enum Resend {
 /// A protocol extension hooked into every query. Every hook defaults to a no-op.
 pub(crate) trait Plugin {
     /// Once per query, before the first attempt: may rewrite the query packet.
-    fn start(&self, _cx: &Ctx, _payload: &mut Vec<u8>) {}
+    fn on_start(&self, _cx: &Ctx, _payload: &mut Vec<u8>) {}
 
     /// Before each send, on that send's copy of the packet. An error ends the
     /// query with that status.
-    fn prepare(&self, _cx: &Ctx, _wire: &mut Vec<u8>) -> Result<(), c_int> {
+    fn on_send(&self, _cx: &Ctx, _wire: &mut Vec<u8>) -> Result<(), c_int> {
         Ok(())
     }
 
     /// Each reply carrying the query's id; `sent` is the packet as sent.
-    fn screen(&self, _cx: &Ctx, _sent: &[u8], _reply: &[u8]) -> Screen {
+    fn on_receive(&self, _cx: &Ctx, _sent: &[u8], _reply: &[u8]) -> Screen {
         Screen::Accept
     }
 
@@ -85,5 +85,5 @@ pub(crate) trait Plugin {
     }
 
     /// The channel's server list changed to `servers`.
-    fn servers_changed(&self, _servers: &[ServerId]) {}
+    fn on_servers_changed(&self, _servers: &[ServerId]) {}
 }

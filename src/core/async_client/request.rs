@@ -192,14 +192,14 @@ impl AsyncClient {
     }
 
     /// Per-query state before the first attempt: starting transport, first
-    /// server, and the packet as the plugins' `start` hooks leave it.
+    /// server, and the packet as the plugins' `on_start` hooks leave it.
     fn create_query_state(&self, query: ReservedQuery) -> QueryState {
         let use_tcp = self.config.options.use_vc;
         let server = self.shared.health.borrow().pick_next();
         let mut payload = query.payload.to_vec();
         let cx = Ctx { client: self, server, use_tcp, rejections: 0 };
         for plugin in &self.plugins {
-            plugin.start(&cx, &mut payload);
+            plugin.on_start(&cx, &mut payload);
         }
         QueryState {
             opts: self.opts(),
@@ -241,7 +241,7 @@ impl AsyncClient {
         let cx = Ctx { client: self, server, use_tcp: q.use_tcp, rejections: q.rejections };
         let mut wire = q.payload.clone();
         for plugin in &self.plugins {
-            plugin.prepare(&cx, &mut wire)?;
+            plugin.on_send(&cx, &mut wire)?;
         }
         let deadline = Instant::now()
             + calc_query_timeout(q.opts.timeout, q.try_count, self.servers.len(), q.opts.maxtimeout);
@@ -266,7 +266,7 @@ impl AsyncClient {
                     let screen = self
                         .plugins
                         .iter()
-                        .map(|plugin| plugin.screen(&cx, &wire, &buf))
+                        .map(|plugin| plugin.on_receive(&cx, &wire, &buf))
                         .find(|&screen| screen != Screen::Accept)
                         .unwrap_or(Screen::Accept);
                     match screen {
@@ -336,7 +336,7 @@ struct QueryState {
     opts: QueryOpts,
     /// The channel-unique transaction id, reserved for the query's whole life.
     qid: QidLease,
-    /// The query as sent; plugins may rewrite it (start / on_reply).
+    /// The query as sent; plugins may rewrite it (on_start / on_reply).
     payload: Vec<u8>,
     /// Starts at ARES_FLAG_USEVC; a TC reply or a plugin upgrades.
     use_tcp: bool,

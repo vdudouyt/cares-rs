@@ -88,7 +88,7 @@ impl Plugin for EdnsPlugin {
     /// BADCOOKIE retry must pick up the learned server cookie, a TCP upgrade
     /// must strip it. No OPT on the packet → untouched. `ARES_EFORMERR` means
     /// the rewrite would exceed the 16-bit DNS limit.
-    fn prepare(&self, cx: &Ctx, packet: &mut Vec<u8>) -> Result<(), c_int> {
+    fn on_send(&self, cx: &Ctx, packet: &mut Vec<u8>) -> Result<(), c_int> {
         if !wire::has_opt(packet) {
             return Ok(());
         }
@@ -102,7 +102,7 @@ impl Plugin for EdnsPlugin {
     /// Validate the reply's COOKIE option against this server's state and the
     /// client cookie that was sent (RFC 7873 §5.3: a mismatch is dropped as
     /// spoofed).
-    fn screen(&self, cx: &Ctx, sent: &[u8], reply: &[u8]) -> Screen {
+    fn on_receive(&self, cx: &Ctx, sent: &[u8], reply: &[u8]) -> Screen {
         let sent_client: Option<[u8; 8]> = if cx.use_tcp {
             None
         } else {
@@ -133,7 +133,7 @@ impl Plugin for EdnsPlugin {
         }
     }
 
-    fn servers_changed(&self, servers: &[ServerId]) {
+    fn on_servers_changed(&self, servers: &[ServerId]) {
         self.cookies.borrow_mut().retain(|id, _| servers.contains(id));
     }
 }
