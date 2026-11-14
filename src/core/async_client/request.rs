@@ -66,7 +66,8 @@ impl AsyncClient {
                     }
                     // NOCHECKRESP passes server-error rcodes through (upstream
                     // still marks the server good and delivers).
-                    let server_error = !q.opts.no_check_resp && matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
+                    let server_error = !q.opts.no_check_resp
+                        && matches!(summary.rcode, RCODE_SERVFAIL | RCODE_NOTIMP | RCODE_REFUSED);
                     if server_error {
                         // Fail over while the send budget (`nservers * attempts`,
                         // monotonic, so a single server is retried in place) lasts.
@@ -183,7 +184,9 @@ impl AsyncClient {
                         q.use_tcp = true;
                         continue;
                     }
-                    if !q.opts.no_check_resp && matches!(summary.rcode, 2 | 4 | 5) {
+                    if !q.opts.no_check_resp
+                        && matches!(summary.rcode, RCODE_SERVFAIL | RCODE_NOTIMP | RCODE_REFUSED)
+                    {
                         self.shared.health.borrow_mut().record_failure(q.server);
                         self.fire_server_state_callbacks(q.server, false, q.use_tcp);
                     } else {

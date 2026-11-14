@@ -45,7 +45,7 @@ use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
     is_localhost, is_onion_domain, qid_matches, summarize, SearchPlan, ServerHealth, ServerId,
-    AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
+    AF_INET, AF_INET6, RCODE_NOTIMP, RCODE_REFUSED, RCODE_SERVFAIL, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
 use crate::plugins::edns::wire::EDNS_PACKETSZ;

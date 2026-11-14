@@ -120,6 +120,12 @@ pub use libc::{AF_INET, AF_INET6};
 pub(crate) const RTYPE_A: u16 = 0x01;
 pub(crate) const RTYPE_AAAA: u16 = 0x1c;
 
+/// Header RCODEs (RFC 1035 §4.1.1) that mark a server as failing: it could not
+/// or would not answer, so the query fails over (see `ReplySummary::rcode`).
+pub(crate) const RCODE_SERVFAIL: u8 = 2;
+pub(crate) const RCODE_NOTIMP: u8 = 4;
+pub(crate) const RCODE_REFUSED: u8 = 5;
+
 /// A server's identity: its address and both ports, the fields upstream's
 /// `ares_server_find` matches on, so a server keeps its identity (and its
 /// per-server state) across server-list changes for as long as it stays
