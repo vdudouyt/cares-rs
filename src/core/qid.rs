@@ -100,6 +100,9 @@ mod tests {
     }
 
     #[test]
+    // ~135k HashSet operations at ~3 ms each under Miri (about 8 minutes) for a test with no
+    // unsafe code: native runs cover it in milliseconds.
+    #[cfg_attr(miri, ignore)]
     fn exhaustion_returns_none_and_a_release_makes_room() {
         let sh = ChannelShared::new();
         sh.qids.borrow_mut().in_flight.extend(0..=u16::MAX);
