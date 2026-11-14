@@ -285,3 +285,94 @@ impl EpollSet {
         ready
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::os::fd::AsRawFd;
+
+    /// A UDP socket with one datagram already queued, so it is readable.
+    fn readable_socket() -> UdpSocket {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.send_to(b"x", sock.local_addr().unwrap()).unwrap();
+        sock
+    }
+
+    fn ready_fds(backend: &mut Backend, wake: &WakePipe, waits: &[(i32, bool, u64)]) -> Vec<i32> {
+        backend.wait(wake, waits, 200).events.iter().map(|e| e.fd).collect()
+    }
+
+    /// The kernel drops an epoll registration when its fd closes. If the number is
+    /// recycled by a new socket, only the registration generation tells us to
+    /// register it again — otherwise the new socket's events are never seen.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn recycled_fd_number_is_reregistered() {
+        let wake = WakePipe::new().unwrap();
+        let mut backend = Backend::new(ARES_EVSYS_EPOLL);
+        assert!(matches!(backend, Backend::Epoll(_)));
+        let mut reused = 0;
+        for generation in 1..=500u64 {
+            let first = readable_socket();
+            let fd = first.as_raw_fd();
+            assert_eq!(ready_fds(&mut backend, &wake, &[(fd, false, generation * 2)]), vec![fd]);
+            drop(first); // closes fd; the kernel forgets the registration
+
+            // The lowest free number is handed out again.
+            let second = readable_socket();
+            if second.as_raw_fd() != fd {
+                continue;
+            }
+            reused += 1;
+            // New registration of the same number: a new generation.
+            assert_eq!(
+                ready_fds(&mut backend, &wake, &[(fd, false, generation * 2 + 1)]),
+                vec![fd],
+                "iteration {generation}: recycled fd {fd} was not re-registered"
+            );
+        }
+        assert!(reused > 50, "fd numbers were not recycled ({reused}/500)");
+    }
+
+    /// Interest changes on a live registration go through `modify`, and removal
+    /// through `delete`, repeatedly and while sockets churn.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn interest_churn_matches_poll() {
+        let wake = WakePipe::new().unwrap();
+        let mut epoll = Backend::new(ARES_EVSYS_EPOLL);
+        let mut poll = Backend::new(ARES_EVSYS_POLL);
+        for round in 0..300usize {
+            let socks: Vec<UdpSocket> = (0..4).map(|_| readable_socket()).collect();
+            let generation = round as u64 + 1;
+            let waits: Vec<(i32, bool, u64)> = socks
+                .iter()
+                .enumerate()
+                // Alternate read/write interest; skip some fds entirely.
+                .filter(|(i, _)| (i + round) % 3 != 0)
+                .map(|(i, s)| (s.as_raw_fd(), (i + round) % 2 == 0, generation * 10 + i as u64))
+                .collect();
+            let mut a = ready_fds(&mut epoll, &wake, &waits);
+            let mut b = ready_fds(&mut poll, &wake, &waits);
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "round {round}: epoll and poll disagree");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn wake_pipe_interrupts_wait() {
+        for evsys in [ARES_EVSYS_EPOLL, ARES_EVSYS_POLL] {
+            let wake = WakePipe::new().unwrap();
+            let mut backend = Backend::new(evsys);
+            wake.wake();
+            let started = std::time::Instant::now();
+            let ready = backend.wait(&wake, &[], 5000);
+            assert!(ready.woke && started.elapsed().as_millis() < 1000);
+            wake.drain();
+            assert!(!backend.wait(&wake, &[], 10).woke);
+        }
+    }
+}
