@@ -56,30 +56,38 @@ impl AsyncClient {
                 Response::Rejected => continue,
                 Response::Answer(buf) => {
                     let summary = summarize(&buf, 0);
-                    let policy = ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
-                    let (actions, verdict) = on_datagram(
-                        &summary,
-                        q.server,
-                        q.use_tcp,
-                        q.opts.attempts,
-                        q.failover_tries,
-                        policy,
-                        &mut self.shared.health.borrow_mut(),
-                    );
-                    self.fire_server_state_callbacks(actions);
-                    match verdict {
-                        TaskVerdict::RetryNextServer { server, tries } => {
+                    // Truncated UDP reply: retry over TCP (IGNTC accepts it as
+                    // is). Checked before the rcode, so an error rcode on a
+                    // truncated reply still upgrades, and the server is marked
+                    // neither good nor bad.
+                    if summary.truncated && !q.use_tcp && !q.opts.ignore_tc {
+                        q.use_tcp = true;
+                        continue;
+                    }
+                    // NOCHECKRESP passes server-error rcodes through (upstream
+                    // still marks the server good and delivers).
+                    let server_error = !q.opts.no_check_resp && matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
+                    if server_error {
+                        // Fail over while the send budget (`nservers * attempts`,
+                        // monotonic, so a single server is retried in place) lasts.
+                        let next = {
+                            let mut health = self.shared.health.borrow_mut();
+                            health.record_failure(q.server);
+                            ((q.failover_tries as usize + 1) < health.len() * q.opts.attempts as usize)
+                                .then(|| health.pick_next())
+                        };
+                        self.fire_server_state_callbacks(q.server, false, q.use_tcp);
+                        if let Some(server) = next {
                             q.server = server;
-                            q.failover_tries = tries;
+                            q.failover_tries += 1;
                             q.try_count += 1;
                             continue;
                         }
-                        TaskVerdict::RetryTcp => {
-                            q.use_tcp = true;
-                            continue;
-                        }
-                        TaskVerdict::Deliver => return (Ok(buf), q.timeouts),
+                    } else {
+                        self.shared.health.borrow_mut().record_success(q.server);
+                        self.fire_server_state_callbacks(q.server, true, q.use_tcp);
                     }
+                    return (Ok(buf), q.timeouts);
                 }
                 // The send itself failed: retry on the next server while the
                 // attempt budget lasts.
@@ -106,17 +114,23 @@ impl AsyncClient {
 
             // Shared failover: report the server down, then retry on the next
             // server or expire with `expire`.
-            self.fire_server_state_callbacks(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
-            match on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut()) {
-                TimeoutVerdict::Retry { server } => {
-                    q.tries += 1;
-                    q.try_count += 1;
-                    if counts_timeout {
-                        q.timeouts += 1;
-                    }
-                    q.server = server;
+            self.fire_server_state_callbacks(q.server, false, q.use_tcp);
+            if q.tries >= q.opts.attempts {
+                return (Err(expire), q.timeouts);
+            }
+            // With several servers the failure counts against this one and the
+            // retry moves on; a lone server is retried in place.
+            {
+                let mut health = self.shared.health.borrow_mut();
+                if health.len() > 1 {
+                    health.record_failure(q.server);
+                    q.server = health.pick_next();
                 }
-                TimeoutVerdict::Expire => return (Err(expire), q.timeouts),
+            }
+            q.tries += 1;
+            q.try_count += 1;
+            if counts_timeout {
+                q.timeouts += 1;
             }
         }
     }
@@ -163,28 +177,28 @@ impl AsyncClient {
                 Response::Rejected => continue,
                 Response::Answer(buf) => {
                     let summary = summarize(&buf, 0);
-                    let policy = ReplyPolicy { ignore_tc: q.opts.ignore_tc, no_check_resp: q.opts.no_check_resp };
-                    let (actions, verdict) = on_datagram(
-                        &summary,
-                        q.server,
-                        q.use_tcp,
-                        q.opts.attempts,
-                        q.failover_tries,
-                        policy,
-                        &mut self.shared.health.borrow_mut(),
-                    );
-                    self.fire_server_state_callbacks(actions);
-                    // The verdict is recorded in health; only a TC upgrade re-sends.
-                    match verdict {
-                        TaskVerdict::RetryTcp => q.use_tcp = true,
-                        TaskVerdict::RetryNextServer { .. } | TaskVerdict::Deliver => return,
+                    // Only a TC upgrade re-sends (see `run_reserved_query()`);
+                    // anything else is recorded in health and ends the probe.
+                    if summary.truncated && !q.use_tcp && !q.opts.ignore_tc {
+                        q.use_tcp = true;
+                        continue;
                     }
+                    if !q.opts.no_check_resp && matches!(summary.rcode, 2 | 4 | 5) {
+                        self.shared.health.borrow_mut().record_failure(q.server);
+                        self.fire_server_state_callbacks(q.server, false, q.use_tcp);
+                    } else {
+                        self.shared.health.borrow_mut().record_success(q.server);
+                        self.fire_server_state_callbacks(q.server, true, q.use_tcp);
+                    }
+                    return;
                 }
                 Response::SendFailed => return,
-                // A failure is reported and recorded (by `on_timeout`), never retried.
+                // A failure is reported and recorded, never retried.
                 Response::TimedOut | Response::Unreachable => {
-                    self.fire_server_state_callbacks(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
-                    let _ = on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut());
+                    self.fire_server_state_callbacks(q.server, false, q.use_tcp);
+                    if q.tries < q.opts.attempts && self.shared.health.borrow().len() > 1 {
+                        self.shared.health.borrow_mut().record_failure(q.server);
+                    }
                     return;
                 }
             }

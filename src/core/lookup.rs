@@ -169,96 +169,6 @@ impl ServerId {
     }
 }
 
-/// A server-state event for the application's callback (fired by `AsyncClient::notify`).
-#[derive(Debug, PartialEq)]
-pub enum ReactorAction {
-    NotifyServerState { server: ServerId, ok: bool, tcp: bool },
-}
-
-/// Reactor-level verdict for a datagram that already passed QID matching.
-#[derive(Debug, PartialEq)]
-pub enum TaskVerdict {
-    /// Server-error failover: resend to `server`, carrying `tries` onto the retry.
-    RetryNextServer { server: ServerId, tries: u32 },
-    /// Truncated UDP reply: resend over TCP to the same server.
-    RetryTcp,
-    Deliver,
-}
-
-/// Channel flags that change datagram handling (snapshotted per query).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReplyPolicy {
-    /// ARES_FLAG_IGNTC: accept a truncated UDP reply instead of retrying over TCP.
-    pub ignore_tc: bool,
-    /// ARES_FLAG_NOCHECKRESP: deliver SERVFAIL/NOTIMP/REFUSED responses.
-    pub no_check_resp: bool,
-}
-
-/// Datagram policy, in upstream order: TC check (TCP retry, no health update),
-/// then rcode failover/health, then delivery. The send budget is monotonic
-/// (`nservers * attempts`), so a single server is retried in place.
-pub fn on_datagram(
-    summary: &ReplySummary,
-    server: ServerId,
-    is_tcp: bool,
-    attempts: u32,
-    tries: u32,
-    policy: ReplyPolicy,
-    health: &mut ServerHealth,
-) -> (Vec<ReactorAction>, TaskVerdict) {
-    let mut actions = Vec::new();
-
-    // IGNTC: accept a truncated UDP reply as-is. TC is checked before rcode, so
-    // an error rcode on a truncated UDP reply still triggers the TCP retry.
-    if summary.truncated && !is_tcp && !policy.ignore_tc {
-        return (actions, TaskVerdict::RetryTcp);
-    }
-
-    // NOCHECKRESP: pass server-error rcodes through (upstream still marks the
-    // server good and delivers).
-    let is_server_error =
-        !policy.no_check_resp && matches!(summary.rcode, 2 | 4 | 5); // SERVFAIL, NOTIMP, REFUSED
-    let nservers = health.len();
-
-    if is_server_error {
-        actions.push(ReactorAction::NotifyServerState { server, ok: false, tcp: is_tcp });
-        health.record_failure(server);
-        if (tries as usize + 1) < nservers * attempts as usize {
-            let tries = tries + 1;
-            return (actions, TaskVerdict::RetryNextServer { server: health.pick_next(), tries });
-        }
-    } else {
-        actions.push(ReactorAction::NotifyServerState { server, ok: true, tcp: is_tcp });
-        health.record_success(server);
-    }
-
-    (actions, TaskVerdict::Deliver)
-}
-
-/// Verdict for an expired (timed-out) task.
-#[derive(Debug, PartialEq)]
-pub enum TimeoutVerdict {
-    Retry { server: ServerId },
-    /// Out of attempts: deliver ARES_ETIMEOUT.
-    Expire,
-}
-
-/// Retry until `attempts` are used up; a timeout counts as a failure and moves
-/// to the next server only when there is more than one.
-pub fn on_timeout(tries_done: u32, attempts: u32, server: ServerId, health: &mut ServerHealth) -> TimeoutVerdict {
-    if tries_done < attempts {
-        let server = if health.len() > 1 {
-            health.record_failure(server);
-            health.pick_next()
-        } else {
-            server
-        };
-        TimeoutVerdict::Retry { server }
-    } else {
-        TimeoutVerdict::Expire
-    }
-}
-
 /// One server's failure bookkeeping.
 #[derive(Clone, Copy, Debug, Default)]
 struct ServerStats {
@@ -390,10 +300,6 @@ impl ServerHealth {
     pub fn failure_counts(&self) -> Vec<u32> {
         self.order.iter().map(|&id| self.failures(id)).collect()
     }
-
-    pub fn last_failure_of(&self, server: ServerId) -> Option<Instant> {
-        self.stats.get(&server).and_then(|s| s.last_failure)
-    }
 }
 
 #[cfg(test)]
@@ -424,10 +330,6 @@ mod tests {
         // Too-short response or query: accepted (historical behavior)
         assert!(qid_matches(&[0xab], &query, false));
         assert!(qid_matches(&[0xab, 0xcd], &[0x00], false));
-    }
-
-    fn reply(rcode: u8, ancount: u16) -> Vec<u8> {
-        vec![0, 0, 0x80, rcode, 0, 1, (ancount >> 8) as u8, ancount as u8]
     }
 
     #[test]
@@ -509,129 +411,6 @@ mod tests {
         assert!(!h.record_success(ServerId::test(5)));
         h.set_probing(ServerId::test(5), true); // no panic
         assert_eq!(h.failure_counts(), vec![0]);
-    }
-
-    #[test]
-    fn on_datagram_truth_table() {
-        let notify_fail = |s| ReactorAction::NotifyServerState { server: s, ok: false, tcp: false };
-        let notify_ok = |s| ReactorAction::NotifyServerState { server: s, ok: true, tcp: false };
-
-        // success rcode: notify-ok, reset failures, Deliver
-        let mut h = ServerHealth::default();
-        h.reset(2);
-        h.record_failure(ServerId::test(0));
-        let (a, v) = on_datagram(&summarize(&reply(0, 1), 0), ServerId::test(0), false, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::Deliver);
-        assert_eq!(a, vec![notify_ok(ServerId::test(0))]);
-        assert_eq!(h.failure_counts()[0], 0, "success resets failures");
-
-        // SERVFAIL, 2 servers: fail over to the next server, notify fail.
-        let mut h = ServerHealth::default();
-        h.reset(2);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId::test(0), false, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId::test(1), tries: 1 });
-        assert_eq!(a, vec![notify_fail(ServerId::test(0))]);
-        assert_eq!(h.failure_counts()[0], 1);
-
-        // SERVFAIL, single server: retried in place (pick_next returns the same
-        // server), failure recorded, still notified.
-        let mut h = ServerHealth::default();
-        h.reset(1);
-        let (a, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId::test(0), false, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::RetryNextServer { server: ServerId::test(0), tries: 1 });
-        assert_eq!(a, vec![notify_fail(ServerId::test(0))]);
-        assert_eq!(h.failure_counts()[0], 1);
-
-        // budget exhausted: tries+1 >= nservers*attempts falls through to Deliver
-        let mut h = ServerHealth::default();
-        h.reset(2);
-        let (_, v) = on_datagram(&summarize(&reply(2, 0), 0), ServerId::test(0), false, 2, 3, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::Deliver);
-
-        // TC flag on UDP: RetryTcp; already-TCP never TC-retries.
-        let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
-        let mut h = ServerHealth::default();
-        h.reset(1);
-        let (_, v) = on_datagram(&summarize(&tc, 0), ServerId::test(0), false, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::RetryTcp);
-        let (_, v) = on_datagram(&summarize(&tc, 0), ServerId::test(0), true, 2, 0, ReplyPolicy::default(), &mut h);
-        assert_eq!(v, TaskVerdict::Deliver);
-    }
-
-    #[test]
-    fn on_datagram_honors_igntc_and_nocheckresp() {
-        let tc = [0u8, 0, 0x02, 0, 0, 1, 0, 1];
-
-        // IGNTC: deliver the truncated UDP reply instead of retrying over TCP.
-        let mut h = ServerHealth::default();
-        h.reset(1);
-        let (_, v) = on_datagram(
-            &summarize(&tc, 0),
-            ServerId::test(0),
-            false,
-            2,
-            0,
-            ReplyPolicy { ignore_tc: true, no_check_resp: false },
-            &mut h,
-        );
-        assert_eq!(v, TaskVerdict::Deliver);
-
-        // TC is checked before the rcode: a truncated SERVFAIL UDP reply goes
-        // to TCP and must not mark the server good or bad.
-        let tc_servfail = [0u8, 0, 0x02, 2, 0, 1, 0, 0];
-        let mut h = ServerHealth::default();
-        h.reset(1);
-        let (a, v) = on_datagram(
-            &summarize(&tc_servfail, 0),
-            ServerId::test(0),
-            false,
-            2,
-            0,
-            ReplyPolicy::default(),
-            &mut h,
-        );
-        assert_eq!(v, TaskVerdict::RetryTcp);
-        assert!(a.is_empty());
-        assert_eq!(h.failure_counts()[0], 0);
-        assert_eq!(h.last_failure_of(ServerId::test(0)), None);
-
-        // NOCHECKRESP: deliver SERVFAIL/NOTIMP/REFUSED, notifying success
-        // (upstream's pass-through path marks the server good).
-        for rcode in [2u8, 4, 5] {
-            let mut h = ServerHealth::default();
-            h.reset(2);
-            let (a, v) = on_datagram(
-                &summarize(&reply(rcode, 0), 0),
-                ServerId::test(0),
-                false,
-                2,
-                0,
-                ReplyPolicy { ignore_tc: false, no_check_resp: true },
-                &mut h,
-            );
-            assert_eq!(v, TaskVerdict::Deliver);
-            assert_eq!(
-                a,
-                vec![ReactorAction::NotifyServerState { server: ServerId::test(0), ok: true, tcp: false }]
-            );
-            assert_eq!(h.failure_counts()[0], 0);
-        }
-    }
-
-    #[test]
-    fn on_timeout_policy() {
-        // retries left, multiple servers: count a failure, move on
-        let mut h = ServerHealth::default();
-        h.reset(2);
-        assert_eq!(on_timeout(1, 3, ServerId::test(0), &mut h), TimeoutVerdict::Retry { server: ServerId::test(1) });
-        assert_eq!(h.failure_counts()[0], 1);
-        // retries left, single server: same server, no failure counted
-        let mut h = ServerHealth::default();
-        h.reset(1);
-        assert_eq!(on_timeout(1, 3, ServerId::test(0), &mut h), TimeoutVerdict::Retry { server: ServerId::test(0) });
-        assert_eq!(h.failure_counts()[0], 0);
-        // out of attempts
-        assert_eq!(on_timeout(3, 3, ServerId::test(0), &mut h), TimeoutVerdict::Expire);
     }
 
     #[test]

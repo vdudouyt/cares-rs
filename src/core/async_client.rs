@@ -44,9 +44,8 @@ use crate::async_runtime::reactor::Runtime;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
-    is_localhost, is_onion_domain, on_datagram, on_timeout, qid_matches,
-    summarize, ReactorAction, ReplyPolicy, SearchPlan, ServerHealth, ServerId, TaskVerdict,
-    TimeoutVerdict, AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
+    is_localhost, is_onion_domain, qid_matches, summarize, SearchPlan, ServerHealth, ServerId,
+    AF_INET, AF_INET6, RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
 use crate::plugins::edns::wire::EDNS_PACKETSZ;
@@ -235,23 +234,18 @@ impl AsyncClient {
         self.flags & ARES_FLAG_NORECURSE == 0
     }
 
-    /// Report server successes/failures to the server-state callback, right
+    /// Report a server success/failure to the server-state callback, right
     /// now: it runs inside the task's poll, so callers must not hold a
     /// `RefCell` borrow across this call. The hook is cloned out of its cell
     /// first, so even a callback that replaces itself cannot hit a live borrow.
-    fn fire_server_state_callbacks(&self, actions: Vec<ReactorAction>) {
+    /// Upstream reports the server's UDP address for either transport
+    /// (`ares_get_server_addr`); the transport is `tcp`. A server no longer in
+    /// the list (it changed under the query) is not reported.
+    fn fire_server_state_callbacks(&self, server: ServerId, ok: bool, tcp: bool) {
         let hook = self.shared.server_state_hook.borrow().clone();
         let Some(hook) = hook else { return };
-        for a in actions {
-            match a {
-                // Upstream reports the server's UDP address for either
-                // transport (`ares_get_server_addr`); the transport is `tcp`.
-                ReactorAction::NotifyServerState { server, ok, tcp } => {
-                    if self.servers.contains(&server) {
-                        hook(server.udp_addr(), ok, tcp);
-                    }
-                }
-            }
+        if self.servers.contains(&server) {
+            hook(server.udp_addr(), ok, tcp);
         }
     }
 }
