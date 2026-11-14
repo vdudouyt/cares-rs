@@ -346,7 +346,7 @@ impl crate::async_runtime::socket::Socket for CSocket {
         };
         if result == -1 {
             let err = Error::last_os_error();
-            if err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EINPROGRESS) {
+            if err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(rustix::io::Errno::INPROGRESS.raw_os_error()) {
                 return Ok(());
             }
             return Err(err);
@@ -502,7 +502,7 @@ impl CSocketFactory {
         // via CSocket::drop -> aclose and surfacing ECONNREFUSED.
         self.configure(fd, addr.is_ipv4())?;
         if !self.run_sock_callbacks(fd, socket_type == SOCK_STREAM) {
-            return Err(Error::from_raw_os_error(libc::ECONNREFUSED));
+            return Err(Error::from_raw_os_error(rustix::io::Errno::CONNREFUSED.raw_os_error()));
         }
         // Approximation of upstream's state machine: report readable when live and
         // (0,0) on close; write-interest transitions are not modeled by this reactor.
@@ -549,7 +549,7 @@ impl CSocketFactory {
             let (storage, len) = socket_addr_to_raw(addr);
             let rv = unsafe { bind(fd, &storage as *const _ as *const sockaddr, len) };
             if rv != 0 {
-                return Err(Error::from_raw_os_error(libc::ECONNREFUSED));
+                return Err(Error::from_raw_os_error(rustix::io::Errno::CONNREFUSED.raw_os_error()));
             }
         }
         Ok(())
@@ -575,10 +575,10 @@ impl CSocketFactory {
         };
         if rv != 0 {
             let err = Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOSYS) {
+            if err.raw_os_error() == Some(rustix::io::Errno::NOSYS.raw_os_error()) {
                 return Ok(());
             }
-            return Err(Error::from_raw_os_error(libc::ECONNREFUSED));
+            return Err(Error::from_raw_os_error(rustix::io::Errno::CONNREFUSED.raw_os_error()));
         }
         Ok(())
     }

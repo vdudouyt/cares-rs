@@ -192,6 +192,10 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
     if optmask & ARES_OPT_EVENT_THREAD != 0 && optmask & ARES_OPT_SOCK_STATE_CB != 0 {
         return Err(crate::ffi::error::ARES_EFORMERR);
     }
+    // Upstream: a backend this platform lacks (kqueue, win32, junk) is ARES_ENOTIMP.
+    if optmask & ARES_OPT_EVENT_THREAD != 0 && !crate::ffi::event_backend::supported(options.evsys) {
+        return Err(crate::ffi::error::ARES_ENOTIMP);
+    }
     let decoded_sortlist = match (optmask & ARES_OPT_SORTLIST != 0)
         .then(|| decode_sortlist_options(options))
     {
@@ -249,6 +253,9 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
     };
     let mut channeldata = ChannelData::new_unfinalized(resolvconf.as_deref());
     channeldata.event_mode = optmask & ARES_OPT_EVENT_THREAD != 0;
+    if channeldata.event_mode {
+        channeldata.evsys = options.evsys;
+    }
     channeldata.state.apply_options(optmask, decoded);
     install_socket_options(&mut channeldata, optmask, options);
     Ok(channeldata)
@@ -390,7 +397,7 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
     save_socket_options(channeldata, out, &mut mask);
     if channeldata.event_mode {
         mask |= ARES_OPT_EVENT_THREAD;
-        out.evsys = crate::ffi::ARES_EVSYS_DEFAULT;
+        out.evsys = channeldata.evsys;
     }
 
     unsafe { *optmask = mask };

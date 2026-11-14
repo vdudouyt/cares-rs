@@ -45,33 +45,141 @@ const std::vector<std::pair<int, bool>> ipv6_family_both_modes = {
 };
 
 const std::vector<std::tuple<ares_evsys_t, int, bool>> all_evsys_ipv4_family_both_modes = {
+#ifdef _WIN32
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_WIN32, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_WIN32, AF_INET, true),
+#endif
+#ifdef HAVE_KQUEUE
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_KQUEUE, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_KQUEUE, AF_INET, true),
+#endif
+#ifdef HAVE_EPOLL
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_EPOLL, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_EPOLL, AF_INET, true),
+#endif
+#ifdef HAVE_POLL
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_POLL, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_POLL, AF_INET, true),
+#endif
+#ifdef HAVE_PIPE
   std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET, false),
   std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET, true),
+#endif
 };
 
 const std::vector<std::tuple<ares_evsys_t, int, bool>> all_evsys_ipv6_family_both_modes = {
+#ifdef _WIN32
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_WIN32, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_WIN32, AF_INET6, true),
+#endif
+#ifdef HAVE_KQUEUE
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_KQUEUE, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_KQUEUE, AF_INET6, true),
+#endif
+#ifdef HAVE_EPOLL
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_EPOLL, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_EPOLL, AF_INET6, true),
+#endif
+#ifdef HAVE_POLL
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_POLL, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_POLL, AF_INET6, true),
+#endif
+#ifdef HAVE_PIPE
   std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET6, false),
   std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET6, true),
+#endif
 };
 
 const std::vector<std::tuple<ares_evsys_t, int, bool>> all_evsys_both_families_both_modes = {
+#ifdef _WIN32
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_WIN32, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_WIN32, AF_INET, true),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_WIN32, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_WIN32, AF_INET6, true),
+#endif
+#ifdef HAVE_KQUEUE
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_KQUEUE, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_KQUEUE, AF_INET, true),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_KQUEUE, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_KQUEUE, AF_INET6, true),
+#endif
+#ifdef HAVE_EPOLL
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_EPOLL, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_EPOLL, AF_INET, true),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_EPOLL, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_EPOLL, AF_INET6, true),
+#endif
+#ifdef HAVE_POLL
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_POLL, AF_INET, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_POLL, AF_INET, true),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_POLL, AF_INET6, false),
+  std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_POLL, AF_INET6, true),
+#endif
+#ifdef HAVE_PIPE
   std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET, false),
   std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET, true),
   std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET6, false),
   std::make_tuple<ares_evsys_t, int, bool>(ARES_EVSYS_SELECT, AF_INET6, true),
+#endif
 };
 
 const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_ipv4_family = {
+#ifdef _WIN32
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_WIN32, AF_INET),
+#endif
+#ifdef HAVE_KQUEUE
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_KQUEUE, AF_INET),
+#endif
+#ifdef HAVE_EPOLL
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_EPOLL, AF_INET),
+#endif
+#ifdef HAVE_POLL
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_POLL, AF_INET),
+#endif
+#ifdef HAVE_PIPE
   std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_SELECT, AF_INET),
+#endif
 };
 
 const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_ipv6_family = {
+#ifdef _WIN32
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_WIN32, AF_INET6),
+#endif
+#ifdef HAVE_KQUEUE
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_KQUEUE, AF_INET6),
+#endif
+#ifdef HAVE_EPOLL
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_EPOLL, AF_INET6),
+#endif
+#ifdef HAVE_POLL
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_POLL, AF_INET6),
+#endif
+#ifdef HAVE_PIPE
   std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_SELECT, AF_INET6),
+#endif
 };
 
 const std::vector<std::tuple<ares_evsys_t, int>> all_evsys_both_families = {
+#ifdef _WIN32
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_WIN32, AF_INET),
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_WIN32, AF_INET6),
+#endif
+#ifdef HAVE_KQUEUE
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_KQUEUE, AF_INET),
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_KQUEUE, AF_INET6),
+#endif
+#ifdef HAVE_EPOLL
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_EPOLL, AF_INET),
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_EPOLL, AF_INET6),
+#endif
+#ifdef HAVE_POLL
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_POLL, AF_INET),
+  std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_POLL, AF_INET6),
+#endif
+#ifdef HAVE_PIPE
   std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_SELECT, AF_INET),
   std::make_tuple<ares_evsys_t, int>(ARES_EVSYS_SELECT, AF_INET6),
+#endif
 };
 
 // Which parameters to use in tests

@@ -23,6 +23,7 @@ Tests are organized by file:
 ### Supported test categories
 - **EDNS / DNS cookies / DNS 0x20** — implemented and covered by the restored upstream tests.
 - **Event thread** — `ARES_OPT_EVENT_THREAD` is implemented; `ares_threadsafety()` returns 1.
+  The event-thread suites run once per backend (`EPOLL`, `POLL`, `SELECT`), as upstream does on Linux.
   The manual reactor API (`ares_fds`/`ares_process`/`ares_process_fd`/`ares_timeout`) is
   still supported for channels without the event thread.
 

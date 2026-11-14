@@ -28,6 +28,7 @@ use std::io::Cursor;
 mod addrinfo;
 mod convert;
 mod channel;
+mod event_backend;
 mod event_thread;
 mod lookups;
 mod parsers;

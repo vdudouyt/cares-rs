@@ -27,6 +27,8 @@ pub struct ChannelData {
     executor: Executor,
     /// `ARES_OPT_EVENT_THREAD` was requested (carried over by `ares_dup`).
     pub(crate) event_mode: bool,
+    /// The `ares_evsys_t` requested with the event thread (carried over by `ares_dup`).
+    pub(crate) evsys: libc::c_int,
     /// The running event thread, when `event_mode` is set.
     pub(crate) event: Option<EventThread>,
     /// Per-channel recursive lock; user callbacks fire while it is held.
@@ -46,6 +48,7 @@ impl ChannelData {
             sock_state_cb_data: std::ptr::null_mut(),
             executor: Executor::default(),
             event_mode: false,
+            evsys: crate::ffi::ARES_EVSYS_DEFAULT,
             event: None,
             lock: Arc::new(ReentrantMutex::new()),
         }
@@ -68,6 +71,7 @@ impl ChannelData {
             sock_state_cb_data: self.sock_state_cb_data,
             executor: Executor::default(),
             event_mode: self.event_mode,
+            evsys: self.evsys,
             event: None,
             lock: Arc::new(ReentrantMutex::new()),
         };
@@ -195,6 +199,11 @@ impl ChannelData {
 
     pub(crate) fn all_poll_fds(&self) -> Vec<(i32, bool)> {
         self.state.rt.reactor().interests()
+    }
+
+    /// [`all_poll_fds`](Self::all_poll_fds) with each fd's registration generation.
+    pub(crate) fn all_poll_fds_with_generation(&self) -> Vec<(i32, bool, u64)> {
+        self.state.rt.reactor().interests_with_generation()
     }
 
     /// Lookups still in flight (spawned, not yet delivered).

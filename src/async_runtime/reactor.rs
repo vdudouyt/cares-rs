@@ -94,6 +94,9 @@ impl Direction {
 pub(crate) struct Source {
     fd: i32,
     key: usize,
+    /// Reactor-unique, never reused: tells a fresh registration of a recycled
+    /// fd number from the old one (see `Reactor::interests_with_generation`).
+    generation: u64,
     state: RefCell<[Direction; 2]>,
 }
 
@@ -110,6 +113,7 @@ pub(crate) struct Reactor {
     sources: RefCell<Slab<Rc<Source>>>,
     timers: RefCell<BTreeMap<(Instant, usize), Waker>>,
     next_timer: Cell<usize>,
+    next_generation: Cell<u64>,
     /// Receive scratch (grown to 64 KB on first use), lent out for one
     /// synchronous recv at a time — avoids zeroing 64 KB per call.
     scratch: Cell<Vec<u8>>,
@@ -124,6 +128,7 @@ impl Reactor {
             sources: RefCell::new(Slab::default()),
             timers: RefCell::new(BTreeMap::new()),
             next_timer: Cell::new(0),
+            next_generation: Cell::new(0),
             scratch: Cell::new(Vec::new()),
         })
     }
@@ -134,7 +139,9 @@ impl Reactor {
 
     pub(crate) fn insert_io(&self, fd: i32) -> Rc<Source> {
         let mut sources = self.sources.borrow_mut();
-        let source = Rc::new(Source { fd, key: sources.vacant_key(), state: RefCell::default() });
+        let generation = self.next_generation.get().wrapping_add(1);
+        self.next_generation.set(generation);
+        let source = Rc::new(Source { fd, key: sources.vacant_key(), generation, state: RefCell::default() });
         sources.insert(source.clone());
         source
     }
@@ -181,6 +188,22 @@ impl Reactor {
             for (dir, d) in state.iter().enumerate() {
                 if d.has_waiters() {
                     out.push((source.fd, dir == WRITE));
+                }
+            }
+        }
+        out
+    }
+
+    /// [`interests`](Self::interests) plus each source's registration generation,
+    /// so a persistent backend (epoll) can tell a recycled fd number from the
+    /// registration it already holds.
+    pub(crate) fn interests_with_generation(&self) -> Vec<(i32, bool, u64)> {
+        let mut out = Vec::new();
+        for source in self.sources.borrow().iter() {
+            let state = source.state.borrow();
+            for (dir, d) in state.iter().enumerate() {
+                if d.has_waiters() {
+                    out.push((source.fd, dir == WRITE, source.generation));
                 }
             }
         }
