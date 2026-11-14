@@ -117,6 +117,7 @@ unsafe fn run_in_batches(channel: Channel, tally: &Arc<Tally>, total: usize, bat
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // real sockets and threads: Miri can't emulate them
 fn queries_complete_on_every_backend() {
     for evsys in BACKENDS {
         let server = Server::start(true);
@@ -134,6 +135,7 @@ fn queries_complete_on_every_backend() {
 /// Destroy while queries are in flight (the server never answers): every
 /// callback fires exactly once, with `ARES_EDESTRUCTION`, before destroy returns.
 #[test]
+#[cfg_attr(miri, ignore)] // real sockets and threads: Miri can't emulate them
 fn destroy_with_queries_in_flight() {
     for evsys in BACKENDS {
         let server = Server::start(false);
@@ -157,6 +159,7 @@ fn destroy_with_queries_in_flight() {
 /// `ares_cancel` from another thread while this one keeps issuing queries and
 /// the event thread completes them.
 #[test]
+#[cfg_attr(miri, ignore)] // real sockets and threads: Miri can't emulate them
 fn cancel_races_with_new_queries() {
     for evsys in BACKENDS {
         let server = Server::start(true);
@@ -189,6 +192,7 @@ fn cancel_races_with_new_queries() {
 
 /// Many channels at once, each with its own event thread and backend instance.
 #[test]
+#[cfg_attr(miri, ignore)] // real sockets and threads: Miri can't emulate them
 fn many_channels_in_parallel() {
     let server = Arc::new(Server::start(true));
     let handles: Vec<_> = (0..16)
