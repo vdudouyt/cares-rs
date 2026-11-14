@@ -5,7 +5,7 @@
 
 use rand::Rng;
 
-use super::{Ctx, Plugin, Screen};
+use super::{Ctx, Plugin, ReceiveVerdict};
 use crate::ffi::ares_options::ARES_FLAG_DNS0x20;
 
 /// The DNS 0x20 query plugin.
@@ -30,13 +30,13 @@ impl Plugin for Dns0x20Plugin {
     }
 
     /// On UDP, the reply's question must match the sent one's case exactly.
-    fn on_receive(&self, cx: &Ctx, sent: &[u8], reply: &[u8]) -> Screen {
+    fn on_receive(&self, cx: &Ctx, sent: &[u8], reply: &[u8]) -> ReceiveVerdict {
         if !Self::enabled(cx) {
-            return Screen::Accept;
+            return ReceiveVerdict::Accept;
         }
         match question_name(sent) {
-            Some(expected) if !question_matches_case(reply, &expected) => Screen::Drop,
-            _ => Screen::Accept,
+            Some(expected) if !question_matches_case(reply, &expected) => ReceiveVerdict::Drop,
+            _ => ReceiveVerdict::Accept,
         }
     }
 }

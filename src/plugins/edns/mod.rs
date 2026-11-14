@@ -18,7 +18,7 @@ use std::ffi::c_int;
 use bytes::BytesMut;
 
 use self::wire::{CookieVerdict, ServerCookie, EDNS_PACKETSZ};
-use super::{Ctx, Plugin, Reply, Resend, Screen};
+use super::{Ctx, Plugin, Reply, Resend, ReceiveVerdict};
 use crate::core::async_client::AsyncClient;
 use crate::core::lookup::{summarize, ServerId};
 use crate::core::AresError;
@@ -102,7 +102,7 @@ impl Plugin for EdnsPlugin {
     /// Validate the reply's COOKIE option against this server's state and the
     /// client cookie that was sent (RFC 7873 §5.3: a mismatch is dropped as
     /// spoofed).
-    fn on_receive(&self, cx: &Ctx, sent: &[u8], reply: &[u8]) -> Screen {
+    fn on_receive(&self, cx: &Ctx, sent: &[u8], reply: &[u8]) -> ReceiveVerdict {
         let sent_client: Option<[u8; 8]> = if cx.use_tcp {
             None
         } else {
@@ -111,9 +111,9 @@ impl Plugin for EdnsPlugin {
         let rcode = wire::extended_rcode(reply, summarize(reply, 0).rcode);
         let verdict = self.with_cookie(cx, |cookie| cookie.validate_response(reply, sent_client.as_ref(), rcode));
         match verdict.unwrap_or(CookieVerdict::Accept) {
-            CookieVerdict::Accept => Screen::Accept,
-            CookieVerdict::Drop => Screen::Drop,
-            CookieVerdict::BadCookie => Screen::Reject,
+            CookieVerdict::Accept => ReceiveVerdict::Accept,
+            CookieVerdict::Drop => ReceiveVerdict::Drop,
+            CookieVerdict::BadCookie => ReceiveVerdict::Reject,
         }
     }
 

@@ -31,13 +31,13 @@ pub(crate) struct Ctx<'a> {
     /// The server this attempt reached.
     pub server: ServerId,
     pub use_tcp: bool,
-    /// Replies rejected (by a plugin's [`Screen::Reject`]) so far in this query.
+    /// Replies rejected (by a plugin's [`ReceiveVerdict::Reject`]) so far in this query.
     pub rejections: u32,
 }
 
 /// A plugin's verdict on a reply carrying the query's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Screen {
+pub(crate) enum ReceiveVerdict {
     Accept,
     /// Not a genuine reply (stray or spoofed): keep listening.
     Drop,
@@ -74,8 +74,8 @@ pub(crate) trait Plugin {
     }
 
     /// Each reply carrying the query's id; `sent` is the packet as sent.
-    fn on_receive(&self, _cx: &Ctx, _sent: &[u8], _reply: &[u8]) -> Screen {
-        Screen::Accept
+    fn on_receive(&self, _cx: &Ctx, _sent: &[u8], _reply: &[u8]) -> ReceiveVerdict {
+        ReceiveVerdict::Accept
     }
 
     /// The decision step: may rewrite the query packet and claim the reply as

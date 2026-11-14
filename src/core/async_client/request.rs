@@ -277,16 +277,16 @@ impl AsyncClient {
                     if !qid_matches(&buf, &q.payload, false) {
                         continue;
                     }
-                    let screen = self
+                    let verdict = self
                         .plugins
                         .iter()
                         .map(|plugin| plugin.on_receive(&cx, &wire, &buf))
-                        .find(|&screen| screen != Screen::Accept)
-                        .unwrap_or(Screen::Accept);
-                    match screen {
-                        Screen::Drop => continue,
-                        Screen::Reject => return Ok((server, Response::Rejected)),
-                        Screen::Accept => return Ok((server, Response::Answer(buf))),
+                        .find(|&verdict| verdict != ReceiveVerdict::Accept)
+                        .unwrap_or(ReceiveVerdict::Accept);
+                    match verdict {
+                        ReceiveVerdict::Drop => continue,
+                        ReceiveVerdict::Reject => return Ok((server, Response::Rejected)),
+                        ReceiveVerdict::Accept => return Ok((server, Response::Answer(buf))),
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => {
