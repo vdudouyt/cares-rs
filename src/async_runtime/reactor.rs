@@ -831,4 +831,137 @@ mod tests {
         println!("{sources} sources, {ready_fds} ready: dispatch {scanning:?}, dispatch_events {indexed:?}");
         assert!(indexed * 20 < scanning, "dispatch_events should be far cheaper");
     }
+
+    /// Randomized model check of the change log. A shadow registry, edited only by
+    /// the drained `InterestChanges` (the way a backend is), must always equal the
+    /// ground truth from a full scan (`interests()`) — through registering, waking,
+    /// dropping, removing sources, recycled fd numbers, recycled slab keys, and
+    /// tracking being switched on while sources already exist.
+    #[test]
+    fn change_log_never_loses_an_update() {
+        struct Live {
+            src: Rc<Source>,
+            readers: Vec<Pin<Box<Ready>>>,
+            writers: Vec<Pin<Box<Ready>>>,
+        }
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, bound: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % bound as u64) as usize
+            }
+        }
+
+        // (read, write, generation) per fd, built only from drained changes.
+        type Shadow = HashMap<i32, (bool, bool, u64)>;
+        fn apply(shadow: &mut Shadow, c: InterestChanges) {
+            for (fd, generation) in c.removed {
+                if shadow.get(&fd).is_some_and(|e| e.2 == generation) {
+                    shadow.remove(&fd);
+                }
+            }
+            for u in c.updates {
+                match (u.read || u.write, shadow.get(&u.fd).copied()) {
+                    (true, Some((_, _, g))) if g > u.generation => {} // a newer source owns the fd
+                    (true, _) => {
+                        shadow.insert(u.fd, (u.read, u.write, u.generation));
+                    }
+                    (false, Some((_, _, g))) if g == u.generation => {
+                        shadow.remove(&u.fd);
+                    }
+                    (false, _) => {}
+                }
+            }
+        }
+        fn truth(r: &Reactor, live: &[Live]) -> Shadow {
+            let mut out = Shadow::new();
+            for (fd, write) in r.interests() {
+                let generation = live.iter().find(|l| l.src.fd == fd).map_or(0, |l| l.src.generation);
+                let e = out.entry(fd).or_insert((false, false, generation));
+                if write {
+                    e.1 = true;
+                } else {
+                    e.0 = true;
+                }
+            }
+            out
+        }
+
+        let (_c, w) = counter();
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let r = Reactor::new();
+            let mut live: Vec<Live> = Vec::new();
+            let mut shadow = Shadow::new();
+            let enable_at = rng.next(60);
+
+            for step in 0..400 {
+                if step == enable_at {
+                    r.enable_change_tracking();
+                }
+                match rng.next(9) {
+                    0 | 1 => {
+                        // A new source; a small fd range forces recycled numbers.
+                        let fd = rng.next(6) as i32;
+                        if !live.iter().any(|l| l.src.fd == fd) {
+                            live.push(Live { src: r.insert_io(fd), readers: vec![], writers: vec![] });
+                        }
+                    }
+                    2 | 3 if !live.is_empty() => {
+                        let n = rng.next(live.len());
+                        let l = &mut live[n];
+                        let dir = rng.next(2);
+                        let mut f = Box::pin(Ready::new(r.clone(), l.src.clone(), if dir == 0 { READ } else { WRITE }));
+                        if f.as_mut().poll(&mut Context::from_waker(&w)).is_pending() {
+                            if dir == 0 { l.readers.push(f) } else { l.writers.push(f) }
+                        }
+                    }
+                    4 if !live.is_empty() => {
+                        // Re-poll one (registers again after a wake; completes if an event came).
+                        let n = rng.next(live.len());
+                        let l = &mut live[n];
+                        let dir = rng.next(2);
+                        let list = if dir == 0 { &mut l.readers } else { &mut l.writers };
+                        if !list.is_empty() {
+                            let k = rng.next(list.len());
+                            if list[k].as_mut().poll(&mut Context::from_waker(&w)).is_ready() {
+                                list.remove(k);
+                            }
+                        }
+                    }
+                    5 if !live.is_empty() => {
+                        let n = rng.next(live.len());
+                        let l = &mut live[n];
+                        let dir = rng.next(2);
+                        let list = if dir == 0 { &mut l.readers } else { &mut l.writers };
+                        if !list.is_empty() {
+                            let k = rng.next(list.len());
+                            drop(list.remove(k));
+                        }
+                    }
+                    6 => {
+                        let events: Vec<(i32, bool, bool)> =
+                            (0..1 + rng.next(3)).map(|_| (rng.next(6) as i32, rng.next(2) == 0, rng.next(2) == 0)).collect();
+                        r.dispatch_events(Instant::now(), true, events);
+                    }
+                    7 if !live.is_empty() => {
+                        let n = rng.next(live.len());
+                        let l = live.remove(n);
+                        let Live { src, readers, writers } = l;
+                        drop(readers);
+                        drop(writers);
+                        r.remove_io(&src);
+                    }
+                    _ => {}
+                }
+                if rng.next(4) == 0 && r.tracking.get() {
+                    apply(&mut shadow, r.take_interest_changes());
+                    assert_eq!(shadow, truth(&r, &live), "seed {seed} step {step}: change log diverged from a full scan");
+                }
+            }
+        }
+    }
 }
