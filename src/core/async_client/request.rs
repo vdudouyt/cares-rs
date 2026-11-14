@@ -5,7 +5,7 @@
 //! failed conn out of service, and decides nothing else. `run_reserved_query()`
 //! makes every decision (retry, fail over, deliver), performs its channel side
 //! effects (health, server-state callback) and makes every change to the query
-//! state, in one place (`drive_query()`). A failover probe runs the same loop with
+//! state, in one place (`run_reserved_query_impl()`). A failover probe runs the same loop with
 //! `no_retry` set (`probe()`). Protocol extensions are not handled here: the
 //! registered [`Plugin`]s are run at each hook. A child of `async_client`, so it
 //! uses the client's private fields and helpers directly.
@@ -46,15 +46,20 @@ impl AsyncClient {
     }
 
     async fn run_reserved_query_impl(&self, mut q: QueryState, cancelled: &Cell<bool>) -> QueryOutcome {
+        // Counters only this loop reads and changes (`q.try_count` also feeds
+        // the backoff in `request()`, so it lives in the state).
+        let mut tries = 0u32; // retries counted against `opts.attempts`
+        let mut failover_tries = 0u32; // server-error failovers, against the send budget
+        let mut timeouts: c_int = 0; // timed-out attempts, reported to the caller
         loop {
             // A-cancels-AAAA: the sibling answered, so don't (re)send. A reply
             // already in flight is still delivered: this runs between attempts.
             if cancelled.get() {
-                return (Err(ARES_ETIMEOUT), q.timeouts);
+                return (Err(ARES_ETIMEOUT), timeouts);
             }
             let (server, response) = match self.request(&q).await {
                 Ok(exchange) => exchange,
-                Err(e) => return (Err(e), q.timeouts),
+                Err(e) => return (Err(e), timeouts),
             };
             q.server = server;
 
@@ -93,13 +98,13 @@ impl AsyncClient {
                         let next = {
                             let mut health = self.shared.health.borrow_mut();
                             health.record_failure(q.server);
-                            (!q.no_retry && (q.failover_tries as usize + 1) < health.len() * q.opts.attempts as usize)
+                            (!q.no_retry && (failover_tries as usize + 1) < health.len() * q.opts.attempts as usize)
                                 .then(|| health.pick_next())
                         };
                         self.fire_server_state_callbacks(q.server, false, q.use_tcp);
                         if let Some(server) = next {
                             q.server = server;
-                            q.failover_tries += 1;
+                            failover_tries += 1;
                             q.try_count += 1;
                             continue;
                         }
@@ -107,15 +112,15 @@ impl AsyncClient {
                         self.shared.health.borrow_mut().record_success(q.server);
                         self.fire_server_state_callbacks(q.server, true, q.use_tcp);
                     }
-                    return (Ok(buf), q.timeouts);
+                    return (Ok(buf), timeouts);
                 }
                 // The send itself failed: retry on the next server while the
                 // attempt budget lasts.
                 Response::SendFailed => {
-                    if q.no_retry || q.tries + 1 >= q.opts.attempts.max(1) {
-                        return (Err(ARES_ECONNREFUSED), q.timeouts);
+                    if q.no_retry || tries + 1 >= q.opts.attempts.max(1) {
+                        return (Err(ARES_ECONNREFUSED), timeouts);
                     }
-                    q.tries += 1;
+                    tries += 1;
                     q.try_count += 1;
                     if self.shared.health.borrow().len() > 1 {
                         self.shared.health.borrow_mut().record_failure(q.server);
@@ -135,8 +140,8 @@ impl AsyncClient {
             // Shared failover: report the server down, then retry on the next
             // server or expire with `expire`.
             self.fire_server_state_callbacks(q.server, false, q.use_tcp);
-            if q.tries >= q.opts.attempts {
-                return (Err(expire), q.timeouts);
+            if tries >= q.opts.attempts {
+                return (Err(expire), timeouts);
             }
             // With several servers the failure counts against this one and the
             // retry moves on; a lone server is retried in place.
@@ -148,12 +153,12 @@ impl AsyncClient {
                 }
             }
             if q.no_retry {
-                return (Err(expire), q.timeouts);
+                return (Err(expire), timeouts);
             }
-            q.tries += 1;
+            tries += 1;
             q.try_count += 1;
             if counts_timeout {
-                q.timeouts += 1;
+                timeouts += 1;
             }
         }
     }
@@ -174,11 +179,8 @@ impl AsyncClient {
             payload,
             use_tcp,
             server,
-            tries: 0,
             try_count: 0,
-            failover_tries: 0,
             rejections: 0,
-            timeouts: 0,
             no_retry: false,
         }
     }
@@ -296,9 +298,10 @@ enum Response {
     Unreachable,
 }
 
-/// State of one `run_reserved_query()` across its attempts (upstream
-/// `ares_query_t`). `request()` only reads it; `run_reserved_query()` (and,
-/// for a failover probe, `probe()`) changes it.
+/// What each attempt of one `run_reserved_query()` is built from (upstream
+/// `ares_query_t`). `request()` only reads it; `run_reserved_query_impl()` (for a
+/// failover probe too) changes it. The loop's own counters (`tries`,
+/// `failover_tries`, `timeouts`) are locals there, not fields.
 struct QueryState {
     opts: QueryOpts,
     /// The channel-unique transaction id, reserved for the query's whole life.
@@ -308,15 +311,10 @@ struct QueryState {
     /// Starts at ARES_FLAG_USEVC; a TC reply or a plugin upgrades.
     use_tcp: bool,
     server: ServerId,
-    /// Retries counted against `opts.attempts`.
-    tries: u32,
     /// Upstream `query->try_count`: every retry across servers; drives backoff.
     try_count: u32,
-    failover_tries: u32,
     /// Replies a plugin rejected so far.
     rejections: u32,
-    /// Timed-out attempts, reported to the caller.
-    timeouts: c_int,
     /// A failover probe: one server, no failover or retries.
     no_retry: bool,
 }
