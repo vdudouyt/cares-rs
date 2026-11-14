@@ -891,14 +891,16 @@ mod tests {
         }
 
         let (_c, w) = counter();
-        for seed in 1..=300u64 {
+        // Miri is ~1000x slower: a few seeds still cover every operation under its checks.
+        let (seeds, steps) = if cfg!(miri) { (6u64, 150) } else { (300, 400) };
+        for seed in 1..=seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let r = Reactor::new();
             let mut live: Vec<Live> = Vec::new();
             let mut shadow = Shadow::new();
-            let enable_at = rng.next(60);
+            let enable_at = rng.next(steps / 6);
 
-            for step in 0..400 {
+            for step in 0..steps {
                 if step == enable_at {
                     r.enable_change_tracking();
                 }
