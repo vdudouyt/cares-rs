@@ -5,10 +5,10 @@
 //! failed conn out of service, and decides nothing else. `run_reserved_query()`
 //! makes every decision (retry, fail over, deliver), performs its channel side
 //! effects (health, server-state callback) and makes every change to the query
-//! state, in one place. A failover probe runs the same attempts with its own copy of the
-//! (no-retry) decisions in `probe()`. Protocol extensions are not handled
-//! here: the registered [`Plugin`]s are run at each hook. A child of `async_client`, so it uses the client's private fields and
-//! helpers directly.
+//! state, in one place (`drive_query()`). A failover probe runs the same loop with
+//! `no_retry` set (`probe()`). Protocol extensions are not handled here: the
+//! registered [`Plugin`]s are run at each hook. A child of `async_client`, so it
+//! uses the client's private fields and helpers directly.
 
 use super::*;
 
@@ -23,9 +23,17 @@ impl AsyncClient {
         if query.payload.len() > u16::MAX as usize {
             return (Err(ARES_EBADQUERY), 0);
         }
-        let mut q = self.create_query_state(query);
+        let q = self.create_query_state(query);
         self.maybe_spawn_probe(&q);
+        self.drive_query(q, cancelled).await
+    }
 
+    /// The attempt loop over a prepared [`QueryState`], shared by lookups and
+    /// failover probes. With `q.no_retry` (a probe) every decision that would
+    /// move on — fail over, retry a send or a timeout — ends the query instead,
+    /// after the same health and server-state side effects; only a TC upgrade
+    /// and a plugin-claimed re-send still loop.
+    async fn drive_query(&self, mut q: QueryState, cancelled: &Cell<bool>) -> QueryOutcome {
         loop {
             // A-cancels-AAAA: the sibling answered, so don't (re)send. A reply
             // already in flight is still delivered: this runs between attempts.
@@ -74,7 +82,7 @@ impl AsyncClient {
                         let next = {
                             let mut health = self.shared.health.borrow_mut();
                             health.record_failure(q.server);
-                            ((q.failover_tries as usize + 1) < health.len() * q.opts.attempts as usize)
+                            (!q.no_retry && (q.failover_tries as usize + 1) < health.len() * q.opts.attempts as usize)
                                 .then(|| health.pick_next())
                         };
                         self.fire_server_state_callbacks(q.server, false, q.use_tcp);
@@ -93,7 +101,7 @@ impl AsyncClient {
                 // The send itself failed: retry on the next server while the
                 // attempt budget lasts.
                 Response::SendFailed => {
-                    if q.tries + 1 >= q.opts.attempts.max(1) {
+                    if q.no_retry || q.tries + 1 >= q.opts.attempts.max(1) {
                         return (Err(ARES_ECONNREFUSED), q.timeouts);
                     }
                     q.tries += 1;
@@ -128,6 +136,9 @@ impl AsyncClient {
                     q.server = health.pick_next();
                 }
             }
+            if q.no_retry {
+                return (Err(expire), q.timeouts);
+            }
             q.tries += 1;
             q.try_count += 1;
             if counts_timeout {
@@ -154,58 +165,16 @@ impl AsyncClient {
 
     /// Run a failover probe: one no-retry attempt to its server, whose outcome
     /// only feeds `ServerHealth` and the server-state callback (upstream sends it
-    /// with `ARES_SEND_FLAG_NORETRY`). The same decisions as
-    /// `run_reserved_query()`, minus everything that moves on: no failover, no
-    /// counted retry. It still re-sends when a plugin asks to and on a TC
-    /// upgrade. Dropping it clears the server's probe-in-flight mark.
+    /// with `ARES_SEND_FLAG_NORETRY`). It is `drive_query()` on a query pinned
+    /// to that server with `no_retry` set. Dropping it clears the server's
+    /// probe-in-flight mark.
     async fn probe(self, mut probe: Probe) {
         let Some(query) = probe.query.take() else { return };
         let mut q = self.create_query_state(query);
         q.server = probe.server;
         q.no_retry = true;
-        loop {
-            let Ok((server, response)) = self.request(&q).await else { return };
-            q.server = server;
-            let resend = self.plugins_on_reply(&mut q, &response);
-            if matches!(response, Response::Rejected) {
-                q.rejections += 1;
-            }
-            if let Some(resend) = resend {
-                q.use_tcp |= resend == Resend::OverTcp;
-                continue;
-            }
-            match response {
-                Response::Rejected => continue,
-                Response::Answer(buf) => {
-                    let summary = summarize(&buf, 0);
-                    // Only a TC upgrade re-sends (see `run_reserved_query()`);
-                    // anything else is recorded in health and ends the probe.
-                    if summary.truncated && !q.use_tcp && !q.opts.ignore_tc {
-                        q.use_tcp = true;
-                        continue;
-                    }
-                    if !q.opts.no_check_resp
-                        && matches!(summary.rcode, RCODE_SERVFAIL | RCODE_NOTIMP | RCODE_REFUSED)
-                    {
-                        self.shared.health.borrow_mut().record_failure(q.server);
-                        self.fire_server_state_callbacks(q.server, false, q.use_tcp);
-                    } else {
-                        self.shared.health.borrow_mut().record_success(q.server);
-                        self.fire_server_state_callbacks(q.server, true, q.use_tcp);
-                    }
-                    return;
-                }
-                Response::SendFailed => return,
-                // A failure is reported and recorded, never retried.
-                Response::TimedOut | Response::Unreachable => {
-                    self.fire_server_state_callbacks(q.server, false, q.use_tcp);
-                    if q.tries < q.opts.attempts && self.shared.health.borrow().len() > 1 {
-                        self.shared.health.borrow_mut().record_failure(q.server);
-                    }
-                    return;
-                }
-            }
-        }
+        // Nothing consumes a probe's outcome: it only feeds health.
+        let _ = self.drive_query(q, &Cell::new(false)).await;
     }
 
     /// Per-query state before the first attempt: starting transport, first
