@@ -25,14 +25,6 @@ impl AsyncClient {
         self.run_reserved_query_impl(q, cancelled).await
     }
 
-    async fn probe(self, mut probe: Probe) {
-        let Some(query) = probe.query.take() else { return };
-        let mut q = self.create_query_state(query);
-        q.server = probe.server;
-        q.no_retry = true;
-        let _ = self.run_reserved_query_impl(q, &Cell::new(false)).await;
-    }
-
     fn maybe_spawn_probe(&self, q: &QueryState) {
         let chance = q.opts.failover_chance;
         if chance == 0 || !rand::thread_rng().r#gen::<u16>().is_multiple_of(chance) {
@@ -43,6 +35,14 @@ impl AsyncClient {
         self.shared.health.borrow_mut().set_probing(server, true);
         let probe = Probe { query: Some(query), server, shared: self.shared.clone() };
         self.rt.spawn(self.copy().probe(probe));
+    }
+
+    async fn probe(self, mut probe: Probe) {
+        let Some(query) = probe.query.take() else { return };
+        let mut q = self.create_query_state(query);
+        q.server = probe.server;
+        q.no_retry = true;
+        let _ = self.run_reserved_query_impl(q, &Cell::new(false)).await;
     }
 
     async fn run_reserved_query_impl(&self, mut q: QueryState, cancelled: &Cell<bool>) -> QueryOutcome {
