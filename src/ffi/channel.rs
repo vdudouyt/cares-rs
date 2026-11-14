@@ -201,9 +201,16 @@ impl ChannelData {
         self.state.rt.reactor().interests()
     }
 
-    /// [`all_poll_fds`](Self::all_poll_fds) with each fd's registration generation.
-    pub(crate) fn all_poll_fds_with_generation(&self) -> Vec<(i32, bool, u64)> {
-        self.state.rt.reactor().interests_with_generation()
+    /// Called as the event thread starts: turn on the reactor's change log (the
+    /// thread's source of interest updates) and return the requested `evsys`.
+    pub(crate) fn begin_event_mode(&self) -> libc::c_int {
+        self.state.rt.reactor().enable_change_tracking();
+        self.evsys
+    }
+
+    /// Interest changes since the last call — O(changes), unlike `all_poll_fds`.
+    pub(crate) fn take_interest_changes(&self) -> crate::async_runtime::reactor::InterestChanges {
+        self.state.rt.reactor().take_interest_changes()
     }
 
     /// Lookups still in flight (spawned, not yet delivered).
@@ -246,6 +253,16 @@ impl ChannelData {
             let bit = if writable { ARES_FD_EVENT_WRITE } else { ARES_FD_EVENT_READ };
             events.iter().any(|ev| ev.fd == fd && ev.events & bit != 0)
         });
+    }
+
+    /// The event thread's turn: the backend already says *which* fds are ready,
+    /// so each finds its waiters through the reactor's fd index (O(ready fds)).
+    pub(crate) fn process_fd_events(&mut self, events: &[crate::ffi::ares_socket::ares_fd_events_t]) {
+        use crate::ffi::ares_socket::{ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
+        let reactor = self.state.rt.reactor().clone();
+        let ready = events.iter().map(|ev| (ev.fd, ev.events & ARES_FD_EVENT_READ != 0, ev.events & ARES_FD_EVENT_WRITE != 0));
+        reactor.dispatch_events(Instant::now(), false, ready);
+        self.run_ready();
     }
 
     /// Fire the server-state callback if installed; a stale index is skipped.

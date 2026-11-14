@@ -3,9 +3,9 @@
 //! the option never starts one and the caller drives `ares_process*` itself.
 //!
 //! The thread is just another caller of the channel's reactor turn: it
-//! snapshots the reactor's interests under the channel lock, waits on the
+//! drains the reactor's interest changes under the channel lock, waits on the
 //! `ares_evsys_t` backend (`event_backend.rs`: epoll or poll) without holding
-//! it, then re-locks to run `process_events`. Callbacks therefore fire on this
+//! it, then re-locks to run `process_fd_events`. Callbacks therefore fire on this
 //! thread, under the recursive lock (destroy inside one is unsupported).
 
 use super::*;
@@ -43,8 +43,8 @@ pub(crate) fn start(channel: *mut ChannelData) -> bool {
     // outlives the thread (`stop` joins before the channel is freed).
     let lock: &'static ReentrantMutex = unsafe { &*((*channel).lock.as_ref() as *const ReentrantMutex) };
     let raw = channel as usize;
-    // SAFETY: as above; read before the thread exists, so nothing races it.
-    let evsys = unsafe { (*channel).evsys };
+    // SAFETY: as above; done before the thread exists, so nothing races it.
+    let evsys = unsafe { (*channel).begin_event_mode() };
     let (thread_stop, thread_wake) = (stop.clone(), wake.clone());
     let spawned = std::thread::Builder::new()
         .name("cares-event".to_string())
@@ -72,9 +72,9 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
             break;
         }
 
-        // Snapshot the reactor interests while serialized; the channel pointer
-        // stays valid until `ares_destroy` joins this thread.
-        let (waits, next_timeout) = {
+        // Drain what changed in the reactor while serialized (O(changes)); the
+        // channel pointer stays valid until `ares_destroy` joins this thread.
+        let (changes, next_timeout) = {
             let _guard = lock.lock();
             if stop.load(Ordering::Acquire) {
                 break;
@@ -82,8 +82,9 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
             // SAFETY: the channel is alive for the lifetime of this thread and
             // the lock excludes every other access while we read it.
             let data = unsafe { &*(channel as *const ChannelData) };
-            (data.all_poll_fds_with_generation(), data.next_timeout_ms())
+            (data.take_interest_changes(), data.next_timeout_ms())
         };
+        backend.apply(changes);
 
         let timeout_ms = match next_timeout {
             Some(ms) => ms.clamp(1, EVENT_MAX_WAIT_MS) as c_int,
@@ -91,7 +92,7 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
         };
         // A timeout/error just means no fd is ready; timeouts are still
         // processed below, so no extra sleep is needed.
-        let ready = backend.wait(&wake, &waits, timeout_ms);
+        let ready = backend.wait(&wake, timeout_ms);
         if ready.woke {
             wake.drain();
         }
@@ -104,7 +105,7 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
             }
             // SAFETY: as above; the lock excludes all other channel access.
             let data = unsafe { &mut *(channel as *mut ChannelData) };
-            data.process_events(&events, false);
+            data.process_fd_events(&events);
         }
     }
 }

@@ -6,7 +6,7 @@
 //! channel (no global): handles are passed explicitly via [`Runtime`].
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::io;
@@ -62,6 +62,10 @@ impl<T> Slab<T> {
         value
     }
 
+    pub(crate) fn get(&self, key: usize) -> Option<&T> {
+        self.entries.get(key).and_then(Option::as_ref)
+    }
+
     pub(crate) fn get_mut(&mut self, key: usize) -> Option<&mut T> {
         self.entries.get_mut(key).and_then(Option::as_mut)
     }
@@ -77,15 +81,71 @@ impl<T> Slab<T> {
 
 /// One direction (read or write) of a source: the tick of its last event and
 /// the wakers of the [`Ready`] futures awaiting it (async-io's `Direction`).
+/// `live` counts the wakers currently set, so "is anyone waiting" is O(1).
 #[derive(Default)]
 struct Direction {
     tick: usize,
     wakers: Slab<Option<Waker>>,
+    live: usize,
 }
 
 impl Direction {
     fn has_waiters(&self) -> bool {
-        self.wakers.iter().any(Option::is_some)
+        self.live > 0
+    }
+
+    /// Set (or refresh) the waker at `index`, inserting a slot if there is none.
+    /// Returns the slot and whether the direction just gained its first waiter.
+    fn register(&mut self, index: Option<usize>, waker: &Waker) -> (usize, bool) {
+        let was_waiting = self.has_waiters();
+        let existing = index.filter(|&i| self.wakers.get_mut(i).is_some());
+        let slot = match existing {
+            Some(i) => {
+                if let Some(slot) = self.wakers.get_mut(i) {
+                    match slot {
+                        Some(w) => {
+                            if !w.will_wake(waker) {
+                                *w = waker.clone();
+                            }
+                        }
+                        // The slot was emptied by a dispatch; waiting again.
+                        None => {
+                            *slot = Some(waker.clone());
+                            self.live += 1;
+                        }
+                    }
+                }
+                i
+            }
+            None => {
+                self.live += 1;
+                self.wakers.insert(Some(waker.clone()))
+            }
+        };
+        (slot, !was_waiting && self.has_waiters())
+    }
+
+    /// Drop the slot at `index`. Returns its waker (to drop outside any borrow)
+    /// and whether the direction just lost its last waiter.
+    fn deregister(&mut self, index: usize) -> (Option<Waker>, bool) {
+        let removed = self.wakers.remove(index).flatten();
+        let had_waker = removed.is_some();
+        if had_waker {
+            self.live = self.live.saturating_sub(1);
+        }
+        (removed, had_waker && self.live == 0)
+    }
+
+    /// Move every set waker into `out`. Returns whether the direction just went idle.
+    fn take_wakers(&mut self, out: &mut Vec<Waker>) -> bool {
+        let was_waiting = self.has_waiters();
+        for slot in self.wakers.iter_mut() {
+            if let Some(w) = slot.take() {
+                out.push(w);
+            }
+        }
+        self.live = 0;
+        was_waiting
     }
 }
 
@@ -95,9 +155,31 @@ pub(crate) struct Source {
     fd: i32,
     key: usize,
     /// Reactor-unique, never reused: tells a fresh registration of a recycled
-    /// fd number from the old one (see `Reactor::interests_with_generation`).
+    /// fd number from the old one (see [`InterestUpdate::generation`]).
     generation: u64,
+    /// Interest changed since the last [`Reactor::take_interest_changes`].
+    dirty: Cell<bool>,
     state: RefCell<[Direction; 2]>,
+}
+
+/// One source's current interest, as of [`Reactor::take_interest_changes`].
+/// `read == write == false` means "watch nothing".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InterestUpdate {
+    pub(crate) fd: i32,
+    /// Reactor-unique registration id; a recycled fd number gets a new one.
+    pub(crate) generation: u64,
+    pub(crate) read: bool,
+    pub(crate) write: bool,
+}
+
+/// What changed since the host last asked: sources that were dropped, and
+/// sources whose interest differs from (or may differ from) what it was.
+#[derive(Default, Debug)]
+pub(crate) struct InterestChanges {
+    /// `(fd, generation)` of every dropped source.
+    pub(crate) removed: Vec<(i32, u64)>,
+    pub(crate) updates: Vec<InterestUpdate>,
 }
 
 impl Source {
@@ -114,6 +196,14 @@ pub(crate) struct Reactor {
     timers: RefCell<BTreeMap<(Instant, usize), Waker>>,
     next_timer: Cell<usize>,
     next_generation: Cell<u64>,
+    /// fd → keys of its live sources, so a ready fd finds its waiters in O(1).
+    by_fd: RefCell<HashMap<i32, Vec<usize>>>,
+    /// Change log for a host that keeps a persistent interest set (the event
+    /// thread). Off unless [`Reactor::enable_change_tracking`] ran, so channels
+    /// driven by `ares_process*` never accumulate entries nobody drains.
+    tracking: Cell<bool>,
+    dirty: RefCell<Vec<usize>>,
+    removed: RefCell<Vec<(i32, u64)>>,
     /// Receive scratch (grown to 64 KB on first use), lent out for one
     /// synchronous recv at a time — avoids zeroing 64 KB per call.
     scratch: Cell<Vec<u8>>,
@@ -129,6 +219,10 @@ impl Reactor {
             timers: RefCell::new(BTreeMap::new()),
             next_timer: Cell::new(0),
             next_generation: Cell::new(0),
+            by_fd: RefCell::new(HashMap::new()),
+            tracking: Cell::new(false),
+            dirty: RefCell::new(Vec::new()),
+            removed: RefCell::new(Vec::new()),
             scratch: Cell::new(Vec::new()),
         })
     }
@@ -141,15 +235,70 @@ impl Reactor {
         let mut sources = self.sources.borrow_mut();
         let generation = self.next_generation.get().wrapping_add(1);
         self.next_generation.set(generation);
-        let source = Rc::new(Source { fd, key: sources.vacant_key(), generation, state: RefCell::default() });
+        let key = sources.vacant_key();
+        let source = Rc::new(Source { fd, key, generation, dirty: Cell::new(false), state: RefCell::default() });
         sources.insert(source.clone());
+        self.by_fd.borrow_mut().entry(fd).or_default().push(key);
         source
     }
 
     pub(crate) fn remove_io(&self, source: &Source) {
         let removed = self.sources.borrow_mut().remove(source.key);
+        {
+            let mut by_fd = self.by_fd.borrow_mut();
+            if let Some(keys) = by_fd.get_mut(&source.fd) {
+                keys.retain(|&k| k != source.key);
+                if keys.is_empty() {
+                    by_fd.remove(&source.fd);
+                }
+            }
+        }
+        if removed.is_some() && self.tracking.get() {
+            self.removed.borrow_mut().push((source.fd, source.generation));
+        }
         // Waker drops (and any socket they keep alive) run with no borrow live.
         drop(removed);
+    }
+
+    /// Record that `source`'s interest may have changed (a direction gained its
+    /// first waiter or lost its last one).
+    fn interest_changed(&self, source: &Source) {
+        if self.tracking.get() && !source.dirty.replace(true) {
+            self.dirty.borrow_mut().push(source.key);
+        }
+    }
+
+    /// Start logging interest changes for [`Reactor::take_interest_changes`];
+    /// every source that already exists is reported by the first call.
+    pub(crate) fn enable_change_tracking(&self) {
+        self.tracking.set(true);
+        for source in self.sources.borrow().iter() {
+            self.interest_changed(source);
+        }
+    }
+
+    /// The sources whose interest may have changed since the last call, with
+    /// their interest *now* (an off-then-on blip inside one turn reads as
+    /// unchanged), plus the sources dropped since. O(changes), not O(sources).
+    pub(crate) fn take_interest_changes(&self) -> InterestChanges {
+        let removed = std::mem::take(&mut *self.removed.borrow_mut());
+        let keys = std::mem::take(&mut *self.dirty.borrow_mut());
+        let sources = self.sources.borrow();
+        let mut updates = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(source) = sources.get(key) else { continue };
+            if !source.dirty.replace(false) {
+                continue; // already reported (a stale or duplicate key)
+            }
+            let state = source.state.borrow();
+            updates.push(InterestUpdate {
+                fd: source.fd,
+                generation: source.generation,
+                read: state[READ].has_waiters(),
+                write: state[WRITE].has_waiters(),
+            });
+        }
+        InterestChanges { removed, updates }
     }
 
     /// Feed one turn of caller-reported readiness (async-io's `react`, minus
@@ -165,10 +314,47 @@ impl Reactor {
             for (dir, d) in state.iter_mut().enumerate() {
                 if d.has_waiters() && ready(source.fd, dir == WRITE) {
                     d.tick = tick;
-                    wake.extend(d.wakers.iter_mut().filter_map(Option::take));
+                    if d.take_wakers(&mut wake) {
+                        self.interest_changed(source);
+                    }
                 }
             }
         }
+        self.finish_dispatch(now, skip_timeouts, wake);
+    }
+
+    /// [`dispatch`](Self::dispatch) for a host that already knows *which* fds are
+    /// ready (the event thread): each `(fd, readable, writable)` finds its source
+    /// through the fd index, so a turn costs O(ready fds), not O(sources).
+    pub(crate) fn dispatch_events(&self, now: Instant, skip_timeouts: bool, events: impl IntoIterator<Item = (i32, bool, bool)>) {
+        let tick = self.ticker.get().wrapping_add(1);
+        self.ticker.set(tick);
+        let mut wake = Vec::new();
+        {
+            let by_fd = self.by_fd.borrow();
+            let sources = self.sources.borrow();
+            for (fd, readable, writable) in events {
+                let Some(keys) = by_fd.get(&fd) else { continue };
+                for source in keys.iter().filter_map(|&key| sources.get(key)) {
+                    let mut state = source.state.borrow_mut();
+                    for (dir, hit) in [(READ, readable), (WRITE, writable)] {
+                        let Some(d) = state.get_mut(dir) else { continue };
+                        if hit && d.has_waiters() {
+                            d.tick = tick;
+                            if d.take_wakers(&mut wake) {
+                                self.interest_changed(source);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.finish_dispatch(now, skip_timeouts, wake);
+    }
+
+    /// Add the due timers' wakers (unless `skip_timeouts`) and fire everything,
+    /// with every borrow released.
+    fn finish_dispatch(&self, now: Instant, skip_timeouts: bool, mut wake: Vec<Waker>) {
         if !skip_timeouts {
             let mut timers = self.timers.borrow_mut();
             let later = timers.split_off(&(now + Duration::from_nanos(1), 0));
@@ -188,22 +374,6 @@ impl Reactor {
             for (dir, d) in state.iter().enumerate() {
                 if d.has_waiters() {
                     out.push((source.fd, dir == WRITE));
-                }
-            }
-        }
-        out
-    }
-
-    /// [`interests`](Self::interests) plus each source's registration generation,
-    /// so a persistent backend (epoll) can tell a recycled fd number from the
-    /// registration it already holds.
-    pub(crate) fn interests_with_generation(&self) -> Vec<(i32, bool, u64)> {
-        let mut out = Vec::new();
-        for source in self.sources.borrow().iter() {
-            let state = source.state.borrow();
-            for (dir, d) in state.iter().enumerate() {
-                if d.has_waiters() {
-                    out.push((source.fd, dir == WRITE, source.generation));
                 }
             }
         }
@@ -282,20 +452,20 @@ impl Future for Ready {
         match this.ticks.get() {
             Some((a, b)) if d.tick != a && d.tick != b => {
                 if let Some(i) = this.index.take() {
-                    d.wakers.remove(i);
+                    let (_waker, idle) = d.deregister(i);
+                    if idle {
+                        this.reactor.interest_changed(&this.source);
+                    }
                 }
                 return Poll::Ready(());
             }
             Some(_) => {}
             None => this.ticks.set(Some((this.reactor.ticker(), d.tick))),
         }
-        match this.index.get().and_then(|i| d.wakers.get_mut(i)) {
-            Some(slot) => {
-                if !slot.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-                    *slot = Some(cx.waker().clone());
-                }
-            }
-            None => this.index.set(Some(d.wakers.insert(Some(cx.waker().clone())))),
+        let (slot, gained) = d.register(this.index.get(), cx.waker());
+        this.index.set(Some(slot));
+        if gained {
+            this.reactor.interest_changed(&this.source);
         }
         Poll::Pending
     }
@@ -304,7 +474,13 @@ impl Future for Ready {
 impl Drop for Ready {
     fn drop(&mut self) {
         if let Some(i) = self.index.take() {
-            let removed = self.source.state.borrow_mut().get_mut(self.dir).and_then(|d| d.wakers.remove(i));
+            let (removed, idle) = match self.source.state.borrow_mut().get_mut(self.dir) {
+                Some(d) => d.deregister(i),
+                None => (None, false),
+            };
+            if idle {
+                self.reactor.interest_changed(&self.source);
+            }
             drop(removed);
         }
     }
@@ -523,5 +699,136 @@ mod tests {
         assert!(poll(&mut rd, &w).is_pending());
         r.remove_io(&src);
         assert!(r.interests().is_empty());
+    }
+
+    #[test]
+    fn dispatch_events_wakes_only_the_named_fd_and_direction() {
+        let r = Reactor::new();
+        let (a, b) = (r.insert_io(5), r.insert_io(6));
+        let (ca, wa) = counter();
+        let (cb, wb) = counter();
+        let mut ra = Box::pin(Ready::new(r.clone(), a.clone(), READ));
+        let mut rb = Box::pin(Ready::new(r.clone(), b.clone(), READ));
+        assert!(poll(&mut ra, &wa).is_pending());
+        assert!(poll(&mut rb, &wb).is_pending());
+
+        r.dispatch_events(Instant::now(), true, [(5, false, true)]); // write only: a read waiter stays
+        r.dispatch_events(Instant::now(), true, [(99, true, true)]); // unknown fd
+        assert_eq!((ca.0.load(Ordering::SeqCst), cb.0.load(Ordering::SeqCst)), (0, 0));
+
+        r.dispatch_events(Instant::now(), true, [(6, true, false)]);
+        assert_eq!((ca.0.load(Ordering::SeqCst), cb.0.load(Ordering::SeqCst)), (0, 1));
+        assert!(poll(&mut rb, &wb).is_ready());
+        assert!(poll(&mut ra, &wa).is_pending());
+        assert_eq!(r.interests(), vec![(5, false)]);
+    }
+
+    #[test]
+    fn change_log_is_off_until_enabled() {
+        let r = Reactor::new();
+        let src = r.insert_io(3);
+        let (_c, w) = counter();
+        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        assert!(poll(&mut rd, &w).is_pending());
+        drop(rd);
+        r.remove_io(&src);
+        let c = r.take_interest_changes();
+        assert!(c.updates.is_empty() && c.removed.is_empty(), "nothing may accumulate for hosts that never drain");
+    }
+
+    #[test]
+    fn change_log_reports_current_interest_once() {
+        let r = Reactor::new();
+        r.enable_change_tracking();
+        let src = r.insert_io(8);
+        let (_c, w) = counter();
+        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut wr = Box::pin(Ready::new(r.clone(), src.clone(), WRITE));
+        assert!(poll(&mut rd, &w).is_pending());
+        assert!(poll(&mut wr, &w).is_pending());
+        let c = r.take_interest_changes();
+        assert_eq!(c.updates, vec![InterestUpdate { fd: 8, generation: src.generation, read: true, write: true }]);
+        assert!(c.removed.is_empty());
+        assert!(r.take_interest_changes().updates.is_empty(), "drained");
+
+        // Off and on again inside one turn: the same interest, reported once.
+        r.dispatch_events(Instant::now(), true, [(8, true, false)]);
+        assert!(poll(&mut rd, &w).is_ready());
+        let mut again = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        assert!(poll(&mut again, &w).is_pending());
+        let c = r.take_interest_changes();
+        assert_eq!(c.updates, vec![InterestUpdate { fd: 8, generation: src.generation, read: true, write: true }]);
+
+        // Waiters gone: reported as no interest; dropping the source is a removal.
+        drop(again);
+        drop(wr);
+        let c = r.take_interest_changes();
+        assert_eq!(c.updates, vec![InterestUpdate { fd: 8, generation: src.generation, read: false, write: false }]);
+        r.remove_io(&src);
+        let c = r.take_interest_changes();
+        assert_eq!(c.removed, vec![(8, src.generation)]);
+        assert!(c.updates.is_empty());
+    }
+
+    #[test]
+    fn enabling_the_log_reports_existing_sources() {
+        let r = Reactor::new();
+        let src = r.insert_io(2);
+        let (_c, w) = counter();
+        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        assert!(poll(&mut rd, &w).is_pending());
+        r.enable_change_tracking();
+        let c = r.take_interest_changes();
+        assert_eq!(c.updates, vec![InterestUpdate { fd: 2, generation: src.generation, read: true, write: false }]);
+    }
+
+    #[test]
+    fn recycled_fd_number_gets_a_new_generation() {
+        let r = Reactor::new();
+        let first = r.insert_io(4);
+        r.remove_io(&first);
+        let second = r.insert_io(4);
+        assert_ne!(first.generation, second.generation);
+    }
+
+    /// `cargo test --lib -- --ignored --nocapture dispatch_cost`: the closure-scanning
+    /// `dispatch` is O(sources × events); `dispatch_events` is O(events).
+    #[test]
+    #[ignore]
+    fn dispatch_cost_scales_with_ready_fds_not_sources() {
+        let sources: i32 = 20_000;
+        let ready_fds: i32 = 200;
+        let r = Reactor::new();
+        let (_c, w) = counter();
+        let held: Vec<_> = (0..sources)
+            .map(|fd| {
+                let src = r.insert_io(fd);
+                let mut f = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+                assert!(poll(&mut f, &w).is_pending());
+                (src, f)
+            })
+            .collect();
+        let events: Vec<(i32, bool, bool)> = (0..ready_fds).map(|fd| (fd, true, false)).collect();
+
+        let started = Instant::now();
+        r.dispatch(Instant::now(), true, |fd, wr| !wr && events.iter().any(|e| e.0 == fd));
+        let scanning = started.elapsed();
+        drop(held);
+
+        let held: Vec<_> = (0..sources)
+            .map(|fd| {
+                let src = r.insert_io(100_000 + fd);
+                let mut f = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+                assert!(poll(&mut f, &w).is_pending());
+                (src, f)
+            })
+            .collect();
+        let events: Vec<(i32, bool, bool)> = (0..ready_fds).map(|fd| (100_000 + fd, true, false)).collect();
+        let started = Instant::now();
+        r.dispatch_events(Instant::now(), true, events);
+        let indexed = started.elapsed();
+        drop(held);
+        println!("{sources} sources, {ready_fds} ready: dispatch {scanning:?}, dispatch_events {indexed:?}");
+        assert!(indexed * 20 < scanning, "dispatch_events should be far cheaper");
     }
 }
