@@ -256,7 +256,7 @@ impl AsyncClient {
                         return Ok((server, Response::Unreachable));
                     }
                     // A retry goes out on a fresh socket (new source port).
-                    self.retire_udp(server, &conn);
+                    self.remove_udp_conn(server, &conn);
                     return Ok((server, Response::TimedOut));
                 }
                 Err(_) => {
@@ -278,7 +278,7 @@ impl AsyncClient {
         } else if self.optmask & ARES_OPT_EVENT_THREAD != 0 {
             conn.mark_dead();
         } else {
-            self.retire_udp(server, conn);
+            self.remove_udp_conn(server, conn);
         }
     }
 }
@@ -366,7 +366,7 @@ impl AsyncClient {
 
     /// Remove a dead/timed-out shared UDP conn so the next attempt opens a fresh
     /// socket. The `Rc` drops after the pool borrow ends (it may close a socket).
-    fn retire_udp(&self, server: ServerId, conn: &Conn) {
+    fn remove_udp_conn(&self, server: ServerId, conn: &Conn) {
         let Some(c) = conn.shared_udp_handle() else { return };
         let retired = self.shared.udp_pool.borrow_mut().remove(server, &c);
         drop(retired);
