@@ -376,3 +376,73 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::os::fd::AsRawFd;
+
+    /// More ready fds than one wait returns: level-triggered epoll must keep
+    /// handing out the rest on later waits, so none is starved.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn more_ready_fds_than_one_wait_returns() {
+        let wake = WakePipe::new().unwrap();
+        let mut backend = Backend::new(ARES_EVSYS_EPOLL);
+        let socks: Vec<UdpSocket> = (0..200)
+            .map(|_| {
+                let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                s.send_to(b"x", s.local_addr().unwrap()).unwrap();
+                s
+            })
+            .collect();
+        let waits: Vec<(i32, bool, u64)> = socks.iter().enumerate().map(|(i, s)| (s.as_raw_fd(), false, i as u64 + 1)).collect();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            for e in backend.wait(&wake, &waits, 100).events {
+                seen.insert(e.fd);
+            }
+            if seen.len() == waits.len() {
+                return;
+            }
+        }
+        panic!("only {}/{} ready fds were ever reported", seen.len(), waits.len());
+    }
+
+    /// epoll refuses regular files (EPERM); like poll(2) they must read as ready, immediately.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn regular_file_is_reported_ready_without_sleeping() {
+        let wake = WakePipe::new().unwrap();
+        let file = std::fs::File::open("/proc/self/exe").unwrap();
+        let waits = [(file.as_raw_fd(), false, 1u64)];
+        for evsys in [ARES_EVSYS_EPOLL, ARES_EVSYS_POLL] {
+            let mut backend = Backend::new(evsys);
+            let started = std::time::Instant::now();
+            let ready = backend.wait(&wake, &waits, 5000);
+            assert_eq!(ready.events.len(), 1, "evsys {evsys}");
+            assert!(started.elapsed().as_millis() < 1000, "evsys {evsys}: slept despite a ready fd");
+        }
+    }
+
+    /// An fd closed under us surfaces as an error event (read+write), as poll's POLLNVAL does.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn closed_fd_surfaces_as_error_event() {
+        let wake = WakePipe::new().unwrap();
+        let fd = {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.as_raw_fd()
+        }; // closed here
+        for evsys in [ARES_EVSYS_EPOLL, ARES_EVSYS_POLL] {
+            let mut backend = Backend::new(evsys);
+            let ready = backend.wait(&wake, &[(fd, false, 1)], 500);
+            let ev = ready.events.iter().find(|e| e.fd == fd);
+            assert!(
+                matches!(ev, Some(e) if e.events == ARES_FD_EVENT_READ | ARES_FD_EVENT_WRITE),
+                "evsys {evsys}: closed fd not reported as an error event"
+            );
+        }
+    }
+}
