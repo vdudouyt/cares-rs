@@ -239,7 +239,7 @@ impl AsyncClient {
     /// now: it runs inside the task's poll, so callers must not hold a
     /// `RefCell` borrow across this call. The hook is cloned out of its cell
     /// first, so even a callback that replaces itself cannot hit a live borrow.
-    fn notify(&self, actions: Vec<ReactorAction>) {
+    fn fire_server_state_callbacks(&self, actions: Vec<ReactorAction>) {
         let hook = self.shared.server_state_hook.borrow().clone();
         let Some(hook) = hook else { return };
         for a in actions {

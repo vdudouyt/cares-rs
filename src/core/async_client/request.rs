@@ -66,7 +66,7 @@ impl AsyncClient {
                         policy,
                         &mut self.shared.health.borrow_mut(),
                     );
-                    self.notify(actions);
+                    self.fire_server_state_callbacks(actions);
                     match verdict {
                         TaskVerdict::RetryNextServer { server, tries } => {
                             q.server = server;
@@ -106,7 +106,7 @@ impl AsyncClient {
 
             // Shared failover: report the server down, then retry on the next
             // server or expire with `expire`.
-            self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
+            self.fire_server_state_callbacks(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
             match on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut()) {
                 TimeoutVerdict::Retry { server } => {
                     q.tries += 1;
@@ -173,7 +173,7 @@ impl AsyncClient {
                         policy,
                         &mut self.shared.health.borrow_mut(),
                     );
-                    self.notify(actions);
+                    self.fire_server_state_callbacks(actions);
                     // The verdict is recorded in health; only a TC upgrade re-sends.
                     match verdict {
                         TaskVerdict::RetryTcp => q.use_tcp = true,
@@ -183,7 +183,7 @@ impl AsyncClient {
                 Response::SendFailed => return,
                 // A failure is reported and recorded (by `on_timeout`), never retried.
                 Response::TimedOut | Response::Unreachable => {
-                    self.notify(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
+                    self.fire_server_state_callbacks(vec![ReactorAction::NotifyServerState { server: q.server, ok: false, tcp: q.use_tcp }]);
                     let _ = on_timeout(q.tries, q.opts.attempts, q.server, &mut self.shared.health.borrow_mut());
                     return;
                 }
