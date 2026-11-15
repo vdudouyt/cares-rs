@@ -99,12 +99,7 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     let Some(callback) = callback else { return; };
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let name = unsafe { cstr_lossy(name) };
-    let payload = {
-        channeldata
-            .state
-            .borrow()
-            .query_payload(name, dnstype as u32, dnsclass as u32)
-    };
+    let payload = { channeldata.state.borrow().query_payload(name, dnstype as u32, dnsclass as u32) };
     match payload {
         Ok(payload) => {
             let client = channeldata.state.borrow().derive();

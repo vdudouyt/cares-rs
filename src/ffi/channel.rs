@@ -635,13 +635,20 @@ pub unsafe extern "C" fn ares_set_servers_ports_csv(channel: Channel, servers: *
 /// Unlocked body of `ares_set_servers[_ports]_csv` (both public wrappers lock).
 unsafe fn set_servers_ports_csv_impl(channeldata: &ChannelData, servers: *const c_char) -> c_int {
     if servers.is_null() {
-        channeldata.state.borrow_mut().clear_servers();
-        return ARES_SUCCESS;
+        return set_servers_csv_none(channeldata);
     }
     let Some(s) = (unsafe { cstr_opt(servers) }) else { return ARES_EBADSTR };
+    set_servers_csv_str(channeldata, s)
+}
+
+fn set_servers_csv_none(channeldata: &ChannelData) -> c_int {
+    channeldata.state.borrow_mut().clear_servers();
+    ARES_SUCCESS
+}
+
+fn set_servers_csv_str(channeldata: &ChannelData, s: &str) -> c_int {
     if s.is_empty() {
-        channeldata.state.borrow_mut().clear_servers();
-        return ARES_SUCCESS;
+        return set_servers_csv_none(channeldata);
     }
     let mut cursor = Cursor::new(s);
     match servers_csv::parse_from_reader(&mut cursor) {
