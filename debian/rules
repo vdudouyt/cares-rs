@@ -2,13 +2,15 @@
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
-# Force the Debian/OS Rust toolchain — never fall through to a rustup proxy on PATH.
+# Prefer the OS Rust toolchain when it is installed; fall back to whatever
+# cargo/rustc is on PATH (e.g. a rustup toolchain) otherwise.
 export PATH := /usr/bin:$(PATH)
-export RUSTC := /usr/bin/rustc
-export CARGO := /usr/bin/cargo
+export RUSTC ?= rustc
+export CARGO ?= cargo
 
-# Resolve crates offline from the system registry populated by the librust-*-dev
-# build-deps; keep all cargo state inside the build tree.
+# Use a clean Cargo home inside the build tree so the build cannot pick up
+# crates from a pre-populated cache (the system registry or the user's
+# ~/.cargo). Cargo fetches the crates.io versions pinned in Cargo.lock.
 export CARGO_HOME := $(CURDIR)/debian/cargo_home
 
 # Embed the stock c-ares SONAME on the cdylib (cargo cannot set it directly).
@@ -23,19 +25,16 @@ DEV := debian/libcares-rs-dev
 	dh $@
 
 override_dh_auto_configure:
-	mkdir -p $(CARGO_HOME)
-	printf '[source.crates-io]\nreplace-with = "debian"\n\n[source.debian]\ndirectory = "/usr/share/cargo/registry"\n' > $(CARGO_HOME)/config.toml
-	# The committed Cargo.lock pins crates.io versions; re-resolve against the
-	# system registry (Cargo.toml is relaxed by debian/patches/relax-deps.patch).
-	rm -f Cargo.lock
-	$(CARGO) generate-lockfile --offline
+	# Download the crates.io versions pinned in the committed Cargo.lock.
+	# --locked makes a stale or unexpectedly updated lockfile a hard error.
+	$(CARGO) fetch --locked
 
 override_dh_auto_build:
-	$(CARGO) build --release --offline
+	$(CARGO) build --release --locked
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	$(CARGO) test --release --offline --tests
+	$(CARGO) test --release --locked --tests
 endif
 
 override_dh_auto_install:
@@ -54,4 +53,3 @@ override_dh_auto_install:
 override_dh_auto_clean:
 	$(CARGO) clean || true
 	rm -rf $(CARGO_HOME)
-	git checkout -- Cargo.lock 2>/dev/null || true

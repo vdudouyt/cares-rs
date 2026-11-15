@@ -6,11 +6,6 @@ Build-Depends:
  debhelper-compat (= 13),
  cargo,
  rustc,
- librust-arrayvec-dev,
- librust-bytes-dev,
- librust-libc-dev,
- librust-rand-dev,
- librust-cbindgen-dev,
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 

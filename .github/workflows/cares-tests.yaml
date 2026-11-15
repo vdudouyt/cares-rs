@@ -101,9 +101,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential debhelper dh-cargo dpkg-dev fakeroot cargo rustc \
-            librust-arrayvec-dev librust-bytes-dev librust-libc-dev \
-            librust-rand-dev librust-cbindgen-dev
+            build-essential debhelper dh-cargo dpkg-dev fakeroot cargo rustc
       - name: Set package version from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"

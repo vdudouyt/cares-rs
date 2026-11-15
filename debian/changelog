@@ -4,8 +4,8 @@ cares-rs (0.1.0-1) UNRELEASED; urgency=medium
     (libcares-rs2 / libcares-rs-dev). Installs the stock c-ares file names
     (<ares.h>, libcares.so.2, libcares.pc, c-ares-config.cmake), so existing
     consumers build against it unchanged; replaces the stock c-ares packages.
-  * Build against system librust-*-dev crates (no vendored sources); the
-    upstream Cargo.toml version requirements are loosened for the Debian
-    toolchain via debian/patches/relax-deps.patch.
+  * Build against the crates.io versions pinned in the committed Cargo.lock
+    instead of the distro's librust-*-dev packages; Cargo downloads the exact
+    locked versions itself. The version-relaxing patch is no longer needed.
 
  -- Valentin Dudouyt <valentin.dudouyt@gmail.com>  Tue, 30 Jun 2026 21:16:41 +0300

@@ -6,7 +6,7 @@
 /include/ares_dns_record.h
 /include/ares_nameser.h
 
-# Debian build artifacts (quilt + debhelper + cargo registry redirect)
+# Debian build artifacts (quilt + debhelper)
 /.cargo/
 /.pc/
 /debian/.debhelper/
