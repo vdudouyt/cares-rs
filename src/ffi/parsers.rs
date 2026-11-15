@@ -344,12 +344,14 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
         }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let mut addr_records = addr_reply(buf, RECORD_TYPE_PTR, ReplyRequire::Aliases).map_err(|e| e.code())?;
-        if addr.is_null() || addrlen < 0 {
-            return Err(ARES_EBADRESP);
+        // Upstream permits a NULL address and still returns the hostent (the
+        // names/aliases); the address is only recorded when the caller supplied
+        // one. pycares relies on this and passes (NULL, 0, AF_UNSPEC).
+        if !addr.is_null() && addrlen > 0 {
+            let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
+            let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
+            push_synthetic_ptr(&mut addr_records, ip);
         }
-        let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
-        let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
-        push_synthetic_ptr(&mut addr_records, ip);
         unsafe { Ok(build_hostent(Hostent::from_parsed(addr_records, family))) }
     };
     unsafe { ares_fn_wrapper(out, build) }

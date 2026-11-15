@@ -146,6 +146,35 @@ fn parse_ptr_reply_and_free() {
 }
 
 #[test]
+fn parse_ptr_reply_without_address() {
+    // pycares calls ares_parse_ptr_reply(NULL, 0, AF_UNSPEC) and expects the
+    // names/aliases back; upstream permits a missing address.
+    let buf = response("1.0.0.127.in-addr.arpa", T_PTR, &[rr(T_PTR, &name_bytes("host.example.com"))]);
+    unsafe {
+        let mut he: *mut libc::hostent = ptr::null_mut();
+        let rc = ares_parse_ptr_reply(
+            buf.as_ptr(),
+            buf.len() as c_int,
+            ptr::null(),
+            0,
+            libc::AF_UNSPEC,
+            &mut he,
+        );
+        assert_eq!(rc, ARES_SUCCESS);
+        assert!(!he.is_null());
+        let host = &*he;
+        assert_eq!(CStr::from_ptr(host.h_name).to_str().unwrap(), "host.example.com");
+        assert!(!host.h_aliases.is_null());
+        assert_eq!(CStr::from_ptr(*host.h_aliases).to_str().unwrap(), "host.example.com");
+        assert!((*host.h_aliases.add(1)).is_null());
+        assert_eq!(host.h_length, 0, "no address was supplied");
+        assert!(!host.h_addr_list.is_null());
+        assert!((*host.h_addr_list).is_null());
+        ares_free_hostent(he);
+    }
+}
+
+#[test]
 fn parse_txt_reply_and_free() {
     let rdata = [0x05u8, b'h', b'e', b'l', b'l', b'o'];
     let buf = response("example.com", T_TXT, &[rr(T_TXT, &rdata)]);
