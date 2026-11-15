@@ -1,0 +1,44 @@
+name: ASan
+
+# AddressSanitizer catches heap use-after-free/overflow on the socket/reactor
+# paths that Miri cannot execute. It needs nightly (`-Zsanitizer`) and a
+# sanitizer-instrumented std (`-Zbuild-std`), so it is a separate job from the
+# stable debug/release suites. Leak detection is off: libc/FFI allocations are
+# not owned by Rust.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  asan:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-Zsanitizer=address"
+      ASAN_OPTIONS: "detect_leaks=0"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust + rust-src
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-asan-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-asan-
+
+      - name: Run Rust tests under AddressSanitizer
+        run: >-
+          cargo test -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          --release --locked --tests
