@@ -2,9 +2,11 @@
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
-# Prefer the OS Rust toolchain when it is installed; fall back to whatever
-# cargo/rustc is on PATH (e.g. a rustup toolchain) otherwise.
-export PATH := /usr/bin:$(PATH)
+# Prefer a rustup toolchain (CI and developer machines) when present, then the
+# OS toolchain. The committed Cargo.lock is v4 and the locked crates use
+# edition 2024, so a cargo older than 1.85 (e.g. Ubuntu 24.04's 1.75) cannot
+# build this package.
+export PATH := $(HOME)/.cargo/bin:/usr/bin:$(PATH)
 export RUSTC ?= rustc
 export CARGO ?= cargo
 

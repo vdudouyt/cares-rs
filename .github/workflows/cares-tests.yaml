@@ -97,11 +97,15 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # The committed Cargo.lock is v4 and the locked crates use edition 2024;
+      # Ubuntu 24.04's apt cargo (1.75) cannot parse/build them.
+      - name: Install Rust (rustup stable)
+        uses: dtolnay/rust-toolchain@stable
       - name: Install Debian build toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential debhelper dh-cargo dpkg-dev fakeroot cargo rustc
+            build-essential debhelper dh-cargo dpkg-dev fakeroot
       - name: Set package version from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
