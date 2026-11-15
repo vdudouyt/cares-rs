@@ -4,8 +4,8 @@
 use std::ffi::{c_int, c_uint, CStr, CString};
 use std::ptr;
 
-use cares_rs::dns_record::*;
-use cares_rs::*;
+use cares::dns_record::*;
+use cares::*;
 
 const T_A: u16 = ARES_REC_TYPE_A;
 const T_CNAME: u16 = ARES_REC_TYPE_CNAME;

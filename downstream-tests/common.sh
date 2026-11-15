@@ -2,20 +2,23 @@
 #
 # Shared helpers for the downstream drop-in tests.
 #
-# cares-rs exposes the c-ares 1.34 C ABI but ships under its own names so it can be
-# installed alongside stock c-ares:
-#     header  <cares-rs/ares.h>   (stock: <ares.h>)
-#     library libcares_rs.so.2    (stock: libcares.so.2)
-#     pkgconf libcares-rs         (stock: libcares)
-# Downstream consumers look for the stock names, so make_cares_shim() builds a throwaway
-# prefix that presents the installed cares-rs under the stock names. Point the consumer's
-# build at it (PKG_CONFIG_PATH / --with-...=$SHIM) and it links cares-rs instead of c-ares.
+# cares-rs installs the stock c-ares names, so consumers need no renaming:
+#     header  <ares.h>          (stock c-ares: <ares.h>)
+#     library libcares.so.2     (stock c-ares: libcares.so.2)
+#     pkgconf libcares          (stock c-ares: libcares)
+# make_cares_shim() still builds a throwaway prefix that pins every lookup to the
+# installed cares-rs files and stops a distro c-ares from shadowing them. Point the
+# consumer's build at it (PKG_CONFIG_PATH / --with-...=$SHIM).
+#
+# Both libraries now share the same basename, so every verification compares the
+# *resolved object path* against the installed cares-rs object. Checking only
+# DT_NEEDED/libcares.so.2 would also pass when the binary loaded stock c-ares.
 
 MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu)"
 CARES_RS_LIBDIR="/usr/lib/${MULTIARCH}"
-CARES_RS_HEADER="/usr/include/cares-rs/ares.h"
-CARES_RS_SO="${CARES_RS_LIBDIR}/libcares_rs.so"
-# Resolved real object (e.g. .../libcares_rs.so.2.0.0) for symbol inspection.
+CARES_RS_HEADER="/usr/include/ares.h"
+CARES_RS_SO="${CARES_RS_LIBDIR}/libcares.so"
+# Resolved real object (e.g. .../libcares.so.2.0.0) for identity/symbol inspection.
 CARES_RS_SO_REAL="$(readlink -f "$CARES_RS_SO" 2>/dev/null || echo "$CARES_RS_SO")"
 
 say() { printf '\n=== %s ===\n' "$*"; }
@@ -28,7 +31,7 @@ cares_rs_preflight() {
     echo "cares-rs lib:    $CARES_RS_SO -> $CARES_RS_SO_REAL"
 }
 
-# make_cares_shim <shim_dir>  — present cares-rs under the stock c-ares names.
+# make_cares_shim <shim_dir>  — pin the stock c-ares names to installed cares-rs.
 make_cares_shim() {
     local shim="$1"
     rm -rf "$shim"
@@ -42,8 +45,8 @@ make_cares_shim() {
         printf '#include <ares.h>\n' > "$shim/include/$h"
     done
 
-    # Stock link name -> cares-rs object. Keep -lcares_rs in the .pc so the consumer's
-    # binary records DT_NEEDED libcares_rs.so.2 (resolves to system cares-rs at runtime).
+    # Pin the stock link name to the installed cares-rs object. The .pc keeps
+    # -lcares so the consumer records the stock SONAME, libcares.so.2.
     ln -sf "$CARES_RS_SO" "$shim/lib/libcares.so"
     cat > "$shim/lib/pkgconfig/libcares.pc" <<EOF
 libdir=${CARES_RS_LIBDIR}
@@ -52,26 +55,36 @@ includedir=${shim}/include
 Name: c-ares
 Description: cares-rs presented as c-ares (compat shim)
 Version: 1.34.6
-Libs: -L\${libdir} -lcares_rs
+Libs: -L\${libdir} -lcares
 Cflags: -I\${includedir}
 EOF
     echo "shim pkg-config (libcares): $(PKG_CONFIG_PATH="$shim/lib/pkgconfig" pkg-config --modversion --libs libcares)"
 }
 
+# ldd_resolved_ares <binary> — print the real path of the libcares.so.2 it loaded.
+ldd_resolved_ares() {
+    local bin="$1" path
+    path=$(ldd "$bin" | awk '/libcares\.so\.2 =>/{print $3; exit}')
+    [ -n "$path" ] && readlink -f "$path"
+}
+
 # verify_cares_rs_link <binary>  — common link-level proof (ldd / DT_NEEDED / nm).
 # Prints PASS/FAIL lines; returns non-zero if any check fails.
 verify_cares_rs_link() {
-    local bin="$1" fail=0
+    local bin="$1" fail=0 resolved
 
     echo "-- ldd (ares) --"; ldd "$bin" | grep -i ares || true
-    if ldd "$bin" | grep -q 'libcares_rs.so.2'; then echo "PASS: ldd shows libcares_rs.so.2"
-    else echo "FAIL: libcares_rs.so.2 absent from ldd"; fail=1; fi
-    if ldd "$bin" | grep -qE '/libcares\.so\.2'; then echo "FAIL: stock libcares.so.2 is linked"; fail=1
-    else echo "PASS: stock libcares.so.2 not linked"; fi
+    resolved="$(ldd_resolved_ares "$bin")"
+    if [ -n "$resolved" ] && [ "$resolved" = "$CARES_RS_SO_REAL" ]; then
+        echo "PASS: loader resolved libcares.so.2 to cares-rs ($resolved)"
+    else
+        echo "FAIL: libcares.so.2 resolves to '${resolved:-<not loaded>}', expected cares-rs ($CARES_RS_SO_REAL)"
+        fail=1
+    fi
 
     echo "-- DT_NEEDED (ares) --"; objdump -p "$bin" | grep NEEDED | grep -i ares || true
-    if objdump -p "$bin" | grep -q 'NEEDED.*libcares_rs.so.2'; then echo "PASS: DT_NEEDED libcares_rs.so.2"
-    else echo "FAIL: DT_NEEDED is not libcares_rs.so.2"; fail=1; fi
+    if objdump -p "$bin" | grep -q 'NEEDED.*libcares\.so\.2'; then echo "PASS: DT_NEEDED libcares.so.2"
+    else echo "FAIL: DT_NEEDED is not libcares.so.2"; fail=1; fi
 
     # nm: every ares_* the binary imports is defined by cares-rs.
     local missing imports

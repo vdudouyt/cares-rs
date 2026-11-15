@@ -2,13 +2,15 @@
 #
 # Build upstream curl against cares-rs and verify it links + resolves through it.
 #
-# curl, like every other c-ares consumer, expects the stock c-ares names
-# (<ares.h>, libcares.so, pkg-config "libcares"). make_cares_shim (see ../common.sh)
-# presents the installed cares-rs under those names; we then configure curl with
-# --enable-ares=$SHIM so it links cares-rs instead of the system c-ares.
+# curl, like every other c-ares consumer, looks for the stock c-ares names
+# (<ares.h>, libcares.so, pkg-config "libcares"). cares-rs now installs those names
+# directly; make_cares_shim (see ../common.sh) pins the lookups to the installed
+# cares-rs files, and we configure curl with --enable-ares=$SHIM so a distro c-ares
+# cannot be picked up instead.
 #
 # Proof that cares-rs (not the system c-ares 1.27) was linked: the built curl reports
-# "c-ares/1.34.6" in --version and has DT_NEEDED libcares_rs.so.2.
+# "c-ares/1.34.6" in --version, has DT_NEEDED libcares.so.2, and the loader's resolved
+# libcares.so.2 path equals the installed cares-rs object.
 #
 # Usage: ./build.sh [BUILD_DIR]   (default: ./build next to this script)
 
@@ -104,7 +106,7 @@ fi
 
 say "RESULT"
 if [ "$fail" -eq 0 ]; then
-    echo "SUCCESS: curl ${CURL_VERSION} built and linked against cares-rs (libcares_rs.so.2)."
+    echo "SUCCESS: curl ${CURL_VERSION} built and linked against cares-rs (libcares.so.2)."
     echo "Binary: $CURL_BIN"
 else
     echo "FAILURE: one or more link-level checks failed (see above)."

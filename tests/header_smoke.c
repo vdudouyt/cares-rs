@@ -1,4 +1,4 @@
-/* Compile-only (-fsyntax-only) sanity check for the cbindgen-generated <cares.h>:
+/* Compile-only (-fsyntax-only) sanity check for the cbindgen-generated <ares.h>:
  * proves the header is valid C and that the SUPPORTED API's types, struct field
  * names, and constants match upstream c-ares spellings, so C consumer source
  * compiles against our header unchanged.
@@ -6,7 +6,14 @@
  * References only functionality cares-rs actually implements.
  * Built in CI with:  cc -std=c11 -Wall -Wextra -Iinclude -fsyntax-only tests/header_smoke.c
  */
-#include <cares.h>
+#include <ares.h>
+/* Upstream-compatible split headers; each one forwards to the self-contained
+   <ares.h>, so consumers that include them directly still compile. */
+#include <ares_version.h>
+#include <ares_build.h>
+#include <ares_dns.h>
+#include <ares_dns_record.h>
+#include <ares_nameser.h>
 #include <stddef.h>
 
 void cares_rs_header_smoke(void)

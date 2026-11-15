@@ -2,7 +2,7 @@
 //! server; reports wall-time and allocation count. Run the same binary on both
 //! commits and compare.
 
-use cares_rs::*;
+use cares::*;
 use libc::*;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::CString;

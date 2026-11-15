@@ -7,8 +7,8 @@
 # ares_init_options / ares_gethostbyname / ares_process_fd / ares_timeout / ares_destroy.
 # nghttp2 detects c-ares with pkg-config: PKG_CHECK_MODULES([libcares >= 1.7.5]).
 #
-# We reuse the same compat shim as the curl test (see ../common.sh) and put it first on
-# PKG_CONFIG_PATH so the shim's libcares (cares-rs, 1.34.6) shadows the stock one (1.27).
+# We reuse the same cares-rs-pinned shim as the curl test (see ../common.sh) and put it
+# first on PKG_CONFIG_PATH so a distro libcares (1.27) cannot shadow cares-rs (1.34.6).
 # --with-libcares makes c-ares mandatory, so a successful build proves it was found+used.
 #
 # Usage: ./build.sh [BUILD_DIR]   (default: ./build next to this script)
@@ -82,8 +82,8 @@ fail=0
 say "Built binaries that link cares-rs"
 for b in "$NGHTTP2_SRC"/src/nghttpx "$NGHTTP2_SRC"/src/nghttp "$NGHTTP2_SRC"/src/nghttpd "$NGHTTP2_SRC"/src/h2load; do
     [ -x "$b" ] || continue
-    if objdump -p "$b" 2>/dev/null | grep -q 'NEEDED.*libcares_rs.so.2'; then
-        echo "  $(basename "$b"): links libcares_rs.so.2"
+    if objdump -p "$b" 2>/dev/null | grep -q 'NEEDED.*libcares.so.2'; then
+        echo "  $(basename "$b"): links libcares.so.2"
     else
         echo "  $(basename "$b"): (no c-ares)"
     fi
@@ -103,7 +103,7 @@ verify_cares_rs_link "$NGHTTPX_BIN" || fail=1
 
 say "RESULT"
 if [ "$fail" -eq 0 ]; then
-    echo "SUCCESS: nghttp2 ${NGHTTP2_VERSION} (nghttpx) built and linked against cares-rs (libcares_rs.so.2)."
+    echo "SUCCESS: nghttp2 ${NGHTTP2_VERSION} (nghttpx) built and linked against cares-rs (libcares.so.2)."
     echo "Binary: $NGHTTPX_BIN"
 else
     echo "FAILURE: one or more link-level checks failed (see above)."

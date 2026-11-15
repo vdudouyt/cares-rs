@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use cares_rs::ares_options::{ares_init_options, ares_options, ARES_OPT_EVENT_THREAD, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES};
-use cares_rs::error::{ARES_ECANCELLED, ARES_EDESTRUCTION};
-use cares_rs::*;
+use cares::ares_options::{ares_init_options, ares_options, ARES_OPT_EVENT_THREAD, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES};
+use cares::error::{ARES_ECANCELLED, ARES_EDESTRUCTION};
+use cares::*;
 
 const T_A: c_int = 1;
 const C_IN: c_int = 1;

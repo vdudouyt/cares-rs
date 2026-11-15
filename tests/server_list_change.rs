@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cares_rs::ares_options::{
+use cares::ares_options::{
     ares_init_options, ares_options, ARES_FLAG_USEVC, ARES_OPT_FLAGS, ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES,
 };
-use cares_rs::dns_record::ares_dns_record_t;
-use cares_rs::*;
+use cares::dns_record::ares_dns_record_t;
+use cares::*;
 
 const ARES_SUCCESS: c_int = 0;
 const T_A: u32 = 1;

@@ -1,4 +1,4 @@
-libcares_rs.so.2 libcares-rs2 #MINVER#
+libcares.so.2 libcares-rs2 #MINVER#
 * Build-Depends-Package: libcares-rs-dev
  ares_cancel@Base 0.1.0
  ares_create_query@Base 0.1.0

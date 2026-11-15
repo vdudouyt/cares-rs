@@ -1,4 +1,4 @@
-use cares_rs::*;
+use cares::*;
 use libc::*;
 use std::ffi::CString;
 use std::ptr;
@@ -42,7 +42,12 @@ struct DynCAres {
 
 impl DynCAres {
     fn load() -> DynCAres {
-        let lib = unsafe { Library::new("libcares.so").unwrap() };
+        // cares-rs is also libcares.so now, so name-only loading is ambiguous.
+        // Default to the installed upstream SONAME; set CARES_UPSTREAM_LIB to
+        // point at a specific c-ares build.
+        let path = std::env::var("CARES_UPSTREAM_LIB")
+            .unwrap_or_else(|_| "libcares.so.2".to_string());
+        let lib = unsafe { Library::new(&path).unwrap() };
         DynCAres { lib }
     }
     fn get_api(&self) -> CAresVariant {

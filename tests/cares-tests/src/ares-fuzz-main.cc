@@ -2,7 +2,7 @@
  * Driver for fuzz corpus tests using the dlsym-based loader.
  * Takes library path as argv[1], remaining args are corpus files.
  *
- * Usage: ./aresfuzz path/to/libcares_rs.so fuzzinput/*
+ * Usage: ./aresfuzz path/to/libcares.so fuzzinput/*
  */
 #include <stdio.h>
 #include <stdlib.h>

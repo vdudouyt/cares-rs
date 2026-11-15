@@ -1,5 +1,10 @@
 /target
-/include/cares.h
+/include/ares.h
+/include/ares_version.h
+/include/ares_build.h
+/include/ares_dns.h
+/include/ares_dns_record.h
+/include/ares_nameser.h
 
 # Debian build artifacts (quilt + debhelper + cargo registry redirect)
 /.cargo/

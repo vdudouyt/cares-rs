@@ -1,8 +1,8 @@
 #include <stdio.h>
 #include <arpa/inet.h>
-#include <cares.h>
+#include <ares.h>
 
-// build: gcc example.c -lcares_rs -o example
+// build: gcc example.c -lcares -o example
 // $ ./example google.com
 // Resolved: 142.250.179.206
 

@@ -4,8 +4,8 @@
 use std::ffi::{c_int, c_void, CString};
 use std::ptr;
 
-use cares_rs::*;
-use cares_rs::ares_socket::ares_set_socket_functions;
+use cares::*;
+use cares::ares_socket::ares_set_socket_functions;
 
 const ARES_SUCCESS: c_int = 0;
 const ARES_ECONNREFUSED: c_int = 11;

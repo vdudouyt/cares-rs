@@ -8,12 +8,12 @@ use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cares_rs::ares_options::{
+use cares::ares_options::{
     apattern, ares_destroy_options, ares_init_options, ares_options, ares_save_options,
     ARES_OPT_FLAGS, ARES_OPT_HOSTS_FILE, ARES_OPT_LOOKUPS, ARES_OPT_SORTLIST, ARES_OPT_TIMEOUTMS,
     ARES_OPT_TRIES,
 };
-use cares_rs::*;
+use cares::*;
 
 const ARES_SUCCESS: c_int = 0;
 const ARES_ESERVICE: c_int = 25;

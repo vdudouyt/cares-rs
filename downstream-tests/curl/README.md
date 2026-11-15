@@ -17,34 +17,34 @@ Requires `libcares-rs-dev` + `libcares-rs2` installed (the cares-rs Debian packa
 plus a C toolchain (`gcc`, `make`). No TLS libraries are needed — the build disables TLS
 because DNS resolution happens before any TLS handshake.
 
-## How it works — the c-ares compat shim
+## How it works — stock c-ares names
 
-cares-rs exposes the full c-ares 1.34 C ABI, but ships under its own names so it can be
-installed alongside the real c-ares:
+cares-rs exposes the full c-ares 1.34 C ABI under the same names as upstream:
 
-| | stock c-ares | cares-rs |
-|---|---|---|
-| header | `<ares.h>` | `<cares-rs/ares.h>` |
-| library / SONAME | `libcares.so.2` | `libcares_rs.so.2` |
-| pkg-config module | `libcares` | `libcares-rs` |
+| | c-ares / cares-rs |
+|---|---|
+| header | `<ares.h>` |
+| library / SONAME | `libcares.so.2` |
+| pkg-config module | `libcares` |
 
-curl (like every c-ares consumer) looks for the **stock** names. `build.sh` therefore
-creates a throwaway *compat shim* prefix that presents the installed cares-rs under the
-stock names, then configures curl with `--enable-ares=$SHIM`:
+curl (like every c-ares consumer) therefore finds it without any renaming. `build.sh`
+still creates a throwaway prefix that pins every lookup to the installed cares-rs files,
+then configures curl with `--enable-ares=$SHIM`:
 
 ```
-$SHIM/include/ares.h            -> symlink -> /usr/include/cares-rs/ares.h
+$SHIM/include/ares.h            -> symlink -> /usr/include/ares.h
 $SHIM/include/ares_*.h          -> stub `#include <ares.h>` (cares-rs's header is self-contained)
-$SHIM/lib/libcares.so           -> symlink -> /usr/lib/<triplet>/libcares_rs.so
-$SHIM/lib/pkgconfig/libcares.pc -> Name: c-ares / Version: 1.34.6 / Libs: -lcares_rs
+$SHIM/lib/libcares.so           -> symlink -> /usr/lib/<triplet>/libcares.so
+$SHIM/lib/pkgconfig/libcares.pc -> Name: c-ares / Version: 1.34.6 / Libs: -lcares
 ```
 
-The shim's `libcares.pc` keeps `Libs: -lcares_rs`, so the linker records
-`DT_NEEDED libcares_rs.so.2` in the curl binary — at run time the loader picks up the
+The shim's `libcares.pc` keeps `Libs: -lcares`, so the linker records
+`DT_NEEDED libcares.so.2` in the curl binary — at run time the loader picks up the
 system-installed cares-rs with **no** `LD_LIBRARY_PATH` needed. Pointing curl explicitly
-at `$SHIM` (rather than the system pkg-config path) also guarantees the stock
-`libcares.pc` (c-ares 1.27, also installed here) can't shadow it. The **c-ares version
-string is the discriminator**: stock would report `1.27.0`, cares-rs reports `1.34.6`.
+at `$SHIM` also guarantees a distro `libcares.pc` (c-ares 1.27, if still installed)
+can't shadow it. The **c-ares version string is the discriminator**: stock would report
+`1.27.0`, cares-rs reports `1.34.6`. Because the filename is now identical, the link
+checker also compares the loader's resolved path with the installed cares-rs object.
 
 No cares-rs source is modified — cares-rs already exports all 16 `ares_*` functions
 curl's `lib/asyn-ares.c` calls, and its generated header declares everything curl
@@ -73,11 +73,11 @@ VERIFY 1/4 — curl --version reports the linked c-ares
   PASS  (c-ares/1.34.6 = cares-rs, not the system c-ares/1.27.0)
 
 VERIFY 2/4 — loader resolves cares-rs
-  libcares_rs.so.2 => /lib/x86_64-linux-gnu/libcares_rs.so.2
-  PASS  (libcares_rs.so.2 present; stock libcares.so.2 absent)
+  libcares.so.2 => /lib/x86_64-linux-gnu/libcares.so.2
+  PASS  (resolved path == installed cares-rs object)
 
 VERIFY 3/4 — DT_NEEDED
-  NEEDED  libcares_rs.so.2
+  NEEDED  libcares.so.2
   PASS
 
 VERIFY 4/4 — functional resolution through cares-rs

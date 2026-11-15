@@ -4,7 +4,7 @@
 use std::ffi::{c_char, c_int, c_long, c_void, CString};
 use std::ptr;
 
-use cares_rs::*;
+use cares::*;
 
 const ARES_ENOTIMP: c_int = 5;
 const ARES_EBADRESP: c_int = 10;
@@ -99,7 +99,7 @@ fn init_options_null_options_optmask_zero_succeeds() {
     unsafe {
         let mut ch: Channel = ptr::null_mut();
         // NULL options with optmask 0 == ares_init (supported upstream).
-        let rc = cares_rs::ares_options::ares_init_options(&mut ch, ptr::null(), 0);
+        let rc = cares::ares_options::ares_init_options(&mut ch, ptr::null(), 0);
         assert_eq!(rc, ARES_SUCCESS);
         assert!(!ch.is_null());
         ares_destroy(ch);
@@ -111,7 +111,7 @@ fn init_options_null_options_with_optmask_is_enodata() {
     unsafe {
         let mut ch: Channel = ptr::null_mut();
         // optmask != 0 with NULL options -> ARES_ENODATA (ARES_OPT_FLAGS = 1<<0).
-        let rc = cares_rs::ares_options::ares_init_options(&mut ch, ptr::null(), 1);
+        let rc = cares::ares_options::ares_init_options(&mut ch, ptr::null(), 1);
         assert_eq!(rc, ARES_ENODATA);
         assert!(ch.is_null());
     }
@@ -184,7 +184,7 @@ fn free_hostent_null_is_noop() {
 /// per-domain loop is skipped and the array is still freed.
 #[test]
 fn destroy_options_negative_ndomains_no_crash() {
-    use cares_rs::ares_options::{ares_destroy_options, ares_options};
+    use cares::ares_options::{ares_destroy_options, ares_options};
     unsafe {
         let mut opts: ares_options = std::mem::zeroed();
         let domains = libc::malloc(std::mem::size_of::<*mut c_char>()) as *mut *mut c_char;

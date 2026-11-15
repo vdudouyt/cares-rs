@@ -4,14 +4,19 @@ A standalone c-ares testing suite derived from original implementation (c-ares 1
 
 ## Synopsis
 ```
-$ ./arestest libcares.so     # Test original c-ares
-$ ./arestest libcares_rs.so  # Test cares-rs
+$ ./arestest /path/to/c-ares/libcares.so   # Test original c-ares (1.34.6)
+$ ./arestest ../../target/release/libcares.so  # Test cares-rs
 ```
+
+Both libraries are now named `libcares.so`, so always pass an explicit path. A bare
+`./arestest libcares.so` makes `dlopen` search the system library path and can silently
+test the distro's c-ares instead of the build under test.
 
 ## Integration tests (arestest)
 
-524 tests ported from the original c-ares test suite. The test binary loads the
-library at runtime via dlsym, so it can test both the original c-ares and cares-rs.
+Tests ported from the original c-ares test suite. The test binary loads the
+library at runtime via dlsym, so the same binary can test both the original c-ares
+and cares-rs — only the path argument changes.
 
 Tests are organized by file:
 - `ares-test-mock.cc` / `ares-test-mock-ai.cc` — mock DNS server tests (search domains, failover, callbacks, cache, etc.)
@@ -38,8 +43,8 @@ Two standalone binaries that feed corpus files through parser functions to catch
 crashes. No network I/O — pure in-memory parsing.
 
 ```
-$ ./aresfuzz libcares_rs.so fuzzinput/*       # 74 binary DNS packets
-$ ./aresfuzzname libcares_rs.so fuzznames/*   # 45 text corpus files (domain names, URIs)
+$ ./aresfuzz ../../target/release/libcares.so fuzzinput/*       # 74 binary DNS packets
+$ ./aresfuzzname ../../target/release/libcares.so fuzznames/*   # 45 text corpus files (domain names, URIs)
 ```
 
 **aresfuzz** runs in modern mode: `ares_dns_parse()` -> accessor functions -> `ares_dns_write()`

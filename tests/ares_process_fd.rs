@@ -1,7 +1,7 @@
 use std::ffi::{c_int, c_void, CString};
 use std::ptr;
 
-use cares_rs::*;
+use cares::*;
 
 const ARES_SUCCESS: c_int = 0;
 

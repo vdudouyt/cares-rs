@@ -12,16 +12,17 @@ c-ares against cares-rs"*.
 
 ## The shared mechanism
 
-cares-rs ships the c-ares 1.34 ABI under its own names so it installs alongside stock
-c-ares (header `<cares-rs/ares.h>`, lib `libcares_rs.so.2`, pkg-config `libcares-rs`).
-Downstream consumers look for the stock names, so [`common.sh`](common.sh)'s
-`make_cares_shim` builds a throwaway prefix that presents the *installed* cares-rs as
-stock c-ares (`ares.h`, `libcares.so`, `libcares.pc`). The shim's `.pc` keeps
-`-lcares_rs`, so each consumer's binary records `DT_NEEDED libcares_rs.so.2` and resolves
-to the installed cares-rs at run time — no `LD_LIBRARY_PATH`.
+cares-rs ships the c-ares 1.34 ABI under the stock names: header `<ares.h>`, library
+`libcares.so.2`, and pkg-config module `libcares`. Downstream consumers therefore need
+no renaming to build against it. [`common.sh`](common.sh)'s `make_cares_shim` still
+builds a throwaway prefix that pins header/library/pkg-config lookups to the *installed*
+cares-rs files, so a distro c-ares cannot shadow them. Each consumer's binary records
+`DT_NEEDED libcares.so.2` and resolves to the installed cares-rs at run time — no
+`LD_LIBRARY_PATH`.
 
-`common.sh` also provides `verify_cares_rs_link`, the shared link-level proof
-(`ldd` / `DT_NEEDED` / `nm`) used by every project's `build.sh`.
+Because both projects are now called `libcares.so`, name-only checks are ambiguous.
+`common.sh` provides `verify_cares_rs_link`, which compares the loader's **resolved path**
+with the installed cares-rs object in addition to `DT_NEEDED` and the `nm` symbol check.
 
 **No cares-rs source is changed** — it already exports the full c-ares 1.34 ABI
 (126 `ares_*` symbols), so these are pure integration tests.

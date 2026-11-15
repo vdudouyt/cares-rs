@@ -19,23 +19,30 @@ Architecture: any
 Multi-Arch: same
 Pre-Depends: ${misc:Pre-Depends}
 Depends: ${shlibs:Depends}, ${misc:Depends}
+Provides: libc-ares2
+Conflicts: libc-ares2
+Replaces: libc-ares2
 Description: asynchronous DNS resolver library (Rust, c-ares-compatible) - runtime
  cares-rs is a Rust reimplementation of the c-ares asynchronous DNS resolver
- library, exposing the c-ares 1.34 C ABI. It is parallel-installable and does
- not replace the system c-ares; link against it explicitly with -lcares_rs.
+ library, exposing the c-ares 1.34 C ABI under the stock c-ares names, so
+ existing consumers link with -lcares and include <ares.h> unchanged.
  .
- This package contains the shared library (libcares_rs.so.2).
+ This package contains the shared library (libcares.so.2) and replaces the
+ stock c-ares runtime package.
 
 Package: libcares-rs-dev
 Architecture: any
 Multi-Arch: same
 Section: libdevel
 Depends: libcares-rs2 (= ${binary:Version}), ${misc:Depends}
+Provides: libc-ares-dev
+Conflicts: libc-ares-dev
+Replaces: libc-ares-dev
 Description: asynchronous DNS resolver library (Rust, c-ares-compatible) - development
  cares-rs is a Rust reimplementation of the c-ares asynchronous DNS resolver
- library, exposing the c-ares 1.34 C ABI. It is parallel-installable and does
- not replace the system c-ares; link against it explicitly with -lcares_rs.
+ library, exposing the c-ares 1.34 C ABI under the stock c-ares names, so
+ existing consumers link with -lcares and include <ares.h> unchanged.
  .
- This package contains the development files: the C header (installed as
- <cares-rs/ares.h>), the static library, the pkg-config metadata (libcares-rs),
- the CMake package configuration, and the .so development symlink.
+ This package contains the development files: the C header (<ares.h>), the
+ pkg-config metadata (libcares.pc), the CMake package configuration
+ (c-ares-config.cmake), and the .so development symlink.

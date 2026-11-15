@@ -1,8 +1,9 @@
 cares-rs (0.1.0-1) UNRELEASED; urgency=medium
 
-  * Initial Debian packaging: own-named, parallel-installable c-ares-compatible
-    Rust resolver (libcares-rs2 / libcares-rs-dev). Coexists with the system
-    c-ares; consumers opt in via -lcares_rs / pkg-config libcares-rs.
+  * Initial Debian packaging of the c-ares-compatible Rust resolver
+    (libcares-rs2 / libcares-rs-dev). Installs the stock c-ares file names
+    (<ares.h>, libcares.so.2, libcares.pc, c-ares-config.cmake), so existing
+    consumers build against it unchanged; replaces the stock c-ares packages.
   * Build against system librust-*-dev crates (no vendored sources); the
     upstream Cargo.toml version requirements are loosened for the Debian
     toolchain via debian/patches/relax-deps.patch.

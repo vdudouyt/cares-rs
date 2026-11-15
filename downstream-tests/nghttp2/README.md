@@ -27,11 +27,13 @@ consumer is **nghttpx**'s dynamic DNS resolver (`src/shrpx_dns_resolver.cc`), wh
 
 nghttp2 detects c-ares purely through pkg-config:
 `PKG_CHECK_MODULES([LIBCARES], [libcares >= 1.7.5])`. Both stock c-ares (1.27) and the
-shim (cares-rs, 1.34.6) satisfy `>= 1.7.5`, so the script puts the shim **first** on
-`PKG_CONFIG_PATH` to shadow the stock module, and passes `--with-libcares` to make c-ares
-**mandatory** — a successful configure+build therefore proves cares-rs was found and used.
-As with curl, the shim's `libcares.pc` keeps `-lcares_rs`, so nghttpx records
-`DT_NEEDED libcares_rs.so.2` and the loader picks up the installed cares-rs at run time.
+installed cares-rs (1.34.6) satisfy `>= 1.7.5`, so the script puts the cares-rs-pinned
+shim **first** on `PKG_CONFIG_PATH` to shadow any distro module, and passes
+`--with-libcares` to make c-ares **mandatory** — a successful configure+build therefore
+proves cares-rs was found and used. As with curl, the shim's `libcares.pc` keeps
+`-lcares`, so nghttpx records `DT_NEEDED libcares.so.2` and the loader picks up the
+installed cares-rs at run time. The link checker compares the resolved path, since the
+filename alone is no longer enough to distinguish cares-rs from stock c-ares.
 
 No cares-rs source is modified.
 
@@ -44,15 +46,15 @@ Built against **nghttp2 1.59.0** (matching the system package version;
 configure resolved c-ares to the shim (cares-rs):
 
 ```
-pkg-config resolves libcares -> 1.34.6 (-lcares_rs)
+pkg-config resolves libcares -> 1.34.6 (-lcares)
 LIBCARES_CFLAGS='-I.../shim/include'
-LIBCARES_LIBS='-lcares_rs'
+LIBCARES_LIBS='-lcares'
 ```
 
 Of the four built apps, only **nghttpx** uses c-ares:
 
 ```
-nghttpx: links libcares_rs.so.2
+nghttpx: links libcares.so.2
 nghttp:  (no c-ares)
 nghttpd: (no c-ares)
 h2load:  (no c-ares)
@@ -67,10 +69,10 @@ VERIFY 1/2 — nghttpx runs (runtime-loads + binds cares-rs symbols)
          ares_* symbol would abort process startup)
 
 VERIFY 2/2 — loader / DT_NEEDED / nm
-  libcares_rs.so.2 => /lib/x86_64-linux-gnu/libcares_rs.so.2
-  NEEDED  libcares_rs.so.2
-  PASS: ldd shows libcares_rs.so.2 / stock libcares.so.2 not linked
-  PASS: DT_NEEDED libcares_rs.so.2
+  libcares.so.2 => /lib/x86_64-linux-gnu/libcares.so.2
+  NEEDED  libcares.so.2
+  PASS: loader resolved libcares.so.2 to cares-rs
+  PASS: DT_NEEDED libcares.so.2
   PASS: all 8 ares_* imports provided by cares-rs
         (ares_init_options, ares_gethostbyname, ares_process_fd, ares_timeout,
          ares_destroy, ares_strerror, ares_library_init, ares_library_cleanup)

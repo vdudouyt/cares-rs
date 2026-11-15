@@ -18,6 +18,9 @@ libloading = "0.8.9"
 cbindgen = { version = "0.29", default-features = false }
 
 [lib]
+# Ship the stock c-ares library name (libcares.so) so consumers can link with
+# plain -lcares. The package itself stays cares-rs.
+name = "cares"
 crate-type = ["cdylib", "rlib"]
 
 [[bench]]

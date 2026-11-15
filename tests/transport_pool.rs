@@ -7,17 +7,17 @@ use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use cares_rs::ares_options::{
+use cares::ares_options::{
     ares_destroy_options, ares_init_options, ares_options, ares_save_options, ARES_FLAG_STAYOPEN,
     ARES_OPT_FLAGS, ARES_OPT_SOCK_RCVBUF, ARES_OPT_SOCK_SNDBUF, ARES_OPT_SOCK_STATE_CB,
     ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES, ARES_OPT_UDP_MAX_QUERIES,
 };
-use cares_rs::ares_socket::{
+use cares::ares_socket::{
     ares_set_socket_functions_ex, AresSocketFunctionsEx, ARES_SOCKET_OPT_RECVBUF_SIZE,
     ARES_SOCKET_OPT_SENDBUF_SIZE,
 };
-use cares_rs::dns_record::*;
-use cares_rs::*;
+use cares::dns_record::*;
+use cares::*;
 
 const ARES_SUCCESS: c_int = 0;
 
@@ -735,7 +735,7 @@ fn unsafe_transport_setters_accept_null_channel() {
         let v6 = [0u8; 16];
         ares_set_local_ip6(ptr::null_mut(), v6.as_ptr());
         ares_set_local_dev(ptr::null_mut(), ptr::null());
-        cares_rs::ares_socket::ares_set_socket_functions(
+        cares::ares_socket::ares_set_socket_functions(
             ptr::null_mut(),
             ptr::null(),
             ptr::null_mut(),

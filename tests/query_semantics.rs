@@ -9,14 +9,14 @@ use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cares_rs::ares_options::{
+use cares::ares_options::{
     ares_init_options, ares_options, ARES_FLAG_IGNTC, ARES_FLAG_NOALIASES, ARES_FLAG_NOCHECKRESP,
     ARES_FLAG_NORECURSE, ARES_FLAG_NOSEARCH, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_USEVC,
     ARES_OPT_DOMAINS, ARES_OPT_FLAGS, ARES_OPT_NDOTS, ARES_OPT_QUERY_CACHE, ARES_OPT_RESOLVCONF,
     ARES_OPT_TIMEOUTMS, ARES_OPT_TRIES,
 };
-use cares_rs::dns_record::*;
-use cares_rs::*;
+use cares::dns_record::*;
+use cares::*;
 
 const ARES_SUCCESS: c_int = 0;
 const ARES_EFORMERR: c_int = 2;

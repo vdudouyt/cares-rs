@@ -1,4 +1,5 @@
-set(PACKAGE_VERSION "0.1.0")
+# Matching upstream's SameMajorVersion semantics for the c-ares 1.34 ABI.
+set(PACKAGE_VERSION "1.34.6")
 
 if(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION)
   set(PACKAGE_VERSION_COMPATIBLE FALSE)
