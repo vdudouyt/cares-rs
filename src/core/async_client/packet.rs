@@ -179,6 +179,12 @@ pub(crate) fn build_query(
         if unescaped.len() > 63 {
             return Err(ARES_EBADNAME.into());
         }
+        // Upstream writes the owner name with validate_hostname=true, so
+        // non-ASCII UTF-8 labels (e.g. an un-IDNA-encoded name) are EBADNAME,
+        // as are other characters outside the hostname set.
+        if !unescaped.iter().all(|b| crate::core::dns_record::is_hostname_ch(*b)) {
+            return Err(ARES_EBADNAME.into());
+        }
         total_len += unescaped.len();
     }
     if !labels.is_empty() && total_len + labels.len() - 1 > 255 {
@@ -294,6 +300,14 @@ mod tests {
         assert_eq!(
             build_query("example..com", 1, 1, 0, true, 0)
                 .expect_err("empty label")
+                .code(),
+            ARES_EBADNAME
+        );
+        // The owner name is written with upstream's hostname-character
+        // validation: raw UTF-8 (not IDNA-encoded) is EBADNAME.
+        assert_eq!(
+            build_query("españa.icom.museum", 1, 1, 0, true, 0)
+                .expect_err("non-ASCII label")
                 .code(),
             ARES_EBADNAME
         );

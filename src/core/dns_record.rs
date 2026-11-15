@@ -132,7 +132,7 @@ pub(crate) fn parse_dns_name(buf: &[u8], pos: &mut usize) -> Option<String> {
     Some(out)
 }
 
-fn is_hostname_ch(b: u8) -> bool {
+pub(crate) fn is_hostname_ch(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'/' | b'*')
 }
 
