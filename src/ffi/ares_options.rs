@@ -173,7 +173,7 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     match init_options_from(optmask, options) {
         Ok(channeldata) => {
             let channel = Box::into_raw(Box::new(channeldata));
-            let event_mode = unsafe { (*channel).event_mode };
+            let event_mode = unsafe { (*channel).event_mode.get() };
             if event_mode && !crate::ffi::event_thread::start(channel) {
                 drop(unsafe { Box::from_raw(channel) });
                 return crate::ffi::error::ARES_ENOMEM;
@@ -251,30 +251,30 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
     } else {
         None
     };
-    let mut channeldata = ChannelData::new_unfinalized(resolvconf.as_deref());
-    channeldata.event_mode = optmask & ARES_OPT_EVENT_THREAD != 0;
-    if channeldata.event_mode {
-        channeldata.evsys = options.evsys;
+    let channeldata = ChannelData::new_unfinalized(resolvconf.as_deref());
+    channeldata.event_mode.set(optmask & ARES_OPT_EVENT_THREAD != 0);
+    if channeldata.event_mode.get() {
+        channeldata.evsys.set(options.evsys);
     }
-    channeldata.state.apply_options(optmask, decoded);
-    install_socket_options(&mut channeldata, optmask, options);
+    channeldata.state.borrow_mut().apply_options(optmask, decoded);
+    install_socket_options(&channeldata, optmask, options);
     Ok(channeldata)
 }
 
 /// Apply the socket state callback and refresh the socket configuration.
-fn install_socket_options(channeldata: &mut ChannelData, optmask: c_int, options: &ares_options) {
+fn install_socket_options(channeldata: &ChannelData, optmask: c_int, options: &ares_options) {
     if optmask & ARES_OPT_SOCK_STATE_CB != 0 {
-        channeldata.sock_state_cb = options.sock_state_cb;
-        channeldata.sock_state_cb_data = options.sock_state_cb_data;
+        channeldata.sock_state_cb.set(options.sock_state_cb);
+        channeldata.sock_state_cb_data.set(options.sock_state_cb_data);
     }
     channeldata.refresh_socket_config();
 }
 
 /// Report the stored socket state callback.
 fn save_socket_options(channeldata: &ChannelData, out: &mut ares_options, mask: &mut c_int) {
-    if channeldata.state.optmask & ARES_OPT_SOCK_STATE_CB != 0 {
-        out.sock_state_cb = channeldata.sock_state_cb;
-        out.sock_state_cb_data = channeldata.sock_state_cb_data;
+    if channeldata.state.borrow().optmask & ARES_OPT_SOCK_STATE_CB != 0 {
+        out.sock_state_cb = channeldata.sock_state_cb.get();
+        out.sock_state_cb_data = channeldata.sock_state_cb_data.get();
         *mask |= ARES_OPT_SOCK_STATE_CB;
     }
 }
@@ -330,7 +330,7 @@ fn save_sortlist(entries: &[crate::core::sortlist::SortlistEntry]) -> Option<(*m
 pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options: *mut ares_options, optmask: *mut c_int) -> c_int {
     if options.is_null() || optmask.is_null() || channel.is_null() { return ARES_ENODATA; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
-    let saved = channeldata.state.saved_options();
+    let saved = channeldata.state.borrow().saved_options();
 
     let out = unsafe { &mut *options };
     *out = ares_options::default();
@@ -395,9 +395,9 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
         out.hosts_path = path.into_raw();
     }
     save_socket_options(channeldata, out, &mut mask);
-    if channeldata.event_mode {
+    if channeldata.event_mode.get() {
         mask |= ARES_OPT_EVENT_THREAD;
-        out.evsys = channeldata.evsys;
+        out.evsys = channeldata.evsys.get();
     }
 
     unsafe { *optmask = mask };

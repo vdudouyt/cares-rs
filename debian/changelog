@@ -11,5 +11,9 @@ cares-rs (0.1.0-1) UNRELEASED; urgency=medium
     queries: a re-entrant spawn could reallocate the executor's slot table while
     a poll still used a pointer into it. The executor state now lives behind
     interior mutability, so re-entrant access always re-reads the current table.
+  * Remove the FFI re-entrancy aliasing: channel_access now hands out a shared
+    &ChannelData, mutable channel state lives in Cell/RefCell, and pooled conns
+    evicted by a server-list change are dropped after the state borrow ends so
+    socket callbacks may re-enter. No second &mut ChannelData is minted.
 
  -- Valentin Dudouyt <valentin.dudouyt@gmail.com>  Tue, 30 Jun 2026 21:16:41 +0300

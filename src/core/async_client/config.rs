@@ -122,12 +122,16 @@ impl AsyncClient {
         for plugin in &self.plugins {
             plugin.on_servers_changed(&servers);
         }
-        // Evicted conns are dropped after each pool borrow ends (closing fires
-        // C callbacks).
+        // Evicted conns are queued and dropped by the ffi caller after the
+        // channel state borrow ends (closing fires C callbacks, which may
+        // re-enter the channel).
         let tcp = self.shared.tcp_pool.borrow_mut().retain_servers(&servers);
-        drop(tcp);
         let udp = self.shared.udp_pool.borrow_mut().retain_servers(&servers);
-        drop(udp);
+        {
+            let mut pending = self.pending_drops.borrow_mut();
+            pending.extend(tcp.into_iter().map(DroppedConn::Tcp));
+            pending.extend(udp.into_iter().map(DroppedConn::Udp));
+        }
         self.servers = Rc::new(servers);
     }
 
@@ -141,7 +145,7 @@ impl AsyncClient {
         let mut client = AsyncClient {
             config,
             rt: Runtime::new(factory),
-            hosts: None,
+            hosts: OnceCell::new(),
             default_udp_port,
             default_tcp_port,
             socket_send_buffer_size: 0,
@@ -163,6 +167,7 @@ impl AsyncClient {
             servers: Rc::new(Vec::new()),
             server_failover_retry_chance: 0,
             server_failover_retry_delay: 0,
+            pending_drops: RefCell::new(Vec::new()),
         };
         // Run order matters: 0x20 drops case-mismatched replies before EDNS
         // validates (and updates) the server's cookie state.
@@ -179,14 +184,14 @@ impl AsyncClient {
 
     /// The hosts table as a shared `Rc`, lazily loaded once. An empty
     /// `ARES_OPT_HOSTS_FILE` path means the system `/etc/hosts`.
-    pub fn hosts(&mut self) -> Rc<Hosts> {
+    pub fn hosts(&self) -> Rc<Hosts> {
         let path = if self.hosts_path.is_empty() {
             "/etc/hosts".to_string()
         } else {
             self.hosts_path.clone()
         };
         self.hosts
-            .get_or_insert_with(|| Rc::new(Hosts::from_path(path).unwrap_or_default()))
+            .get_or_init(|| Rc::new(Hosts::from_path(path).unwrap_or_default()))
             .clone()
     }
 

@@ -536,6 +536,57 @@ fn socket_buffer_options_are_accepted_and_saved() {
 
 #[test]
 #[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
+fn server_list_change_may_reenter_from_socket_close() {
+    let _serial = serial();
+    let (mut mini, port) = Mini::new(ReplyKind::A([5, 5, 5, 5]));
+
+    struct ReentrantChange {
+        channel: Channel,
+        closes: usize,
+        sortlists: usize,
+    }
+    extern "C" fn reenter_on_close(data: *mut c_void, _fd: c_int, readable: c_int, writable: c_int) {
+        if readable == 0 && writable == 0 {
+            let st = unsafe { &mut *(data as *mut ReentrantChange) };
+            st.closes += 1;
+            // Re-enter a mutating channel API while the server change settles:
+            // the state borrow must have been released before the close.
+            if unsafe { ares_set_sortlist(st.channel, ptr::null()) } == ARES_SUCCESS {
+                st.sortlists += 1;
+            }
+        }
+    }
+
+    unsafe {
+        let mut st = ReentrantChange { channel: ptr::null_mut(), closes: 0, sortlists: 0 };
+        let mut options = base_options();
+        options.flags = ARES_FLAG_STAYOPEN;
+        options.sock_state_cb = Some(reenter_on_close);
+        options.sock_state_cb_data = &mut st as *mut _ as *mut c_void;
+        let channel = init_channel(
+            &options,
+            ARES_OPT_FLAGS | ARES_OPT_TIMEOUTMS | ARES_OPT_TRIES | ARES_OPT_SOCK_STATE_CB,
+        );
+        st.channel = channel;
+        use_server(channel, port);
+
+        let name = CString::new("reenter-set-servers.example").unwrap();
+        assert_eq!(run_query(channel, &name, &mut mini).status, ARES_SUCCESS);
+        assert_eq!(st.closes, 0, "STAYOPEN idle socket is still open");
+
+        // Evict the idle conn: servers_changed queues it, and the ffi layer
+        // drops it after releasing the state borrow.
+        let csv = CString::new("127.0.0.2:53").unwrap();
+        assert_eq!(ares_set_servers_csv(channel, csv.as_ptr()), ARES_SUCCESS);
+        assert_eq!(st.closes, 1, "the evicted idle socket was closed");
+        assert_eq!(st.sortlists, 1, "the close callback re-entered a setter");
+
+        ares_destroy(channel);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn socket_state_callback_reports_open_and_close() {
     let _serial = serial();
     let (mut mini, port) = Mini::new(ReplyKind::A([8, 8, 8, 8]));

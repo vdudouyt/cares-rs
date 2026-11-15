@@ -23,7 +23,7 @@ pub(crate) use config::*;
 pub(crate) use lookups::*;
 pub(crate) use packet::*;
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::{c_int, CString};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -90,8 +90,8 @@ pub(crate) struct AsyncClient {
     /// The channel's runtime handle (reactor + socket factory); every lookup
     /// copy shares it.
     pub rt: Runtime,
-    /// Lazily loaded `/etc/hosts`; always `Some` on a lookup copy.
-    hosts: Option<Rc<Hosts>>,
+    /// Lazily loaded `/etc/hosts`; already initialized on a lookup copy.
+    hosts: OnceCell<Rc<Hosts>>,
     pub default_udp_port: u16,
     pub default_tcp_port: u16,
     pub socket_send_buffer_size: i32,
@@ -125,6 +125,18 @@ pub(crate) struct AsyncClient {
     pub servers: Rc<Vec<ServerId>>,
     pub server_failover_retry_chance: u16, // 1/N probability; 0 = disabled
     pub server_failover_retry_delay: u64,  // milliseconds
+    /// Conns evicted by a server-list change, dropped by the caller after it
+    /// releases the channel state borrow (closing one fires a C callback that
+    /// may re-enter the channel).
+    pub(crate) pending_drops: RefCell<Vec<DroppedConn>>,
+}
+
+/// A pooled conn evicted from a server-list change.
+// The conns are held only so they are dropped at the right time.
+#[allow(dead_code)]
+pub(crate) enum DroppedConn {
+    Tcp(Rc<RefCell<TcpConn>>),
+    Udp(Rc<RefCell<UdpConn>>),
 }
 
 /// The channel's mutable state, shared (one `Rc`) by the channel-owned
@@ -166,19 +178,26 @@ impl ChannelShared {
 impl AsyncClient {
     /// Mint the per-lookup copy every entry shim runs on: clone config and
     /// shared `Rc`s (the server list included).
-    pub(crate) fn derive(&mut self) -> Self {
+    pub(crate) fn derive(&self) -> Self {
         self.hosts();
         self.copy()
     }
 
-    /// The per-lookup copy without the lazy hosts load: `derive` minus `&mut`,
-    /// for a lookup copy (hosts already loaded) that needs a copy of its own,
-    /// e.g. to spawn a failover probe.
+    /// Hand the caller the conns evicted by the last server-list change. The
+    /// caller drops them after releasing the channel state borrow: closing a
+    /// conn fires the socket-state callback, which may re-enter the channel.
+    pub(crate) fn take_pending_drops(&self) -> Vec<DroppedConn> {
+        std::mem::take(&mut *self.pending_drops.borrow_mut())
+    }
+
+    /// The per-lookup copy without the lazy hosts load: `derive` minus the
+    /// hosts load, for a lookup copy (hosts already loaded) that needs a copy
+    /// of its own, e.g. to spawn a failover probe.
     fn copy(&self) -> Self {
         AsyncClient {
             config: self.config.clone(),
             rt: self.rt.clone(),
-            hosts: Some(self.hostsfile()),
+            hosts: OnceCell::from(self.hostsfile()),
             default_udp_port: self.default_udp_port,
             default_tcp_port: self.default_tcp_port,
             socket_send_buffer_size: self.socket_send_buffer_size,
@@ -200,12 +219,13 @@ impl AsyncClient {
             servers: self.servers.clone(),
             server_failover_retry_chance: self.server_failover_retry_chance,
             server_failover_retry_delay: self.server_failover_retry_delay,
+            pending_drops: RefCell::new(Vec::new()),
         }
     }
 
     /// The hosts table; empty only on the channel-owned instance before first use.
     fn hostsfile(&self) -> Rc<Hosts> {
-        self.hosts.clone().unwrap_or_default()
+        self.hosts.get().cloned().unwrap_or_default()
     }
 
     /// Hosts lookup honouring ARES_AI_ENVHOSTS (`CARES_HOSTS`); HOSTALIASES
@@ -225,7 +245,7 @@ impl AsyncClient {
     }
 
     /// ares_gethostbyname_file: a synchronous hosts-file-only lookup.
-    pub(crate) fn gethostbyname_file(&mut self, name: &str, family: i32) -> Result<Hostent, AresError> {
+    pub(crate) fn gethostbyname_file(&self, name: &str, family: i32) -> Result<Hostent, AresError> {
         hosts_file_lookup(self, name, family).map(Hostent::from_lookup)
     }
 
@@ -261,7 +281,7 @@ pub(crate) enum Delivery {
     Raw { result: Result<Vec<u8>, c_int>, timeouts: c_int },
 }
 
-fn hosts_file_lookup(st: &mut AsyncClient, name: &str, family: i32) -> Result<HostLookup, AresError> {
+fn hosts_file_lookup(st: &AsyncClient, name: &str, family: i32) -> Result<HostLookup, AresError> {
     let family_filter = AddressFamily::from_af(family).ok_or(ARES_ENOTFOUND)?;
 
     let lookup = st.hosts().lookup(name, family_filter).ok_or(ARES_ENOTFOUND)?;

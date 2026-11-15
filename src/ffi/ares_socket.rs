@@ -55,11 +55,11 @@ pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *con
 }
 
 fn install_socket_functions(
-    channeldata: &mut ChannelData,
+    channeldata: &ChannelData,
     funcs: &AresSocketFunctions,
     user_data: *mut c_void,
 ) {
-    let factory = CSocketFactory::with_funcs(funcs.clone(), user_data, &channeldata.socket_factory);
+    let factory = CSocketFactory::with_funcs(funcs.clone(), user_data, &channeldata.socket_factory.borrow());
     channeldata.apply_socket_factory(factory);
 }
 
@@ -95,7 +95,7 @@ pub unsafe extern "C" fn ares_set_socket_functions_ex(channel: Channel, funcs: *
 
 /// Validate the extended ABI, then rebuild the channel's factory with both callback sets.
 fn install_socket_functions_ex(
-    channeldata: &mut ChannelData,
+    channeldata: &ChannelData,
     ex: &AresSocketFunctionsEx,
     user_data: *mut c_void,
 ) -> crate::ffi::ares_status_t {
@@ -122,7 +122,7 @@ fn install_socket_functions_ex(
         aconnect: ex.aconnect,
         asendto: ex.asendto,
     };
-    let factory = CSocketFactory::with_ex_funcs(basic, exfuncs, user_data, &channeldata.socket_factory);
+    let factory = CSocketFactory::with_ex_funcs(basic, exfuncs, user_data, &channeldata.socket_factory.borrow());
     channeldata.apply_socket_factory(factory);
     crate::ffi::error::ARES_SUCCESS
 }

@@ -19,7 +19,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let hostname = unsafe { cstr_lossy(hostname) };
-    let client = channeldata.state.derive();
+    let client = channeldata.state.borrow().derive();
     let fut = client.gethostbyname(hostname.to_string(), family);
     channeldata.spawn(fut, move |r| on_hostent_reply(callback, arg, r));
 }
@@ -31,7 +31,8 @@ pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENOTFOUND; };
     let name_str = unsafe { cstr_lossy(name) };
 
-    match channeldata.state.gethostbyname_file(name_str, family) {
+    let result = { channeldata.state.borrow().gethostbyname_file(name_str, family) };
+    match result {
         Ok(bp) => {
             unsafe { *host = build_hostent(bp) };
             ARES_SUCCESS
@@ -61,7 +62,7 @@ pub unsafe extern "C" fn ares_gethostbyaddr(channel: Channel, addr: *const c_voi
         unsafe { callback(arg, ARES_ENOTIMP, 0, std::ptr::null_mut()) };
         return;
     };
-    let client = channeldata.state.derive();
+    let client = channeldata.state.borrow().derive();
     let fut = client.gethostbyaddr(ip, family);
     channeldata.spawn(fut, move |r| on_hostent_reply(callback, arg, r));
 }
@@ -81,7 +82,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
         return;
     }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
-    let client = channeldata.state.derive();
+    let client = channeldata.state.borrow().derive();
     let fut = client.search(
         name_str.to_string(),
         dnsclass as u32,
@@ -98,12 +99,15 @@ pub unsafe extern "C" fn ares_query(channel: Channel, name: *const c_char, dnscl
     let Some(callback) = callback else { return; };
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let name = unsafe { cstr_lossy(name) };
-    match channeldata
-        .state
-        .query_payload(name, dnstype as u32, dnsclass as u32)
-    {
+    let payload = {
+        channeldata
+            .state
+            .borrow()
+            .query_payload(name, dnstype as u32, dnsclass as u32)
+    };
+    match payload {
         Ok(payload) => {
-            let client = channeldata.state.derive();
+            let client = channeldata.state.borrow().derive();
                     let fut = client.query_raw(payload);
             channeldata.spawn(fut, move |r| on_raw_reply(callback, arg, r));
         }
@@ -139,7 +143,7 @@ pub unsafe extern "C" fn ares_query_dnsrec(
 }
 
 fn query_dnsrec_record(
-    channeldata: &mut ChannelData,
+    channeldata: &ChannelData,
     name: &str,
     dnsclass: crate::ffi::ares_dns_class_t,
     dnstype: crate::ffi::ares_dns_rec_type_t,
@@ -149,7 +153,10 @@ fn query_dnsrec_record(
 ) -> crate::ffi::ares_status_t {
     // Build (and thereby validate the raw class/type/name) once, before the
     // cache probe: upstream constructs the query before qcache_fetch.
-    let payload = match channeldata.state.query_payload(name, dnstype, dnsclass) {
+    let payload = {
+        channeldata.state.borrow().query_payload(name, dnstype, dnsclass)
+    };
+    let payload = match payload {
         Ok(p) => p,
         Err(e) => {
             let status = e.code();
@@ -165,10 +172,10 @@ fn query_dnsrec_record(
         dnstype as u16,
         dnsclass as u16,
         0,
-        channeldata.state.recursion_desired(),
+        channeldata.state.borrow().recursion_desired(),
         false,
     );
-    let cached = channeldata.state.shared.cache.borrow_mut().get(&cache_key, Instant::now());
+    let cached = channeldata.state.borrow().shared.cache.borrow_mut().get(&cache_key, Instant::now());
     if let Some(cached_buf) = cached {
         if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf, 0) {
             let dnsrec = Box::into_raw(Box::new(rec));
@@ -180,7 +187,7 @@ fn query_dnsrec_record(
     if !qid.is_null() {
         unsafe { *qid = payload.qid(); }
     }
-    let client = channeldata.state.derive();
+    let client = channeldata.state.borrow().derive();
     let shared = client.shared.clone();
     let fut = client.query_raw(payload);
     channeldata.spawn(fut, move |r| {
@@ -207,7 +214,7 @@ pub unsafe extern "C" fn ares_search_dnsrec(
 }
 
 fn search_dnsrec_record(
-    channeldata: Option<&mut ChannelData>,
+    channeldata: Option<&ChannelData>,
     rec: &dns_record::ares_dns_record_t,
     callback: AresCallbackDnsRec,
     arg: *mut c_void,
@@ -235,7 +242,7 @@ fn search_dnsrec_record(
         }
     };
     let Some(channeldata) = channeldata else { return ARES_EFORMERR; };
-    let client = channeldata.state.derive();
+    let client = channeldata.state.borrow().derive();
     let shared = client.shared.clone();
     let fut = client.search_dnsrec(template, true);
     channeldata.spawn(fut, move |r| on_dnsrec_reply(callback, arg, &shared.cache, None, r));
@@ -260,7 +267,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 
     // Synchronous short-circuits (service-only / NUMERICHOST / no-servers) fire
     // re-entrantly on the first advance.
-    let client = channeldata.state.derive();
+    let client = channeldata.state.borrow().derive();
     let fut = client.getnameinfo(addr_info, flags);
     channeldata.spawn(fut, move |r| on_nameinfo_reply(callback, arg, r));
 }
@@ -435,7 +442,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
 
     // A synchronous preflight hit (IP literal / hosts file) fires re-entrantly.
     let hostname_raw = unsafe { cstr_lossy(name) };
-    let client = channeldata.state.derive();
+    let client = channeldata.state.borrow().derive();
     let fut = client.getaddrinfo(
         hostname_raw.to_string(),
         ai_family,
@@ -466,7 +473,7 @@ pub unsafe extern "C" fn ares_send(channel: Channel, qbuf: *const u8, qlen: c_in
 }
 
 fn send_raw_packet(
-    channeldata: &mut ChannelData,
+    channeldata: &ChannelData,
     query_buf: &[u8],
     callback: AresCallback,
     arg: *mut c_void,
@@ -478,7 +485,7 @@ fn send_raw_packet(
             return;
         }
     };
-    let shared = channeldata.state.shared.clone();
+    let shared = channeldata.state.borrow().shared.clone();
     let outcome = send_record(
         channeldata,
         &rec,
@@ -529,7 +536,7 @@ fn record_cache_key(rec: &dns_record::ares_dns_record_t) -> Option<CacheKey> {
 /// Shared ares_send/ares_send_dnsrec path: preflight, cache probe, non-zero qid
 /// stamp, async lifecycle. `Ok(Some)` is a cache hit (qid untouched).
 fn send_record<F>(
-    channeldata: &mut ChannelData,
+    channeldata: &ChannelData,
     rec: &dns_record::ares_dns_record_t,
     qid: *mut libc::c_ushort,
     on_reply: F,
@@ -537,12 +544,12 @@ fn send_record<F>(
 where
     F: FnOnce(Result<Delivery, c_int>, Option<CacheKey>) + 'static,
 {
-    if channeldata.state.config.nameservers.is_empty() {
+    if channeldata.state.borrow().config.nameservers.is_empty() {
         return Err(ARES_ENOSERVER);
     }
     let cache_key = record_cache_key(rec);
     if let Some(key) = cache_key.as_ref() {
-        let cached = channeldata.state.shared.cache.borrow_mut().get(key, Instant::now());
+        let cached = channeldata.state.borrow().shared.cache.borrow_mut().get(key, Instant::now());
         if let Some(buf) = cached {
             return Ok(Some(buf));
         }
@@ -563,14 +570,14 @@ where
     }
     // send_payload stamps a fresh channel-unique id (upstream overwrites the
     // caller's id too); it stays fixed for every retry.
-    let payload = match channeldata.state.send_payload(&buf) {
+    let payload = match channeldata.state.borrow_mut().send_payload(&buf) {
         Ok(p) => p,
         Err(e) => return Err(e.code()),
     };
     if !qid.is_null() {
         unsafe { *qid = payload.qid(); }
     }
-    let client = channeldata.state.derive();
+    let client = channeldata.state.borrow().derive();
     // ares_send / ares_send_dnsrec: transmit the caller's bytes unchanged (no
     // synthesized OPT/COOKIE); a caller-supplied OPT is preserved because it is
     // already part of the serialized record.
@@ -597,14 +604,14 @@ pub unsafe extern "C" fn ares_send_dnsrec(
 }
 
 fn send_dnsrec_record(
-    channeldata: Option<&mut ChannelData>,
+    channeldata: Option<&ChannelData>,
     rec: &dns_record::ares_dns_record_t,
     callback: AresCallbackDnsRec,
     arg: *mut c_void,
     qid: *mut libc::c_ushort,
 ) -> crate::ffi::ares_status_t {
     let Some(channeldata) = channeldata else { return ARES_EFORMERR; };
-    let shared = channeldata.state.shared.clone();
+    let shared = channeldata.state.borrow().shared.clone();
     let outcome = send_record(
         channeldata,
         rec,

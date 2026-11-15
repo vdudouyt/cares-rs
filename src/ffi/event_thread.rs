@@ -53,7 +53,7 @@ pub(crate) fn start(channel: *mut ChannelData) -> bool {
     // Stored under the channel lock: the thread may already be running a turn.
     let _guard = lock.lock();
     // SAFETY: as above; the lock excludes the thread's access to the channel.
-    unsafe { (*channel).event = Some(EventThread { stop, wake, join }) };
+    unsafe { *(*channel).event.borrow_mut() = Some(EventThread { stop, wake, join }) };
     true
 }
 
@@ -104,7 +104,7 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
                 break;
             }
             // SAFETY: as above; the lock excludes all other channel access.
-            let data = unsafe { &mut *(channel as *mut ChannelData) };
+            let data = unsafe { &*(channel as *const ChannelData) };
             data.process_fd_events(&events);
         }
     }
