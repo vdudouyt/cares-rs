@@ -78,6 +78,20 @@ impl AsyncClient {
             return NameinfoReply { status: ARES_SUCCESS.into(), node: Some(node), service, timeouts: 0 };
         }
 
+        // ares_getnameinfo delegates the host lookup to ares_gethostbyaddr,
+        // which consults the hosts file before issuing a PTR query.
+        if let Some(lookup) = self.hostsfile().reverse_lookup(addr.ip) {
+            let Ok(name) = CString::new(lookup.canonical) else {
+                return NameinfoReply {
+                    status: crate::ffi::error::ARES_EBADSTR.into(),
+                    node: None,
+                    service: None,
+                    timeouts: 0,
+                };
+            };
+            return nameinfo_from_hostname(name, addr.port, flags, 0);
+        }
+
         if self.servers.is_empty() {
             return NameinfoReply { status: ARES_ENOSERVER.into(), node: None, service: None, timeouts: 0 };
         }

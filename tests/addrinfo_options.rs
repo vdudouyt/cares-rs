@@ -256,6 +256,36 @@ unsafe extern "C" fn host_cb(
     }
 }
 
+#[derive(Default)]
+struct NameinfoResult {
+    done: bool,
+    status: c_int,
+    node: Option<String>,
+    service: Option<String>,
+}
+
+unsafe extern "C" fn nameinfo_cb(
+    arg: *mut c_void,
+    status: c_int,
+    _timeouts: c_int,
+    node: *mut c_char,
+    service: *mut c_char,
+) {
+    let result = unsafe { &mut *(arg as *mut NameinfoResult) };
+    result.done = true;
+    result.status = status;
+    result.node = (!node.is_null()).then(|| {
+        unsafe { CStr::from_ptr(node) }
+            .to_string_lossy()
+            .into_owned()
+    });
+    result.service = (!service.is_null()).then(|| {
+        unsafe { CStr::from_ptr(service) }
+            .to_string_lossy()
+            .into_owned()
+    });
+}
+
 fn base_options() -> ares_options {
     ares_options {
         timeout: 500,
@@ -343,6 +373,28 @@ unsafe fn gethostbyname(channel: Channel, name: &CStr, mini: Option<&mut Mini>) 
     };
     drive(channel, mini, || result.done);
     assert!(result.done, "ares_gethostbyname callback did not fire");
+    result
+}
+
+unsafe fn getnameinfo(
+    channel: Channel,
+    sa: &libc::sockaddr_in,
+    flags: c_int,
+    mini: Option<&mut Mini>,
+) -> NameinfoResult {
+    let mut result = NameinfoResult::default();
+    unsafe {
+        ares_getnameinfo(
+            channel,
+            sa as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            flags,
+            Some(nameinfo_cb),
+            &mut result as *mut _ as *mut c_void,
+        )
+    };
+    drive(channel, mini, || result.done);
+    assert!(result.done, "ares_getnameinfo callback did not fire");
     result
 }
 
@@ -455,6 +507,59 @@ fn hosts_file_merges_addresses_and_exposes_cnames() {
                 ),
             ]
         );
+        ares_destroy(channel);
+    }
+}
+
+#[test]
+fn getnameinfo_uses_hosts_file_before_dns() {
+    let _serial = serial();
+    let hosts = TempFile::new("10.20.30.40 canonical.example alias.example\n");
+    let path = hosts.cstring();
+    // A real server is configured so a DNS query would be observable. The
+    // hosts-file answer must win and leave the server untouched.
+    let (mut mini, port) = Mini::new(ReplyKind::A([10, 2, 2, 2]));
+    unsafe {
+        let mut options = base_options();
+        options.hosts_path = path.as_ptr() as *mut c_char;
+        let channel = init_channel(
+            &options,
+            ARES_OPT_FLAGS | ARES_OPT_TIMEOUTMS | ARES_OPT_TRIES | ARES_OPT_HOSTS_FILE,
+        );
+        use_server(channel, port);
+
+        let mut sa: libc::sockaddr_in = std::mem::zeroed();
+        sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        sa.sin_port = 80u16.to_be();
+        sa.sin_addr = libc::in_addr {
+            s_addr: u32::from_ne_bytes(Ipv4Addr::new(10, 20, 30, 40).octets()),
+        };
+
+        let result = getnameinfo(
+            channel,
+            &sa,
+            ARES_NI_LOOKUPHOST | ARES_NI_LOOKUPSERVICE,
+            Some(&mut mini),
+        );
+        assert_eq!(result.status, ARES_SUCCESS);
+        assert_eq!(result.node.as_deref(), Some("canonical.example"));
+        assert_eq!(result.service.as_deref(), Some("http"));
+        assert!(
+            mini.queries.is_empty(),
+            "getnameinfo must answer from /etc/hosts without a PTR query"
+        );
+
+        let result = getnameinfo(
+            channel,
+            &sa,
+            ARES_NI_LOOKUPHOST | ARES_NI_LOOKUPSERVICE | ARES_NI_NOFQDN,
+            Some(&mut mini),
+        );
+        assert_eq!(result.status, ARES_SUCCESS);
+        assert_eq!(result.node.as_deref(), Some("canonical"));
+        assert_eq!(result.service.as_deref(), Some("http"));
+        assert!(mini.queries.is_empty());
+
         ares_destroy(channel);
     }
 }

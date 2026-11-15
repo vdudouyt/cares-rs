@@ -51,7 +51,9 @@ use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, re
 use crate::plugins::edns::wire::EDNS_PACKETSZ;
 use crate::plugins::{Ctx, Plugin, Reply, Resend, ReceiveVerdict};
 use crate::core::packets::AddrRecord;
-use crate::core::nameinfo::{assemble_nameinfo, format_ip_with_scope, get_service_string, AddrInfo, NameinfoReply};
+use crate::core::nameinfo::{
+    assemble_nameinfo, format_ip_with_scope, get_service_string, nameinfo_from_hostname, AddrInfo, NameinfoReply,
+};
 use crate::core::qid::{QidLease, QidRegistry, ReservedQuery};
 use crate::core::response::{addr_reply, push_synthetic_ptr, CnameEntry, ParsedRRs, ReplyRequire};
 use crate::core::services::Services;

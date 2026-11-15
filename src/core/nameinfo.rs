@@ -43,40 +43,54 @@ pub(crate) fn assemble_nameinfo(
             return Err(ARES_ENOTFOUND.into());
         }
 
-        let mut name = ptr_records.name;
-
-        if flags & ARES_NI_NOFQDN != 0 {
-            let name_str = name.to_string_lossy();
-            if let Some(dot_pos) = name_str.find('.') {
-                name = CString::new(&name_str[..dot_pos]).map_err(|_| AresError::from(ARES_EBADSTR))?;
-            }
-        }
-
-        Ok(name)
+        Ok(ptr_records.name)
     })();
 
-    let (status, node): (AresError, _) = match hostname_result {
-        Ok(name) => (ARES_SUCCESS.into(), Some(name)),
+    match hostname_result {
+        Ok(name) => nameinfo_from_hostname(name, port, flags, io_timeouts),
         Err(err) => {
             if err.code() == ARES_ENOTFOUND && (flags & ARES_NI_NAMEREQD) == 0 {
                 let ip_str = format_ip_with_scope(&ip, scope_id, flags);
                 match CString::new(ip_str) {
-                    Ok(name) => (ARES_SUCCESS.into(), Some(name)),
-                    Err(_) => return NameinfoReply { status: ARES_EBADSTR.into(), node: None, service: None, timeouts: 0 },
+                    Ok(name) => {
+                        let service = if want_service {
+                            get_service_string(&services, port, flags)
+                        } else {
+                            None
+                        };
+                        NameinfoReply { status: ARES_SUCCESS.into(), node: Some(name), service, timeouts: io_timeouts }
+                    }
+                    Err(_) => NameinfoReply { status: ARES_EBADSTR.into(), node: None, service: None, timeouts: 0 },
                 }
             } else {
-                return NameinfoReply { status: err, node: None, service: None, timeouts: 0 };
+                NameinfoReply { status: err, node: None, service: None, timeouts: 0 }
             }
         }
-    };
+    }
+}
 
-    let service = if want_service {
-        get_service_string(&services, port, flags)
+/// Turn a resolved hostname (DNS PTR or /etc/hosts) into the getnameinfo
+/// reply: apply NOFQDN and, when requested, attach the service.
+pub(crate) fn nameinfo_from_hostname(name: CString, port: u16, flags: i32, timeouts: i32) -> NameinfoReply {
+    let mut name = name;
+
+    if flags & ARES_NI_NOFQDN != 0 {
+        let name_str = name.to_string_lossy();
+        if let Some(dot_pos) = name_str.find('.') {
+            name = match CString::new(&name_str[..dot_pos]) {
+                Ok(name) => name,
+                Err(_) => return NameinfoReply { status: ARES_EBADSTR.into(), node: None, service: None, timeouts: 0 },
+            };
+        }
+    }
+
+    let service = if flags & ARES_NI_LOOKUPSERVICE != 0 {
+        get_service_string(&Services::default(), port, flags)
     } else {
         None
     };
 
-    NameinfoReply { status, node, service, timeouts: io_timeouts }
+    NameinfoReply { status: ARES_SUCCESS.into(), node: Some(name), service, timeouts }
 }
 
 pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: i32) -> String {
