@@ -7,5 +7,9 @@ cares-rs (0.1.0-1) UNRELEASED; urgency=medium
   * Build against the crates.io versions pinned in the committed Cargo.lock
     instead of the distro's librust-*-dev packages; Cargo downloads the exact
     locked versions itself. The version-relaxing patch is no longer needed.
+  * Fix a release-mode heap corruption when a server-state callback starts
+    queries: a re-entrant spawn could reallocate the executor's slot table while
+    a poll still used a pointer into it. The executor state now lives behind
+    interior mutability, so re-entrant access always re-reads the current table.
 
  -- Valentin Dudouyt <valentin.dudouyt@gmail.com>  Tue, 30 Jun 2026 21:16:41 +0300

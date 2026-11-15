@@ -2,9 +2,11 @@
 //! by the host once per `ares_process*` turn instead of by a thread). Tasks get
 //! real wakers, so any `std` future combinator works. No DNS/framing knowledge.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
@@ -92,10 +94,17 @@ struct Slot {
 ///
 /// Re-entrant use is safe: a C callback that fires during a poll may call back
 /// into the channel, and so into this executor (`spawn` may grow `slots`,
-/// `deliver` may target the running task). The poll holds no reference into
-/// `slots`, and a `deliver` aimed at the running task only records the cancel.
+/// `deliver` may target the running task). The mutable state sits behind a
+/// `RefCell` and no borrow is held across a future poll or a delivery callback,
+/// so a re-entrant call always observes the current table; nothing caches a
+/// pointer into `slots` that a re-entrant `spawn` could invalidate.
 #[derive(Default)]
 pub(crate) struct Executor {
+    inner: Rc<RefCell<ExecutorInner>>,
+}
+
+#[derive(Default)]
+struct ExecutorInner {
     slots: Vec<Option<Slot>>,
     queue: RunQueue,
     next_gen: u32,
@@ -104,26 +113,27 @@ pub(crate) struct Executor {
 impl Executor {
     /// Register `fut` in a free slot and return its id; does not poll.
     pub(crate) fn spawn<T: 'static>(
-        &mut self,
+        &self,
         fut: impl Future<Output = T> + 'static,
         on: impl FnOnce(Result<T, i32>) + 'static,
     ) -> usize {
+        let mut inner = self.inner.borrow_mut();
         let task: Box<dyn AbstractTask> = Box::new(Task { fut: Box::pin(fut), out: None, on: Box::new(on) });
-        let id = self.slots.iter().position(|s| s.is_none()).unwrap_or(self.slots.len());
+        let id = inner.slots.iter().position(|s| s.is_none()).unwrap_or(inner.slots.len());
         // A generation per spawn: a stale waker for a reaped occupant of this
         // slot must not poll the new one.
-        self.next_gen = self.next_gen.wrapping_add(1);
+        inner.next_gen = inner.next_gen.wrapping_add(1);
         let flag = Arc::new(TaskWaker {
             id,
-            gen: self.next_gen,
+            gen: inner.next_gen,
             scheduled: AtomicBool::new(false),
-            queue: self.queue.clone(),
+            queue: inner.queue.clone(),
         });
         let waker = Waker::from(flag.clone());
         let slot = Some(Slot { task: Some(task), cancel: None, flag, waker });
-        match self.slots.get_mut(id) {
+        match inner.slots.get_mut(id) {
             Some(s) => *s = slot,
-            None => self.slots.push(slot),
+            None => inner.slots.push(slot),
         }
         id
     }
@@ -131,9 +141,10 @@ impl Executor {
     /// Pop the next runnable live task, skipping stale or reaped entries. The
     /// queue lock is released before returning, so the poll that follows may wake.
     pub(crate) fn pop_ready(&self) -> Option<usize> {
+        let inner = self.inner.borrow();
         loop {
-            let (id, gen) = self.queue.lock().unwrap_or_else(PoisonError::into_inner).pop_front()?;
-            if self.slots.get(id).and_then(|s| s.as_ref()).is_some_and(|s| s.flag.gen == gen) {
+            let (id, gen) = inner.queue.lock().unwrap_or_else(PoisonError::into_inner).pop_front()?;
+            if inner.slots.get(id).and_then(|s| s.as_ref()).is_some_and(|s| s.flag.gen == gen) {
                 return Some(id);
             }
         }
@@ -141,73 +152,89 @@ impl Executor {
 
     /// Whether any woken task is waiting to be polled.
     pub(crate) fn has_ready(&self) -> bool {
-        !self.queue.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
+        !self.inner.borrow().queue.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
     }
 
     /// Poll `id` once with its own waker; `true` when it completed. A reaped id
     /// yields `false`. If the task was cancelled during the poll, it is
     /// delivered with that status here and the call returns `false`.
-    pub(crate) fn poll(&mut self, id: usize) -> bool {
-        let Some(slot) = self.slots.get_mut(id).and_then(|s| s.as_mut()) else {
-            return false;
-        };
-        let Some(mut task) = slot.task.take() else {
-            // Already being polled further up the stack (a re-entrant turn):
-            // re-queue it so this wake isn't lost.
+    pub(crate) fn poll(&self, id: usize) -> bool {
+        let (mut task, waker) = {
+            let mut inner = self.inner.borrow_mut();
+            let Some(slot) = inner.slots.get_mut(id).and_then(|s| s.as_mut()) else {
+                return false;
+            };
+            let Some(task) = slot.task.take() else {
+                // Already being polled further up the stack (a re-entrant turn):
+                // re-queue it so this wake isn't lost.
+                slot.flag.scheduled.store(false, Ordering::Release);
+                slot.waker.wake_by_ref();
+                return false;
+            };
+            // Cleared before the poll so a wake during it re-queues the task.
             slot.flag.scheduled.store(false, Ordering::Release);
-            slot.waker.wake_by_ref();
-            return false;
+            (task, slot.waker.clone())
         };
-        // Cleared before the poll so a wake during it re-queues the task.
-        slot.flag.scheduled.store(false, Ordering::Release);
-        let waker = slot.waker.clone();
+        // No borrow of `inner` is held here: the task may re-enter the channel,
+        // spawning tasks that grow `slots` and delivering this very id.
         let done = task.poll(&mut Context::from_waker(&waker));
-        // Look the slot up again: a re-entrant spawn may have moved `slots`.
-        // (A running slot is never reaped or reused, so it is still there.)
-        let Some(entry) = self.slots.get_mut(id) else { return false };
-        let Some(slot) = entry.as_mut() else { return false };
-        if let Some(status) = slot.cancel.take() {
-            *entry = None;
-            task.deliver(Some(status));
-            return false;
-        }
-        slot.task = Some(task);
-        done
+        // Re-read the table after the poll; a re-entrant spawn may have moved it.
+        let cancel = {
+            let mut inner = self.inner.borrow_mut();
+            let Some(entry) = inner.slots.get_mut(id) else { return false };
+            let Some(slot) = entry.as_mut() else { return false };
+            match slot.cancel.take() {
+                Some(status) => {
+                    *entry = None;
+                    Some(status)
+                }
+                None => {
+                    slot.task = Some(task);
+                    return done;
+                }
+            }
+        };
+        // The delivery callback may itself re-enter; call it unborrowed.
+        task.deliver(cancel);
+        false
     }
 
     /// Reap `id` and deliver its output or cancel status; an already-reaped id
     /// is a no-op (a re-entrant abort cannot double-deliver). A cancel aimed at
     /// a task that is being polled is recorded and applied when its poll returns.
-    pub(crate) fn deliver(&mut self, id: usize, cancel: Option<i32>) {
-        let Some(entry) = self.slots.get_mut(id) else { return };
-        if let Some(slot) = entry.as_mut().filter(|slot| slot.task.is_none()) {
-            if let Some(status) = cancel {
-                slot.cancel.get_or_insert(status);
+    pub(crate) fn deliver(&self, id: usize, cancel: Option<i32>) {
+        let task = {
+            let mut inner = self.inner.borrow_mut();
+            let Some(entry) = inner.slots.get_mut(id) else { return };
+            if let Some(slot) = entry.as_mut().filter(|slot| slot.task.is_none()) {
+                if let Some(status) = cancel {
+                    slot.cancel.get_or_insert(status);
+                }
+                return;
             }
-            return;
-        }
-        if let Some(task) = entry.take().and_then(|slot| slot.task) {
+            entry.take().and_then(|slot| slot.task)
+        };
+        // The delivery callback may itself re-enter; call it unborrowed.
+        if let Some(task) = task {
             task.deliver(cancel);
         }
     }
 
     /// The id range spanning every slot, live or reaped.
     pub(crate) fn ids(&self) -> std::ops::Range<usize> {
-        0..self.slots.len()
+        0..self.inner.borrow().slots.len()
     }
 
     /// Number of live tasks.
     pub(crate) fn active_count(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
+        self.inner.borrow().slots.iter().filter(|s| s.is_some()).count()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::future::poll_fn;
-    use std::rc::Rc;
 
     /// A future that stores its waker on first poll and completes on the second.
     fn wake_later(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
@@ -224,7 +251,7 @@ mod tests {
 
     #[test]
     fn waker_queues_task_once() {
-        let mut ex = Executor::default();
+        let ex = Executor::default();
         let w = Rc::new(RefCell::new(None));
         let id = ex.spawn(wake_later(w.clone()), |_| {});
         assert!(!ex.poll(id));
@@ -238,7 +265,7 @@ mod tests {
 
     #[test]
     fn stale_waker_does_not_poll_reused_slot() {
-        let mut ex = Executor::default();
+        let ex = Executor::default();
         let w = Rc::new(RefCell::new(None));
         let id = ex.spawn(wake_later(w.clone()), |_| {});
         assert!(!ex.poll(id));

@@ -59,3 +59,31 @@ jobs:
             | awk '$2=="T" && $3 ~ /^ares_/ {print $3}' | LC_ALL=C sort \
             | diff <(LC_ALL=C sort ci-data/exports.baseline) -
           python3 tools/unsafe_lines.py --check tools/unsafe_baseline.json
+
+  # Re-entrancy bugs can be invisible at -O0: the release optimiser is allowed
+  # to assume `&mut` uniqueness across a poll, even though a C callback may
+  # re-enter the channel through its raw pointer. Keep a release-mode run so
+  # aliasing/stale-pointer regressions are caught before a tag build.
+  release-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Run tests (release)
+        run: cargo test --release
