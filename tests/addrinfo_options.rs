@@ -512,6 +512,7 @@ fn hosts_file_merges_addresses_and_exposes_cnames() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
 fn getnameinfo_uses_hosts_file_before_dns() {
     let _serial = serial();
     let hosts = TempFile::new("10.20.30.40 canonical.example alias.example\n");
