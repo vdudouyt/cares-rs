@@ -72,9 +72,11 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
             break;
         }
 
-        // Drain what changed in the reactor while serialized (O(changes)); the
-        // channel pointer stays valid until `ares_destroy` joins this thread.
-        let (changes, next_timeout) = {
+        // Drain and apply what changed in the reactor while serialized: an
+        // epoll_ctl racing another thread's close() can otherwise act on a
+        // reused fd. The channel pointer stays valid until `ares_destroy`
+        // joins this thread.
+        let next_timeout = {
             let _guard = lock.lock();
             if stop.load(Ordering::Acquire) {
                 break;
@@ -82,9 +84,9 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
             // SAFETY: the channel is alive for the lifetime of this thread and
             // the lock excludes every other access while we read it.
             let data = unsafe { &*(channel as *const ChannelData) };
-            (data.take_interest_changes(), data.next_timeout_ms())
+            backend.apply(data.take_interest_changes());
+            data.next_timeout_ms()
         };
-        backend.apply(changes);
 
         let timeout_ms = match next_timeout {
             Some(ms) => ms.clamp(1, EVENT_MAX_WAIT_MS) as c_int,
