@@ -863,3 +863,43 @@ pub unsafe extern "C" fn ares_set_pending_write_cb(
 pub extern "C" fn ares_process_pending_write(channel: Channel) {
     if channel.is_null() {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    /// A server-state/completion callback may start queries while the task that
+    /// fired it is still being polled. This used to reallocate the executor's
+    /// slot table under `poll(&mut self)` (a stale pointer in release, an
+    /// aliasing violation for Miri). The test needs no sockets, so Miri can run
+    /// it directly and Tree Borrows can see any re-entrant `&mut ChannelData`.
+    #[test]
+    fn reentrant_spawn_from_poll_is_aliasing_clean() {
+        let channel = Box::into_raw(Box::new(ChannelData::new_default()));
+        // SAFETY: `channel` is a live Box for the whole test; the guards are
+        // dropped before it is.
+        let (guard, outer) = unsafe { channel_access(channel) }.expect("live channel");
+        let spawned = Cell::new(false);
+        let fut = poll_fn(move |_| {
+            if !spawned.replace(true) {
+                // Re-enter the channel from inside the poll. Before the fix this
+                // minted a second `&mut ChannelData` and grew the slot table
+                // while the outer poll still used a pointer into it.
+                let (inner_guard, inner) =
+                    unsafe { channel_access(channel) }.expect("live channel");
+                for _ in 0..64 {
+                    inner.spawn(std::future::pending::<()>(), |_| {});
+                }
+                drop(inner_guard);
+            }
+            Poll::Ready(())
+        });
+        outer.spawn(fut, |_| {});
+        drop(guard);
+        // SAFETY: the last guard is gone and nothing else references the Box.
+        drop(unsafe { Box::from_raw(channel) });
+    }
+}
