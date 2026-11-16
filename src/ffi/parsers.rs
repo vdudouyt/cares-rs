@@ -154,6 +154,7 @@ fn txt_reply_entry(
     if out.is_null() {
         return ARES_EBADRESP;
     }
+    unsafe { *out = std::ptr::null_mut(); }
     match txt_reply_from_buf(buf, ext) {
         Ok(ptr) => {
             unsafe { *out = ptr; }
@@ -425,6 +426,10 @@ pub unsafe extern "C" fn ares_expand_name(
     if encoded.is_null() || abuf.is_null() || s.is_null() || enclen.is_null() || alen < 0 {
         return ARES_EBADNAME;
     }
+    unsafe {
+        *s = std::ptr::null_mut();
+        *enclen = 0;
+    }
     let full_buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let offset = unsafe { encoded.offset_from(abuf) };
     if offset < 0 || offset as usize >= full_buf.len() {
@@ -484,6 +489,10 @@ pub unsafe extern "C" fn ares_expand_string(
     if encoded.is_null() || abuf.is_null() || s.is_null() || enclen.is_null() || alen < 0 {
         return ARES_EBADSTR;
     }
+    unsafe {
+        *s = std::ptr::null_mut();
+        *enclen = 0;
+    }
     let full_buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
     let offset = unsafe { encoded.offset_from(abuf) };
     if offset < 0 || offset as usize >= full_buf.len() {
@@ -518,6 +527,10 @@ pub unsafe extern "C" fn ares_create_query(
     }
     if buf.is_null() || buflen.is_null() {
         return ARES_EFORMERR;
+    }
+    unsafe {
+        *buf = std::ptr::null_mut();
+        *buflen = 0;
     }
     let Some(name_str) = (unsafe { cstr_opt(name) }) else { return ARES_EBADNAME };
 

@@ -8,7 +8,7 @@ use cares::ares_data::{ares_free_data, AresAddrPortNode};
 use cares::ares_options::{ares_destroy_options, ares_options, ares_save_options};
 use cares::ares_socket::ares_set_socket_functions_ex;
 use cares::dns_record::*;
-use cares::error::ares_strerror;
+use cares::error::{ares_strerror, ARES_EBADRESP};
 use cares::*;
 
 const ARES_SUCCESS: c_int = 0;
@@ -191,6 +191,42 @@ fn parse_srv_reply_without_srv_answers_writes_null_out() {
     };
     assert_eq!(rc, ARES_SUCCESS);
     assert!(out.is_null(), "success must write a NULL out-list");
+}
+
+#[test]
+fn parse_error_clears_out_pointer() {
+    // Upstream clears the out parameter before parsing; an error must not
+    // leave a caller sentinel (or uninitialized stack slot) in place.
+    let mut out: *mut cares::ares_data::AresSrvReply =
+        std::ptr::NonNull::dangling().as_ptr();
+    let buf = [0u8; 12];
+    let rc = unsafe {
+        ares_parse_srv_reply(buf.as_ptr(), -1, &mut out)
+    };
+    assert_eq!(rc, ARES_EBADRESP);
+    assert!(out.is_null());
+}
+
+#[test]
+fn get_servers_empty_is_success_with_null() {
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+        let empty = CString::new("").unwrap();
+        assert_eq!(ares_set_servers_csv(ch, empty.as_ptr()), ARES_SUCCESS);
+
+        let mut nodes: *mut ares_addr_node =
+            std::ptr::NonNull::dangling().as_ptr();
+        assert_eq!(ares_get_servers(ch, &mut nodes), ARES_SUCCESS);
+        assert!(nodes.is_null());
+
+        let mut pnodes: *mut AresAddrPortNode =
+            std::ptr::NonNull::dangling().as_ptr();
+        assert_eq!(ares_get_servers_ports(ch, &mut pnodes), ARES_SUCCESS);
+        assert!(pnodes.is_null());
+
+        ares_destroy(ch);
+    }
 }
 
 #[test]

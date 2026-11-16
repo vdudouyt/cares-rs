@@ -224,6 +224,7 @@ pub unsafe extern "C" fn ares_dns_record_create(
     if dnsrec.is_null() {
         return ARES_EFORMERR;
     }
+    unsafe { *dnsrec = std::ptr::null_mut(); }
     match ares_dns_record_t::create(id, flags, opcode, rcode) {
         Ok(rec) => {
             unsafe { *dnsrec = Box::into_raw(Box::new(rec)); }
@@ -409,6 +410,7 @@ pub unsafe extern "C" fn ares_dns_record_rr_add(
     if dnsrec.is_null() || name.is_null() || rr.is_null() {
         return ARES_EFORMERR;
     }
+    unsafe { *rr = std::ptr::null_mut(); }
     let name_str = match unsafe { CStr::from_ptr(name) }.to_str() {
         Ok(s) => s,
         Err(_) => return ARES_EBADRESP,
@@ -848,6 +850,7 @@ pub unsafe extern "C" fn ares_dns_parse(
     if buf.is_null() || dnsrec.is_null() || buf_len == 0 || buf_len > 0xFFFF {
         return ARES_EFORMERR;
     }
+    unsafe { *dnsrec = std::ptr::null_mut(); }
     let data = unsafe { std::slice::from_raw_parts(buf, buf_len) };
     match parse_record(data, flags) {
         Ok(rec) => {

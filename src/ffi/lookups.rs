@@ -28,19 +28,19 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
 /// `channel` must be a valid channel, `name` a valid NUL-terminated C string, and `host` a writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_gethostbyname_file(channel: *mut ChannelData, name: *const c_char, family: c_int, host: *mut *mut libc::hostent) -> c_int {
+    if host.is_null() { return ARES_ENOTFOUND; }
+    unsafe { *host = std::ptr::null_mut(); }
+    if name.is_null() { return ARES_ENOTFOUND; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENOTFOUND; };
     let name_str = unsafe { cstr_lossy(name) };
 
-    let result = { channeldata.state.borrow().gethostbyname_file(name_str, family) };
+    let result = channeldata.state.borrow().gethostbyname_file(name_str, family);
     match result {
         Ok(bp) => {
             unsafe { *host = build_hostent(bp) };
             ARES_SUCCESS
         }
-        Err(status) => {
-            unsafe { *host = std::ptr::null_mut() };
-            status.code()
-        }
+        Err(status) => status.code(),
     }
 }
 

@@ -589,8 +589,9 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, head: *const A
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_ports(channel: *const ChannelData, out: *mut *mut AresAddrPortNode) -> c_int {
+    if out.is_null() { return ARES_ENODATA; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
-    let Some(ptr) = get_servers_ports_ptr(channeldata) else { unsafe { *out = std::ptr::null_mut() }; return ARES_ENODATA; };
+    let Some(ptr) = get_servers_ports_ptr(channeldata) else { unsafe { *out = std::ptr::null_mut() }; return ARES_SUCCESS; };
     unsafe { *out = ptr };
     ARES_SUCCESS
 }
@@ -745,7 +746,7 @@ pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ar
 pub unsafe extern "C" fn ares_get_servers(channel: *const ChannelData, out: *mut *mut ares_addr_node) -> c_int {
     if out.is_null() { return ARES_ENODATA; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
-    let Some(ptr) = get_servers_ptr(channeldata) else { unsafe { *out = std::ptr::null_mut() }; return ARES_ENODATA; };
+    let Some(ptr) = get_servers_ptr(channeldata) else { unsafe { *out = std::ptr::null_mut() }; return ARES_SUCCESS; };
     unsafe { *out = ptr };
     ARES_SUCCESS
 }

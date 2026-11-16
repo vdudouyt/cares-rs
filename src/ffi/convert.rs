@@ -60,7 +60,13 @@ where F: FnOnce() -> Result<*mut T, c_int>
             unsafe { *out = res };
             ARES_SUCCESS
         },
-        Err(err) => err,
+        Err(err) => {
+            // Upstream parse entry points clear the caller's output before
+            // parsing; do the same so an error never leaves a stale or
+            // uninitialized pointer behind.
+            unsafe { *out = std::ptr::null_mut() };
+            err
+        },
     }
 }
 
