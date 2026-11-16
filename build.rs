@@ -104,21 +104,7 @@ fn main() {
     // rewrites when contents change, so mtimes stay untouched).
     let include_dir = crate_dir.join("include");
     let _ = std::fs::create_dir_all(&include_dir);
-    // Generate to a temp file and post-process before touching the watched
-    // ares.h.  cbindgen emits <stdbool.h> whenever cpp_compat is enabled, but
-    // the public API has no `bool`; upstream c-ares does not expose it either,
-    // and including it breaks old consumers that typedef `bool` themselves.
-    let header_path = include_dir.join("ares.h");
-    let tmp_path = include_dir.join("ares.h.tmp");
-    let _ = std::fs::remove_file(&tmp_path);
-    bindings.write_to_file(&tmp_path);
-    if let Ok(text) = std::fs::read_to_string(&tmp_path) {
-        let text = text.replacen("#include <stdbool.h>\n", "", 1);
-        if std::fs::read_to_string(&header_path).ok().as_deref() != Some(text.as_str()) {
-            let _ = std::fs::write(&header_path, text);
-        }
-    }
-    let _ = std::fs::remove_file(&tmp_path);
+    bindings.write_to_file(include_dir.join("ares.h"));
 
     // Upstream splits its public header into ares_version.h, ares_build.h,
     // ares_dns.h, ares_dns_record.h and ares_nameser.h. Our generated ares.h is

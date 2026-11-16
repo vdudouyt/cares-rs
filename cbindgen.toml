@@ -6,7 +6,8 @@ documentation = false
 tab_width = 2
 line_length = 100
 
-sys_includes = ["netdb.h", "sys/socket.h", "netinet/in.h", "sys/select.h", "sys/time.h", "sys/types.h"]
+no_includes = true
+sys_includes = ["stdarg.h", "stdint.h", "stdlib.h", "netdb.h", "sys/socket.h", "netinet/in.h", "sys/select.h", "sys/time.h", "sys/types.h"]
 includes = []
 
 after_includes = """
