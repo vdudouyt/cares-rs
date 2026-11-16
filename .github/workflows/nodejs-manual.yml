@@ -44,8 +44,12 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          if ! grep -q '^Types:.*deb-src' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo 'deb-src http://archive.ubuntu.com/ubuntu noble main universe' \
+              | sudo tee /etc/apt/sources.list.d/cares-deb-src.list
+          fi
           sudo apt-get update
-          sudo apt-get install -y build-essential dpkg-dev devscripts
+          sudo apt-get install -y build-essential dpkg-dev devscripts netbase
           sudo apt-get build-dep -y nodejs
 
       - name: Build cares-rs
