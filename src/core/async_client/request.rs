@@ -12,6 +12,22 @@
 
 use super::*;
 
+/// Return `Pending` once (with the current waker) so the executor can apply a
+/// cancel recorded during the current poll, then complete on the next poll.
+async fn yield_once() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
 impl AsyncClient {
     // The single-query driver every lookup runs on
     pub(super) async fn run_reserved_query(&self, query: ReservedQuery, cancelled: &Cell<bool>) -> QueryOutcome {
@@ -202,6 +218,16 @@ impl AsyncClient {
     /// `q.server` after a connect failover) and the [`Response`]; `Err` only when
     /// no conn could be had. Reads the query state, never changes it.
     async fn request(&self, q: &QueryState) -> Result<(ServerId, Response), c_int> {
+        // A retry follows a callback (server-state, socket-state) that may have
+        // called ares_cancel. Sending immediately here would race that cancel
+        // and put a packet on the wire after the application cancelled; give
+        // the executor one turn to deliver the abort first. The initial send
+        // stays immediate (upstream semantics; hosts such as Node register
+        // poll interest only for directions c-ares requested).
+        if q.try_count > 0 {
+            yield_once().await;
+        }
+
         let tries = if q.no_retry { 1 } else { q.opts.attempts };
         let (mut conn, server) =
             self.connect_with_failover(q.qid.id(), q.server, q.use_tcp, tries).ok_or(ARES_ECONNREFUSED)?;

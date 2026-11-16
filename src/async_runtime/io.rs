@@ -89,21 +89,23 @@ fn ensure_scratch(scratch: &mut Vec<u8>) {
     }
 }
 
-/// Await writability, then send once. Writability is checked before expiry, so
-/// a fd that fired in the same turn the timeout passed still sends.
+/// Send once, waiting for writability only if the first attempt reports
+/// `WouldBlock`. Conforming sockets are non-blocking, so the common datagram
+/// path sends immediately — matching upstream c-ares. Applications such as
+/// Node only register a poll interest for directions c-ares reports; waiting
+/// for a writable event that was never requested would stall the query.
 pub(crate) async fn send_when_writable(sock: &Async, bytes: &[u8], timeout: Instant) -> io::Result<()> {
     loop {
-        {
-            let mut writable = pin!(sock.writable().fuse());
-            let mut t = pin!(Timer::at(sock.reactor(), timeout).fuse());
-            select_biased! {
-                _ = writable => {}
-                _ = t => return Err(io::ErrorKind::TimedOut.into()), // timed out before writable
-            }
-        }
         match sock.get_ref().send(bytes) {
             Ok(_) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // re-await writable
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let mut writable = pin!(sock.writable().fuse());
+                let mut t = pin!(Timer::at(sock.reactor(), timeout).fuse());
+                select_biased! {
+                    _ = writable => {}
+                    _ = t => return Err(io::ErrorKind::TimedOut.into()), // timed out before writable
+                }
+            }
             Err(e) => return Err(e),
         }
     }

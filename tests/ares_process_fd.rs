@@ -116,7 +116,7 @@ fn resolves_localhost() {
 
 #[test]
 #[cfg_attr(miri, ignore = "issues a real query → creates a UDP socket (libc::socket); Miri can't run syscalls")]
-fn getsock_reports_writable_for_pending_query() {
+fn getsock_reports_socket_for_pending_query() {
     unsafe {
         let mut channel: Channel = ptr::null_mut();
         assert_eq!(ares_init(&mut channel), ARES_SUCCESS);
@@ -139,7 +139,10 @@ fn getsock_reports_writable_for_pending_query() {
         let bitmask = ares_getsock(channel, socks.as_mut_ptr(), ARES_GETSOCK_MAXNUM as c_int);
         assert_ne!(bitmask, 0, "should have active sockets after query");
         assert_ne!(socks[0], ARES_SOCKET_BAD, "first socket should be valid");
-        assert!(ares_getsock_writable(bitmask, 0), "pending query socket should be writable");
+        // The query is sent immediately (upstream semantics), so only read
+        // interest remains; write interest is reported only on WouldBlock.
+        assert!(ares_getsock_readable(bitmask, 0), "pending query socket should be readable");
+        assert!(!ares_getsock_writable(bitmask, 0), "query send should not remain pending");
 
         ares_cancel(channel);
         ares_destroy(channel);
