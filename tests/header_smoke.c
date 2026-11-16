@@ -6,10 +6,19 @@
  * References only functionality cares-rs actually implements.
  * Built in CI with:  cc -std=c11 -Wall -Wextra -Iinclude -fsyntax-only tests/header_smoke.c
  */
-#include <ares.h>
-/* Upstream-compatible split headers; each one forwards to the self-contained
-   <ares.h>, so consumers that include them directly still compile. */
 #include <ares_version.h>
+#ifndef ARES_VERSION_STR
+#error "ares_version.h must define ARES_VERSION_STR without <ares.h>"
+#endif
+_Static_assert(ARES_VERSION_MAJOR == 1, "ARES_VERSION_MAJOR");
+_Static_assert(ARES_VERSION_MINOR == 34, "ARES_VERSION_MINOR");
+_Static_assert(ARES_VERSION_PATCH == 6, "ARES_VERSION_PATCH");
+_Static_assert(ARES_VERSION == 0x12206, "ARES_VERSION");
+
+#include <ares.h>
+/* Upstream-compatible split headers; consumers that include them directly
+   must still compile.  ares_version.h is standalone (like upstream); the
+   others forward to <ares.h>. */
 #include <ares_build.h>
 #include <ares_dns.h>
 #include <ares_dns_record.h>

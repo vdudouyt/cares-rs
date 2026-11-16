@@ -10,16 +10,9 @@
 #include <sys/select.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include "ares_version.h"
 
 /* --- Items cbindgen cannot derive from Rust (injected verbatim) --- */
-
-/* Version (upstream ships these in ares_version.h) */
-#define ARES_VERSION_MAJOR 1
-#define ARES_VERSION_MINOR 34
-#define ARES_VERSION_PATCH 6
-#define ARES_VERSION_STR   "1.34.6"
-#define ARES_VERSION \
-  ((ARES_VERSION_MAJOR << 16) | (ARES_VERSION_MINOR << 8) | (ARES_VERSION_PATCH))
 
 /* ares_getsock() bit helpers: function-like macros have no Rust equivalent.
    ARES_GETSOCK_MAXNUM is emitted by cbindgen and resolved at macro-expansion
