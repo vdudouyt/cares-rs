@@ -16,6 +16,10 @@
 #include <ares_nameser.h>
 #include <stddef.h>
 
+/* Old consumers (e.g. Xymon, Gross) typedef bool themselves after including
+   <ares.h>.  The public header must not pull in <stdbool.h>. */
+typedef int bool;
+
 void cares_rs_header_smoke(void)
 {
   /* opaque handle + status type */
