@@ -1,0 +1,202 @@
+name: Xymon downstream (manual)
+
+# Manual-only: start from the GitHub Actions UI ("Run workflow").
+# Builds Ubuntu's Xymon source against this checkout's cares-rs, then runs
+# xymonnet's DNS/HTTP path natively and (by default) under Valgrind.
+
+on:
+  workflow_dispatch:
+    inputs:
+      valgrind:
+        description: "Run xymonnet under Valgrind"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  xymon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout cares-rs
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-xymon-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-xymon-
+
+      - name: Install Xymon build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          if ! grep -q '^Types:.*deb-src' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo 'deb-src http://archive.ubuntu.com/ubuntu noble main universe' \
+              | sudo tee /etc/apt/sources.list.d/cares-deb-src.list
+          fi
+          sudo apt-get update
+          # Xymon's Build-Depends includes libc-ares-dev; install the rest
+          # explicitly so the distro c-ares never enters the image.
+          sudo apt-get install -y \
+            build-essential dpkg-dev devscripts netbase \
+            apache2-dev imagemagick libldap2-dev libpcre2-dev librrd-dev \
+            libssl-dev libtirpc-dev man2html-base po-debconf procps
+          for p in libc-ares-dev libcares2 libc-ares2; do
+            if dpkg -s "$p" >/dev/null 2>&1; then
+              echo "ERROR: stock c-ares package $p was installed" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install Valgrind
+        if: ${{ inputs.valgrind }}
+        run: sudo apt-get install -y valgrind
+
+      - name: Build cares-rs
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-soname,libcares.so.2"
+        run: cargo build --release --locked
+
+      - name: Stage cares-rs for Xymon
+        run: |
+          PREFIX=/tmp/cares-prefix
+          mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
+          install -m755 target/release/libcares.so "$PREFIX/lib/libcares.so.2.0.0"
+          ln -sf libcares.so.2.0.0 "$PREFIX/lib/libcares.so.2"
+          ln -sf libcares.so.2 "$PREFIX/lib/libcares.so"
+          install -m644 include/ares*.h "$PREFIX/include/"
+          sed -e "s|^prefix=.*|prefix=$PREFIX|" \
+              -e 's|@MULTIARCH@||' \
+              debian/libcares.pc.in > "$PREFIX/lib/pkgconfig/libcares.pc"
+
+      - name: Fetch Xymon source
+        working-directory: /tmp
+        run: |
+          apt-get source xymon
+          src=$(find /tmp -maxdepth 1 -type d -name 'xymon-*' | sort | tail -1)
+          test -n "$src"
+          echo "XYMON_SRC=$src" >> "$GITHUB_ENV"
+
+      - name: Configure Xymon with cares-rs
+        working-directory: ${{ env.XYMON_SRC }}
+        env:
+          CFLAGS: "-I/tmp/cares-prefix/include -L/tmp/cares-prefix/lib -Wl,-rpath,/tmp/cares-prefix/lib"
+        run: |
+          USEXYMONPING=y \
+          ENABLESSL=y \
+          ENABLELDAP=y \
+          ENABLELDAPSSL=y \
+          XYMONUSER=xymon \
+          XYMONTOPDIR=/tmp/xymon-inst \
+          XYMONVAR=/tmp/xymon-var \
+          XYMONHOSTURL=/xymon \
+          CGIDIR=/tmp/xymon-inst/cgi-bin \
+          XYMONCGIURL=/xymon-cgi \
+          SECURECGIDIR=/tmp/xymon-inst/cgi-secure \
+          SECUREXYMONCGIURL=/xymon-seccgi \
+          HTTPDGID=www-data \
+          XYMONLOGDIR=/tmp/xymon-var/log \
+          XYMONHOSTNAME=localhost \
+          XYMONHOSTIP=127.0.0.1 \
+          MANROOT=/usr/share/man \
+          INSTALLBINDIR=/tmp/xymon-inst/bin \
+          INSTALLETCDIR=/tmp/xymon-etc \
+          INSTALLWEBDIR=/tmp/xymon-etc/web \
+          INSTALLEXTDIR=/tmp/xymon-inst/ext \
+          INSTALLTMPDIR=/tmp/xymon-var/tmp \
+          INSTALLWWWDIR=/tmp/xymon-var/www \
+          ./configure --server \
+            --pcrelib "$(pcre2-config --libs8)" \
+            --ssllib /usr/lib/x86_64-linux-gnu \
+            --ldaplib /usr/lib/x86_64-linux-gnu </dev/null
+
+          grep -q '^SYSTEMCARES = yes' Makefile
+
+      - name: Build Xymon
+        working-directory: ${{ env.XYMON_SRC }}
+        env:
+          CFLAGS: "-I/tmp/cares-prefix/include -L/tmp/cares-prefix/lib -Wl,-rpath,/tmp/cares-prefix/lib"
+        run: make -j1
+
+      - name: Verify cares-rs linkage
+        working-directory: ${{ env.XYMON_SRC }}
+        env:
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+        run: |
+          ldd xymonnet/xymonnet | tee /tmp/xymon-ldd.txt
+          grep -q "/tmp/cares-prefix/lib/libcares.so.2" /tmp/xymon-ldd.txt
+
+      - name: Run xymonnet DNS/HTTP test
+        working-directory: ${{ env.XYMON_SRC }}
+        env:
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+          XYMONHOME: "/tmp/xymon-test"
+          XYMONVAR: "/tmp/xymon-test/var"
+          XYMONLOGDIR: "/tmp/xymon-test/logs"
+          XYMONTMP: "/tmp/xymon-test/tmp"
+        run: |
+          mkdir -p "$XYMONHOME/etc" "$XYMONVAR" "$XYMONLOGDIR" "$XYMONTMP"
+          printf 'page test\n0.0.0.0 example.com # http://example.com/\n' \
+            > "$XYMONHOME/etc/hosts.cfg"
+
+          ./xymonnet/xymonnet \
+            --no-update --noping --no-ssl \
+            --dns=standard --dns-timeout=10 --report \
+            | tee /tmp/xymon-run.log
+
+          grep -q 'example,com.http green' /tmp/xymon-run.log
+          grep -Eq '# successful[[:space:]]*:[[:space:]]*1' /tmp/xymon-run.log
+
+      - name: Run xymonnet under Valgrind
+        if: ${{ inputs.valgrind }}
+        working-directory: ${{ env.XYMON_SRC }}
+        env:
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+          XYMONHOME: "/tmp/xymon-test"
+          XYMONVAR: "/tmp/xymon-test/var"
+          XYMONLOGDIR: "/tmp/xymon-test/logs"
+          XYMONTMP: "/tmp/xymon-test/tmp"
+        run: |
+          set +e
+          valgrind --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=definite \
+            --errors-for-leak-kinds=none \
+            --error-exitcode=99 \
+            --num-callers=25 \
+            --log-file=/tmp/xymon-valgrind.log \
+            ./xymonnet/xymonnet \
+            --no-update --noping --no-ssl \
+            --dns=standard --dns-timeout=10 --report \
+            > /tmp/xymon-valgrind.out 2>&1
+          rc=$?
+          set -e
+
+          tail -40 /tmp/xymon-valgrind.out
+          grep -E 'ERROR SUMMARY|definitely lost:' /tmp/xymon-valgrind.log \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+          # Xymon itself has known definite leaks; the gate here is invalid
+          # memory access.  Still fail if any report mentions cares-rs.
+          if grep -qE 'libcares|/cares-prefix/' /tmp/xymon-valgrind.log; then
+            echo "ERROR: cares-rs appeared in the Valgrind report" >&2
+            grep -nE 'libcares|/cares-prefix/' /tmp/xymon-valgrind.log >&2
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            tail -300 /tmp/xymon-valgrind.log
+            exit "$rc"
+          fi
