@@ -203,13 +203,16 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
         Some(Ok(list)) => list,
         None => None,
     };
+    // Only read fields the caller says are initialized (optmask).  C callers
+    // commonly pass a partially initialized `struct ares_options`; reading an
+    // unset pointer field (Xymon does exactly this) would dereference garbage.
     let decoded = DecodedOptions {
-        flags: options.flags,
-        timeout: options.timeout,
-        tries: options.tries,
-        ndots: options.ndots,
-        udp_port: options.udp_port,
-        tcp_port: options.tcp_port,
+        flags: if optmask & ARES_OPT_FLAGS != 0 { options.flags } else { 0 },
+        timeout: if optmask & (ARES_OPT_TIMEOUTMS | ARES_OPT_TIMEOUT) != 0 { options.timeout } else { 0 },
+        tries: if optmask & ARES_OPT_TRIES != 0 { options.tries } else { 0 },
+        ndots: if optmask & ARES_OPT_NDOTS != 0 { options.ndots } else { 0 },
+        udp_port: if optmask & ARES_OPT_UDP_PORT != 0 { options.udp_port } else { 0 },
+        tcp_port: if optmask & ARES_OPT_TCP_PORT != 0 { options.tcp_port } else { 0 },
         servers: if optmask & ARES_OPT_SERVERS != 0 && !options.servers.is_null() {
             unsafe { std::slice::from_raw_parts(options.servers, options.nservers as usize) }
                 .iter()
@@ -229,21 +232,38 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
         } else {
             None
         },
-        lookups: (!options.lookups.is_null())
-            .then(|| unsafe { CStr::from_ptr(options.lookups) }.to_string_lossy().into_owned()),
+        lookups: if optmask & ARES_OPT_LOOKUPS != 0 && !options.lookups.is_null() {
+            Some(unsafe { CStr::from_ptr(options.lookups) }.to_string_lossy().into_owned())
+        } else {
+            None
+        },
         sortlist: decoded_sortlist,
-        resolvconf_path: (!options.resolvconf_path.is_null())
-            .then(|| unsafe { CStr::from_ptr(options.resolvconf_path) }.to_string_lossy().into_owned()),
-        hosts_path: (!options.hosts_path.is_null())
-            .then(|| unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned()),
-        maxtimeout: options.maxtimeout,
-        qcache_max_ttl: options.qcache_max_ttl,
-        ednspsz: options.ednspsz,
-        udp_max_queries: options.udp_max_queries,
-        socket_send_buffer_size: options.socket_send_buffer_size,
-        socket_receive_buffer_size: options.socket_receive_buffer_size,
-        failover_retry_chance: options.server_failover_opts.retry_chance,
-        failover_retry_delay: options.server_failover_opts.retry_delay as u64,
+        resolvconf_path: if optmask & ARES_OPT_RESOLVCONF != 0 && !options.resolvconf_path.is_null() {
+            Some(unsafe { CStr::from_ptr(options.resolvconf_path) }.to_string_lossy().into_owned())
+        } else {
+            None
+        },
+        hosts_path: if optmask & ARES_OPT_HOSTS_FILE != 0 && !options.hosts_path.is_null() {
+            Some(unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned())
+        } else {
+            None
+        },
+        maxtimeout: if optmask & ARES_OPT_MAXTIMEOUTMS != 0 { options.maxtimeout } else { 0 },
+        qcache_max_ttl: if optmask & ARES_OPT_QUERY_CACHE != 0 { options.qcache_max_ttl } else { 0 },
+        ednspsz: if optmask & ARES_OPT_EDNSPSZ != 0 { options.ednspsz } else { 0 },
+        udp_max_queries: if optmask & ARES_OPT_UDP_MAX_QUERIES != 0 { options.udp_max_queries } else { 0 },
+        socket_send_buffer_size: if optmask & ARES_OPT_SOCK_SNDBUF != 0 { options.socket_send_buffer_size } else { 0 },
+        socket_receive_buffer_size: if optmask & ARES_OPT_SOCK_RCVBUF != 0 { options.socket_receive_buffer_size } else { 0 },
+        failover_retry_chance: if optmask & ARES_OPT_SERVER_FAILOVER != 0 {
+            options.server_failover_opts.retry_chance
+        } else {
+            0
+        },
+        failover_retry_delay: if optmask & ARES_OPT_SERVER_FAILOVER != 0 {
+            options.server_failover_opts.retry_delay as u64
+        } else {
+            0
+        },
     };
 
     let resolvconf = if optmask & ARES_OPT_RESOLVCONF != 0 {

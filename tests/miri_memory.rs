@@ -572,6 +572,27 @@ fn library_globals_and_strerror() {
 }
 
 #[test]
+fn init_options_ignores_unmasked_pointer_fields() {
+    // Xymon passes a partially initialized ares_options with only timeout/tries
+    // set.  Unmasked pointer fields must never be read.
+    unsafe {
+        let mut opts: ares_options = std::mem::zeroed();
+        opts.timeout = 1000;
+        opts.tries = 1;
+        opts.lookups = std::ptr::NonNull::<c_char>::dangling().as_ptr();
+        opts.resolvconf_path = std::ptr::NonNull::<c_char>::dangling().as_ptr();
+        opts.hosts_path = std::ptr::NonNull::<c_char>::dangling().as_ptr();
+
+        let mut ch: Channel = ptr::null_mut();
+        let mask = cares::ares_options::ARES_OPT_TIMEOUTMS
+            | cares::ares_options::ARES_OPT_TRIES;
+        assert_eq!(cares::ares_options::ares_init_options(&mut ch, &opts, mask), ARES_SUCCESS);
+        assert!(!ch.is_null());
+        ares_destroy(ch);
+    }
+}
+
+#[test]
 fn mkquery_roundtrip() {
     let name = CString::new("example.com").unwrap();
     unsafe {
