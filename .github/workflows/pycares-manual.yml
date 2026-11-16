@@ -1,0 +1,87 @@
+name: pycares downstream (manual)
+
+# Manual-only: start from the GitHub Actions UI ("Run workflow").
+# Builds Ubuntu's pycares source against the cares-rs in this checkout and
+# runs pycares' own unittest suite.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pycares:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout cares-rs
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pycares-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pycares-
+
+      - name: Install pycares build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y build-essential dpkg-dev devscripts
+          sudo apt-get build-dep -y pycares
+
+      - name: Build cares-rs
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-soname,libcares.so.2"
+        run: cargo build --release --locked
+
+      - name: Stage cares-rs for pycares
+        run: |
+          PREFIX=/tmp/cares-prefix
+          mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
+          install -m755 target/release/libcares.so "$PREFIX/lib/libcares.so.2.0.0"
+          ln -sf libcares.so.2.0.0 "$PREFIX/lib/libcares.so.2"
+          ln -sf libcares.so.2 "$PREFIX/lib/libcares.so"
+          install -m644 include/ares*.h "$PREFIX/include/"
+          sed -e "s|^prefix=.*|prefix=$PREFIX|" \
+              -e 's|@MULTIARCH@||' \
+              debian/libcares.pc.in > "$PREFIX/lib/pkgconfig/libcares.pc"
+
+      - name: Fetch pycares source
+        working-directory: /tmp
+        run: |
+          apt-get source pycares
+          src=$(find /tmp -maxdepth 1 -type d -name 'pycares-*' | sort | tail -1)
+          test -n "$src"
+          echo "PYCARES_SRC=$src" >> "$GITHUB_ENV"
+
+      - name: Build pycares extension against cares-rs
+        working-directory: ${{ env.PYCARES_SRC }}
+        env:
+          PYCARES_USE_SYSTEM_LIB: "1"
+          LDFLAGS: "-L/tmp/cares-prefix/lib -Wl,-rpath,/tmp/cares-prefix/lib"
+        run: |
+          python3 setup.py build_ext --inplace --force
+          LD_LIBRARY_PATH=/tmp/cares-prefix/lib \
+            ldd src/pycares/_cares*.so | tee /tmp/pycares-ldd.txt
+          grep -q "/tmp/cares-prefix/lib/libcares.so.2" /tmp/pycares-ldd.txt
+
+      - name: Run pycares tests
+        working-directory: ${{ env.PYCARES_SRC }}
+        env:
+          DEBCI: "1"
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+          PYTHONPATH: "src:."
+        run: python3 -m unittest -v tests.test_all
