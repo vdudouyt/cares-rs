@@ -244,7 +244,20 @@ where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
         }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
         let (aresreplies, success) = T2::parse_buf_to_clinkedlist_parts(buf, expected_record_type)?;
-        let reply = clinkedlist::chain_nodes(aresreplies).ok_or_else(|| empty_chain_status(success).code())?;
+        // No records of the requested type. Upstream returns ARES_SUCCESS with
+        // a NULL out-list when the answer section has other record types (and
+        // ENODATA when there are no answers at all). Callers such as Node test
+        // `*out` on success, so it must be written.
+        let reply = match clinkedlist::chain_nodes(aresreplies) {
+            Some(reply) => reply,
+            None => {
+                let status = empty_chain_status(success);
+                if status.code() == ARES_SUCCESS {
+                    return Ok(std::ptr::null_mut());
+                }
+                return Err(status.code());
+            }
+        };
 
         let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
         let aresdata = Box::into_raw(Box::new(aresdata));

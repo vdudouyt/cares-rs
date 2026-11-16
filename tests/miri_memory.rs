@@ -175,6 +175,25 @@ fn parse_ptr_reply_without_address() {
 }
 
 #[test]
+fn parse_srv_reply_without_srv_answers_writes_null_out() {
+    // A non-empty answer section with no SRV records: upstream returns
+    // ARES_SUCCESS and *out == NULL. Node's resolveAny path calls this for
+    // every ANY response and dereferences the out-list on success.
+    //
+    // Prefill with a non-null dangling pointer so a missing write fails
+    // deterministically under both plain `cargo test` and Miri (a MaybeUninit
+    // slot only catches it reliably under Miri).
+    let buf = response("example.com", T_SRV, &[rr(T_A, &[1, 2, 3, 4])]);
+    let mut out: *mut cares::ares_data::AresSrvReply =
+        std::ptr::NonNull::dangling().as_ptr();
+    let rc = unsafe {
+        ares_parse_srv_reply(buf.as_ptr(), buf.len() as c_int, &mut out)
+    };
+    assert_eq!(rc, ARES_SUCCESS);
+    assert!(out.is_null(), "success must write a NULL out-list");
+}
+
+#[test]
 fn parse_txt_reply_and_free() {
     let rdata = [0x05u8, b'h', b'e', b'l', b'l', b'o'];
     let buf = response("example.com", T_TXT, &[rr(T_TXT, &rdata)]);
