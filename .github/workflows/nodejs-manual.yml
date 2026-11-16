@@ -50,7 +50,37 @@ jobs:
           fi
           sudo apt-get update
           sudo apt-get install -y build-essential dpkg-dev devscripts netbase
-          sudo apt-get build-dep -y nodejs
+          # Install Node's native build dependencies explicitly.  Do not use
+          # `apt-get build-dep nodejs`: the node-* packages pull in nodejs,
+          # which depends on libnode109 -> libcares2, installing the distro's
+          # c-ares.  --shared-cares must resolve only to our prefix.
+          sudo apt-get install -y \
+            bash-completion ca-certificates curl gyp jq \
+            libbrotli-dev libhttp-parser-dev libicu-dev libnghttp2-dev \
+            libssl-dev libuv1-dev openssl pkgconf procps python3 zlib1g-dev
+          for p in libc-ares-dev libcares2 libc-ares2; do
+            if dpkg -s "$p" >/dev/null 2>&1; then
+              echo "ERROR: stock c-ares package $p was installed" >&2
+              exit 1
+            fi
+          done
+
+      - name: Fetch Node shared builtins without installing nodejs
+        run: |
+          # The DFSG source tree omits acorn, cjs-module-lexer and undici.
+          # Extract just their JS files from the debs instead of installing the
+          # node-* packages (which would drag in nodejs and libcares2).
+          mkdir -p /tmp/node-builtins
+          cd /tmp/node-builtins
+          apt-get download node-acorn node-cjs-module-lexer node-undici
+          for deb in ./*.deb; do
+            dpkg-deb -x "$deb" /tmp/node-builtins
+          done
+          test -f /tmp/node-builtins/usr/share/nodejs/acorn/dist/acorn.js
+          test -f /tmp/node-builtins/usr/share/nodejs/acorn-walk/dist/walk.js
+          test -f /tmp/node-builtins/usr/share/nodejs/cjs-module-lexer/lexer.js
+          test -f /tmp/node-builtins/usr/share/nodejs/cjs-module-lexer/dist/lexer.js
+          test -f /tmp/node-builtins/usr/share/nodejs/undici/undici-fetch.js
 
       - name: Build cares-rs
         env:
@@ -90,11 +120,11 @@ jobs:
             --shared-zlib --shared-libuv --shared-nghttp2 --shared-brotli --shared-openssl \
             --with-intl=system-icu \
             --prefix=/tmp/node-cares \
-            --shared-builtin-undici/undici-path=/usr/share/nodejs/undici/undici-fetch.js \
-            --shared-builtin-acorn-path=/usr/share/nodejs/acorn/dist/acorn.js \
-            --shared-builtin-acorn_walk-path=/usr/share/nodejs/acorn-walk/dist/walk.js \
-            --shared-builtin-cjs_module_lexer/lexer-path=/usr/share/nodejs/cjs-module-lexer/lexer.js \
-            --shared-builtin-cjs_module_lexer/dist/lexer-path=/usr/share/nodejs/cjs-module-lexer/dist/lexer.js
+            --shared-builtin-undici/undici-path=/tmp/node-builtins/usr/share/nodejs/undici/undici-fetch.js \
+            --shared-builtin-acorn-path=/tmp/node-builtins/usr/share/nodejs/acorn/dist/acorn.js \
+            --shared-builtin-acorn_walk-path=/tmp/node-builtins/usr/share/nodejs/acorn-walk/dist/walk.js \
+            --shared-builtin-cjs_module_lexer/lexer-path=/tmp/node-builtins/usr/share/nodejs/cjs-module-lexer/lexer.js \
+            --shared-builtin-cjs_module_lexer/dist/lexer-path=/tmp/node-builtins/usr/share/nodejs/cjs-module-lexer/dist/lexer.js
 
       - name: Build Node.js
         working-directory: ${{ env.NODE_SRC }}
