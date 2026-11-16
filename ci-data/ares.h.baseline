@@ -11,6 +11,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include "ares_version.h"
+#include "ares_build.h"
 
 /* --- Items cbindgen cannot derive from Rust (injected verbatim) --- */
 

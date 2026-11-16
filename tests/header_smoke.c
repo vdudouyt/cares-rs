@@ -17,8 +17,8 @@ _Static_assert(ARES_VERSION == 0x12206, "ARES_VERSION");
 
 #include <ares.h>
 /* Upstream-compatible split headers; consumers that include them directly
-   must still compile.  ares_version.h is standalone (like upstream); the
-   others forward to <ares.h>. */
+   must still compile.  ares_version.h, ares_build.h and ares_nameser.h are
+   standalone (like upstream); the DNS headers forward to <ares.h>. */
 #include <ares_build.h>
 #include <ares_dns.h>
 #include <ares_dns_record.h>
@@ -81,6 +81,11 @@ void cares_rs_header_smoke(void)
     (void)u_txt; (void)u_prop; (void)u_val; (void)u_flag; (void)u_rs;
     (void)s_host; (void)s_ns; (void)s_repl;
   }
+
+  /* ares_nameser.h must expose the BIND nameser names consumers use (e.g.
+     PgBouncer's ares_search() call with ns_c_in / ns_t_soa). */
+  (void)ns_c_in;
+  (void)ns_t_soa;
 
   /* Legacy <ares_dns.h> accessors used by consumers such as Xymon. */
   {

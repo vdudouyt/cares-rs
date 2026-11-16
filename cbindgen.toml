@@ -12,6 +12,7 @@ includes = []
 
 after_includes = """
 #include \"ares_version.h\"
+#include \"ares_build.h\"
 
 /* --- Items cbindgen cannot derive from Rust (injected verbatim) --- */
 
