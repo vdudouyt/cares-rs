@@ -15,14 +15,21 @@ _Static_assert(ARES_VERSION_MINOR == 34, "ARES_VERSION_MINOR");
 _Static_assert(ARES_VERSION_PATCH == 6, "ARES_VERSION_PATCH");
 _Static_assert(ARES_VERSION == 0x12206, "ARES_VERSION");
 
+#include <ares_build.h>
+#ifndef CARES_TYPEOF_ARES_SOCKLEN_T
+#error "ares_build.h must define the socklen type alias"
+#endif
+#ifndef CARES_HAVE_SYS_TYPES_H
+#error "ares_build.h must describe the target system headers"
+#endif
+#include <ares_nameser.h>
+
 #include <ares.h>
 /* Upstream-compatible split headers; consumers that include them directly
    must still compile.  ares_version.h, ares_build.h and ares_nameser.h are
    standalone (like upstream); the DNS headers forward to <ares.h>. */
-#include <ares_build.h>
 #include <ares_dns.h>
 #include <ares_dns_record.h>
-#include <ares_nameser.h>
 #include <stddef.h>
 
 /* Old consumers (e.g. Xymon, Gross) typedef bool themselves after including
