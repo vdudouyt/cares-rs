@@ -69,6 +69,18 @@ void cares_rs_header_smoke(void)
     (void)s_host; (void)s_ns; (void)s_repl;
   }
 
+  /* Legacy <ares_dns.h> accessors used by consumers such as Xymon. */
+  {
+    unsigned char packet[12] = {0};
+    unsigned char question[4] = {0};
+    unsigned char rr[10] = {0};
+    (void)DNS_HEADER_QID(packet);
+    (void)DNS_HEADER_ANCOUNT(packet);
+    (void)DNS_QUESTION_TYPE(question);
+    (void)DNS_RR_LEN(rr);
+    DNS_HEADER_SET_QID(packet, 1);
+  }
+
   /* options struct */
   struct ares_options opts;
   opts.flags   = 0;
