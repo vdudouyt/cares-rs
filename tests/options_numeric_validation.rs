@@ -4,9 +4,11 @@
 //!
 //! A panic inside an `extern "C"` function cannot be caught in-process: Rust
 //! aborts.  To still get a per-case pass/fail report, each case runs in a child
-//! copy of this test binary.
+//! copy of this test binary.  Miri cannot spawn processes, so there the cases
+//! run directly in-process instead (they are not expected to panic).
 
 use std::ffi::c_int;
+#[cfg(not(miri))]
 use std::process::Command;
 use std::ptr;
 
@@ -17,6 +19,7 @@ use cares::ares_options::{
 use cares::*;
 
 const ARES_SUCCESS: c_int = 0;
+#[cfg(not(miri))]
 const CASE_ENV: &str = "CARES_RS_NUMERIC_OPTION_CASE";
 
 const CASES: [&str; 5] = [
@@ -74,6 +77,7 @@ fn run_case(name: &str) {
 
 /// Child entry point: runs one case selected by `CASE_ENV`.  With no env var
 /// (a normal `cargo test` run) it is simply a no-op.
+#[cfg(not(miri))]
 #[test]
 fn numeric_option_case_child() {
     let Ok(name) = std::env::var(CASE_ENV) else {
@@ -84,6 +88,7 @@ fn numeric_option_case_child() {
 
 /// Parent test: every non-positive numeric option must be accepted without
 /// panicking/aborting and produce a usable channel.
+#[cfg(not(miri))]
 #[test]
 fn init_options_nonpositive_numeric_options_do_not_abort() {
     let exe = std::env::current_exe().expect("test executable path");
@@ -116,4 +121,15 @@ fn init_options_nonpositive_numeric_options_do_not_abort() {
         "non-positive option values caused a panic/abort or failure:\n\n{}",
         failures.join("\n\n")
     );
+}
+
+/// Miri variant: process spawning is unsupported, so run every case directly
+/// in-process.  Any panic or abort still fails the run, just without the
+/// per-case child isolation that native runs get.
+#[cfg(miri)]
+#[test]
+fn init_options_nonpositive_numeric_options_do_not_abort() {
+    for name in CASES {
+        run_case(name);
+    }
 }
