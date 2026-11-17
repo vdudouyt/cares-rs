@@ -287,10 +287,10 @@ impl AsyncClient {
         let hostname = hostname_raw.strip_suffix('.').unwrap_or(&hostname_raw);
 
         if !matches!(ai_family, libc::AF_INET | libc::AF_INET6 | libc::AF_UNSPEC) {
-            return fail(ARES_ENOTIMP);
+            return fail(ARES_ENOTIMP, 0);
         }
         if hostname.is_empty() || is_onion_domain(hostname) {
-            return fail(ARES_ENOTFOUND);
+            return fail(ARES_ENOTFOUND, 0);
         }
 
         let can_name = ai_flags & crate::ffi::ARES_AI_CANONNAME != 0;
@@ -321,14 +321,16 @@ impl AsyncClient {
                     cnames,
                     socktype,
                     protocol,
+                    0,
                 );
             }
-            return fail(ARES_ENOTFOUND);
+            return fail(ARES_ENOTFOUND, 0);
         }
 
         let family_filter = AddressFamily::from_af(ai_family).unwrap_or(AddressFamily::Any);
         let order: Vec<char> = self.lookups.chars().collect();
         let mut last_error: AresError = ARES_ECONNREFUSED.into();
+        let mut timeouts: c_int = 0;
 
         for ch in order {
             match ch {
@@ -360,6 +362,7 @@ impl AsyncClient {
                                 cnames,
                                 socktype,
                                 protocol,
+                                0,
                             );
                         }
                     }
@@ -378,6 +381,7 @@ impl AsyncClient {
                             Vec::new(),
                             socktype,
                             protocol,
+                            0,
                         );
                     }
                 }
@@ -399,7 +403,7 @@ impl AsyncClient {
                     let (search_name, alias_found) = match hostaliases_lookup(&hostname_raw, no_aliases) {
                         Ok(Some(alias)) => (alias, true),
                         Ok(None) => (hostname_raw.clone(), false),
-                        Err(status) => return fail(status),
+                        Err(status) => return fail(status, 0),
                     };
                     let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
                     let names = SearchPlan::for_search(
@@ -410,6 +414,7 @@ impl AsyncClient {
                     )
                     .into_names();
                     let lookup = self.resolve_addrinfo(&names, &rtypes).await;
+                    timeouts = lookup.timeouts;
                     if lookup.replies.is_empty() {
                         last_error = lookup.status;
                         continue;
@@ -429,12 +434,12 @@ impl AsyncClient {
                     if !no_sort {
                         sort_addrinfo(&mut records);
                     }
-                    return AddrInfoOut::success(name, records, cnames, socktype, protocol);
+                    return AddrInfoOut::success(name, records, cnames, socktype, protocol, lookup.timeouts);
                 }
                 _ => {}
             }
         }
-        fail(last_error.code())
+        fail(last_error.code(), timeouts)
     }
 }
 
@@ -463,6 +468,8 @@ pub(crate) struct AddrInfoOut {
     pub socktype: c_int,
     pub protocol: c_int,
     pub status: AresError,
+    /// Timeouts observed during the DNS phase, reported to the C callback.
+    pub timeouts: c_int,
 }
 
 impl AddrInfoOut {
@@ -472,6 +479,7 @@ impl AddrInfoOut {
         cnames: Vec<CnameEntry>,
         socktype: c_int,
         protocol: c_int,
+        timeouts: c_int,
     ) -> Self {
         AddrInfoOut {
             name,
@@ -480,11 +488,12 @@ impl AddrInfoOut {
             socktype,
             protocol,
             status: ARES_SUCCESS.into(),
+            timeouts,
         }
     }
 }
 
-fn fail(status: c_int) -> AddrInfoOut {
+fn fail(status: c_int, timeouts: c_int) -> AddrInfoOut {
     AddrInfoOut {
         name: String::new(),
         records: Vec::new(),
@@ -492,6 +501,7 @@ fn fail(status: c_int) -> AddrInfoOut {
         socktype: 0,
         protocol: 0,
         status: status.into(),
+        timeouts,
     }
 }
 

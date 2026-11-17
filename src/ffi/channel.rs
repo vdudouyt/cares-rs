@@ -114,6 +114,8 @@ impl ChannelData {
                 local_dev: state.local_dev.clone(),
                 sock_state_cb: self.sock_state_cb.get(),
                 sock_state_cb_data: self.sock_state_cb_data.get(),
+                pending_write_cb: self.pending_write_cb.get(),
+                pending_write_arg: self.pending_write_arg.get(),
             }
         };
         let factory = self.socket_factory.borrow().with_config(socket);
@@ -242,9 +244,14 @@ impl ChannelData {
         self.state.borrow().rt.reactor().take_interest_changes()
     }
 
-    /// Lookups still in flight (spawned, not yet delivered).
+    /// DNS queries still in flight: every reserved transaction id corresponds to
+    /// one active query, including the A and AAAA siblings of an AF_UNSPEC
+    /// lookup. The borrows are released before returning (no callback runs here).
     pub(crate) fn active_queries(&self) -> usize {
-        self.executor.active_count()
+        let shared = self.state.borrow().shared.clone();
+        let count = shared.qids.borrow().len();
+        drop(shared);
+        count
     }
 
     pub(crate) fn next_timeout_ms(&self) -> Option<u128> {
@@ -499,8 +506,8 @@ fn destroy_impl(channel: *mut ChannelData) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_fds(channel: *const ChannelData, read_fds: &mut libc::fd_set, write_fds: &mut libc::fd_set) -> libc::c_int {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return 0; };
-    unsafe { libc::FD_ZERO(write_fds); libc::FD_ZERO(read_fds) };
-
+    // The caller owns initialization (FD_ZERO); descriptors already set in the
+    // caller's sets must remain set (ares_fds.3).
     let fds = channeldata.all_poll_fds();
     for (fd, wants_write) in &fds {
         unsafe { if *wants_write { libc::FD_SET(*fd, write_fds) } else { libc::FD_SET(*fd, read_fds) } };
@@ -541,11 +548,11 @@ pub unsafe extern "C" fn ares_set_servers(channel: Channel, head: *const ares_ad
         match node.family {
             libc::AF_INET => {
                 let oct4 = unsafe { node.addr.addr4 }.s_addr.to_ne_bytes();
-                servers.push(ServerSpec { ip: IpAddr::from(oct4), udp_port: None, tcp_port: None });
+                servers.push(ServerSpec { ip: IpAddr::from(oct4), udp_port: None, tcp_port: None, scope_id: 0 });
             }
             libc::AF_INET6 => {
                 let oct16 = unsafe { node.addr.addr6._S6_un._S6_u8 };
-                servers.push(ServerSpec { ip: IpAddr::from(oct16), udp_port: None, tcp_port: None });
+                servers.push(ServerSpec { ip: IpAddr::from(oct16), udp_port: None, tcp_port: None, scope_id: 0 });
             }
             _ => {}
         }
@@ -570,11 +577,11 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, head: *const A
         match node.family {
             libc::AF_INET => {
                 let octets = unsafe { node.addr.addr4.s_addr.to_ne_bytes() };
-                servers.push(ServerSpec { ip: IpAddr::from(octets), udp_port, tcp_port });
+                servers.push(ServerSpec { ip: IpAddr::from(octets), udp_port, tcp_port, scope_id: 0 });
             }
             libc::AF_INET6 => {
                 let octets = unsafe { node.addr.addr6._S6_un._S6_u8 };
-                servers.push(ServerSpec { ip: IpAddr::from(octets), udp_port, tcp_port });
+                servers.push(ServerSpec { ip: IpAddr::from(octets), udp_port, tcp_port, scope_id: 0 });
             }
             _ => {}
         }
@@ -598,7 +605,7 @@ pub unsafe extern "C" fn ares_get_servers_ports(channel: *const ChannelData, out
 
 fn get_servers_ports_ptr(channeldata: &ChannelData) -> Option<*mut AresAddrPortNode> {
     let mut data: Vec<AresAddrPortNode> = vec![];
-    for (ip, udp_port, tcp_port) in channeldata.state.borrow().server_list() {
+    for (ip, udp_port, tcp_port, _scope) in channeldata.state.borrow().server_list() {
         let (family, addr) = match ip {
             IpAddr::V4(v4) => {
                 let s_addr = u32::from_ne_bytes(v4.octets());
@@ -652,13 +659,34 @@ fn set_servers_csv_str(channeldata: &ChannelData, s: &str) -> c_int {
         return set_servers_csv_none(channeldata);
     }
     let mut cursor = Cursor::new(s);
-    match servers_csv::parse_from_reader(&mut cursor) {
-        Some(ns) => {
-            channeldata.state.borrow_mut().install_csv_servers(ns);
-            ARES_SUCCESS
+    let Some(parsed) = servers_csv::parse_from_reader_scoped(&mut cursor) else {
+        return ARES_EBADSTR;
+    };
+    // Resolve `%<iface>` through the channel's current socket factory. An
+    // entry whose interface cannot be resolved (unknown name, or a custom
+    // table without an if-name adapter) is skipped, keeping the rest of the
+    // list, matching c-ares.
+    let mut specs = Vec::with_capacity(parsed.len());
+    {
+        let factory = channeldata.socket_factory.borrow();
+        for entry in parsed {
+            let scope_id = match entry.iface.as_deref() {
+                Some(iface) => match factory.if_nametoindex(iface) {
+                    Some(index) => index,
+                    None => continue,
+                },
+                None => 0,
+            };
+            specs.push(ServerSpec {
+                ip: entry.ip,
+                udp_port: entry.port,
+                tcp_port: entry.port,
+                scope_id,
+            });
         }
-        None => ARES_EBADSTR,
     }
+    channeldata.state.borrow_mut().install_csv_servers(specs);
+    ARES_SUCCESS
 }
 
 #[no_mangle]
@@ -755,7 +783,7 @@ pub unsafe extern "C" fn ares_get_servers(channel: *const ChannelData, out: *mut
 /// the caller can free it with ares_free_data, the c-ares contract).
 fn get_servers_ptr(channeldata: &ChannelData) -> Option<*mut ares_addr_node> {
     let mut data: Vec<ares_addr_node> = vec![];
-    for (ip, _, _) in channeldata.state.borrow().server_list() {
+    for (ip, _, _, _scope) in channeldata.state.borrow().server_list() {
         let (family, addr) = match ip {
             IpAddr::V4(v4) => {
                 let s_addr = u32::from_ne_bytes(v4.octets());
@@ -776,7 +804,24 @@ fn get_servers_ptr(channeldata: &ChannelData) -> Option<*mut ares_addr_node> {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *mut c_char {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return std::ptr::null_mut(); };
-    let csv = channeldata.state.borrow().servers_csv_string();
+    let servers = channeldata.state.borrow().server_list();
+    // Prefer the adapter-provided interface name for a scoped IPv6 entry, and
+    // fall back to the numeric index when no `aif_indextoname` is available.
+    let factory = channeldata.socket_factory.borrow();
+    let csv = servers
+        .iter()
+        .map(|&(ip, udp_port, _tcp_port, scope)| match ip {
+            IpAddr::V6(_) if scope != 0 => {
+                let scope = factory
+                    .if_indextoname(scope)
+                    .unwrap_or_else(|| scope.to_string());
+                format!("[{}%{}]:{}", ip, scope, udp_port)
+            }
+            IpAddr::V6(_) => format!("[{}]:{}", ip, udp_port),
+            _ => format!("{}:{}", ip, udp_port),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
     unsafe { malloc_cstr(csv.as_bytes()) }
 }
@@ -828,6 +873,8 @@ fn reinit_channel(channeldata: &ChannelData) -> c_int {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_socket_configure_callback(channel: Channel, callback: ares_sock_config_callback, arg: *mut c_void) {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
+    // The event thread owns socket setup; the configure callback cannot be used.
+    if channeldata.event_mode.get() { return; }
     let factory = channeldata.socket_factory.borrow().with_config_cb(callback, arg);
     channeldata.apply_socket_factory(factory);
 }
@@ -839,8 +886,9 @@ pub unsafe extern "C" fn ares_set_server_state_callback(channel: Channel, callba
     channeldata.set_server_state_callback(callback, arg);
 }
 
-/// In-flight executor tasks. One host lookup is one task even when it races
-/// A/AAAA internally (upstream counts per-family query objects — a minor gap).
+/// In-flight DNS queries. Every reserved transaction id is one query, so an
+/// AF_UNSPEC `ares_getaddrinfo` racing A and AAAA reports two (upstream counts
+/// per-family query objects).
 ///
 /// # Safety
 /// `channel` must be null or a valid channel handle returned by
@@ -851,8 +899,9 @@ pub unsafe extern "C" fn ares_queue_active_queries(channel: *const ChannelData) 
     channeldata.active_queries()
 }
 
-/// Store the pending-write callback (copied by ares_dup) but never fire it:
-/// writes are awaited inline, so this is upstream API parity only.
+/// Store the pending-write callback and push it into the socket factory so
+/// sockets created later fire it before queueing TCP bytes. `ares_process_pending_write`
+/// stays a no-op because writes are completed inline in this architecture.
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_set_pending_write_cb(
@@ -861,8 +910,11 @@ pub unsafe extern "C" fn ares_set_pending_write_cb(
     arg: *mut c_void,
 ) {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
+    // The event thread injects its own write completions; this hook is unused.
+    if channeldata.event_mode.get() { return; }
     channeldata.pending_write_cb.set(callback);
     channeldata.pending_write_arg.set(arg);
+    channeldata.refresh_socket_config();
 }
 
 /// Everything is written inline, so there is nothing to drain; accepting NULL

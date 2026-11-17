@@ -32,10 +32,11 @@ impl AsyncClient {
         let mut servers_updated = false;
         if self.optmask & ARES_OPT_SERVERS == 0
             && !sys.nameservers.is_empty()
-            && sys.nameservers != self.config.nameservers
+            && (sys.nameservers != self.config.nameservers || sys.scopes != self.config.scopes)
         {
             self.config.nameservers = sys.nameservers;
             self.config.tcp_ports = sys.tcp_ports;
+            self.config.scopes = sys.scopes;
             servers_updated = true;
         }
         if self.optmask & ARES_OPT_DOMAINS == 0 && !sys.search.is_empty() {
@@ -65,7 +66,9 @@ impl AsyncClient {
                 self.sortlist = parse_sortlist(sortlist).unwrap_or_default();
             }
         }
-        if sys.options.use_vc {
+        // System `use-vc` must not override caller-supplied flags
+        // (ares_reinit.3: configuration never overrides explicit options).
+        if self.optmask & ARES_OPT_FLAGS == 0 && sys.options.use_vc {
             self.flags |= ARES_FLAG_USEVC;
             self.config.options.use_vc = true;
         }
@@ -89,6 +92,7 @@ impl AsyncClient {
         if self.config.nameservers.is_empty() && self.flags & ARES_FLAG_NO_DFLT_SVR == 0 {
             self.config.nameservers.push((IpAddr::V4(Ipv4Addr::LOCALHOST), None));
             self.config.tcp_ports.push(None);
+            self.config.scopes.push(0);
         }
         // The end of every init path: options may have changed the servers or
         // their default ports.
@@ -106,10 +110,12 @@ impl AsyncClient {
         let mut servers: Vec<ServerId> = Vec::with_capacity(self.config.nameservers.len());
         for (i, &(addr, udp_port)) in self.config.nameservers.iter().enumerate() {
             let tcp_port = self.config.tcp_ports.get(i).copied().flatten();
+            let scope_id = self.config.scopes.get(i).copied().unwrap_or(0);
             let id = ServerId {
                 addr,
                 udp_port: udp_port.unwrap_or(self.default_udp_port),
                 tcp_port: tcp_port.unwrap_or(self.default_tcp_port),
+                scope_id,
             };
             if !servers.contains(&id) {
                 servers.push(id);
@@ -165,8 +171,11 @@ impl AsyncClient {
             hosts_path: String::new(),
             udp_max_queries: 0,
             servers: Rc::new(Vec::new()),
-            server_failover_retry_chance: 0,
-            server_failover_retry_delay: 0,
+            // Documented defaults (ares_init_options(3)): a 1-in-10 retry
+            // chance with a 5 s minimum delay. They are applied here rather
+            // than in `apply_defaults` so they never show up in the optmask.
+            server_failover_retry_chance: 10,
+            server_failover_retry_delay: 5000,
             pending_drops: RefCell::new(Vec::new()),
         };
         // Run order matters: 0x20 drops case-mismatched replies before EDNS
@@ -236,9 +245,11 @@ impl AsyncClient {
         if optmask & ARES_OPT_SERVERS != 0 && !o.servers.is_empty() {
             self.config.nameservers.clear();
             self.config.tcp_ports.clear();
+            self.config.scopes.clear();
             for v4 in &o.servers {
                 self.config.nameservers.push((IpAddr::V4(*v4), None));
                 self.config.tcp_ports.push(None);
+                self.config.scopes.push(0);
             }
         }
         if optmask & ARES_OPT_UDP_PORT != 0 {
@@ -248,16 +259,35 @@ impl AsyncClient {
             self.default_tcp_port = o.tcp_port;
         }
         if optmask & ARES_OPT_TIMEOUTMS != 0 {
-            self.config.options.timeout_ms = std::cmp::max(1, o.timeout as u32);
-        }
-        if optmask & ARES_OPT_TIMEOUT != 0 {
-            self.config.options.timeout_ms = o.timeout as u32 * 1000;
+            // Upstream: non-positive means "use the default" and drops the bit.
+            if o.timeout <= 0 {
+                stored_mask &= !ARES_OPT_TIMEOUTMS;
+            } else {
+                self.config.options.timeout_ms = o.timeout as u32;
+            }
+        } else if optmask & ARES_OPT_TIMEOUT != 0 {
+            // ARES_OPT_TIMEOUT is converted to ARES_OPT_TIMEOUTMS; a
+            // non-positive value drops the option entirely.
+            stored_mask &= !ARES_OPT_TIMEOUT;
+            if o.timeout > 0 {
+                let ms = (o.timeout as u64).saturating_mul(1000);
+                self.config.options.timeout_ms = ms.min(u32::MAX as u64) as u32;
+                stored_mask |= ARES_OPT_TIMEOUTMS;
+            }
         }
         if optmask & ARES_OPT_TRIES != 0 {
-            self.config.options.attempts = o.tries as u32;
+            if o.tries <= 0 {
+                stored_mask &= !ARES_OPT_TRIES;
+            } else {
+                self.config.options.attempts = o.tries as u32;
+            }
         }
         if optmask & ARES_OPT_NDOTS != 0 {
-            self.config.options.ndots = o.ndots as u32;
+            if o.ndots < 0 {
+                stored_mask &= !ARES_OPT_NDOTS;
+            } else {
+                self.config.options.ndots = o.ndots as u32;
+            }
         }
         if optmask & ARES_OPT_EDNSPSZ != 0 {
             if o.ednspsz <= 0 {
@@ -275,6 +305,7 @@ impl AsyncClient {
             if (o.flags & ARES_FLAG_PRIMARY) != 0 {
                 self.config.nameservers.truncate(1);
                 self.config.tcp_ports.truncate(1);
+                self.config.scopes.truncate(1);
             }
         }
         if optmask & ARES_OPT_DOMAINS != 0 {
@@ -289,11 +320,18 @@ impl AsyncClient {
             self.config.options.rotate = true;
         }
         if optmask & ARES_OPT_MAXTIMEOUTMS != 0 {
-            self.maxtimeout = o.maxtimeout;
+            if o.maxtimeout <= 0 {
+                stored_mask &= !ARES_OPT_MAXTIMEOUTMS;
+            } else {
+                self.maxtimeout = o.maxtimeout;
+            }
         }
         if optmask & ARES_OPT_LOOKUPS != 0 {
             if let Some(lookups) = o.lookups {
                 self.lookups = lookups;
+            } else {
+                // A NULL pointer is "not supplied"; upstream drops the bit.
+                stored_mask &= !ARES_OPT_LOOKUPS;
             }
         }
         if optmask & ARES_OPT_SORTLIST != 0 {
@@ -308,11 +346,15 @@ impl AsyncClient {
         if optmask & ARES_OPT_RESOLVCONF != 0 {
             if let Some(path) = o.resolvconf_path {
                 self.resolvconf_path = path;
+            } else {
+                stored_mask &= !ARES_OPT_RESOLVCONF;
             }
         }
         if optmask & ARES_OPT_HOSTS_FILE != 0 {
             if let Some(path) = o.hosts_path {
                 self.hosts_path = path;
+            } else {
+                stored_mask &= !ARES_OPT_HOSTS_FILE;
             }
         }
         if optmask & ARES_OPT_QUERY_CACHE != 0 {
@@ -348,74 +390,57 @@ impl AsyncClient {
         self.apply_defaults();
     }
 
-    /// The pure inverse of the cascade: read the channel back into option fields.
+    /// The pure inverse of the cascade: read the channel back into option
+    /// fields. Every reported value is gated on the channel's stored optmask
+    /// so inherited/system defaults are not mistaken for explicit options.
     pub fn saved_options(&self) -> SavedOptions {
         let config = &self.config;
         let opts = &config.options;
-
-        let mut base_mask = ARES_OPT_FLAGS
-            | ARES_OPT_TIMEOUTMS
-            | ARES_OPT_TRIES
-            | ARES_OPT_NDOTS
-            | ARES_OPT_UDP_PORT
-            | ARES_OPT_TCP_PORT;
-        base_mask |= if opts.rotate { ARES_OPT_ROTATE } else { ARES_OPT_NOROTATE };
-        // Preserve explicit sortlist state (including an explicit empty list);
-        // a sortlist merely inherited from resolv.conf is not reported.
-        if self.optmask & ARES_OPT_SORTLIST != 0 {
-            base_mask |= ARES_OPT_SORTLIST;
-        }
+        let mask = self.optmask;
 
         // servers (IPv4 only in ares_options)
-        let v4_servers: Vec<Ipv4Addr> = config
-            .nameservers
-            .iter()
-            .filter_map(|(ip, _)| match ip {
-                IpAddr::V4(v4) => Some(*v4),
-                _ => None,
-            })
-            .collect();
+        let v4_servers: Vec<Ipv4Addr> = if mask & ARES_OPT_SERVERS != 0 {
+            config
+                .nameservers
+                .iter()
+                .filter_map(|(ip, _)| match ip {
+                    IpAddr::V4(v4) => Some(*v4),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        let domains: Vec<CString> = config
-            .search
-            .iter()
-            .map(|domain| CString::new(domain.as_str()).unwrap_or_default())
-            .collect();
+        let domains: Vec<CString> = if mask & ARES_OPT_DOMAINS != 0 {
+            config
+                .search
+                .iter()
+                .map(|domain| CString::new(domain.as_str()).unwrap_or_default())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        let maxtimeout = (self.maxtimeout != 0).then_some(self.maxtimeout);
-        if maxtimeout.is_some() {
-            base_mask |= ARES_OPT_MAXTIMEOUTMS;
-        }
-        let lookups = (!self.lookups.is_empty())
+        let sortlist = if mask & ARES_OPT_SORTLIST != 0 {
+            self.sortlist.clone()
+        } else {
+            Vec::new()
+        };
+        let maxtimeout = (mask & ARES_OPT_MAXTIMEOUTMS != 0).then_some(self.maxtimeout);
+        let lookups = (mask & ARES_OPT_LOOKUPS != 0)
             .then(|| CString::new(self.lookups.as_str()).unwrap_or_default());
-        if lookups.is_some() {
-            base_mask |= ARES_OPT_LOOKUPS;
-        }
-        let resolvconf_path = (!self.resolvconf_path.is_empty())
+        let resolvconf_path = (mask & ARES_OPT_RESOLVCONF != 0)
             .then(|| CString::new(self.resolvconf_path.as_str()).unwrap_or_default());
-        if resolvconf_path.is_some() {
-            base_mask |= ARES_OPT_RESOLVCONF;
-        }
-        let hosts_path = (!self.hosts_path.is_empty())
+        let hosts_path = (mask & ARES_OPT_HOSTS_FILE != 0)
             .then(|| CString::new(self.hosts_path.as_str()).unwrap_or_default());
-        if hosts_path.is_some() {
-            base_mask |= ARES_OPT_HOSTS_FILE;
-        }
-
-        if self.optmask & ARES_OPT_UDP_MAX_QUERIES != 0 && self.udp_max_queries > 0 {
-            base_mask |= ARES_OPT_UDP_MAX_QUERIES;
-        }
-        if self.optmask & ARES_OPT_SOCK_SNDBUF != 0 && self.socket_send_buffer_size > 0 {
-            base_mask |= ARES_OPT_SOCK_SNDBUF;
-        }
-        if self.optmask & ARES_OPT_SOCK_RCVBUF != 0 && self.socket_receive_buffer_size > 0 {
-            base_mask |= ARES_OPT_SOCK_RCVBUF;
-        }
-        if self.optmask & ARES_OPT_EDNSPSZ != 0 && self.ednspsz > 0 {
-            base_mask |= ARES_OPT_EDNSPSZ;
-        }
+        let qcache_max_ttl =
+            (mask & ARES_OPT_QUERY_CACHE != 0).then(|| self.shared.cache.borrow().max_ttl());
+        let server_failover = (mask & ARES_OPT_SERVER_FAILOVER != 0)
+            .then_some((self.server_failover_retry_chance, self.server_failover_retry_delay));
 
         SavedOptions {
+            mask,
             flags: self.flags,
             ednspsz: self.ednspsz,
             timeout: opts.timeout_ms as i32,
@@ -425,7 +450,7 @@ impl AsyncClient {
             tcp_port: self.default_tcp_port,
             v4_servers,
             domains,
-            sortlist: self.sortlist.clone(),
+            sortlist,
             maxtimeout,
             lookups,
             resolvconf_path,
@@ -433,7 +458,8 @@ impl AsyncClient {
             udp_max_queries: self.udp_max_queries as i32,
             socket_send_buffer_size: self.socket_send_buffer_size,
             socket_receive_buffer_size: self.socket_receive_buffer_size,
-            base_mask,
+            qcache_max_ttl,
+            server_failover,
         }
     }
 
@@ -441,9 +467,11 @@ impl AsyncClient {
     pub fn set_servers(&mut self, servers: Vec<ServerSpec>) {
         self.config.nameservers.clear();
         self.config.tcp_ports.clear();
+        self.config.scopes.clear();
         for server in servers {
             self.config.nameservers.push((server.ip, server.udp_port));
             self.config.tcp_ports.push(server.tcp_port);
+            self.config.scopes.push(server.scope_id);
         }
         self.optmask |= ARES_OPT_SERVERS;
         self.servers_changed();
@@ -453,49 +481,37 @@ impl AsyncClient {
     pub fn clear_servers(&mut self) {
         self.config.nameservers.clear();
         self.config.tcp_ports.clear();
+        self.config.scopes.clear();
         self.optmask |= ARES_OPT_SERVERS;
         self.servers_changed();
     }
 
-    /// Install a parsed CSV server list (ares_set_servers_ports_csv). A CSV
-    /// `ip:port` sets both transports; the ports variant can still override TCP.
-    pub fn install_csv_servers(&mut self, ns: Vec<(IpAddr, Option<u16>)>) {
-        self.config.tcp_ports = ns.iter().map(|&(_, port)| port).collect();
-        self.config.nameservers = ns;
+    /// Install a parsed CSV server list (ares_set_servers_ports_csv). The CSV
+    /// parser sets the same port on both transports; `scope_id` comes from
+    /// resolving any `%iface` suffix through the channel's if-index adapter.
+    pub fn install_csv_servers(&mut self, ns: Vec<ServerSpec>) {
+        self.config.nameservers = ns.iter().map(|s| (s.ip, s.udp_port)).collect();
+        self.config.tcp_ports = ns.iter().map(|s| s.tcp_port).collect();
+        self.config.scopes = ns.iter().map(|s| s.scope_id).collect();
         self.optmask |= ARES_OPT_SERVERS;
         self.servers_changed();
     }
 
-    /// The configured servers with per-entry defaults, in order.
-    pub fn server_list(&self) -> Vec<(IpAddr, u16, u16)> {
+    /// The configured servers with per-entry defaults and IPv6 scope ids, in order.
+    pub fn server_list(&self) -> Vec<(IpAddr, u16, u16, u32)> {
         self.config
             .nameservers
             .iter()
-            .map(|(ip, port)| {
+            .enumerate()
+            .map(|(i, (ip, port))| {
                 (
                     *ip,
                     port.unwrap_or(self.default_udp_port),
                     port.unwrap_or(self.default_tcp_port),
+                    self.config.scopes.get(i).copied().unwrap_or(0),
                 )
             })
             .collect()
-    }
-
-    /// The `ip:port` CSV report behind ares_get_servers_csv (IPv6 bracketed).
-    pub fn servers_csv_string(&self) -> String {
-        let default_port = self.default_udp_port;
-        self.config
-            .nameservers
-            .iter()
-            .map(|(ip, port_opt)| {
-                let port = port_opt.unwrap_or(default_port);
-                match ip {
-                    IpAddr::V6(_) => format!("[{}]:{}", ip, port),
-                    _ => format!("{}:{}", ip, port),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",")
     }
 }
 
@@ -511,6 +527,8 @@ pub(crate) struct ServerSpec {
     pub ip: IpAddr,
     pub udp_port: Option<u16>,
     pub tcp_port: Option<u16>,
+    /// IPv6 scope id for link-local addresses; 0 when unscoped.
+    pub scope_id: u32,
 }
 
 /// 0 and 53 mean "no override".
@@ -547,9 +565,11 @@ pub(crate) struct DecodedOptions {
     pub failover_retry_delay: u64,
 }
 
-/// Everything ares_save_options reports. `base_mask` carries all bits except
-/// SERVERS/DOMAINS, which the shim adds after the malloc'd copies land.
+/// Everything ares_save_options reports. `mask` is the channel's stored
+/// optmask; the shim only writes a field when its bit is present, and the
+/// `Option` fields are populated only for explicitly-configured options.
 pub(crate) struct SavedOptions {
+    pub mask: i32,
     pub flags: i32,
     pub ednspsz: i32,
     pub timeout: i32,
@@ -567,7 +587,9 @@ pub(crate) struct SavedOptions {
     pub udp_max_queries: i32,
     pub socket_send_buffer_size: i32,
     pub socket_receive_buffer_size: i32,
-    pub base_mask: i32,
+    pub qcache_max_ttl: Option<u32>,
+    /// `(retry_chance, retry_delay_ms)` when `ARES_OPT_SERVER_FAILOVER` is set.
+    pub server_failover: Option<(u16, u64)>,
 }
 
 #[cfg(test)]
@@ -604,8 +626,31 @@ mod tests {
         assert!(client.config.nameservers.is_empty());
     }
 
+    /// Upstream `init_by_defaults`: without `ARES_OPT_SERVER_FAILOVER` the
+    /// channel gets a 10% retry chance and a 5 s minimum delay, but the default
+    /// is not recorded in the optmask (so `ares_save_options` must not report
+    /// it as explicitly configured).
+    #[test]
+    fn defaults_set_server_failover_without_adding_optmask_bit() {
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        client.apply_defaults();
+        assert_eq!(
+            client.server_failover_retry_chance, 10,
+            "default server failover retry chance"
+        );
+        assert_eq!(
+            client.server_failover_retry_delay, 5000,
+            "default server failover retry delay (ms)"
+        );
+        assert_eq!(
+            client.optmask & ARES_OPT_SERVER_FAILOVER,
+            0,
+            "applying defaults must not add ARES_OPT_SERVER_FAILOVER to the optmask"
+        );
+    }
+
     fn spec(last: u8) -> ServerSpec {
-        ServerSpec { ip: IpAddr::from([10, 0, 0, last]), udp_port: None, tcp_port: None }
+        ServerSpec { ip: IpAddr::from([10, 0, 0, last]), scope_id: 0, udp_port: None, tcp_port: None }
     }
 
     /// The server list is resolved once per change and shared by lookup copies.
@@ -719,6 +764,7 @@ mod reinit_tests {
         client.resolvconf_path = path.to_string_lossy().into_owned();
         client.set_servers(vec![ServerSpec {
             ip: IpAddr::from([8, 8, 4, 4]),
+            scope_id: 0,
             udp_port: None,
             tcp_port: None,
         }]);

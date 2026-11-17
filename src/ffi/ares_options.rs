@@ -164,19 +164,20 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     }
     // Bind a zeroed default so no field is read through a NULL pointer.
     let default_opts;
+    let options_supplied = !options.is_null();
     let options = if options.is_null() {
         default_opts = ares_options::default();
         &default_opts
     } else {
         unsafe { & *options }
     };
-    match init_options_from(optmask, options) {
+    match init_options_from(optmask, options, options_supplied) {
         Ok(channeldata) => {
             let channel = Box::into_raw(Box::new(channeldata));
             let event_mode = unsafe { (*channel).event_mode.get() };
             if event_mode && !crate::ffi::event_thread::start(channel) {
                 drop(unsafe { Box::from_raw(channel) });
-                return crate::ffi::error::ARES_ENOMEM;
+                return crate::ffi::error::ARES_ESERVFAIL;
             }
             unsafe { *out_channel = channel };
             ARES_SUCCESS
@@ -186,7 +187,20 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
 }
 
 /// Decode the C option struct and build the unfinalized channel.
-fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelData, c_int> {
+fn init_options_from(
+    optmask: c_int,
+    options: &ares_options,
+    options_supplied: bool,
+) -> Result<ChannelData, c_int> {
+    // Upstream `ares_init_by_options`: a caller-supplied `ares_options` with no
+    // query-cache bit gets the documented 3600 s default, recorded in the mask.
+    // The plain `ares_init` (NULL options) path does not.
+    let query_cache_default = options_supplied && optmask & ARES_OPT_QUERY_CACHE == 0;
+    let optmask = if query_cache_default {
+        optmask | ARES_OPT_QUERY_CACHE
+    } else {
+        optmask
+    };
     // Upstream rejects the event thread combined with a caller state callback,
     // since the event thread issues those notifications itself.
     if optmask & ARES_OPT_EVENT_THREAD != 0 && optmask & ARES_OPT_SOCK_STATE_CB != 0 {
@@ -213,22 +227,33 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
         ndots: if optmask & ARES_OPT_NDOTS != 0 { options.ndots } else { 0 },
         udp_port: if optmask & ARES_OPT_UDP_PORT != 0 { options.udp_port } else { 0 },
         tcp_port: if optmask & ARES_OPT_TCP_PORT != 0 { options.tcp_port } else { 0 },
-        servers: if optmask & ARES_OPT_SERVERS != 0 && !options.servers.is_null() {
+        servers: if optmask & ARES_OPT_SERVERS != 0
+            && !options.servers.is_null()
+            && options.nservers > 0
+        {
             unsafe { std::slice::from_raw_parts(options.servers, options.nservers as usize) }
                 .iter()
                 .map(|server| Ipv4Addr::from(u32::from_be(server.s_addr)))
                 .collect()
         } else {
+            // Upstream treats `nservers <= 0` as "not supplied".
             Vec::new()
         },
         domains: if optmask & ARES_OPT_DOMAINS != 0 && !options.domains.is_null() {
-            let domains = unsafe { std::slice::from_raw_parts(options.domains, options.ndomains as usize) };
-            Some(
-                domains
-                    .iter()
-                    .map(|&p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-                    .collect(),
-            )
+            if options.ndomains > 0 {
+                let domains =
+                    unsafe { std::slice::from_raw_parts(options.domains, options.ndomains as usize) };
+                Some(
+                    domains
+                        .iter()
+                        .map(|&p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+                        .collect(),
+                )
+            } else {
+                // `ndomains <= 0` is "not supplied"; never build a slice from
+                // a negative or huge length.
+                Some(Vec::new())
+            }
         } else {
             None
         },
@@ -249,7 +274,15 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
             None
         },
         maxtimeout: if optmask & ARES_OPT_MAXTIMEOUTMS != 0 { options.maxtimeout } else { 0 },
-        qcache_max_ttl: if optmask & ARES_OPT_QUERY_CACHE != 0 { options.qcache_max_ttl } else { 0 },
+        qcache_max_ttl: if optmask & ARES_OPT_QUERY_CACHE != 0 {
+            if query_cache_default {
+                3600
+            } else {
+                options.qcache_max_ttl
+            }
+        } else {
+            0
+        },
         ednspsz: if optmask & ARES_OPT_EDNSPSZ != 0 { options.ednspsz } else { 0 },
         udp_max_queries: if optmask & ARES_OPT_UDP_MAX_QUERIES != 0 { options.udp_max_queries } else { 0 },
         socket_send_buffer_size: if optmask & ARES_OPT_SOCK_SNDBUF != 0 { options.socket_send_buffer_size } else { 0 },
@@ -277,6 +310,16 @@ fn init_options_from(optmask: c_int, options: &ares_options) -> Result<ChannelDa
         channeldata.evsys.set(options.evsys);
     }
     channeldata.state.borrow_mut().apply_options(optmask, decoded);
+    // Upstream `init_by_defaults`: with ARES_FLAG_NO_DFLT_SVR and no nameserver
+    // configured there is nothing to resolve with, so initialization fails
+    // rather than handing back a channel that can only return ENOSERVER.
+    {
+        let state = channeldata.state.borrow();
+        if state.flags & ARES_FLAG_NO_DFLT_SVR != 0 && state.config.nameservers.is_empty() {
+            drop(state);
+            return Err(ARES_ENOSERVER);
+        }
+    }
     install_socket_options(&channeldata, optmask, options);
     Ok(channeldata)
 }
@@ -290,11 +333,15 @@ fn install_socket_options(channeldata: &ChannelData, optmask: c_int, options: &a
     channeldata.refresh_socket_config();
 }
 
-/// Report the stored socket state callback.
-fn save_socket_options(channeldata: &ChannelData, out: &mut ares_options, mask: &mut c_int) {
+/// Report the stored socket state callback. `out` is a raw pointer because the
+/// caller's struct may be an older, smaller `ares_options`.
+fn save_socket_options(channeldata: &ChannelData, out: *mut ares_options, mask: &mut c_int) {
     if channeldata.state.borrow().optmask & ARES_OPT_SOCK_STATE_CB != 0 {
-        out.sock_state_cb = channeldata.sock_state_cb.get();
-        out.sock_state_cb_data = channeldata.sock_state_cb_data.get();
+        unsafe {
+            std::ptr::addr_of_mut!((*out).sock_state_cb).write(channeldata.sock_state_cb.get());
+            std::ptr::addr_of_mut!((*out).sock_state_cb_data)
+                .write(channeldata.sock_state_cb_data.get());
+        }
         *mask |= ARES_OPT_SOCK_STATE_CB;
     }
 }
@@ -345,79 +392,126 @@ fn save_sortlist(entries: &[crate::core::sortlist::SortlistEntry]) -> Option<(*m
     Some((arr, count as c_int))
 }
 
+/// Write one scalar field of the caller's (possibly older/smaller)
+/// `ares_options` only when the channel's optmask selected it. Using
+/// `addr_of_mut!` avoids forming a reference to the full current struct.
+macro_rules! save_opt_field {
+    ($out:expr, $mask:expr, $bit:expr, $field:ident, $value:expr) => {
+        if $mask & $bit != 0 {
+            unsafe { std::ptr::addr_of_mut!((*$out).$field).write($value) };
+        }
+    };
+}
+
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options: *mut ares_options, optmask: *mut c_int) -> c_int {
     if options.is_null() || optmask.is_null() || channel.is_null() { return ARES_ENODATA; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
     let saved = channeldata.state.borrow().saved_options();
+    let out = options;
+    let mut mask = saved.mask;
 
-    let out = unsafe { &mut *options };
-    *out = ares_options::default();
-    let mut mask = saved.base_mask;
+    // `ares_destroy_options` has no optmask argument, so every pointer field it
+    // may free must start out NULL. Do NOT zero the whole struct: the caller
+    // may have compiled against an older, smaller `ares_options`.
+    unsafe {
+        std::ptr::addr_of_mut!((*out).servers).write(std::ptr::null_mut());
+        std::ptr::addr_of_mut!((*out).domains).write(std::ptr::null_mut());
+        std::ptr::addr_of_mut!((*out).sortlist).write(std::ptr::null_mut());
+        std::ptr::addr_of_mut!((*out).lookups).write(std::ptr::null_mut());
+        std::ptr::addr_of_mut!((*out).resolvconf_path).write(std::ptr::null_mut());
+        std::ptr::addr_of_mut!((*out).hosts_path).write(std::ptr::null_mut());
+    }
 
     save_flags_and_ednspsz(out, saved.flags, saved.ednspsz, mask);
-    out.timeout = saved.timeout;
-    out.tries = saved.tries;
-    out.ndots = saved.ndots;
-    out.udp_port = saved.udp_port;
-    out.tcp_port = saved.tcp_port;
-    if mask & ARES_OPT_UDP_MAX_QUERIES != 0 {
-        out.udp_max_queries = saved.udp_max_queries;
+    save_opt_field!(out, mask, ARES_OPT_TIMEOUTMS, timeout, saved.timeout);
+    save_opt_field!(out, mask, ARES_OPT_TRIES, tries, saved.tries);
+    save_opt_field!(out, mask, ARES_OPT_NDOTS, ndots, saved.ndots);
+    save_opt_field!(out, mask, ARES_OPT_UDP_PORT, udp_port, saved.udp_port);
+    save_opt_field!(out, mask, ARES_OPT_TCP_PORT, tcp_port, saved.tcp_port);
+    save_opt_field!(out, mask, ARES_OPT_UDP_MAX_QUERIES, udp_max_queries, saved.udp_max_queries);
+    if mask & ARES_OPT_SOCK_SNDBUF != 0 && saved.socket_send_buffer_size > 0 {
+        unsafe {
+            std::ptr::addr_of_mut!((*out).socket_send_buffer_size)
+                .write(saved.socket_send_buffer_size)
+        };
     }
-    if mask & ARES_OPT_SOCK_SNDBUF != 0 {
-        out.socket_send_buffer_size = saved.socket_send_buffer_size;
-    }
-    if mask & ARES_OPT_SOCK_RCVBUF != 0 {
-        out.socket_receive_buffer_size = saved.socket_receive_buffer_size;
+    if mask & ARES_OPT_SOCK_RCVBUF != 0 && saved.socket_receive_buffer_size > 0 {
+        unsafe {
+            std::ptr::addr_of_mut!((*out).socket_receive_buffer_size)
+                .write(saved.socket_receive_buffer_size)
+        };
     }
 
-    // Servers/domains are malloc'd for the caller; their mask bits are only
-    // set when the allocation succeeds.
-    if !saved.v4_servers.is_empty() {
+    // Servers/domains are malloc'd for the caller. An allocation failure is
+    // ARES_ENOMEM (upstream behavior); fields already written remain freeable.
+    if mask & ARES_OPT_SERVERS != 0 {
         let count = saved.v4_servers.len();
-        let ptr = unsafe { libc::malloc(count * std::mem::size_of::<in_addr>()) as *mut in_addr };
-        if !ptr.is_null() {
+        if count > 0 {
+            let ptr = unsafe { libc::malloc(count * std::mem::size_of::<in_addr>()) as *mut in_addr };
+            if ptr.is_null() {
+                return ARES_ENOMEM;
+            }
             for (i, v4) in saved.v4_servers.iter().enumerate() {
                 unsafe { *ptr.add(i) = in_addr { s_addr: u32::from(*v4).to_be() } };
             }
-            out.servers = ptr;
-            out.nservers = count as c_int;
-            mask |= ARES_OPT_SERVERS;
+            unsafe {
+                std::ptr::addr_of_mut!((*out).servers).write(ptr);
+                std::ptr::addr_of_mut!((*out).nservers).write(count as c_int);
+            }
+        } else {
+            unsafe { std::ptr::addr_of_mut!((*out).nservers).write(0) };
         }
     }
-    if !saved.domains.is_empty() {
+    if mask & ARES_OPT_DOMAINS != 0 {
         let count = saved.domains.len();
-        let arr = unsafe { libc::malloc(count * std::mem::size_of::<*mut c_char>()) as *mut *mut c_char };
-        if !arr.is_null() {
+        if count > 0 {
+            let arr = unsafe { libc::malloc(count * std::mem::size_of::<*mut c_char>()) as *mut *mut c_char };
+            if arr.is_null() {
+                return ARES_ENOMEM;
+            }
             for (i, cstr) in saved.domains.into_iter().enumerate() {
                 unsafe { *arr.add(i) = cstr.into_raw() };
             }
-            out.domains = arr;
-            out.ndomains = count as c_int;
-            mask |= ARES_OPT_DOMAINS;
+            unsafe {
+                std::ptr::addr_of_mut!((*out).domains).write(arr);
+                std::ptr::addr_of_mut!((*out).ndomains).write(count as c_int);
+            }
+        } else {
+            unsafe { std::ptr::addr_of_mut!((*out).ndomains).write(0) };
         }
     }
-    if mask & ARES_OPT_SORTLIST != 0 {
-        mask |= save_sortlist_into(out, &saved.sortlist);
+    if mask & ARES_OPT_SORTLIST != 0 && !save_sortlist_into(out, &saved.sortlist) {
+        return ARES_ENOMEM;
     }
 
     if let Some(maxtimeout) = saved.maxtimeout {
-        out.maxtimeout = maxtimeout;
+        unsafe { std::ptr::addr_of_mut!((*out).maxtimeout).write(maxtimeout) };
     }
     if let Some(lookups) = saved.lookups {
-        out.lookups = lookups.into_raw();
+        unsafe { std::ptr::addr_of_mut!((*out).lookups).write(lookups.into_raw()) };
     }
     if let Some(path) = saved.resolvconf_path {
-        out.resolvconf_path = path.into_raw();
+        unsafe { std::ptr::addr_of_mut!((*out).resolvconf_path).write(path.into_raw()) };
     }
     if let Some(path) = saved.hosts_path {
-        out.hosts_path = path.into_raw();
+        unsafe { std::ptr::addr_of_mut!((*out).hosts_path).write(path.into_raw()) };
+    }
+    if let Some(ttl) = saved.qcache_max_ttl {
+        unsafe { std::ptr::addr_of_mut!((*out).qcache_max_ttl).write(ttl) };
+    }
+    if let Some((chance, delay)) = saved.server_failover {
+        unsafe {
+            std::ptr::addr_of_mut!((*out).server_failover_opts.retry_chance).write(chance);
+            std::ptr::addr_of_mut!((*out).server_failover_opts.retry_delay)
+                .write(delay as libc::size_t);
+        }
     }
     save_socket_options(channeldata, out, &mut mask);
     if channeldata.event_mode.get() {
         mask |= ARES_OPT_EVENT_THREAD;
-        out.evsys = channeldata.evsys.get();
+        unsafe { std::ptr::addr_of_mut!((*out).evsys).write(channeldata.evsys.get()) };
     }
 
     unsafe { *optmask = mask };
@@ -425,11 +519,9 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
 }
 
 /// Copy the flags word and optional EDNS payload size into a saved options struct.
-fn save_flags_and_ednspsz(out: &mut ares_options, flags: c_int, ednspsz: c_int, mask: c_int) {
-    out.flags = flags;
-    if mask & ARES_OPT_EDNSPSZ != 0 {
-        out.ednspsz = ednspsz;
-    }
+fn save_flags_and_ednspsz(out: *mut ares_options, flags: c_int, ednspsz: c_int, mask: c_int) {
+    save_opt_field!(out, mask, ARES_OPT_FLAGS, flags, flags);
+    save_opt_field!(out, mask, ARES_OPT_EDNSPSZ, ednspsz, ednspsz);
 }
 
 fn free_sortlist(ptr: *mut apattern) {
@@ -438,20 +530,25 @@ fn free_sortlist(ptr: *mut apattern) {
     }
 }
 
-/// Fill `out.sortlist`/`out.nsort`; returns the optmask contribution.
+/// Fill `out.sortlist`/`out.nsort`. Returns `false` only when the allocation
+/// failed; the mask bit is provided by the caller.
 fn save_sortlist_into(
-    out: &mut ares_options,
+    out: *mut ares_options,
     entries: &[crate::core::sortlist::SortlistEntry],
-) -> c_int {
+) -> bool {
     if entries.is_empty() {
-        return 0;
+        // An explicit empty sortlist is written as NULL/0.
+        unsafe { std::ptr::addr_of_mut!((*out).nsort).write(0) };
+        return true;
     }
     let Some((arr, count)) = save_sortlist(entries) else {
-        return 0;
+        return false;
     };
-    out.sortlist = arr;
-    out.nsort = count;
-    ARES_OPT_SORTLIST
+    unsafe {
+        std::ptr::addr_of_mut!((*out).sortlist).write(arr);
+        std::ptr::addr_of_mut!((*out).nsort).write(count);
+    }
+    true
 }
 
 /// Free and clear a saved sortlist on an options struct.

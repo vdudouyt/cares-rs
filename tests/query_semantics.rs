@@ -892,7 +892,7 @@ fn hostaliases_alias_suppresses_search_domains() {
 }
 
 #[test]
-fn no_dflt_svr_leaves_no_servers_but_default_is_loopback() {
+fn empty_resolvconf_still_defaults_to_loopback() {
     let _serial = serial();
     let empty = TempFile::new("");
     let path = empty.cstring();
@@ -907,26 +907,32 @@ fn no_dflt_svr_leaves_no_servers_but_default_is_loopback() {
         let csv = get_servers_csv(channel);
         assert_eq!(csv, "127.0.0.1:53");
         ares_destroy(channel);
+    }
+}
 
+#[test]
+fn no_dflt_svr_with_empty_resolvconf_fails_init() {
+    let _serial = serial();
+    let empty = TempFile::new("");
+    let path = empty.cstring();
+
+    unsafe {
         let mut opts = base_options(ARES_FLAG_NO_DFLT_SVR);
         opts.resolvconf_path = path.as_ptr() as *mut std::ffi::c_char;
-        let channel = init_channels(
+        let mut channel: Channel = ptr::null_mut();
+        let rc = ares_init_options(
+            &mut channel,
             &opts,
             ARES_OPT_FLAGS | ARES_OPT_TIMEOUTMS | ARES_OPT_TRIES | ARES_OPT_RESOLVCONF,
         );
-        let name = CString::new("no-servers.example").unwrap();
-        let mut result = RawResult::default();
-        ares_query(
-            channel,
-            name.as_ptr(),
-            c_int::from(ARES_CLASS_IN),
-            c_int::from(ARES_REC_TYPE_A),
-            Some(raw_cb),
-            &mut result as *mut _ as *mut c_void,
+        assert_eq!(
+            rc, ARES_ENOSERVER,
+            "ARES_FLAG_NO_DFLT_SVR with no configured nameserver must fail at init"
         );
-        assert!(result.done, "no-server query must fail synchronously");
-        assert_eq!(result.status, ARES_ENOSERVER);
-        ares_destroy(channel);
+        assert!(
+            channel.is_null(),
+            "a failed initialization must leave the channel NULL"
+        );
     }
 }
 

@@ -2,8 +2,21 @@ use std::io::Read;
 use std::net::IpAddr;
 use crate::core::sysconfig::parse_ns_addr;
 
+/// One parsed CSV server entry. `iface` is the optional `%<interface>` scope
+/// specifier for a link-local IPv6 address (c-ares resolves it to a scope id
+/// through the channel's `aif_nametoindex` adapter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedServer {
+    pub ip: IpAddr,
+    pub port: Option<u16>,
+    pub iface: Option<String>,
+}
+
 /// Parse a comma/newline/space-separated server list; `[IPv6]:port` and bare
 /// addresses are accepted, and a missing port defaults to 53.
+// Kept for callers that do not need scopes; the ffi CSV path uses the
+// scope-aware variant below.
+#[allow(dead_code)]
 pub fn parse_from_reader<R: Read>(mut r: R) -> Option<Vec<(IpAddr, Option<u16>)>> {
     let mut buf = Vec::new();
     r.read_to_end(&mut buf).ok()?;
@@ -11,6 +24,7 @@ pub fn parse_from_reader<R: Read>(mut r: R) -> Option<Vec<(IpAddr, Option<u16>)>
     parse_servers_str(&s)
 }
 
+#[allow(dead_code)]
 pub fn parse_servers_str(s: &str) -> Option<Vec<(IpAddr, Option<u16>)>> {
     let mut out = Vec::new();
 
@@ -24,6 +38,56 @@ pub fn parse_servers_str(s: &str) -> Option<Vec<(IpAddr, Option<u16>)>> {
     }
 
     Some(out)
+}
+
+/// Scope-aware variant of [`parse_from_reader`]: preserves `%<interface>`
+/// suffixes instead of skipping those entries.
+pub fn parse_from_reader_scoped<R: Read>(mut r: R) -> Option<Vec<ParsedServer>> {
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).ok()?;
+    let s = String::from_utf8(buf).ok()?;
+    parse_servers_scoped_str(&s)
+}
+
+/// Scope-aware variant of [`parse_servers_str`]. Accepts `ip[:port][%iface]`,
+/// `[ipv6]:port%iface` and the natural `[ipv6%iface]:port` spelling.
+pub fn parse_servers_scoped_str(s: &str) -> Option<Vec<ParsedServer>> {
+    let mut out = Vec::new();
+
+    for item in s.split([',', '\n', ' ']).map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        out.push(parse_scoped_server(item)?);
+    }
+
+    Some(out)
+}
+
+/// Split a `%<iface>` suffix off one entry, returning the address/port text
+/// and the interface name. `[fe80::1%lo]:5353` keeps the scope inside the
+/// brackets while `[fe80::1]:5353%lo` and `fe80::1%lo` carry it at the end.
+fn parse_scoped_server(item: &str) -> Option<ParsedServer> {
+    let (addr_text, iface) = match item.find('%') {
+        None => (item.to_string(), None),
+        Some(pct) => {
+            if let Some(close) = item.find(']') {
+                if item.starts_with('[') && pct < close {
+                    let iface = &item[pct + 1..close];
+                    // Rebuild "[ip]" plus anything after the closing bracket.
+                    let addr_text = format!("[{}]{}", &item[1..pct], &item[close + 1..]);
+                    (addr_text, Some(iface.to_string()))
+                } else {
+                    (item[..pct].to_string(), Some(item[pct + 1..].to_string()))
+                }
+            } else {
+                (item[..pct].to_string(), Some(item[pct + 1..].to_string()))
+            }
+        }
+    };
+    if iface.as_deref().is_some_and(str::is_empty) {
+        return None;
+    }
+
+    let (ip, port) = parse_ns_addr(&addr_text)?;
+    Some(ParsedServer { ip, port, iface })
 }
 
 #[cfg(test)]

@@ -853,6 +853,115 @@ fn dns_record_cached_addr_pointer_stability() {
     }
 }
 
+/// An application compiled against an older c-ares has a smaller
+/// `struct ares_options` ending at `hosts_path`.  `ares_save_options` must only
+/// write fields that exist in that prefix (upstream intentionally does not
+/// zero/overwrite the whole current struct).
+#[cfg(miri)]
+#[test]
+fn save_options_does_not_write_past_older_struct_prefix() {
+    use cares::ares_options::{apattern, ares_sock_state_cb};
+
+    #[repr(C)]
+    struct AresOptionsOld {
+        flags: c_int,
+        timeout: c_int,
+        tries: c_int,
+        ndots: c_int,
+        udp_port: libc::c_ushort,
+        tcp_port: libc::c_ushort,
+        socket_send_buffer_size: c_int,
+        socket_receive_buffer_size: c_int,
+        servers: *mut libc::in_addr,
+        nservers: c_int,
+        domains: *mut *mut c_char,
+        ndomains: c_int,
+        lookups: *mut c_char,
+        sock_state_cb: ares_sock_state_cb,
+        sock_state_cb_data: *mut c_void,
+        sortlist: *mut apattern,
+        nsort: c_int,
+        ednspsz: c_int,
+        resolvconf_path: *mut c_char,
+        hosts_path: *mut c_char,
+    }
+
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(
+            cares::ares_options::ares_init_options(&mut ch, ptr::null(), 0),
+            ARES_SUCCESS
+        );
+        assert!(!ch.is_null());
+
+        let mut older = Box::new(std::mem::zeroed::<AresOptionsOld>());
+        let mut mask: c_int = 0;
+        let rc = ares_save_options(
+            ch,
+            &mut *older as *mut AresOptionsOld as *mut ares_options,
+            &mut mask,
+        );
+        assert_eq!(rc, ARES_SUCCESS);
+
+        // Deliberately no ares_destroy_options() on the prefix: with the
+        // channel's optmask empty, a correct ares_save_options allocates no
+        // pointer fields and leaves the prefix's pointers NULL.  (Calling
+        // ares_destroy_options with a full-size reference would itself be a
+        // separate older-struct ABI test.)
+        drop(older);
+        ares_destroy(ch);
+    }
+}
+
+/// Upstream treats `nservers <= 0` as "not supplied"; a negative count must not
+/// become `usize::MAX` in `slice::from_raw_parts`.
+#[cfg(miri)]
+#[test]
+fn init_options_negative_nservers_is_not_supplied() {
+    let mut server = libc::in_addr {
+        s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+    };
+    let mut opts: ares_options = unsafe { std::mem::zeroed() };
+    opts.servers = &mut server;
+    opts.nservers = -1;
+
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        let rc = cares::ares_options::ares_init_options(
+            &mut ch,
+            &opts,
+            cares::ares_options::ARES_OPT_SERVERS,
+        );
+        assert_eq!(rc, ARES_SUCCESS);
+        assert!(!ch.is_null());
+        ares_destroy(ch);
+    }
+}
+
+/// Same contract for `ndomains <= 0`: the array pointer may be valid, but a
+/// negative count means the option was not supplied.
+#[cfg(miri)]
+#[test]
+fn init_options_negative_ndomains_is_not_supplied() {
+    let domain = CString::new("example.com").unwrap();
+    let mut domains = [domain.as_ptr() as *mut c_char];
+    let mut opts: ares_options = unsafe { std::mem::zeroed() };
+    opts.domains = domains.as_mut_ptr();
+    opts.ndomains = -1;
+
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        let rc = cares::ares_options::ares_init_options(
+            &mut ch,
+            &opts,
+            cares::ares_options::ARES_OPT_DOMAINS,
+        );
+        assert_eq!(rc, ARES_SUCCESS);
+        assert!(!ch.is_null());
+        ares_destroy(ch);
+    }
+}
+
 /// rr_add -> rr_get -> rr_del over a growing/shrinking section: counts stay
 /// consistent, survivors shift down, out-of-range accesses fail cleanly.
 #[test]

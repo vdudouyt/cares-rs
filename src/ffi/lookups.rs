@@ -76,12 +76,14 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     if channel.is_null() || name.is_null() {
         return;
     }
+    // Hold the channel lock while the synchronous precheck callback runs, as
+    // upstream does; no state borrow may span the callback.
+    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let name_str = unsafe { cstr_lossy(name) };
     if let Some(status) = search_precheck(name_str) {
         unsafe { callback(arg, status.code(), 0, std::ptr::null_mut(), 0) };
         return;
     }
-    let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let client = channeldata.state.borrow().derive();
     let fut = client.search(
         name_str.to_string(),
@@ -361,9 +363,9 @@ pub(crate) fn on_addrinfo_reply(callback: AresAddrInfoCallback, arg: *mut c_void
             );
             let cnames = crate::ffi::addrinfo::cnames_from_entries(&out.cnames);
             let ai = crate::ffi::addrinfo::build_ares_addrinfo(&out.name, nodes, cnames);
-            unsafe { callback(arg, ARES_SUCCESS, 0, ai) };
+            unsafe { callback(arg, ARES_SUCCESS, out.timeouts, ai) };
         }
-        Ok(out) => unsafe { callback(arg, out.status.code(), 0, std::ptr::null_mut()) },
+        Ok(out) => unsafe { callback(arg, out.status.code(), out.timeouts, std::ptr::null_mut()) },
         Err(status) => unsafe { callback(arg, status, 0, std::ptr::null_mut()) },
     }
 }

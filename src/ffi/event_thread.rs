@@ -119,10 +119,11 @@ pub unsafe extern "C" fn ares_queue_wait_empty(channel: Channel, timeout_ms: c_i
     wait_empty_impl(channel, timeout_ms)
 }
 
-/// Sleep-poll the executor's active count, releasing the channel lock between
-/// checks so the event thread can finish the queries. Blocking by contract, like
-/// upstream (which waits on a condvar instead); it never drives I/O itself, so it
-/// only returns early when another thread (normally this event thread) runs turns.
+/// Sleep-poll the channel's in-flight DNS query count, releasing the channel
+/// lock between checks so the event thread can finish the queries. Blocking by
+/// contract, like upstream (which waits on a condvar instead); it never drives
+/// I/O itself, so it only returns early when another thread (normally this event
+/// thread) runs turns.
 fn wait_empty_impl(channel: *mut ChannelData, timeout_ms: c_int) -> c_int {
     let Some((guard, data)) = (unsafe { channel_access(channel) }) else { return ARES_EFORMERR; };
     if data.active_queries() == 0 { return ARES_SUCCESS; }

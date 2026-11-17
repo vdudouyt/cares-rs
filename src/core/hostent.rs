@@ -16,6 +16,9 @@ pub(crate) struct Hostent {
     pub addrtype: i32,
     pub length: usize,
     pub addrs: Vec<IpAddr>,
+    /// Address bytes supplied verbatim (PTR replies); each box has exactly
+    /// `length` bytes, which need not be 4 or 16.
+    pub raw_addrs: Vec<Box<[u8]>>,
 }
 
 impl Hostent {
@@ -44,6 +47,7 @@ impl Hostent {
             addrtype,
             length,
             addrs,
+            raw_addrs: Vec::new(),
         }
     }
 
@@ -55,7 +59,31 @@ impl Hostent {
             _ => 0,
         };
         let addrs = rrs.items.iter().map(|r| r.ip).filter(|ip| ip_len(ip) == length).collect();
-        Hostent { name: rrs.name, aliases: rrs.aliases, addrtype: family, length, addrs }
+        Hostent { name: rrs.name, aliases: rrs.aliases, addrtype: family, length, addrs, raw_addrs: Vec::new() }
+    }
+
+    /// A result whose metadata comes straight from the caller: `addrtype` and
+    /// `length` are reported as given, and `raw_addr` (if any) is copied
+    /// verbatim rather than decoded as an IPv4/IPv6 address. This is the PTR/NS
+    /// contract, where the reply itself carries no address records.
+    pub fn from_parsed_explicit(
+        rrs: ParsedRRs<AddrRecord>,
+        addrtype: i32,
+        length: usize,
+        raw_addr: Option<&[u8]>,
+    ) -> Self {
+        let raw_addrs = match raw_addr {
+            Some(bytes) if !bytes.is_empty() => vec![bytes.to_vec().into_boxed_slice()],
+            _ => Vec::new(),
+        };
+        Hostent {
+            name: rrs.name,
+            aliases: rrs.aliases,
+            addrtype,
+            length,
+            addrs: Vec::new(),
+            raw_addrs,
+        }
     }
 
     /// Apply the channel sortlist, whether the addresses came from hosts or DNS.

@@ -2,7 +2,7 @@
 //! no I/O: reply classification, search plans, server health, and verdicts.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::{Duration, Instant};
 
 /// Header-level summary of a DNS reply buffer.
@@ -137,23 +137,39 @@ pub struct ServerId {
     pub addr: IpAddr,
     pub udp_port: u16,
     pub tcp_port: u16,
+    /// IPv6 scope id (`%iface` resolved through `aif_nametoindex`); 0 when
+    /// unscoped. Part of the identity: link-local servers on different
+    /// interfaces with the same address are distinct.
+    pub scope_id: u32,
 }
 
 /// A placeholder that matches no configured server (`0.0.0.0`, ports 0), for
 /// selection on an empty server list: connecting to it simply finds no server.
 impl Default for ServerId {
     fn default() -> Self {
-        ServerId { addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED), udp_port: 0, tcp_port: 0 }
+        ServerId {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            udp_port: 0,
+            tcp_port: 0,
+            scope_id: 0,
+        }
     }
 }
 
 impl ServerId {
+    fn socket_addr(&self, port: u16) -> SocketAddr {
+        match self.addr {
+            IpAddr::V6(ip) => SocketAddr::V6(SocketAddrV6::new(ip, port, 0, self.scope_id)),
+            IpAddr::V4(ip) => SocketAddr::from((ip, port)),
+        }
+    }
+
     pub fn udp_addr(&self) -> SocketAddr {
-        SocketAddr::from((self.addr, self.udp_port))
+        self.socket_addr(self.udp_port)
     }
 
     pub fn tcp_addr(&self) -> SocketAddr {
-        SocketAddr::from((self.addr, self.tcp_port))
+        self.socket_addr(self.tcp_port)
     }
 
     /// The wildcard local address of the server's family; local-address
@@ -171,7 +187,12 @@ impl ServerId {
 impl ServerId {
     /// Test server `n`: `127.0.0.(n + 1)`, port 53 for both transports.
     pub fn test(n: usize) -> Self {
-        ServerId { addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, n as u8 + 1)), udp_port: 53, tcp_port: 53 }
+        ServerId {
+            addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, n as u8 + 1)),
+            scope_id: 0,
+            udp_port: 53,
+            tcp_port: 53,
+        }
     }
 }
 

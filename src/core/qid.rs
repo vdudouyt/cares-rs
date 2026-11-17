@@ -23,8 +23,7 @@ pub(crate) struct QidRegistry {
 
 impl QidRegistry {
 
-    /// Number of ids currently in flight.
-    #[cfg(test)]
+    /// Number of ids currently in flight (i.e. live DNS queries).
     pub(crate) fn len(&self) -> usize {
         self.in_flight.len()
     }

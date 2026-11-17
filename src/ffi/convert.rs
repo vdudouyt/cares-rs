@@ -73,11 +73,11 @@ where F: FnOnce() -> Result<*mut T, c_int>
 use crate::core::nameinfo::AddrInfo;
 
 /// Validate + decode a caller-supplied `sockaddr`/`salen` pair.
-/// Error codes match upstream getnameinfo: NULL/short → ENOMEM, unknown
-/// family → ENOTIMP.
+/// Error codes match upstream getnameinfo: NULL/short/unknown family all
+/// report ENOTIMP.
 pub(crate) fn extract_addr_port(sa: *const libc::sockaddr, salen: libc::socklen_t) -> Result<AddrInfo, c_int> {
     if sa.is_null() {
-        return Err(ARES_ENOMEM);
+        return Err(ARES_ENOTIMP);
     }
 
     let family = unsafe { (*sa).sa_family as c_int };
@@ -85,7 +85,7 @@ pub(crate) fn extract_addr_port(sa: *const libc::sockaddr, salen: libc::socklen_
     match family {
         libc::AF_INET => {
             if (salen as usize) < std::mem::size_of::<libc::sockaddr_in>() {
-                return Err(ARES_ENOMEM);
+                return Err(ARES_ENOTIMP);
             }
             let sa_in = sa as *const libc::sockaddr_in;
             let addr_bytes = unsafe { (*sa_in).sin_addr.s_addr.to_ne_bytes() };
@@ -95,7 +95,7 @@ pub(crate) fn extract_addr_port(sa: *const libc::sockaddr, salen: libc::socklen_
         }
         libc::AF_INET6 => {
             if (salen as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
-                return Err(ARES_ENOMEM);
+                return Err(ARES_ENOTIMP);
             }
             let sa_in6 = sa as *const libc::sockaddr_in6;
             let addr_bytes = unsafe { (*sa_in6).sin6_addr.s6_addr };

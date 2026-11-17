@@ -45,24 +45,26 @@ pub use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::hostent::{addrttl_fill, Hostent};
 use crate::core::async_client::build_query;
 use crate::core::response::{
-    addr_reply, empty_chain_status, expand_name_at, expand_string_at, push_synthetic_ptr,
-    soa_status, ReplyRequire,
+    addr_reply, empty_chain_status, expand_name_at, expand_string_at, soa_status, ReplyRequire,
 };
 use crate::ffi::convert::malloc_bytes;
 
 /// Build the C hostent graph from a core blueprint; all policy decisions were made in core.
 pub(crate) unsafe fn build_hostent(bp: Hostent) -> *mut libc::hostent {
-    let addrlist: Vec<*mut i8> = bp
-        .addrs
-        .iter()
-        .map(|ip| {
+    let mut addrlist: Vec<*mut i8> = Vec::new();
+    if bp.raw_addrs.is_empty() {
+        addrlist.extend(bp.addrs.iter().map(|ip| {
             let raw: Box<[u8]> = match ip {
                 IpAddr::V4(v4) => Box::new(v4.octets()),
                 IpAddr::V6(v6) => Box::new(v6.octets()),
             };
             Box::into_raw(raw) as *mut i8
-        })
-        .collect();
+        }));
+    } else {
+        // Explicit raw addresses already have exactly `h_length` bytes;
+        // `ares_free_hostent` reconstructs the same slice length.
+        addrlist.extend(bp.raw_addrs.into_iter().map(|raw| Box::into_raw(raw) as *mut i8));
+    }
     let aliases: Vec<*mut i8> = bp.aliases.into_iter().map(|c| c.into_raw()).collect();
     let hostent = libc::hostent {
         h_name: bp.name.into_raw(),
@@ -299,7 +301,34 @@ pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out:
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    unsafe { parse_to_hostent(RECORD_TYPE_NS, abuf, alen, out, std::ptr::null_mut::<ares_addrttl>(), std::ptr::null_mut(), 0) }
+    let try_parse = || -> Result<ParsedRRs<AddrRecord>, c_int> {
+        if abuf.is_null() || alen < 0 {
+            return Err(ARES_EBADRESP);
+        }
+        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        addr_reply(buf, RECORD_TYPE_NS, ReplyRequire::ItemsOrAliases).map_err(|e| e.code())
+    };
+    match try_parse() {
+        Ok(res) => {
+            if !out.is_null() {
+                // Upstream reports an IPv4-shaped hostent with no addresses for
+                // NS replies, even though NS answers carry no address data.
+                unsafe {
+                    *out = build_hostent(Hostent::from_parsed_explicit(
+                        res,
+                        libc::AF_INET,
+                        std::mem::size_of::<libc::in_addr>(),
+                        None,
+                    ));
+                }
+            }
+            ARES_SUCCESS
+        }
+        Err(err) => {
+            if !out.is_null() { unsafe { *out = std::ptr::null_mut(); } }
+            err
+        }
+    }
 }
 
 pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, out_addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
@@ -357,16 +386,24 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
             return Err(ARES_EBADRESP);
         }
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let mut addr_records = addr_reply(buf, RECORD_TYPE_PTR, ReplyRequire::Aliases).map_err(|e| e.code())?;
-        // Upstream permits a NULL address and still returns the hostent (the
-        // names/aliases); the address is only recorded when the caller supplied
-        // one. pycares relies on this and passes (NULL, 0, AF_UNSPEC).
-        if !addr.is_null() && addrlen > 0 {
-            let ipbuf = unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) };
-            let ip = buf_to_ip(ipbuf).map_err(|_| ARES_EBADRESP)?;
-            push_synthetic_ptr(&mut addr_records, ip);
+        let addr_records = addr_reply(buf, RECORD_TYPE_PTR, ReplyRequire::Aliases).map_err(|e| e.code())?;
+        // Upstream copies the caller's address bytes verbatim and reports the
+        // caller's family/addrlen (even AF_UNSPEC or a non-4/16 length); a NULL
+        // address still yields the names/aliases with an empty address list.
+        let raw_addr = if !addr.is_null() && addrlen > 0 {
+            Some(unsafe { std::slice::from_raw_parts(addr as *const u8, addrlen as usize) })
+        } else {
+            None
+        };
+        let length = addrlen.max(0) as usize;
+        unsafe {
+            Ok(build_hostent(Hostent::from_parsed_explicit(
+                addr_records,
+                family,
+                length,
+                raw_addr,
+            )))
         }
-        unsafe { Ok(build_hostent(Hostent::from_parsed(addr_records, family))) }
     };
     unsafe { ares_fn_wrapper(out, build) }
 }
@@ -395,22 +432,46 @@ pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
     }
 }
 
+/// Set the C `errno`, matching the platform's `inet_pton` contract.
+#[cfg(unix)]
+unsafe fn set_errno(err: c_int) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        unsafe { *libc::__errno_location() = err; }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { *libc::__error() = err; }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = err;
+    }
+}
+
+#[cfg(not(unix))]
+unsafe fn set_errno(_err: c_int) {}
+
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_inet_pton(af: c_int, src: *const c_char, dst: *mut c_void) -> c_int {
+    if af != libc::AF_INET && af != libc::AF_INET6 {
+        // Upstream's inet_pton sets EAFNOSUPPORT for unknown families.
+        unsafe { set_errno(libc::EAFNOSUPPORT) };
+        return -1;
+    }
+    if src.is_null() || dst.is_null() {
+        return 0;
+    }
     let Some(s) = (unsafe { cstr_opt(src) }) else { return 0 };
-    match af {
-        libc::AF_INET => {
-            let Ok(addr) = s.parse::<std::net::Ipv4Addr>() else { return 0 };
-            unsafe { std::ptr::copy_nonoverlapping(addr.octets().as_ptr(), dst as *mut u8, 4) };
-            1
-        }
-        libc::AF_INET6 => {
-            let Ok(addr) = s.parse::<std::net::Ipv6Addr>() else { return 0 };
-            unsafe { std::ptr::copy_nonoverlapping(addr.octets().as_ptr(), dst as *mut u8, 16) };
-            1
-        }
-        _ => -1,
+    if af == libc::AF_INET {
+        let Ok(addr) = s.parse::<std::net::Ipv4Addr>() else { return 0 };
+        unsafe { std::ptr::copy_nonoverlapping(addr.octets().as_ptr(), dst as *mut u8, 4) };
+        1
+    } else {
+        let Ok(addr) = s.parse::<std::net::Ipv6Addr>() else { return 0 };
+        unsafe { std::ptr::copy_nonoverlapping(addr.octets().as_ptr(), dst as *mut u8, 16) };
+        1
     }
 }
 

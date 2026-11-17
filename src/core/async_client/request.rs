@@ -12,6 +12,10 @@
 
 use super::*;
 
+/// ares_init_options(3): timeouts below 250 ms are raised to 250 ms for the
+/// query machinery, while `ares_save_options` still reports the stored value.
+const MIN_TIMEOUT_MS: u32 = 250;
+
 /// Return `Pending` once (with the current waker) so the executor can apply a
 /// cancel recorded during the current poll, then complete on the next poll.
 async fn yield_once() {
@@ -380,7 +384,11 @@ impl AsyncClient {
     pub(super) fn opts(&self) -> QueryOpts {
         QueryOpts {
             attempts: self.config.options.attempts,
-            timeout: Duration::from_millis(self.config.options.timeout_ms as u64),
+            // ares_init_options(3) documents a 250 ms minimum effective
+            // timeout; the stored/saved option keeps the caller's value.
+            timeout: Duration::from_millis(u64::from(
+                self.config.options.timeout_ms.max(MIN_TIMEOUT_MS),
+            )),
             maxtimeout: (self.maxtimeout > 0)
                 .then(|| Duration::from_millis(self.maxtimeout as u64)),
             failover_chance: self.server_failover_retry_chance,
@@ -419,7 +427,10 @@ impl AsyncClient {
                 let pooled = self.shared.tcp_pool.borrow().get(s);
                 let checked_out = pooled.or_else(|| {
                     let sock = self.rt.tcp(s.bind_addr()).ok()?;
-                    let _ = sock.get_ref().connect(s.tcp_addr()); // optimistic (EINPROGRESS → Ok)
+                    // `connect` runs the create callback and is optimistic for
+                    // EINPROGRESS; a refusal fails this attempt, so the socket
+                    // is dropped instead of pooled and the loop moves on.
+                    sock.get_ref().connect(s.tcp_addr()).ok()?;
                     let c = TcpConn::new(sock);
                     if current {
                         let replaced = self.shared.tcp_pool.borrow_mut().insert(s, c.clone());
@@ -439,7 +450,9 @@ impl AsyncClient {
                 drop(retired);
                 let checked_out = pooled.or_else(|| {
                     let sk = self.rt.udp(s.bind_addr()).ok()?;
-                    let _ = sk.get_ref().connect(s.udp_addr());
+                    // A create-callback refusal drops this socket (never
+                    // pooled) and the failover loop retries with a fresh one.
+                    sk.get_ref().connect(s.udp_addr()).ok()?;
                     let c = UdpConn::new(sk, event_driven);
                     if current {
                         self.shared.udp_pool.borrow_mut().insert(s, c.clone());

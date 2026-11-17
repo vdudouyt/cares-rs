@@ -6,6 +6,9 @@ pub struct SysConfig {
     pub nameservers: Vec<(IpAddr, Option<u16>)>,
     // Parallel to `nameservers`.
     pub tcp_ports: Vec<Option<u16>>,
+    /// IPv6 scope ids, parallel to `nameservers` (0 = unscoped). resolv.conf
+    /// entries never carry a scope, so parsing pushes 0 for each nameserver.
+    pub scopes: Vec<u32>,
     pub domain: Option<String>,
     pub search: Vec<String>,
     /// Raw `lookup`/`hostresorder` tokens mapped to c-ares's `b`/`f` order.
@@ -27,7 +30,7 @@ pub struct SysConfigOptions {
 
 impl Default for SysConfigOptions {
     fn default() -> Self {
-        SysConfigOptions { ndots: 1, attempts: 4, timeout_ms: 5000, use_vc: false, rotate: false, inet6: false, edns0: false }
+        SysConfigOptions { ndots: 1, attempts: 3, timeout_ms: 2000, use_vc: false, rotate: false, inet6: false, edns0: false }
     }
 }
 
@@ -60,6 +63,7 @@ impl FromStr for SysConfig {
                         if let Some(ns) = parse_ns_addr(tok) {
                             conf.nameservers.push(ns);
                             conf.tcp_ports.push(None);
+                            conf.scopes.push(0);
                         }
                     }
                 }
@@ -173,6 +177,16 @@ pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
 mod tests {
     use super::*;
 
+    /// Documented c-ares defaults: `DEFAULT_TIMEOUT` is 2000 ms,
+    /// `DEFAULT_TRIES` is 3, and ndots is 1.
+    #[test]
+    fn defaults_match_documented_timeout_and_tries() {
+        let opts = SysConfigOptions::default();
+        assert_eq!(opts.ndots, 1, "documented default ndots");
+        assert_eq!(opts.attempts, 3, "documented default tries");
+        assert_eq!(opts.timeout_ms, 2000, "documented default timeout in ms");
+    }
+
     #[test]
     fn skips_malformed_nameserver() {
         // A malformed nameserver token must be skipped, not panic on init/reinit.
@@ -189,8 +203,8 @@ mod tests {
         assert_eq!(conf.nameservers.len(), 1);
         assert_eq!(conf.domain, None);
         assert!(conf.search.is_empty());
-        assert_eq!(conf.options.timeout_ms, 5000);
-        assert_eq!(conf.options.attempts, 4);
+        assert_eq!(conf.options.timeout_ms, 2000);
+        assert_eq!(conf.options.attempts, 3);
     }
 
     #[test]

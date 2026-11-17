@@ -1,6 +1,6 @@
 use libc::{bind, close, connect, fcntl, iovec, recvfrom, setsockopt, sockaddr, socket, socklen_t, writev, F_GETFL, F_SETFL, O_NONBLOCK, sockaddr_in, sockaddr_in6, AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use std::cell::Cell;
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{c_int, c_uint, c_void, CStr, CString};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::Rc;
 use std::io;
@@ -8,7 +8,7 @@ use std::io::{Error, ErrorKind};
 use crate::ffi::ares_options::ares_sock_state_cb;
 use crate::ffi::channel::ChannelData;
 use crate::ffi::channel::channel_access;
-use crate::ffi::{ares_sock_config_callback, ares_sock_create_callback};
+use crate::ffi::{ares_pending_write_cb, ares_sock_config_callback, ares_sock_create_callback};
 use crate::{Channel, ARES_SOCKET_BAD};
 
 #[allow(non_camel_case_types)]
@@ -51,6 +51,8 @@ pub unsafe extern "C" fn ares_set_socket_functions(channel: Channel, funcs: *con
     if funcs.is_null() || channel.is_null() { return; }
     let funcs = unsafe { &*funcs };
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
+    // The event thread owns socket creation; a custom table cannot be used.
+    if channeldata.event_mode.get() { return; }
     install_socket_functions(channeldata, funcs, user_data);
 }
 
@@ -118,9 +120,14 @@ fn install_socket_functions_ex(
         asendv: None, // ex.asendto has a different signature
     };
     let exfuncs = ExFuncs {
+        flags: ex.flags,
         asetsockopt: ex.asetsockopt,
         aconnect: ex.aconnect,
         asendto: ex.asendto,
+        agetsockname: ex.agetsockname,
+        abind: ex.abind,
+        aif_nametoindex: ex.aif_nametoindex,
+        aif_indextoname: ex.aif_indextoname,
     };
     let factory = CSocketFactory::with_ex_funcs(basic, exfuncs, user_data, &channeldata.socket_factory.borrow());
     channeldata.apply_socket_factory(factory);
@@ -141,9 +148,21 @@ pub struct AresSocketFunctions {
 /// `AresSocketFunctions` so the legacy struct's ABI is unchanged.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ExFuncs {
+    /// `ARES_SOCKFUNC_FLAG_*` bits from the installed table. A legacy table has
+    /// no flags field; `with_funcs` clears `ex`, so this is `0` there.
+    pub flags: c_uint,
     pub asetsockopt: Option<unsafe extern "C" fn(ares_socket_t, crate::ffi::ares_socket_opt_t, *const c_void, socklen_t, *mut c_void) -> c_int>,
     pub aconnect: Option<unsafe extern "C" fn(ares_socket_t, *const sockaddr, socklen_t, c_uint, *mut c_void) -> c_int>,
     pub asendto: Option<unsafe extern "C" fn(ares_socket_t, *const c_void, libc::size_t, c_int, *const sockaddr, socklen_t, *mut c_void) -> ares_ssize_t>,
+    /// Optional local-address query; upstream calls it after socket creation
+    /// (it can matter for DNS Cookies).
+    pub agetsockname: Option<unsafe extern "C" fn(ares_socket_t, *mut sockaddr, *mut socklen_t, *mut c_void) -> c_int>,
+    /// Optional local-address bind; used in place of the platform `bind(2)`.
+    pub abind: Option<unsafe extern "C" fn(ares_socket_t, c_uint, *const sockaddr, socklen_t, *mut c_void) -> c_int>,
+    /// Optional interface-name lookup for `%<iface>` scopes in server CSVs.
+    pub aif_nametoindex: Option<unsafe extern "C" fn(*const libc::c_char, *mut c_void) -> c_uint>,
+    /// Optional interface-index lookup when rendering scoped server CSVs.
+    pub aif_indextoname: Option<unsafe extern "C" fn(c_uint, *mut libc::c_char, libc::size_t, *mut c_void) -> *const libc::c_char>,
 }
 
 /// The per-channel socket settings applied to each freshly created fd.
@@ -156,6 +175,9 @@ pub(crate) struct SocketConfig {
     pub local_dev: String,
     pub sock_state_cb: ares_sock_state_cb,
     pub sock_state_cb_data: *mut c_void,
+    /// Notified before pending TCP bytes are queued; see `ares_set_pending_write_cb`.
+    pub pending_write_cb: ares_pending_write_cb,
+    pub pending_write_arg: *mut c_void,
 }
 
 impl Default for SocketConfig {
@@ -168,6 +190,8 @@ impl Default for SocketConfig {
             local_dev: String::new(),
             sock_state_cb: None,
             sock_state_cb_data: std::ptr::null_mut(),
+            pending_write_cb: None,
+            pending_write_arg: std::ptr::null_mut(),
         }
     }
 }
@@ -325,10 +349,22 @@ struct CSocket {
     user_data: *mut c_void,
     sock_state_cb: ares_sock_state_cb,
     sock_state_cb_data: *mut c_void,
-    /// Caller-supplied sockets may be blocking, so the UDP drain must not loop on them.
+    /// Caller-supplied sockets may be blocking, so the UDP drain must not loop on
+    /// them unless an extended table declared `ARES_SOCKFUNC_FLAG_NONBLOCKING`.
     drain_safe: bool,
     /// Set once the open notification fired, avoiding a spurious close on failed creation.
     notified_open: Cell<bool>,
+    /// The create callback observes the socket only after `connect(2)` starts,
+    /// so it is held here rather than run by `CSocketFactory::create`.
+    create_cb: ares_sock_create_callback,
+    create_arg: *mut c_void,
+    sock_type: c_int,
+    /// Guards against firing the create callback twice for one socket.
+    notified_create: Cell<bool>,
+    /// Snapshot of the channel's pending-write notification, fired before TCP
+    /// bytes are queued. Plain fields, so no borrow is held across the callback.
+    pending_write_cb: ares_pending_write_cb,
+    pending_write_arg: *mut c_void,
 }
 
 impl crate::async_runtime::socket::Socket for CSocket {
@@ -347,9 +383,21 @@ impl crate::async_runtime::socket::Socket for CSocket {
         if result == -1 {
             let err = Error::last_os_error();
             if err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(rustix::io::Errno::INPROGRESS.raw_os_error()) {
-                return Ok(());
+                // Non-blocking TCP connect: initiated, completion is polled later.
+            } else {
+                return Err(err);
             }
-            return Err(err);
+        }
+        // The create callback runs after connect(2) is initiated, matching the
+        // documented contract that the socket is already connected.
+        let first_connect = !self.notified_create.get();
+        self.fire_create_callback()?;
+        // A pending TCP connect needs write-interest monitoring; report it so an
+        // event loop knows to watch writability (and a UDP connect is writable too).
+        if first_connect {
+            if let Some(cb) = self.sock_state_cb {
+                cb(self.sock_state_cb_data, self.fd, 1, 1);
+            }
         }
         Ok(())
     }
@@ -373,6 +421,13 @@ impl crate::async_runtime::socket::Socket for CSocket {
     }
 
     fn send(&self, data: &[u8]) -> io::Result<usize> {
+        // The pending-write hook reports bytes about to be queued on a TCP
+        // stream. It fires once per send, before the syscall, and never for UDP.
+        if self.sock_type == SOCK_STREAM {
+            if let Some(cb) = self.pending_write_cb {
+                unsafe { cb(self.pending_write_arg) };
+            }
+        }
         let result = if let Some(asendto) = self.ex.and_then(|ex| ex.asendto) {
             // Connected socket: NULL destination means "use the connected peer".
             let ptr = data.as_ptr() as *const c_void;
@@ -387,6 +442,22 @@ impl crate::async_runtime::socket::Socket for CSocket {
             return Err(Error::last_os_error());
         }
         Ok(result as usize)
+    }
+}
+
+impl CSocket {
+    /// Run `ares_set_socket_callback` once, after the connect was initiated.
+    /// A nonzero return means the caller refuses the connection.
+    fn fire_create_callback(&self) -> io::Result<()> {
+        if self.notified_create.replace(true) {
+            return Ok(());
+        }
+        if let Some(cb) = self.create_cb {
+            if unsafe { cb(self.fd, self.sock_type, self.create_arg) } != 0 {
+                return Err(Error::from_raw_os_error(rustix::io::Errno::CONNREFUSED.raw_os_error()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -481,6 +552,47 @@ impl CSocketFactory {
         })
     }
 
+    /// Resolve an interface name to its index for a `%<iface>` server scope.
+    /// Uses the extended table's `aif_nametoindex` when installed, else the
+    /// platform call for the default table. A custom legacy table has no
+    /// adapter, so scoped names cannot be resolved (returns `None`).
+    pub(crate) fn if_nametoindex(&self, name: &str) -> Option<u32> {
+        let cname = CString::new(name).ok()?;
+        if let Some(cb) = self.ex.and_then(|ex| ex.aif_nametoindex) {
+            let index = unsafe { cb(cname.as_ptr(), self.user_data) };
+            return (index != 0).then_some(index);
+        }
+        if self.custom {
+            return None;
+        }
+        let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        (index != 0).then_some(index)
+    }
+
+    /// Render a scope id as an interface name for a scoped server CSV entry.
+    /// Uses the extended table's `aif_indextoname` when installed, else the
+    /// platform call for the default table.
+    pub(crate) fn if_indextoname(&self, index: u32) -> Option<String> {
+        // Generous buffer: IF_NAMESIZE is 16 on Linux/BSD.
+        let mut buf = [0 as libc::c_char; 64];
+        if let Some(cb) = self.ex.and_then(|ex| ex.aif_indextoname) {
+            let name = unsafe { cb(index, buf.as_mut_ptr(), buf.len(), self.user_data) };
+            if name.is_null() {
+                return None;
+            }
+            return Some(unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned());
+        }
+        if self.custom {
+            return None;
+        }
+        let name = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
+        if name.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned())
+        }
+    }
+
     fn create(&self, addr: SocketAddr, socket_type: c_int) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
         let domain = if addr.is_ipv4() { AF_INET } else { AF_INET6 };
         let asocket = self.funcs.asocket.unwrap_or(default_asocket);
@@ -495,26 +607,52 @@ impl CSocketFactory {
             user_data: self.user_data,
             sock_state_cb: self.socket.sock_state_cb,
             sock_state_cb_data: self.socket.sock_state_cb_data,
-            drain_safe: !self.custom,
+            // Extended tables declare their sockets nonblocking via
+            // ARES_SOCKFUNC_FLAG_NONBLOCKING. A legacy custom table has no flags
+            // field, so it is treated as possibly blocking and never drained.
+            drain_safe: !self.custom
+                || self.ex.is_some_and(|ex| ex.flags & ARES_SOCKFUNC_FLAG_NONBLOCKING != 0),
             notified_open: Cell::new(false),
+            create_cb: self.create_cb,
+            create_arg: self.create_arg,
+            sock_type: socket_type,
+            notified_create: Cell::new(false),
+            pending_write_cb: self.socket.pending_write_cb,
+            pending_write_arg: self.socket.pending_write_arg,
         });
-        // Apply settings then callbacks; any failure drops `sock`, closing the fd
-        // via CSocket::drop -> aclose and surfacing ECONNREFUSED.
-        self.configure(fd, addr.is_ipv4())?;
-        if !self.run_sock_callbacks(fd, socket_type == SOCK_STREAM) {
+        // Apply settings then the configure callback; any failure drops `sock`,
+        // closing the fd via CSocket::drop -> aclose and surfacing ECONNREFUSED.
+        self.configure(fd, addr.is_ipv4(), socket_type == SOCK_STREAM)?;
+        // The configure callback must observe the socket before it is connected;
+        // ares_set_socket_callback is deferred to CSocket::connect instead.
+        if !self.run_config_callback(fd, socket_type == SOCK_STREAM) {
             return Err(Error::from_raw_os_error(rustix::io::Errno::CONNREFUSED.raw_os_error()));
         }
-        // Approximation of upstream's state machine: report readable when live and
-        // (0,0) on close; write-interest transitions are not modeled by this reactor.
+        // Report the open state; the writable transition follows connect.
         if let Some(cb) = self.socket.sock_state_cb {
             sock.notified_open.set(true);
             cb(self.socket.sock_state_cb_data, fd, 1, 0);
         }
+        // Optional local-address query; its result is not needed here but the
+        // adapter is part of the contract (upstream uses it for DNS Cookies).
+        if let Some(getsockname) = self.ex.and_then(|ex| ex.agetsockname) {
+            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut storage_len = std::mem::size_of::<libc::sockaddr_storage>() as socklen_t;
+            unsafe {
+                getsockname(
+                    fd,
+                    &mut storage as *mut _ as *mut sockaddr,
+                    &mut storage_len,
+                    self.user_data,
+                );
+            }
+        }
         Ok(sock)
     }
 
-    /// Apply buffer/device/local-address settings; a custom table owns its own addressing.
-    fn configure(&self, fd: ares_socket_t, is_ipv4: bool) -> io::Result<()> {
+    /// Apply buffer/device/local-address settings; a legacy custom table owns its
+    /// own addressing, while an extended table may supply `abind`.
+    fn configure(&self, fd: ares_socket_t, is_ipv4: bool, is_tcp: bool) -> io::Result<()> {
         if self.socket.send_buf > 0 {
             self.setsockopt(fd, ARES_SOCKET_OPT_SENDBUF_SIZE, &self.socket.send_buf.to_ne_bytes())?;
         }
@@ -522,15 +660,11 @@ impl CSocketFactory {
             self.setsockopt(fd, ARES_SOCKET_OPT_RECVBUF_SIZE, &self.socket.recv_buf.to_ne_bytes())?;
         }
         if !self.socket.local_dev.is_empty() {
+            // The option value is a C string: include the trailing NUL in val_size.
+            let mut device = self.socket.local_dev.as_bytes().to_vec();
+            device.push(0);
             // Device-bind failure is ignored, matching prior c-ares behavior.
-            let _ = self.setsockopt(
-                fd,
-                ARES_SOCKET_OPT_BIND_DEVICE,
-                self.socket.local_dev.as_bytes(),
-            );
-        }
-        if self.custom {
-            return Ok(());
+            let _ = self.setsockopt(fd, ARES_SOCKET_OPT_BIND_DEVICE, &device);
         }
         let local = if is_ipv4 && self.socket.local_ip4 != 0 {
             Some(SocketAddr::new(
@@ -547,7 +681,19 @@ impl CSocketFactory {
         };
         if let Some(addr) = local {
             let (storage, len) = socket_addr_to_raw(addr);
-            let rv = unsafe { bind(fd, &storage as *const _ as *const sockaddr, len) };
+            let addr_ptr = &storage as *const _ as *const sockaddr;
+            let rv = if let Some(abind) = self.ex.and_then(|ex| ex.abind) {
+                let mut flags = ARES_SOCKET_BIND_CLIENT;
+                if is_tcp {
+                    flags |= ARES_SOCKET_BIND_TCP;
+                }
+                unsafe { abind(fd, flags, addr_ptr, len, self.user_data) }
+            } else if self.custom {
+                // Legacy custom tables manage their own local addressing.
+                return Ok(());
+            } else {
+                unsafe { bind(fd, addr_ptr, len) }
+            };
             if rv != 0 {
                 return Err(Error::from_raw_os_error(rustix::io::Errno::CONNREFUSED.raw_os_error()));
             }
@@ -583,12 +729,10 @@ impl CSocketFactory {
         Ok(())
     }
 
-    /// Run create then configure callbacks; false means refused.
-    fn run_sock_callbacks(&self, fd: c_int, is_tcp: bool) -> bool {
+    /// Run the configure callback before connect; the create callback is
+    /// deferred to `CSocket::connect`. False means the caller refused the socket.
+    fn run_config_callback(&self, fd: c_int, is_tcp: bool) -> bool {
         let sock_type = if is_tcp { SOCK_STREAM } else { SOCK_DGRAM };
-        if let Some(cb) = self.create_cb {
-            if unsafe { cb(fd, sock_type, self.create_arg) } != 0 { return false; }
-        }
         if let Some(cb) = self.config_cb {
             if unsafe { cb(fd, sock_type, self.config_arg) } != 0 { return false; }
         }
