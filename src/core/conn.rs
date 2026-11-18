@@ -254,9 +254,9 @@ mod tests {
         fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
             Ok(())
         }
-        fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+        fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
             buf[..4].copy_from_slice(&[0xAB; 4]);
-            Ok((4, None))
+            Ok(4)
         }
         fn send(&self, data: &[u8]) -> io::Result<usize> {
             Ok(data.len())

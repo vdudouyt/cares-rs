@@ -9,7 +9,7 @@ use std::rc::Rc;
 pub trait Socket {
     fn as_raw_fd(&self) -> i32;
     fn connect(&self, addr: SocketAddr) -> io::Result<()>;
-    fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)>;
+    fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
     fn send(&self, data: &[u8]) -> io::Result<usize>;
     /// Whether repeated `recv` calls cannot block; draining loops must not
     /// re-read a caller-supplied socket that may be blocking.

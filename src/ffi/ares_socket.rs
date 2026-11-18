@@ -254,33 +254,6 @@ fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, socklen_t) {
     (storage, len)
 }
 
-fn raw_to_socket_addr(storage: &libc::sockaddr_storage, len: socklen_t) -> Option<SocketAddr> {
-    if len == 0 {
-        return None;
-    }
-    match storage.ss_family as c_int {
-        AF_INET => {
-            let sockaddr = storage as *const _ as *const sockaddr_in;
-            let addr = unsafe {
-                let ip = std::net::Ipv4Addr::from(u32::from_be((*sockaddr).sin_addr.s_addr));
-                let port = u16::from_be((*sockaddr).sin_port);
-                SocketAddr::from((ip, port))
-            };
-            Some(addr)
-        }
-        AF_INET6 => {
-            let sockaddr = storage as *const _ as *const sockaddr_in6;
-            let addr = unsafe {
-                let ip = std::net::Ipv6Addr::from((*sockaddr).sin6_addr.s6_addr);
-                let port = u16::from_be((*sockaddr).sin6_port);
-                SocketAddr::from((ip, port))
-            };
-            Some(addr)
-        }
-        _ => None,
-    }
-}
-
 /// Map an `ares_socket_opt_t` onto the platform `setsockopt` call.
 fn default_setsockopt(fd: ares_socket_t, opt: c_uint, value: &[u8]) -> c_int {
     let (level, name) = match opt {
@@ -402,7 +375,7 @@ impl crate::async_runtime::socket::Socket for CSocket {
         Ok(())
     }
 
-    fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+    fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let arecvfrom = self.funcs.arecvfrom.unwrap_or(default_arecvfrom);
         let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut addrlen = std::mem::size_of::<libc::sockaddr_storage>() as socklen_t;
@@ -412,8 +385,7 @@ impl crate::async_runtime::socket::Socket for CSocket {
         if result == -1 {
             return Err(Error::last_os_error());
         }
-        let sock_addr = raw_to_socket_addr(&addr, addrlen);
-        Ok((result as usize, sock_addr))
+        Ok(result as usize)
     }
 
     fn drain_safe(&self) -> bool {

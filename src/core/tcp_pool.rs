@@ -212,8 +212,8 @@ mod tests {
         fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
             Ok(())
         }
-        fn recv(&self, _buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
-            Ok((0, None))
+        fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
         }
         fn send(&self, data: &[u8]) -> io::Result<usize> {
             Ok(data.len())

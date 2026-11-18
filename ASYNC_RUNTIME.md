@@ -145,7 +145,7 @@ invoked) is deferred until its poll returns.
 pub trait Socket {
     fn as_raw_fd(&self) -> i32;
     fn connect(&self, addr: SocketAddr) -> io::Result<()>;
-    fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)>;
+    fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
     fn send(&self, data: &[u8]) -> io::Result<usize>;
     fn drain_safe(&self) -> bool { true }
 }
@@ -155,9 +155,10 @@ Contract:
 
 - The fd is non-blocking. `connect` may return `EINPROGRESS`; report that as
   `Ok(())` and let the first writable event complete the connection.
-- `recv` returns `Ok((0, _))` for orderly EOF. `WouldBlock` is `Err` with
-  `ErrorKind::WouldBlock`; the runtime only calls it after the host reported
-  readability, so it normally does not happen.
+- `recv` returns the number of bytes read. For a stream, `Ok(0)` is orderly
+  EOF; for a datagram, `Ok(0)` is a valid zero-length datagram. `WouldBlock`
+  is `Err` with `ErrorKind::WouldBlock`; the runtime only calls it after the
+  host reported readability, so it normally does not happen.
 - `send` returns the byte count or a `WouldBlock` error. Use
   `Async::write` for one attempt (returns the accepted byte count), or
   `Async::write_all` for a stream when every byte must be sent. A datagram
@@ -187,7 +188,7 @@ zero-length datagrams):
 1. **Never perform I/O before the host reported readiness.** `Ready` only
    completes when a *newer* `dispatch` reported that direction.
 2. **Readiness lasts one turn.** A report not consumed in that turn is not
-   readiness later. `Async::readable_this_turn()` is the same-turn peek used
+   readiness later. The runtime's same-turn peek is used
    when a timeout expires alongside a report.
 3. **Read and write are independent.** A writable event never wakes a read
    waiter, and vice versa.
@@ -229,7 +230,7 @@ are polled through shared references by `select_biased!`); pin them with
 
 1. `StreamFactory` creates a non-blocking `TcpStream` from a `rustix` socket
    and implements `Socket` for it.
-2. `Runtime::tcp(local)` creates and registers the socket.
+2. `Runtime::create_tcp(local)` creates and registers the socket.
 3. The task connects, waits for writability (non-blocking connect completes),
    sends `"<name>\n"`, and reads until `'\n'`.
 4. `drive()` builds the `poll(2)` set from `Reactor::interests()`, uses

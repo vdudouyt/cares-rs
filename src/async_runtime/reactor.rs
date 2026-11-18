@@ -575,12 +575,12 @@ impl Runtime {
         self.factory = factory;
     }
 
-    pub fn udp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+    pub fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
         let sock: Rc<dyn Socket> = self.factory.create_udp(bind)?;
         Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
     }
 
-    pub fn tcp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+    pub fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
         let sock: Rc<dyn Socket> = self.factory.create_tcp(bind)?;
         Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
     }

@@ -389,7 +389,7 @@ mod tests {
         fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
             Ok(())
         }
-        fn recv(&self, _buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+        fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
             Err(io::Error::from(io::ErrorKind::WouldBlock))
         }
         fn send(&self, data: &[u8]) -> io::Result<usize> {
@@ -408,12 +408,12 @@ mod tests {
         fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
             Ok(())
         }
-        fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+        fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
             let Some(datagram) = self.queued.borrow_mut().pop_front() else {
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
             };
             buf[..datagram.len()].copy_from_slice(&datagram);
-            Ok((datagram.len(), None))
+            Ok(datagram.len())
         }
         fn send(&self, data: &[u8]) -> io::Result<usize> {
             Ok(data.len())

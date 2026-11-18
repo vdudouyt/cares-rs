@@ -60,7 +60,7 @@ impl Async {
 
     /// The caller reported this fd readable in the current turn and nothing has
     /// read since — the peek for a timeout that expired alongside readiness.
-    pub fn readable_this_turn(&self) -> bool {
+    pub(crate) fn readable_this_turn(&self) -> bool {
         let now = self.reactor.ticker();
         self.source.tick(READ) == now && self.read_tick.get() != Some(now)
     }
@@ -75,7 +75,7 @@ impl Async {
         self.reactor.with_scratch(|scratch| {
             ensure_scratch(scratch);
             match self.sock.recv(scratch) {
-                Ok((n, _)) => {
+                Ok(n) => {
                     out.extend_from_slice(&scratch[..n]);
                     Ok(Some(n))
                 }
@@ -93,7 +93,7 @@ impl Async {
         self.reactor.with_scratch(|scratch| {
             ensure_scratch(scratch);
             match self.sock.recv(scratch) {
-                Ok((n, _)) => Ok(Some(scratch[..n].to_vec())),
+                Ok(n) => Ok(Some(scratch[..n].to_vec())),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
                 Err(e) => Err(e),
             }
@@ -116,7 +116,7 @@ impl Async {
             // not re-read data this attempt may have consumed.
             self.read_tick.set(Some(self.reactor.ticker()));
             match self.get_ref().recv(buf) {
-                Ok((n, _)) => return Ok(n),
+                Ok(n) => return Ok(n),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // Spurious readiness; wait for the next report.
                 }
@@ -208,9 +208,9 @@ mod tests {
         fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
             Ok(())
         }
-        fn recv(&self, _buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+        fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
             self.reads.set(self.reads.get() + 1);
-            Ok((0, None))
+            Ok(0)
         }
         fn send(&self, data: &[u8]) -> io::Result<usize> {
             Ok(data.len())
