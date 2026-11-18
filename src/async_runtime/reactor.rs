@@ -1,4 +1,4 @@
-//! Per-channel reactor, shaped after async-io's `Reactor`: fd [`Source`]s with
+//! Per-channel reactor, shaped after async-io's `Reactor`: fd `Source`s with
 //! per-direction waker slabs and event ticks, plus a timer map. Where async-io
 //! blocks in `polling::Poller::wait`, the host calls [`Reactor::dispatch`] with
 //! the readiness the caller handed to `ares_process*`, and reads interest back
@@ -165,21 +165,21 @@ pub(crate) struct Source {
 /// One source's current interest, as of [`Reactor::take_interest_changes`].
 /// `read == write == false` means "watch nothing".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct InterestUpdate {
-    pub(crate) fd: i32,
+pub struct InterestUpdate {
+    pub fd: i32,
     /// Reactor-unique registration id; a recycled fd number gets a new one.
-    pub(crate) generation: u64,
-    pub(crate) read: bool,
-    pub(crate) write: bool,
+    pub generation: u64,
+    pub read: bool,
+    pub write: bool,
 }
 
 /// What changed since the host last asked: sources that were dropped, and
 /// sources whose interest differs from (or may differ from) what it was.
 #[derive(Default, Debug)]
-pub(crate) struct InterestChanges {
+pub struct InterestChanges {
     /// `(fd, generation)` of every dropped source.
-    pub(crate) removed: Vec<(i32, u64)>,
-    pub(crate) updates: Vec<InterestUpdate>,
+    pub removed: Vec<(i32, u64)>,
+    pub updates: Vec<InterestUpdate>,
 }
 
 impl Source {
@@ -188,7 +188,7 @@ impl Source {
     }
 }
 
-pub(crate) struct Reactor {
+pub struct Reactor {
     /// Bumped once per `dispatch`; a direction's `tick` records the ticker
     /// value of its last event.
     ticker: Cell<usize>,
@@ -210,7 +210,7 @@ pub(crate) struct Reactor {
 }
 
 impl Reactor {
-    pub(crate) fn new() -> Rc<Self> {
+    pub fn new() -> Rc<Self> {
         Rc::new(Reactor {
             // Starts above every direction's initial tick (0), so a fresh
             // source never looks reported in the current turn.
@@ -270,7 +270,7 @@ impl Reactor {
 
     /// Start logging interest changes for [`Reactor::take_interest_changes`];
     /// every source that already exists is reported by the first call.
-    pub(crate) fn enable_change_tracking(&self) {
+    pub fn enable_change_tracking(&self) {
         self.tracking.set(true);
         for source in self.sources.borrow().iter() {
             self.interest_changed(source);
@@ -280,7 +280,7 @@ impl Reactor {
     /// The sources whose interest may have changed since the last call, with
     /// their interest *now* (an off-then-on blip inside one turn reads as
     /// unchanged), plus the sources dropped since. O(changes), not O(sources).
-    pub(crate) fn take_interest_changes(&self) -> InterestChanges {
+    pub fn take_interest_changes(&self) -> InterestChanges {
         let removed = std::mem::take(&mut *self.removed.borrow_mut());
         let keys = std::mem::take(&mut *self.dirty.borrow_mut());
         let sources = self.sources.borrow();
@@ -305,7 +305,7 @@ impl Reactor {
     /// the wait): directions with waiters whose `(fd, writable)` is `ready` get
     /// this turn's tick and are woken; unless `skip_timeouts`, so are timers due
     /// by `now`. Wakers fire after every borrow is released.
-    pub(crate) fn dispatch(&self, now: Instant, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
+    pub fn dispatch(&self, now: Instant, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
         let tick = self.ticker.get().wrapping_add(1);
         self.ticker.set(tick);
         let mut wake = Vec::new();
@@ -326,7 +326,7 @@ impl Reactor {
     /// [`dispatch`](Self::dispatch) for a host that already knows *which* fds are
     /// ready (the event thread): each `(fd, readable, writable)` finds its source
     /// through the fd index, so a turn costs O(ready fds), not O(sources).
-    pub(crate) fn dispatch_events(&self, now: Instant, skip_timeouts: bool, events: impl IntoIterator<Item = (i32, bool, bool)>) {
+    pub fn dispatch_events(&self, now: Instant, skip_timeouts: bool, events: impl IntoIterator<Item = (i32, bool, bool)>) {
         let tick = self.ticker.get().wrapping_add(1);
         self.ticker.set(tick);
         let mut wake = Vec::new();
@@ -367,7 +367,7 @@ impl Reactor {
     }
 
     /// Every `(fd, wants_write)` some live [`Ready`] is waiting on.
-    pub(crate) fn interests(&self) -> Vec<(i32, bool)> {
+    pub fn interests(&self) -> Vec<(i32, bool)> {
         let mut out = Vec::new();
         for source in self.sources.borrow().iter() {
             let state = source.state.borrow();
@@ -381,7 +381,7 @@ impl Reactor {
     }
 
     /// The earliest registered timer deadline.
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    pub fn next_deadline(&self) -> Option<Instant> {
         self.timers.borrow().keys().next().map(|(when, _)| *when)
     }
 
@@ -427,7 +427,7 @@ impl Reactor {
 /// `&Self`: it is pinned inside async state machines that `select_biased!`
 /// reads through shared references, and a `&mut` to an `Unpin` type would be
 /// treated as unique there (Tree Borrows), making the next self-write UB.
-pub(crate) struct Ready {
+pub struct Ready {
     reactor: Rc<Reactor>,
     source: Rc<Source>,
     dir: usize,
@@ -490,7 +490,7 @@ impl Drop for Ready {
 /// deregistered on completion or drop. Reads the clock on every poll, so a task
 /// polled for another reason still observes its expiry. `!Unpin` with `Cell`
 /// state, for the same reason as [`Ready`].
-pub(crate) struct Timer {
+pub struct Timer {
     reactor: Rc<Reactor>,
     when: Instant,
     id: Cell<Option<usize>>,
@@ -498,7 +498,7 @@ pub(crate) struct Timer {
 }
 
 impl Timer {
-    pub(crate) fn at(reactor: &Rc<Reactor>, when: Instant) -> Self {
+    pub fn at(reactor: &Rc<Reactor>, when: Instant) -> Self {
         Timer { reactor: reactor.clone(), when, id: Cell::new(None), _pin: PhantomPinned }
     }
 }
@@ -531,13 +531,13 @@ impl Drop for Timer {
 }
 
 /// A detached task waiting for the host to move it into the executor.
-pub(crate) type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
+pub type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
 
 /// A channel's runtime handle — smol's implicit global reactor made explicit:
 /// creates [`Async`](crate::async_runtime::io::Async) sockets and [`Timer`]s,
 /// and spawns detached tasks.
 #[derive(Clone)]
-pub(crate) struct Runtime {
+pub struct Runtime {
     reactor: Rc<Reactor>,
     factory: Rc<dyn SocketFactory>,
     /// Tasks from [`Runtime::spawn`], not yet taken by the host.
@@ -545,7 +545,7 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-    pub(crate) fn new(factory: Rc<dyn SocketFactory>) -> Self {
+    pub fn new(factory: Rc<dyn SocketFactory>) -> Self {
         Runtime { reactor: Reactor::new(), factory, spawned: Rc::default() }
     }
 
@@ -554,33 +554,33 @@ impl Runtime {
     /// completes or the channel aborts its tasks. The executor is busy polling
     /// the caller, so the task is queued here and the host moves it into the
     /// executor (see [`Runtime::take_spawned`]) once that poll returns.
-    pub(crate) fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
+    pub fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
         self.spawned.borrow_mut().push(Box::pin(fut));
     }
 
     /// Take every task queued by [`Runtime::spawn`] since the last call.
-    pub(crate) fn take_spawned(&self) -> Vec<SpawnedTask> {
+    pub fn take_spawned(&self) -> Vec<SpawnedTask> {
         std::mem::take(&mut *self.spawned.borrow_mut())
     }
 
-    pub(crate) fn reactor(&self) -> &Rc<Reactor> {
+    pub fn reactor(&self) -> &Rc<Reactor> {
         &self.reactor
     }
 
-    pub(crate) fn factory(&self) -> Rc<dyn SocketFactory> {
+    pub fn factory(&self) -> Rc<dyn SocketFactory> {
         self.factory.clone()
     }
 
-    pub(crate) fn set_factory(&mut self, factory: Rc<dyn SocketFactory>) {
+    pub fn set_factory(&mut self, factory: Rc<dyn SocketFactory>) {
         self.factory = factory;
     }
 
-    pub(crate) fn udp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+    pub fn udp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
         let sock: Rc<dyn Socket> = self.factory.create_udp(bind)?;
         Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
     }
 
-    pub(crate) fn tcp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+    pub fn tcp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
         let sock: Rc<dyn Socket> = self.factory.create_tcp(bind)?;
         Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
     }

@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use futures_util::{select_biased, FutureExt};
 
-use crate::async_runtime::io::{send_when_writable, Async};
+use crate::async_runtime::io::Async;
 use crate::async_runtime::reactor::Timer;
 use crate::core::tcp_pool::TcpConn;
 use crate::core::async_client::ChannelShared;
@@ -89,10 +89,25 @@ impl Conn {
         }
     }
 
-    /// Await writability, then send `bytes` once (WouldBlock re-awaits);
-    /// `TimedOut` if not writable before `timeout`.
+    /// Send one DNS message: the whole stream frame for TCP, one datagram for
+    /// UDP. `TimedOut` if not writable before `timeout`.
     pub async fn send(&self, bytes: &[u8], timeout: Instant) -> io::Result<()> {
-        send_when_writable(&self.sock(), bytes, timeout).await
+        let sock = self.sock();
+        match &self.wire {
+            // TCP carries a length-prefixed frame; a short write must be
+            // continued or the peer sees a truncated message.
+            Wire::Shared(_, _) => sock.write_all(bytes, timeout).await,
+            // A datagram is sent as one unit. A short send would be a second
+            // datagram, not a continuation, so reject it.
+            Wire::SharedUdp(_, _) => {
+                let n = sock.write(bytes, timeout).await?;
+                if n == bytes.len() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(io::ErrorKind::WriteZero, "short datagram send"))
+                }
+            }
+        }
     }
 
     /// Take a message a **sibling** already routed into this tag's slot,

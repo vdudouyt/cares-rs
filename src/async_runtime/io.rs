@@ -19,13 +19,13 @@ use crate::async_runtime::reactor::{Reactor, Ready, Source, Timer, READ, WRITE};
 use crate::async_runtime::socket::Socket;
 
 /// The uniform dead-socket error (EOF / hard recv failure).
-pub(crate) fn dead() -> io::Error {
+pub fn dead() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")
 }
 
 /// A socket registered with the reactor; dropping it deregisters the fd before
 /// the socket itself closes.
-pub(crate) struct Async {
+pub struct Async {
     source: Rc<Source>,
     reactor: Rc<Reactor>,
     /// Ticker value of the last read attempt, so a same-turn peek
@@ -36,43 +36,81 @@ pub(crate) struct Async {
 }
 
 impl Async {
-    pub(crate) fn new(sock: Rc<dyn Socket>, reactor: &Rc<Reactor>) -> Rc<Self> {
+    pub fn new(sock: Rc<dyn Socket>, reactor: &Rc<Reactor>) -> Rc<Self> {
         let source = reactor.insert_io(sock.as_raw_fd());
         Rc::new(Async { source, reactor: reactor.clone(), read_tick: Cell::new(None), sock })
     }
 
-    pub(crate) fn get_ref(&self) -> &dyn Socket {
+    pub fn get_ref(&self) -> &dyn Socket {
         &*self.sock
     }
 
-    pub(crate) fn reactor(&self) -> &Rc<Reactor> {
+    pub fn reactor(&self) -> &Rc<Reactor> {
         &self.reactor
     }
 
     /// Resolves on the next readable report for this fd.
-    pub(crate) fn readable(&self) -> Ready {
+    pub fn readable(&self) -> Ready {
         Ready::new(self.reactor.clone(), self.source.clone(), READ)
     }
 
     /// Resolves on the next writable report for this fd.
-    pub(crate) fn writable(&self) -> Ready {
+    pub fn writable(&self) -> Ready {
         Ready::new(self.reactor.clone(), self.source.clone(), WRITE)
     }
 
     /// The caller reported this fd readable in the current turn and nothing has
     /// read since — the peek for a timeout that expired alongside readiness.
-    pub(crate) fn readable_this_turn(&self) -> bool {
+    pub fn readable_this_turn(&self) -> bool {
         let now = self.reactor.ticker();
         self.source.tick(READ) == now && self.read_tick.get() != Some(now)
     }
 
     /// One read attempt with the reactor's scratch; marks this turn's readiness consumed.
-    pub(crate) fn read<R>(&self, op: impl FnOnce(&dyn Socket, &mut Vec<u8>) -> R) -> R {
+    pub fn read<R>(&self, op: impl FnOnce(&dyn Socket, &mut Vec<u8>) -> R) -> R {
         self.read_tick.set(Some(self.reactor.ticker()));
         self.reactor.with_scratch(|scratch| {
             ensure_scratch(scratch);
             op(&*self.sock, scratch)
         })
+    }
+
+    /// Write once, waiting for writability if the socket reports `WouldBlock`.
+    /// Returns the number of bytes accepted, which may be less than
+    /// `bytes.len()` on a stream socket. `deadline` is an absolute `Instant`.
+    pub async fn write(&self, bytes: &[u8], deadline: Instant) -> io::Result<usize> {
+        loop {
+            match self.get_ref().send(bytes) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let mut writable = pin!(self.writable().fuse());
+                    let mut t = pin!(Timer::at(&self.reactor, deadline).fuse());
+                    select_biased! {
+                        _ = writable => {}
+                        _ = t => return Err(io::ErrorKind::TimedOut.into()),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Write every byte before `deadline`.
+    ///
+    /// This is the stream-friendly counterpart of [`write`](Self::write): it
+    /// retries short writes and reports `WriteZero` if the socket accepts no
+    /// more bytes. Datagram sockets normally accept the whole buffer on the
+    /// first send.
+    pub async fn write_all(&self, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+        let mut sent = 0;
+        while sent < bytes.len() {
+            let n = self.write(&bytes[sent..], deadline).await?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            sent += n;
+        }
+        Ok(())
     }
 }
 
@@ -89,31 +127,9 @@ fn ensure_scratch(scratch: &mut Vec<u8>) {
     }
 }
 
-/// Send once, waiting for writability only if the first attempt reports
-/// `WouldBlock`. Conforming sockets are non-blocking, so the common datagram
-/// path sends immediately — matching upstream c-ares. Applications such as
-/// Node only register a poll interest for directions c-ares reports; waiting
-/// for a writable event that was never requested would stall the query.
-pub(crate) async fn send_when_writable(sock: &Async, bytes: &[u8], timeout: Instant) -> io::Result<()> {
-    loop {
-        match sock.get_ref().send(bytes) {
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let mut writable = pin!(sock.writable().fuse());
-                let mut t = pin!(Timer::at(sock.reactor(), timeout).fuse());
-                select_biased! {
-                    _ = writable => {}
-                    _ = t => return Err(io::ErrorKind::TimedOut.into()), // timed out before writable
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// One non-blocking datagram receive (UDP) into `scratch`: `Ready` on any read
 /// including zero-length, `Pending` on `WouldBlock`, `Ready(Err)` on hard error.
-pub(crate) fn recv_datagram(sock: &dyn Socket, scratch: &mut [u8]) -> Poll<io::Result<Vec<u8>>> {
+pub fn recv_datagram(sock: &dyn Socket, scratch: &mut [u8]) -> Poll<io::Result<Vec<u8>>> {
     match sock.recv(scratch) {
         Ok((n, _)) => Poll::Ready(Ok(scratch[..n].to_vec())),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
@@ -122,7 +138,7 @@ pub(crate) fn recv_datagram(sock: &dyn Socket, scratch: &mut [u8]) -> Poll<io::R
 }
 
 /// Drain available stream bytes (TCP) into `buf`; `false` if the connection died.
-pub(crate) fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>, scratch: &mut [u8]) -> bool {
+pub fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>, scratch: &mut [u8]) -> bool {
     match sock.recv(scratch) {
         Ok((0, _)) => false, // peer closed
         Ok((n, _)) => {

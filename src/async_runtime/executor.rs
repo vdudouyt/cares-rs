@@ -99,7 +99,7 @@ struct Slot {
 /// so a re-entrant call always observes the current table; nothing caches a
 /// pointer into `slots` that a re-entrant `spawn` could invalidate.
 #[derive(Default)]
-pub(crate) struct Executor {
+pub struct Executor {
     inner: Rc<RefCell<ExecutorInner>>,
 }
 
@@ -112,7 +112,7 @@ struct ExecutorInner {
 
 impl Executor {
     /// Register `fut` in a free slot and return its id; does not poll.
-    pub(crate) fn spawn<T: 'static>(
+    pub fn spawn<T: 'static>(
         &self,
         fut: impl Future<Output = T> + 'static,
         on: impl FnOnce(Result<T, i32>) + 'static,
@@ -140,7 +140,7 @@ impl Executor {
 
     /// Pop the next runnable live task, skipping stale or reaped entries. The
     /// queue lock is released before returning, so the poll that follows may wake.
-    pub(crate) fn pop_ready(&self) -> Option<usize> {
+    pub fn pop_ready(&self) -> Option<usize> {
         let inner = self.inner.borrow();
         loop {
             let (id, gen) = inner.queue.lock().unwrap_or_else(PoisonError::into_inner).pop_front()?;
@@ -151,14 +151,14 @@ impl Executor {
     }
 
     /// Whether any woken task is waiting to be polled.
-    pub(crate) fn has_ready(&self) -> bool {
+    pub fn has_ready(&self) -> bool {
         !self.inner.borrow().queue.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
     }
 
     /// Poll `id` once with its own waker; `true` when it completed. A reaped id
     /// yields `false`. If the task was cancelled during the poll, it is
     /// delivered with that status here and the call returns `false`.
-    pub(crate) fn poll(&self, id: usize) -> bool {
+    pub fn poll(&self, id: usize) -> bool {
         let (mut task, waker) = {
             let mut inner = self.inner.borrow_mut();
             let Some(slot) = inner.slots.get_mut(id).and_then(|s| s.as_mut()) else {
@@ -202,7 +202,7 @@ impl Executor {
     /// Reap `id` and deliver its output or cancel status; an already-reaped id
     /// is a no-op (a re-entrant abort cannot double-deliver). A cancel aimed at
     /// a task that is being polled is recorded and applied when its poll returns.
-    pub(crate) fn deliver(&self, id: usize, cancel: Option<i32>) {
+    pub fn deliver(&self, id: usize, cancel: Option<i32>) {
         let task = {
             let mut inner = self.inner.borrow_mut();
             let Some(entry) = inner.slots.get_mut(id) else { return };
@@ -221,12 +221,12 @@ impl Executor {
     }
 
     /// The id range spanning every slot, live or reaped.
-    pub(crate) fn ids(&self) -> std::ops::Range<usize> {
+    pub fn ids(&self) -> std::ops::Range<usize> {
         0..self.inner.borrow().slots.len()
     }
 
     /// Number of live tasks.
-    pub(crate) fn active_count(&self) -> usize {
+    pub fn active_count(&self) -> usize {
         self.inner.borrow().slots.iter().filter(|s| s.is_some()).count()
     }
 }

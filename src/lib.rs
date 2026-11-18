@@ -12,7 +12,10 @@
         clippy::unreachable
     )
 )]
-mod async_runtime;
+/// A small, single-threaded async runtime driven by the application's event
+/// loop. See `ASYNC_RUNTIME.md` for the model and `examples/tcp_hello.rs` for
+/// a full socket client.
+pub mod async_runtime;
 mod core;
 mod ffi;
 mod plugins;

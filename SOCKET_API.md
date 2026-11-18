@@ -1,5 +1,9 @@
 # Async socket API (`src/async_runtime/`, used by core/async_client.rs)
 
+> This file describes the DNS connection facade (`Conn`) built on the runtime.
+> For the generic, protocol-agnostic external-loop API (reactor, `Async`
+> sockets, `Timer`, `Executor`), see [ASYNC_RUNTIME.md](ASYNC_RUNTIME.md).
+
 Layering: `async_runtime/executor.rs` (pure-IO reactor) → `async_runtime/conn.rs`
 (async sockets: frames + mux tags, zero DNS) → `core/async_client.rs` (the DNS
 resolver). The whole `src/async_runtime/` section is `#![forbid(unsafe_code)]`

@@ -8,3 +8,13 @@ $ gcc example.c -lcares -o example
 $ ./example google.com
 Resolved: 142.250.179.206
 ```
+
+## Generic async sockets
+
+The async runtime that drives the resolver is also usable for arbitrary
+protocols. It follows the c-ares model: the application owns the event loop,
+asks the reactor which fds/timers it is waiting on, waits itself, and hands
+readiness back with `Reactor::dispatch` (the `ares_process()` step). See
+[ASYNC_RUNTIME.md](ASYNC_RUNTIME.md) and the
+[`tcp_hello`](examples/tcp_hello.rs) example.
+

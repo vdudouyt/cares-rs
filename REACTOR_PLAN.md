@@ -133,8 +133,8 @@ impl Drop for Async { /* reactor.remove_io(&source) */ }
 ```
 
 `read_with` lends the reactor's `scratch` to `op`. `recv_datagram`/`recv_stream`
-stay as plain `op` bodies. `send_when_writable` becomes
-`timer.or(async_sock.write_with(..))` using `select_biased!`, as today.
+stay as plain `op` bodies. `write`/`write_all` use
+`timer.or(async_sock.write(..))` with `select_biased!`.
 
 ### `timer.rs::Timer` (async-io's `Timer`)
 
