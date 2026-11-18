@@ -50,7 +50,7 @@ thread) can call `Reactor::enable_change_tracking()` once and then apply
 | `socket.rs` | `Socket` (one non-blocking fd: `connect`, `recv`, `send`, `as_raw_fd`, `drain_safe`) and `SocketFactory` (`create_udp`, `create_tcp`). |
 | `reactor.rs` | `Reactor` (fd `Source`s, per-direction wakers, timers, receive scratch), `Ready` (readable/writable future), `Timer`, `Runtime` (reactor + detached-task queue + built-in system sockets), `InterestChanges` (for persistent event backends). |
 | `io.rs` | `Async` (a `Socket` registered with a reactor), `readable()`, `writable()`, `read()`, `read_exact()`, `write()`, `write_all()`, `dead`. |
-| `executor.rs` | `Executor<E>` (`spawn`, `pop_ready`, `poll`, `finish`, `has_ready`), one real `Waker` per task. |
+| `executor.rs` | `Executor<E>` (`spawn`, `pop_ready`, `poll`, `finish`, `cancel`, `has_ready`), one real `Waker` per task. |
 | `system.rs` | The built-in system sockets behind `Runtime::create_tcp` / `create_udp`: std `UdpSocket::bind`, and std `TcpStream` over a `rustix`-created/bound fd. |
 
 The whole module is `#![forbid(unsafe_code)]`. Unsafe code, if any, belongs in
@@ -87,7 +87,7 @@ fn drive(runtime: &Runtime, executor: &Executor) {
         });
         while let Some(id) = executor.pop_ready() {
             if executor.poll(id) {
-                executor.finish(id, Ok(()));
+                executor.finish(id);
             }
         }
 
@@ -95,7 +95,7 @@ fn drive(runtime: &Runtime, executor: &Executor) {
         for fut in runtime.take_spawned() {
             let id = executor.spawn(fut, |_| {});
             if executor.poll(id) {
-                executor.finish(id, Ok(()));
+                executor.finish(id);
             }
         }
     }
@@ -117,21 +117,20 @@ kicks it once:
 
 ```rust
 let id = executor.spawn(async { /* ... */ }, |result| {
-    // Ok(value) on completion, Err(status) after cancel (the i32 is a c-ares
-    // status such as ARES_EDESTRUCTION; application code can use any value).
+    // Ok(value) on completion, Err(error) after cancel; E is chosen by the
+    // application (c-ares uses c_int statuses such as ARES_EDESTRUCTION).
 });
 if executor.poll(id) {
-    executor.finish(id, Ok(()));
+    executor.finish(id);
 }
 ```
 
 After that, the task is woken by its `Waker` and becomes runnable via
 `pop_ready()`. `poll(id)` returns `true` when the future completed; the host
-must then call `finish(id, Ok(()))` to run the delivery closure and reuse the
-slot. `finish(id, Err(status))` cancels a task and delivers `Err(status)`.
-`has_ready()` tells the loop not to sleep before polling again. `ids()` and
-`active_count()` are for bookkeeping; `finish` on an already-reaped id is a
-no-op.
+must then call `finish(id)` to run the delivery closure and reuse the slot.
+`cancel(id, error)` cancels a task and delivers `Err(error)`. `has_ready()`
+tells the loop not to sleep before polling again. `ids()` and `active_count()`
+are for bookkeeping; `finish`/`cancel` on an already-reaped id is a no-op.
 
 `Runtime::spawn(fut)` is the detached-task equivalent (`tokio::spawn` with no
 handle): it queues the future because the executor may be mid-poll. The host

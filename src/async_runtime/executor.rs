@@ -216,20 +216,26 @@ impl<E: 'static> Executor<E> {
         false
     }
 
-    /// Reap `id` and deliver its output or cancel status; an already-reaped id
-    /// is a no-op (a re-entrant cancel cannot double-deliver). A cancel aimed
-    /// at a task that is being polled is recorded and applied when its poll
-    /// returns.
-    ///
-    /// `Ok(())` means the task completed and its stashed output is delivered.
-    /// `Err(status)` means cancel it; the callback receives `Err(status)`.
-    pub fn finish(&self, id: usize, status: Result<(), E>) {
+    /// Reap a completed `id` and deliver its stashed output to `on` as
+    /// `Ok(output)`. An already-reaped id is a no-op.
+    pub fn finish(&self, id: usize) {
+        self.reap(id, None);
+    }
+
+    /// Cancel `id`; its callback receives `Err(error)` and the slot is freed.
+    /// An already-reaped id is a no-op. A cancel aimed at a task that is
+    /// currently being polled is recorded and applied when its poll returns.
+    pub fn cancel(&self, id: usize, error: E) {
+        self.reap(id, Some(error));
+    }
+
+    fn reap(&self, id: usize, cancel: Option<E>) {
         let task = {
             let mut inner = self.inner.borrow_mut();
             let Some(entry) = inner.slots.get_mut(id) else { return };
             if let Some(slot) = entry.as_mut().filter(|slot| slot.task.is_none()) {
-                if let Err(status) = status {
-                    slot.cancel.get_or_insert(status);
+                if let Some(error) = cancel {
+                    slot.cancel.get_or_insert(error);
                 }
                 return;
             }
@@ -237,7 +243,7 @@ impl<E: 'static> Executor<E> {
         };
         // The delivery callback may itself re-enter; call it unborrowed.
         if let Some(task) = task {
-            task.finish(status);
+            task.finish(cancel.map_or(Ok(()), Err));
         }
     }
 
@@ -291,7 +297,7 @@ mod tests {
         let id = ex.spawn(wake_later(w.clone()), |_| {});
         assert!(!ex.poll(id));
         let stale = w.borrow_mut().take().expect("registered waker");
-        ex.finish(id, Err(1));
+        ex.cancel(id, 1);
         let id2 = ex.spawn(std::future::pending::<()>(), |_| {});
         assert_eq!(id, id2, "slot reused");
         stale.wake();
