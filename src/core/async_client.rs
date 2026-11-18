@@ -57,7 +57,7 @@ use crate::core::nameinfo::{
 use crate::core::qid::{QidLease, QidRegistry, ReservedQuery};
 use crate::core::response::{addr_reply, push_synthetic_ptr, CnameEntry, ParsedRRs, ReplyRequire};
 use crate::core::services::Services;
-use crate::async_runtime::socket::SocketFactory;
+use crate::async_runtime::socket::{SocketFactory, SocketKind};
 use crate::core::sortlist::{parse_sortlist, sort_addrinfo, SortlistEntry};
 use crate::core::sysconfig::SysConfig;
 use crate::core::AresError;
@@ -89,9 +89,13 @@ use crate::ffi::{
 /// and the same runtime handle).
 pub(crate) struct AsyncClient {
     pub config: SysConfig,
-    /// The channel's runtime handle (reactor + socket factory); every lookup
-    /// copy shares it.
+    /// The channel's runtime handle (reactor + detached-task queue); every
+    /// lookup copy shares it.
     pub rt: Runtime,
+    /// The socket table used for this channel's new sockets. Kept outside the
+    /// runtime so the default system I/O and custom tables are just two
+    /// implementations of the same factory.
+    pub factory: Rc<dyn SocketFactory>,
     /// Lazily loaded `/etc/hosts`; already initialized on a lookup copy.
     hosts: OnceCell<Rc<Hosts>>,
     pub default_udp_port: u16,
@@ -199,6 +203,7 @@ impl AsyncClient {
         AsyncClient {
             config: self.config.clone(),
             rt: self.rt.clone(),
+            factory: self.factory.clone(),
             hosts: OnceCell::from(self.hostsfile()),
             default_udp_port: self.default_udp_port,
             default_tcp_port: self.default_tcp_port,

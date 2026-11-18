@@ -73,7 +73,7 @@ impl ChannelData {
     pub(crate) fn dup_from(&self) -> Self {
         let socket_factory = std::rc::Rc::new((**self.socket_factory.borrow()).clone());
         let mut state = self.state.borrow().duplicate();
-        state.rt.set_factory(socket_factory.clone());
+        state.set_socket_factory(socket_factory.clone());
         let dup = ChannelData {
             state: RefCell::new(state),
             socket_factory: RefCell::new(socket_factory),
@@ -138,7 +138,7 @@ impl ChannelData {
 
     /// Install a rebuilt factory, keeping the concrete handle and core `Rc` in sync.
     pub(crate) fn apply_socket_factory(&self, factory: std::rc::Rc<CSocketFactory>) {
-        self.state.borrow_mut().rt.set_factory(factory.clone());
+        self.state.borrow_mut().set_socket_factory(factory.clone());
         *self.socket_factory.borrow_mut() = factory;
     }
 

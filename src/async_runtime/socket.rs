@@ -5,6 +5,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
+/// Which kind of socket a custom factory should create.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketKind {
+    Tcp,
+    Udp,
+}
+
 /// One non-blocking socket for a fixed address family.
 pub trait Socket {
     fn as_raw_fd(&self) -> i32;

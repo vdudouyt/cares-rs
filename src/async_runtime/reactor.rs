@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use crate::async_runtime::socket::{Socket, SocketFactory};
+use crate::async_runtime::socket::{Socket, SocketFactory, SocketKind};
 
 pub(crate) const READ: usize = 0;
 pub(crate) const WRITE: usize = 1;
@@ -539,14 +539,14 @@ pub type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
 #[derive(Clone)]
 pub struct Runtime {
     reactor: Rc<Reactor>,
-    factory: Rc<dyn SocketFactory>,
     /// Tasks from [`Runtime::spawn`], not yet taken by the host.
     spawned: Rc<RefCell<Vec<SpawnedTask>>>,
 }
 
 impl Runtime {
-    pub fn new(factory: Rc<dyn SocketFactory>) -> Self {
-        Runtime { reactor: Reactor::new(), factory, spawned: Rc::default() }
+    /// A runtime with the reactor and the built-in system socket factory.
+    pub fn new() -> Self {
+        Runtime { reactor: Reactor::new(), spawned: Rc::default() }
     }
 
     /// Spawn a detached task (≈ `tokio::spawn`): fire-and-forget, with no
@@ -567,22 +567,38 @@ impl Runtime {
         &self.reactor
     }
 
-    pub fn factory(&self) -> Rc<dyn SocketFactory> {
-        self.factory.clone()
-    }
-
-    pub fn set_factory(&mut self, factory: Rc<dyn SocketFactory>) {
-        self.factory = factory;
-    }
-
+    /// Create and register a UDP socket over the built-in system I/O.
     pub fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
-        let sock: Rc<dyn Socket> = self.factory.create_udp(bind)?;
+        let sock = crate::async_runtime::system::create(SocketKind::Udp, bind)?;
         Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
     }
 
+    /// Create and register a TCP socket over the built-in system I/O.
     pub fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
-        let sock: Rc<dyn Socket> = self.factory.create_tcp(bind)?;
+        let sock = crate::async_runtime::system::create(SocketKind::Tcp, bind)?;
         Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
+    }
+
+    /// Create and register a socket through a caller-supplied factory (e.g.
+    /// c-ares' `ares_socket_functions` table). The runtime itself stores no
+    /// factory: the application decides per socket.
+    pub fn create_custom_socket(
+        &self,
+        kind: SocketKind,
+        bind: SocketAddr,
+        factory: Rc<dyn SocketFactory>,
+    ) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+        let sock: Rc<dyn Socket> = match kind {
+            SocketKind::Tcp => factory.create_tcp(bind)?,
+            SocketKind::Udp => factory.create_udp(bind)?,
+        };
+        Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

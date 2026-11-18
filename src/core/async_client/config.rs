@@ -150,7 +150,8 @@ impl AsyncClient {
     ) -> Self {
         let mut client = AsyncClient {
             config,
-            rt: Runtime::new(factory),
+            rt: Runtime::new(),
+            factory,
             hosts: OnceCell::new(),
             default_udp_port,
             default_tcp_port,
@@ -186,6 +187,12 @@ impl AsyncClient {
         client
     }
 
+    /// Replace the channel's socket factory (ares_set_socket_functions[_ex],
+    /// local bind/option changes, duplicate).
+    pub(crate) fn set_socket_factory(&mut self, factory: Rc<dyn SocketFactory>) {
+        self.factory = factory;
+    }
+
     /// Register a query plugin; plugins run in registration order.
     pub(crate) fn add_plugin(&mut self, plugin: impl Plugin + 'static) {
         self.plugins.push(Rc::new(plugin));
@@ -209,7 +216,7 @@ impl AsyncClient {
     pub fn duplicate(&self) -> AsyncClient {
         let mut dup = AsyncClient::build(
             self.config.clone(),
-            self.rt.factory(),
+            self.factory.clone(),
             self.default_udp_port,
             self.default_tcp_port,
         );

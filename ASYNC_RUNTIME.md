@@ -48,9 +48,10 @@ thread) can call `Reactor::enable_change_tracking()` once and then apply
 | File | Contents |
 |---|---|
 | `socket.rs` | `Socket` (one non-blocking fd: `connect`, `recv`, `send`, `as_raw_fd`, `drain_safe`) and `SocketFactory` (`create_udp`, `create_tcp`). |
-| `reactor.rs` | `Reactor` (fd `Source`s, per-direction wakers, timers, receive scratch), `Ready` (readable/writable future), `Timer`, `Runtime` (reactor + factory + detached-task queue), `InterestChanges` (for persistent event backends). |
+| `reactor.rs` | `Reactor` (fd `Source`s, per-direction wakers, timers, receive scratch), `Ready` (readable/writable future), `Timer`, `Runtime` (reactor + detached-task queue + built-in system sockets), `InterestChanges` (for persistent event backends). |
 | `io.rs` | `Async` (a `Socket` registered with a reactor), `readable()`, `writable()`, `read()`, `read_exact()`, `write()`, `write_all()`, `dead`. |
 | `executor.rs` | `Executor` (`spawn`, `pop_ready`, `poll`, `deliver`, `has_ready`), one real `Waker` per task. |
+| `system.rs` | The built-in system sockets behind `Runtime::create_tcp` / `create_udp` (stdlib `TcpStream`/`UdpSocket` over `rustix`-created fds). |
 
 The whole module is `#![forbid(unsafe_code)]`. Unsafe code, if any, belongs in
 the `Socket` implementation that talks to the OS or to a foreign network stack.
@@ -166,6 +167,14 @@ Contract:
 - `drain_safe()` should be `false` for caller-supplied sockets that may block,
   so a drain loop does not re-read them. Non-blocking descriptors return the
   default `true`.
+
+`Runtime::create_tcp(bind)` / `create_udp(bind)` use the built-in system socket
+implementation (stdlib/rustix) and need no factory. Applications that need
+custom sockets pass their own factory per socket:
+
+```rust
+let sock = runtime.create_custom_socket(SocketKind::Tcp, bind, factory)?;
+```
 
 `SocketFactory::create_tcp` / `create_udp` receive the **local bind address**
 (the resolver's local-IP/socket settings), not the peer. The runtime connects

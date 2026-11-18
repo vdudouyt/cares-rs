@@ -41,8 +41,9 @@ pub mod socket;
 pub mod executor;
 pub mod io;
 pub mod reactor;
+mod system;
 
 pub use executor::Executor;
 pub use io::Async;
 pub use reactor::{Reactor, Ready, Runtime, Timer};
-pub use socket::{Socket, SocketFactory};
+pub use socket::{Socket, SocketFactory, SocketKind};

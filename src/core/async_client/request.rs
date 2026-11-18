@@ -426,7 +426,7 @@ impl AsyncClient {
                 // callbacks fire during creation, nor while `Conn::shared` borrows.
                 let pooled = self.shared.tcp_pool.borrow().get(s);
                 let checked_out = pooled.or_else(|| {
-                    let sock = self.rt.create_tcp(s.bind_addr()).ok()?;
+                    let sock = self.rt.create_custom_socket(SocketKind::Tcp, s.bind_addr(), self.factory.clone()).ok()?;
                     // `connect` runs the create callback and is optimistic for
                     // EINPROGRESS; a refusal fails this attempt, so the socket
                     // is dropped instead of pooled and the loop moves on.
@@ -449,7 +449,7 @@ impl AsyncClient {
                 };
                 drop(retired);
                 let checked_out = pooled.or_else(|| {
-                    let sk = self.rt.create_udp(s.bind_addr()).ok()?;
+                    let sk = self.rt.create_custom_socket(SocketKind::Udp, s.bind_addr(), self.factory.clone()).ok()?;
                     // A create-callback refusal drops this socket (never
                     // pooled) and the failover loop retries with a fresh one.
                     sk.get_ref().connect(s.udp_addr()).ok()?;
