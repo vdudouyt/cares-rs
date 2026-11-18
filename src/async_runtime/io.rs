@@ -69,7 +69,7 @@ impl Async {
     /// One read attempt with the reactor's scratch; marks this turn's readiness
     /// consumed. This is the protocol-layer helper used by the DNS connection
     /// pools; generic callers normally use [`read`](Self::read).
-    pub fn read_with<R>(&self, op: impl FnOnce(&dyn Socket, &mut Vec<u8>) -> R) -> R {
+    pub(crate) fn read_with<R>(&self, op: impl FnOnce(&dyn Socket, &mut Vec<u8>) -> R) -> R {
         self.read_tick.set(Some(self.reactor.ticker()));
         self.reactor.with_scratch(|scratch| {
             ensure_scratch(scratch);
