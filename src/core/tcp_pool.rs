@@ -112,7 +112,7 @@ impl TcpConn {
     pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<Vec<u8>>> {
         let sock = conn.borrow().sock.clone();
         let mut bytes = Vec::new();
-        let alive = sock.read(|s, scratch| recv_stream(s, &mut bytes, scratch));
+        let alive = sock.read_with(|s, scratch| recv_stream(s, &mut bytes, scratch));
         let mut this = conn.borrow_mut();
         this.rbuf.extend_from_slice(&bytes);
         this.route();

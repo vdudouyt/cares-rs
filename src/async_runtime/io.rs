@@ -66,13 +66,54 @@ impl Async {
         self.source.tick(READ) == now && self.read_tick.get() != Some(now)
     }
 
-    /// One read attempt with the reactor's scratch; marks this turn's readiness consumed.
-    pub fn read<R>(&self, op: impl FnOnce(&dyn Socket, &mut Vec<u8>) -> R) -> R {
+    /// One read attempt with the reactor's scratch; marks this turn's readiness
+    /// consumed. This is the protocol-layer helper used by the DNS connection
+    /// pools; generic callers normally use [`read`](Self::read).
+    pub fn read_with<R>(&self, op: impl FnOnce(&dyn Socket, &mut Vec<u8>) -> R) -> R {
         self.read_tick.set(Some(self.reactor.ticker()));
         self.reactor.with_scratch(|scratch| {
             ensure_scratch(scratch);
             op(&*self.sock, scratch)
         })
+    }
+
+    /// Read once, waiting for readability if necessary. Returns the number of
+    /// bytes read: `0` means end-of-stream for a TCP socket, or a valid
+    /// zero-length datagram for UDP. `deadline` is an absolute `Instant`.
+    pub async fn read(&self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
+        loop {
+            let mut readable = pin!(self.readable().fuse());
+            let mut t = pin!(Timer::at(&self.reactor, deadline).fuse());
+            select_biased! {
+                _ = readable => {}
+                _ = t => return Err(io::ErrorKind::TimedOut.into()),
+            }
+
+            // Mark the turn before the syscall: a same-turn readiness peek must
+            // not re-read data this attempt may have consumed.
+            self.read_tick.set(Some(self.reactor.ticker()));
+            match self.get_ref().recv(buf) {
+                Ok((n, _)) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Spurious readiness; wait for the next report.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Read exactly `buf.len()` bytes before `deadline`. Stream-only: a
+    /// zero-length read is reported as `UnexpectedEof`.
+    pub async fn read_exact(&self, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = self.read(&mut buf[filled..], deadline).await?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            filled += n;
+        }
+        Ok(())
     }
 
     /// Write once, waiting for writability if the socket reports `WouldBlock`.
@@ -189,7 +230,7 @@ mod tests {
         r.dispatch(Instant::now(), true, |fd, w| fd == 11 && !w);
         assert!(a.readable_this_turn());
 
-        let _ = a.read(|s, buf| recv_datagram(s, buf));
+        let _ = a.read_with(|s, buf| recv_datagram(s, buf));
         assert_eq!(sock.reads.get(), 1);
         assert!(!a.readable_this_turn(), "a read consumes the report");
 
