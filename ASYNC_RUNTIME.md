@@ -50,7 +50,7 @@ thread) can call `Reactor::enable_change_tracking()` once and then apply
 | `socket.rs` | `Socket` (one non-blocking fd: `connect`, `recv`, `send`, `as_raw_fd`, `drain_safe`) and `SocketFactory` (`create_udp`, `create_tcp`). |
 | `reactor.rs` | `Reactor` (fd `Source`s, per-direction wakers, timers, receive scratch), `Ready` (readable/writable future), `Timer`, `Runtime` (reactor + detached-task queue + built-in system sockets), `InterestChanges` (for persistent event backends). |
 | `io.rs` | `Async` (a `Socket` registered with a reactor), `readable()`, `writable()`, `read()`, `read_exact()`, `write()`, `write_all()`, `dead`. |
-| `executor.rs` | `Executor` (`spawn`, `pop_ready`, `poll`, `finish`, `has_ready`), one real `Waker` per task. |
+| `executor.rs` | `Executor<E>` (`spawn`, `pop_ready`, `poll`, `finish`, `has_ready`), one real `Waker` per task. |
 | `system.rs` | The built-in system sockets behind `Runtime::create_tcp` / `create_udp`: std `UdpSocket::bind`, and std `TcpStream` over a `rustix`-created/bound fd. |
 
 The whole module is `#![forbid(unsafe_code)]`. Unsafe code, if any, belongs in
@@ -107,6 +107,10 @@ complete `poll(2)` version, including the fd-deduplication and error/hangup
 handling.
 
 ## Tasks
+
+`Executor<E>` is generic over the cancellation/error type; `E` is not tied to
+c-ares. `Executor::new()` is the `Executor<()>` convenience, while c-ares uses
+`Executor<c_int>` for its `ARES_*` statuses.
 
 `Executor::spawn(fut, on)` registers a future but does **not** poll it. The host
 kicks it once:

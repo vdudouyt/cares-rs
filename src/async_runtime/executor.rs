@@ -13,22 +13,22 @@ use std::task::{Context, Poll, Wake, Waker};
 
 /// One in-flight task with its output type erased, so one `Executor` drives
 /// futures of many output types side by side.
-trait AbstractTask {
+trait AbstractTask<E> {
     /// Poll once; on `Ready`, stash the output and return `true`.
     fn poll(&mut self, cx: &mut Context<'_>) -> bool;
     /// Consume the task, delivering the stashed output or a cancel status.
-    fn finish(self: Box<Self>, status: Result<(), i32>);
+    fn finish(self: Box<Self>, status: Result<(), E>);
 }
 
 /// Concrete task: future and result-delivery closure (`Ok` on completion,
 /// `Err(status)` on cancel).
-struct Task<T> {
+struct Task<T, E> {
     fut: Pin<Box<dyn Future<Output = T>>>,
     out: Option<T>,
-    on: Box<dyn FnOnce(Result<T, i32>)>,
+    on: Box<dyn FnOnce(Result<T, E>)>,
 }
 
-impl<T> AbstractTask for Task<T> {
+impl<T, E> AbstractTask<E> for Task<T, E> {
     fn poll(&mut self, cx: &mut Context<'_>) -> bool {
         match self.fut.as_mut().poll(cx) {
             Poll::Ready(v) => {
@@ -38,7 +38,7 @@ impl<T> AbstractTask for Task<T> {
             Poll::Pending => false,
         }
     }
-    fn finish(self: Box<Self>, status: Result<(), i32>) {
+    fn finish(self: Box<Self>, status: Result<(), E>) {
         let this = *self;
         let result = match (status, this.out) {
             (Err(status), _) => Err(status),
@@ -78,13 +78,13 @@ impl Wake for TaskWaker {
     }
 }
 
-struct Slot {
+struct Slot<E> {
     /// `None` while the task is being polled: [`Executor::poll`] moves it onto
     /// the stack, so nothing that runs during the poll can free or move it.
-    task: Option<Box<dyn AbstractTask>>,
+    task: Option<Box<dyn AbstractTask<E>>>,
     /// A cancel that arrived while the task was being polled, applied when the
     /// poll returns.
-    cancel: Option<i32>,
+    cancel: Option<E>,
     flag: Arc<TaskWaker>,
     waker: Waker,
 }
@@ -98,27 +98,44 @@ struct Slot {
 /// `RefCell` and no borrow is held across a future poll or a delivery callback,
 /// so a re-entrant call always observes the current table; nothing caches a
 /// pointer into `slots` that a re-entrant `spawn` could invalidate.
-#[derive(Default)]
-pub struct Executor {
-    inner: Rc<RefCell<ExecutorInner>>,
+pub struct Executor<E = ()> {
+    inner: Rc<RefCell<ExecutorInner<E>>>,
 }
 
-#[derive(Default)]
-struct ExecutorInner {
-    slots: Vec<Option<Slot>>,
+struct ExecutorInner<E> {
+    slots: Vec<Option<Slot<E>>>,
     queue: RunQueue,
     next_gen: u32,
 }
 
-impl Executor {
+impl<E> Default for Executor<E> {
+    fn default() -> Self {
+        Executor { inner: Rc::new(RefCell::new(ExecutorInner::default())) }
+    }
+}
+
+impl<E> Default for ExecutorInner<E> {
+    fn default() -> Self {
+        ExecutorInner { slots: Vec::new(), queue: RunQueue::default(), next_gen: 0 }
+    }
+}
+
+impl Executor<()> {
+    /// A default executor whose cancellation status is `()`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<E: 'static> Executor<E> {
     /// Register `fut` in a free slot and return its id; does not poll.
     pub fn spawn<T: 'static>(
         &self,
         fut: impl Future<Output = T> + 'static,
-        on: impl FnOnce(Result<T, i32>) + 'static,
+        on: impl FnOnce(Result<T, E>) + 'static,
     ) -> usize {
         let mut inner = self.inner.borrow_mut();
-        let task: Box<dyn AbstractTask> = Box::new(Task { fut: Box::pin(fut), out: None, on: Box::new(on) });
+        let task: Box<dyn AbstractTask<E>> = Box::new(Task { fut: Box::pin(fut), out: None, on: Box::new(on) });
         let id = inner.slots.iter().position(|s| s.is_none()).unwrap_or(inner.slots.len());
         // A generation per spawn: a stale waker for a reaped occupant of this
         // slot must not poll the new one.
@@ -206,7 +223,7 @@ impl Executor {
     ///
     /// `Ok(())` means the task completed and its stashed output is delivered.
     /// `Err(status)` means cancel it; the callback receives `Err(status)`.
-    pub fn finish(&self, id: usize, status: Result<(), i32>) {
+    pub fn finish(&self, id: usize, status: Result<(), E>) {
         let task = {
             let mut inner = self.inner.borrow_mut();
             let Some(entry) = inner.slots.get_mut(id) else { return };
@@ -255,7 +272,7 @@ mod tests {
 
     #[test]
     fn waker_queues_task_once() {
-        let ex = Executor::default();
+        let ex = Executor::new();
         let w = Rc::new(RefCell::new(None));
         let id = ex.spawn(wake_later(w.clone()), |_| {});
         assert!(!ex.poll(id));
@@ -269,7 +286,7 @@ mod tests {
 
     #[test]
     fn stale_waker_does_not_poll_reused_slot() {
-        let ex = Executor::default();
+        let ex = Executor::<i32>::default();
         let w = Rc::new(RefCell::new(None));
         let id = ex.spawn(wake_later(w.clone()), |_| {});
         assert!(!ex.poll(id));

@@ -31,7 +31,7 @@ pub struct ChannelData {
     pub(crate) pending_write_arg: Cell<*mut libc::c_void>,
     pub(crate) sock_state_cb: Cell<ares_sock_state_cb>,
     pub(crate) sock_state_cb_data: Cell<*mut libc::c_void>,
-    executor: Executor,
+    executor: Executor<libc::c_int>,
     /// `ARES_OPT_EVENT_THREAD` was requested (carried over by `ares_dup`).
     pub(crate) event_mode: Cell<bool>,
     /// The `ares_evsys_t` requested with the event thread (carried over by `ares_dup`).
