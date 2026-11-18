@@ -579,6 +579,28 @@ impl Runtime {
         Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
     }
 
+    /// Convenience over `create_tcp` + `Socket::connect`: create a TCP socket
+    /// with a kernel-chosen local address and start a non-blocking connect to
+    /// `remote`.
+    ///
+    /// Like `std::net::TcpStream::connect`, this takes only the peer address;
+    /// unlike it, it returns after the connect is *initiated*, not completed.
+    /// Await [`Async::writable`](crate::async_runtime::io::Async::writable)
+    /// before relying on the socket (as the examples do).
+    pub fn connect_tcp(
+        &self,
+        remote: SocketAddr,
+    ) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+        let local = if remote.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        };
+        let sock = self.create_tcp(local)?;
+        sock.get_ref().connect(remote)?;
+        Ok(sock)
+    }
+
     /// Create and register a socket through a caller-supplied factory (e.g.
     /// c-ares' `ares_socket_functions` table). The runtime itself stores no
     /// factory: the application decides per socket.

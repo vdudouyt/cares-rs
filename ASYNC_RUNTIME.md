@@ -169,8 +169,10 @@ Contract:
   default `true`.
 
 `Runtime::create_tcp(bind)` / `create_udp(bind)` use the built-in system socket
-implementation (stdlib/rustix) and need no factory. Applications that need
-custom sockets pass their own factory per socket:
+implementation (stdlib/rustix) and need no factory. `Runtime::connect_tcp(remote)`
+is the usual one-call TCP convenience: it creates a socket with a kernel-chosen
+local address and starts a non-blocking connect. Applications that need custom
+sockets pass their own factory per socket:
 
 ```rust
 let sock = runtime.create_custom_socket(SocketKind::Tcp, bind, factory)?;
@@ -239,7 +241,8 @@ are polled through shared references by `select_biased!`); pin them with
 
 1. `StreamFactory` creates a non-blocking `TcpStream` from a `rustix` socket
    and implements `Socket` for it.
-2. `Runtime::create_tcp(local)` creates and registers the socket.
+2. `Runtime::connect_tcp(server)` creates, registers, and starts the
+   non-blocking connect.
 3. The task connects, waits for writability (non-blocking connect completes),
    sends `"<name>\n"`, and reads until `'\n'`.
 4. `drive()` builds the `poll(2)` set from `Reactor::interests()`, uses
