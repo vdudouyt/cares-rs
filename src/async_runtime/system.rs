@@ -8,7 +8,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 use rustix::net::{AddressFamily, SocketType};
@@ -58,37 +58,30 @@ impl Socket for SystemSocket {
 
 /// Create and bind one non-blocking system socket.
 pub(crate) fn create(kind: SocketKind, bind: SocketAddr) -> io::Result<Rc<dyn Socket>> {
-    let family = if bind.is_ipv4() {
-        AddressFamily::INET
-    } else {
-        AddressFamily::INET6
-    };
-    let socket_type = match kind {
-        SocketKind::Tcp => SocketType::STREAM,
-        SocketKind::Udp => SocketType::DGRAM,
-    };
-
-    let fd = rustix::net::socket(family, socket_type, None)?;
-    if !bind.ip().is_unspecified() || bind.port() != 0 {
-        bind_fd(&fd, bind)?;
-    }
-
     let socket = match kind {
+        // std has a bound datagram constructor.
+        SocketKind::Udp => {
+            let socket = UdpSocket::bind(bind)?;
+            socket.set_nonblocking(true)?;
+            SystemSocket::Udp(socket)
+        }
+        // std has no unconnected/bound TCP constructor: TcpStream only comes
+        // from connect/connect_timeout/accept. Create the fd with rustix, bind
+        // it, then hand it to std.
         SocketKind::Tcp => {
+            let family = if bind.is_ipv4() {
+                AddressFamily::INET
+            } else {
+                AddressFamily::INET6
+            };
+            let fd = rustix::net::socket(family, SocketType::STREAM, None)?;
+            if !bind.ip().is_unspecified() || bind.port() != 0 {
+                rustix::net::bind(&fd, &bind)?;
+            }
             let stream = TcpStream::from(fd);
             stream.set_nonblocking(true)?;
             SystemSocket::Tcp(stream)
         }
-        SocketKind::Udp => {
-            let socket = UdpSocket::from(fd);
-            socket.set_nonblocking(true)?;
-            SystemSocket::Udp(socket)
-        }
     };
     Ok(Rc::new(socket))
-}
-
-fn bind_fd(fd: &OwnedFd, addr: SocketAddr) -> io::Result<()> {
-    rustix::net::bind(fd, &addr)?;
-    Ok(())
 }
