@@ -10,7 +10,6 @@ use std::cell::Cell;
 use std::io;
 use std::pin::pin;
 use std::rc::Rc;
-use std::task::Poll;
 use std::time::Instant;
 
 use futures_util::{select_biased, FutureExt};
@@ -66,14 +65,38 @@ impl Async {
         self.source.tick(READ) == now && self.read_tick.get() != Some(now)
     }
 
-    /// One read attempt with the reactor's scratch; marks this turn's readiness
-    /// consumed. This is the protocol-layer helper used by the DNS connection
-    /// pools; generic callers normally use [`read`](Self::read).
-    pub(crate) fn read_with<R>(&self, op: impl FnOnce(&dyn Socket, &mut Vec<u8>) -> R) -> R {
+    /// One non-blocking stream read, using the reactor scratch and marking this
+    /// turn's readiness consumed. `Ok(None)` means `WouldBlock`;
+    /// `Ok(Some(0))` means EOF; `Ok(Some(n))` appended `n` bytes to `out`.
+    /// This is internal DNS-pool plumbing: generic callers use
+    /// [`read`](Self::read).
+    pub(crate) fn read_stream(&self, out: &mut Vec<u8>) -> io::Result<Option<usize>> {
         self.read_tick.set(Some(self.reactor.ticker()));
         self.reactor.with_scratch(|scratch| {
             ensure_scratch(scratch);
-            op(&*self.sock, scratch)
+            match self.sock.recv(scratch) {
+                Ok((n, _)) => {
+                    out.extend_from_slice(&scratch[..n]);
+                    Ok(Some(n))
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// One non-blocking datagram read, using the reactor scratch.
+    /// `Ok(None)` means `WouldBlock`; `Ok(Some(frame))` is one datagram,
+    /// including a valid zero-length one. Internal to the DNS pools.
+    pub(crate) fn read_datagram(&self) -> io::Result<Option<Vec<u8>>> {
+        self.read_tick.set(Some(self.reactor.ticker()));
+        self.reactor.with_scratch(|scratch| {
+            ensure_scratch(scratch);
+            match self.sock.recv(scratch) {
+                Ok((n, _)) => Ok(Some(scratch[..n].to_vec())),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e),
+            }
         })
     }
 
@@ -168,29 +191,6 @@ fn ensure_scratch(scratch: &mut Vec<u8>) {
     }
 }
 
-/// One non-blocking datagram receive (UDP) into `scratch`: `Ready` on any read
-/// including zero-length, `Pending` on `WouldBlock`, `Ready(Err)` on hard error.
-pub fn recv_datagram(sock: &dyn Socket, scratch: &mut [u8]) -> Poll<io::Result<Vec<u8>>> {
-    match sock.recv(scratch) {
-        Ok((n, _)) => Poll::Ready(Ok(scratch[..n].to_vec())),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-        Err(_) => Poll::Ready(Err(dead())),
-    }
-}
-
-/// Drain available stream bytes (TCP) into `buf`; `false` if the connection died.
-pub fn recv_stream(sock: &dyn Socket, buf: &mut Vec<u8>, scratch: &mut [u8]) -> bool {
-    match sock.recv(scratch) {
-        Ok((0, _)) => false, // peer closed
-        Ok((n, _)) => {
-            buf.extend_from_slice(&scratch[..n]);
-            true
-        }
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,7 +230,7 @@ mod tests {
         r.dispatch(Instant::now(), true, |fd, w| fd == 11 && !w);
         assert!(a.readable_this_turn());
 
-        let _ = a.read_with(|s, buf| recv_datagram(s, buf));
+        let _ = a.read_datagram();
         assert_eq!(sock.reads.get(), 1);
         assert!(!a.readable_this_turn(), "a read consumes the report");
 

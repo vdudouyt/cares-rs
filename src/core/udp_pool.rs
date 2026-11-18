@@ -8,8 +8,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use crate::async_runtime::io::{dead, recv_datagram};
-use crate::async_runtime::io::Async;
+use crate::async_runtime::io::{dead, Async};
 use crate::core::lookup::ServerId;
 use crate::core::tcp_pool::dns_tag;
 
@@ -206,8 +205,8 @@ fn read_datagrams(sock: &Async) -> (Vec<Vec<u8>>, bool) {
     let drain = sock.get_ref().drain_safe();
     let mut frames = Vec::new();
     loop {
-        match sock.read_with(|s, scratch| recv_datagram(s, scratch)) {
-            Poll::Ready(Ok(frame)) => {
+        match sock.read_datagram() {
+            Ok(Some(frame)) => {
                 frames.push(frame);
                 // A caller-supplied socket may be blocking: one datagram per
                 // readiness cycle is safe; the next cycle drains the rest.
@@ -215,8 +214,8 @@ fn read_datagrams(sock: &Async) -> (Vec<Vec<u8>>, bool) {
                     return (frames, true);
                 }
             }
-            Poll::Ready(Err(_)) => return (frames, false),
-            Poll::Pending => return (frames, true),
+            Ok(None) => return (frames, true),
+            Err(_) => return (frames, false),
         }
     }
 }

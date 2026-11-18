@@ -7,8 +7,7 @@ use std::io;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
-use crate::async_runtime::io::{dead, recv_stream};
-use crate::async_runtime::io::Async;
+use crate::async_runtime::io::{dead, Async};
 use crate::core::lookup::ServerId;
 
 /// Demux tag of a frame — its transaction id (header bytes 0..2). `None` for a
@@ -112,7 +111,10 @@ impl TcpConn {
     pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<Vec<u8>>> {
         let sock = conn.borrow().sock.clone();
         let mut bytes = Vec::new();
-        let alive = sock.read_with(|s, scratch| recv_stream(s, &mut bytes, scratch));
+        let alive = match sock.read_stream(&mut bytes) {
+            Ok(Some(0)) | Err(_) => false,
+            Ok(_) => true,
+        };
         let mut this = conn.borrow_mut();
         this.rbuf.extend_from_slice(&bytes);
         this.route();

@@ -49,7 +49,7 @@ thread) can call `Reactor::enable_change_tracking()` once and then apply
 |---|---|
 | `socket.rs` | `Socket` (one non-blocking fd: `connect`, `recv`, `send`, `as_raw_fd`, `drain_safe`) and `SocketFactory` (`create_udp`, `create_tcp`). |
 | `reactor.rs` | `Reactor` (fd `Source`s, per-direction wakers, timers, receive scratch), `Ready` (readable/writable future), `Timer`, `Runtime` (reactor + factory + detached-task queue), `InterestChanges` (for persistent event backends). |
-| `io.rs` | `Async` (a `Socket` registered with a reactor), `readable()`, `writable()`, `read()`, `read_exact()`, `write()`, `write_all()`, `recv_datagram`, `recv_stream`, `dead`. |
+| `io.rs` | `Async` (a `Socket` registered with a reactor), `readable()`, `writable()`, `read()`, `read_exact()`, `write()`, `write_all()`, `dead`. |
 | `executor.rs` | `Executor` (`spawn`, `pop_ready`, `poll`, `deliver`, `has_ready`), one real `Waker` per task. |
 
 The whole module is `#![forbid(unsafe_code)]`. Unsafe code, if any, belongs in
@@ -174,9 +174,10 @@ separately through `Socket::connect`.
 deregisters the source before the socket closes, so a recycled fd number can
 never inherit the old interest. `Async::read` is the readiness-gated one-shot
 read returning the accepted byte count, and `Async::read_exact` is its
-stream-only all-bytes variant. The DNS pools use an internal
-`read_with` helper that lends the reactor's 64 KB scratch buffer for one
-synchronous receive; it is not part of the public client API.
+stream-only all-bytes variant. The DNS pools use internal `read_stream` /
+`read_datagram` helpers that lend the reactor's 64 KB scratch buffer for one
+non-blocking receive after readiness; they are not part of the public client
+API.
 
 ## Readiness rules
 
