@@ -172,7 +172,7 @@ impl ChannelData {
             self.spawn(task, |_| {});
         }
         if done {
-            self.executor.deliver(id, None);
+            self.executor.finish(id, Ok(()));
         }
     }
 
@@ -213,7 +213,7 @@ impl ChannelData {
 
     pub(crate) fn abort_all(&self, status: c_int) {
         for id in self.executor.ids() {
-            self.executor.deliver(id, Some(status));
+            self.executor.finish(id, Err(status));
         }
         let spawned = self.state.borrow().rt.take_spawned();
         drop(spawned);

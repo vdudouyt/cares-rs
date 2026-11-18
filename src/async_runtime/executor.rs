@@ -17,7 +17,7 @@ trait AbstractTask {
     /// Poll once; on `Ready`, stash the output and return `true`.
     fn poll(&mut self, cx: &mut Context<'_>) -> bool;
     /// Consume the task, delivering the stashed output or a cancel status.
-    fn deliver(self: Box<Self>, cancel: Option<i32>);
+    fn finish(self: Box<Self>, status: Result<(), i32>);
 }
 
 /// Concrete task: future and result-delivery closure (`Ok` on completion,
@@ -38,14 +38,14 @@ impl<T> AbstractTask for Task<T> {
             Poll::Pending => false,
         }
     }
-    fn deliver(self: Box<Self>, cancel: Option<i32>) {
+    fn finish(self: Box<Self>, status: Result<(), i32>) {
         let this = *self;
-        let result = match (cancel, this.out) {
-            (Some(status), _) => Err(status),
-            (None, Some(out)) => Ok(out),
-            // Unreachable by construction: the host only delivers `None` after
-            // `poll` returned `true`; degrade rather than panic.
-            (None, None) => return,
+        let result = match (status, this.out) {
+            (Err(status), _) => Err(status),
+            (Ok(()), Some(out)) => Ok(out),
+            // Unreachable by construction: the host only finishes with `Ok`
+            // after `poll` returned `true`; degrade rather than panic.
+            (Ok(()), None) => return,
         };
         (this.on)(result);
     }
@@ -94,7 +94,7 @@ struct Slot {
 ///
 /// Re-entrant use is safe: a C callback that fires during a poll may call back
 /// into the channel, and so into this executor (`spawn` may grow `slots`,
-/// `deliver` may target the running task). The mutable state sits behind a
+/// `finish` may target the running task). The mutable state sits behind a
 /// `RefCell` and no borrow is held across a future poll or a delivery callback,
 /// so a re-entrant call always observes the current table; nothing caches a
 /// pointer into `slots` that a re-entrant `spawn` could invalidate.
@@ -179,14 +179,14 @@ impl Executor {
         // spawning tasks that grow `slots` and delivering this very id.
         let done = task.poll(&mut Context::from_waker(&waker));
         // Re-read the table after the poll; a re-entrant spawn may have moved it.
-        let cancel = {
+        let status = {
             let mut inner = self.inner.borrow_mut();
             let Some(entry) = inner.slots.get_mut(id) else { return false };
             let Some(slot) = entry.as_mut() else { return false };
             match slot.cancel.take() {
                 Some(status) => {
                     *entry = None;
-                    Some(status)
+                    Err(status)
                 }
                 None => {
                     slot.task = Some(task);
@@ -195,19 +195,23 @@ impl Executor {
             }
         };
         // The delivery callback may itself re-enter; call it unborrowed.
-        task.deliver(cancel);
+        task.finish(status);
         false
     }
 
     /// Reap `id` and deliver its output or cancel status; an already-reaped id
-    /// is a no-op (a re-entrant abort cannot double-deliver). A cancel aimed at
-    /// a task that is being polled is recorded and applied when its poll returns.
-    pub fn deliver(&self, id: usize, cancel: Option<i32>) {
+    /// is a no-op (a re-entrant cancel cannot double-deliver). A cancel aimed
+    /// at a task that is being polled is recorded and applied when its poll
+    /// returns.
+    ///
+    /// `Ok(())` means the task completed and its stashed output is delivered.
+    /// `Err(status)` means cancel it; the callback receives `Err(status)`.
+    pub fn finish(&self, id: usize, status: Result<(), i32>) {
         let task = {
             let mut inner = self.inner.borrow_mut();
             let Some(entry) = inner.slots.get_mut(id) else { return };
             if let Some(slot) = entry.as_mut().filter(|slot| slot.task.is_none()) {
-                if let Some(status) = cancel {
+                if let Err(status) = status {
                     slot.cancel.get_or_insert(status);
                 }
                 return;
@@ -216,7 +220,7 @@ impl Executor {
         };
         // The delivery callback may itself re-enter; call it unborrowed.
         if let Some(task) = task {
-            task.deliver(cancel);
+            task.finish(status);
         }
     }
 
@@ -270,7 +274,7 @@ mod tests {
         let id = ex.spawn(wake_later(w.clone()), |_| {});
         assert!(!ex.poll(id));
         let stale = w.borrow_mut().take().expect("registered waker");
-        ex.deliver(id, Some(1));
+        ex.finish(id, Err(1));
         let id2 = ex.spawn(std::future::pending::<()>(), |_| {});
         assert_eq!(id, id2, "slot reused");
         stale.wake();
