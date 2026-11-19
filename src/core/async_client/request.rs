@@ -54,7 +54,7 @@ impl AsyncClient {
         let Ok(query) = self.reserve(BytesMut::from(&q.payload[..])) else { return };
         self.shared.health.borrow_mut().set_probing(server, true);
         let probe = Probe { query: Some(query), server, shared: self.shared.clone() };
-        self.rt.spawn(self.copy().probe(probe));
+        let _ = self.rt.spawn(self.copy().probe(probe), |_| {});
     }
 
     async fn probe(self, mut probe: Probe) {
@@ -255,7 +255,8 @@ impl AsyncClient {
         }
 
         loop {
-            match recv_reply(&mut conn, deadline).await {
+            let timer = self.rt.timer_at(deadline);
+            match recv_reply(&mut conn, timer).await {
                 Ok(buf) => {
                     // Not this query's response (wrong id), or a plugin drops
                     // it as stray or spoofed: keep listening.
@@ -367,8 +368,8 @@ impl Drop for Probe {
 /// Timeout-biased receive, with a last non-blocking read when the timer and
 /// socket readiness land in the same reactor turn: a pending ICMP error must
 /// not report as a timeout.
-async fn recv_reply(conn: &mut Conn, deadline: Instant) -> io::Result<Vec<u8>> {
-    match conn.recv(deadline).await {
+async fn recv_reply(conn: &mut Conn, timer: crate::async_runtime::Timer) -> io::Result<Vec<u8>> {
+    match conn.recv(timer).await {
         Err(e) if e.kind() == io::ErrorKind::TimedOut => match conn.try_recv() {
             Poll::Ready(result) => result,
             Poll::Pending => Err(e),
@@ -567,7 +568,7 @@ mod tests {
             nameservers: vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)],
             ..SysConfig::default()
         };
-        let client = AsyncClient::build(config, Rc::new(TestFactory), 53, 53);
+        let client = AsyncClient::build(config, Rc::new(TestFactory), 53, 53, Runtime::default());
 
         let payload = || BytesMut::from(&[0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]);
         let first = client.reserve(payload()).expect("first reserve");

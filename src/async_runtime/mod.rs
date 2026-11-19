@@ -1,49 +1,33 @@
-//! Protocol-agnostic async IO runtime in the shape of smol: socket traits, the
-//! per-channel reactor (`AsyncSocket` values, `Timer`s), and the executor — driven by
-//! the host's event loop instead of by a blocking runtime thread.
+//! A single-threaded async I/O runtime driven by the host's event loop.
 //!
-//! The host owns the loop, exactly as a c-ares application owns the loop around
-//! [`ares_fds`]/[`ares_timeout`]/[`ares_process`]:
+//! [`Runtime`](crate::async_runtime::Runtime) owns tasks, socket registrations, and timers. Spawning schedules
+//! a task automatically; the host only needs to drive the runtime:
 //!
-//! 1. Ask [`Reactor::interests`](crate::async_runtime::reactor::Reactor::interests) which
-//!    `(fd, writable)` pairs are being waited on and
-//!    [`Reactor::next_deadline`](crate::async_runtime::reactor::Reactor::next_deadline) for the next
-//!    timer.
-//! 2. Block in `poll`/`epoll`/`select`/`io_uring` until one fires.
-//! 3. Hand the result to
-//!    [`Reactor::dispatch`](crate::async_runtime::reactor::Reactor::dispatch), then poll the woken
-//!    tasks with [`Executor::pop_ready`](crate::async_runtime::executor::Executor::pop_ready) and
-//!    [`Executor::poll`](crate::async_runtime::executor::Executor::poll).
+//! 1. Call [`Runtime::run_ready`](crate::async_runtime::Runtime::run_ready) to start queued tasks before the first wait.
+//! 2. Read [`Runtime::interests`](crate::async_runtime::Runtime::interests) and
+//!    [`Runtime::timeout`](crate::async_runtime::Runtime::timeout), then wait in the
+//!    host's `poll`/`epoll`/`select` loop.
+//! 3. Call [`Runtime::process`](crate::async_runtime::Runtime::process) with the reported readiness, then repeat.
 //!
-//! Nothing here creates threads, installs signal handlers, or owns a global
-//! reactor. All state hangs off the [`Runtime`](crate::async_runtime::reactor::Runtime) handle
-//! (reactor + socket factory + detached-task queue), so several independent
-//! applications, or one per channel, can coexist in a process.
+//! A zero timeout means tasks are runnable even if no descriptors are watched.
+//! No threads, signal handlers, or global runtime state are created.
 //!
-//! ```text
-//!   application loop                  runtime
-//!   ----------------                  -------
-//!   interests()/next_deadline()  -->  Ready + Timer registrations
-//!   poll(2), epoll_wait(2), ...       (no syscalls here)
-//!   dispatch(now, ready)         -->  wake the matching futures
-//!   pop_ready()/poll(id)         -->  run woken tasks
-//! ```
+//! The runtime created by `new` or `default` owns its tasks. Pass
+//! [`Runtime::handle`](crate::async_runtime::Runtime::handle) into tasks for shared access without ownership cycles.
+//! Handles expose the same API and keep weak task references internally.
 //!
-//! See `ASYNC_RUNTIME.md` for the full guide and `examples/tcp_hello.rs` for a
-//! complete TCP client built on this module.
-//!
-//! [`ares_fds`]: crate::ares_fds
-//! [`ares_timeout`]: crate::ares_timeout
-//! [`ares_process`]: crate::ares_process
+//! See `ASYNC_RUNTIME.md` for the runtime API and `examples/example.c` for the
+//! C-facing `ares_*` select loop. The C API performs initial driving internally.
 #![forbid(unsafe_code)]
 
 pub mod socket;
-pub mod executor;
-pub mod io;
-pub mod reactor;
+mod executor;
+mod io;
+mod reactor;
+mod runtime;
 mod system;
 
-pub use executor::Executor;
-pub use io::AsyncSocket;
-pub use reactor::{Reactor, Ready, Runtime, Timer};
+pub use io::{dead, AsyncSocket};
+pub use reactor::{InterestChanges, InterestUpdate, Ready, Timer};
+pub use runtime::{Runtime, RuntimeClosed};
 pub use socket::{Socket, SocketFactory, SocketKind};

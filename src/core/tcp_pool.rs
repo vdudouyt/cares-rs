@@ -7,7 +7,7 @@ use std::io;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
-use crate::async_runtime::io::{dead, AsyncSocket};
+use crate::async_runtime::{dead, AsyncSocket};
 use crate::core::lookup::ServerId;
 
 /// Demux tag of a frame — its transaction id (header bytes 0..2). `None` for a
@@ -199,7 +199,7 @@ impl TcpConn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_runtime::reactor::Reactor;
+    use crate::async_runtime::Runtime;
     use crate::async_runtime::socket::Socket;
     use std::net::SocketAddr;
 
@@ -236,7 +236,7 @@ mod tests {
     /// `release` frees only its own query's slot.
     #[test]
     fn release_frees_only_its_slot() {
-        let mut tc = TcpConn { sock: AsyncSocket::new(Rc::new(DummySock), &Reactor::new()), rbuf: Vec::new(), inbox: HashMap::new() };
+        let mut tc = TcpConn { sock: Runtime::new().register_socket(Rc::new(DummySock)), rbuf: Vec::new(), inbox: HashMap::new() };
         tc.register_query(7);
         tc.register_query(9);
         assert!(tc.has_waiter(7) && tc.has_waiter(9));

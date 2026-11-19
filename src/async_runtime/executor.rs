@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
@@ -98,8 +97,8 @@ struct Slot<E> {
 /// `RefCell` and no borrow is held across a future poll or a delivery callback,
 /// so a re-entrant call always observes the current table; nothing caches a
 /// pointer into `slots` that a re-entrant `spawn` could invalidate.
-pub struct Executor<E = ()> {
-    inner: Rc<RefCell<ExecutorInner<E>>>,
+pub(super) struct Executor<E = ()> {
+    inner: RefCell<ExecutorInner<E>>,
 }
 
 struct ExecutorInner<E> {
@@ -110,7 +109,7 @@ struct ExecutorInner<E> {
 
 impl<E> Default for Executor<E> {
     fn default() -> Self {
-        Executor { inner: Rc::new(RefCell::new(ExecutorInner::default())) }
+        Executor { inner: RefCell::new(ExecutorInner::default()) }
     }
 }
 
@@ -120,6 +119,7 @@ impl<E> Default for ExecutorInner<E> {
     }
 }
 
+#[cfg(test)]
 impl Executor<()> {
     /// A default executor whose cancellation status is `()`.
     pub fn new() -> Self {
@@ -128,7 +128,7 @@ impl Executor<()> {
 }
 
 impl<E: 'static> Executor<E> {
-    /// Register `fut` in a free slot and return its id; does not poll.
+    /// Register and schedule `fut` in a free slot; does not poll.
     pub fn spawn<T: 'static>(
         &self,
         fut: impl Future<Output = T> + 'static,
@@ -147,6 +147,9 @@ impl<E: 'static> Executor<E> {
             queue: inner.queue.clone(),
         });
         let waker = Waker::from(flag.clone());
+        // The first poll uses the same queue as every subsequent wake. Tasks
+        // spawned during a poll need no separate adoption or notification.
+        waker.wake_by_ref();
         let slot = Some(Slot { task: Some(task), cancel: None, flag, waker });
         match inner.slots.get_mut(id) {
             Some(s) => *s = slot,
@@ -241,9 +244,20 @@ impl<E: 'static> Executor<E> {
         }
     }
 
-    /// The id range spanning every slot, live or reaped.
-    pub fn ids(&self) -> std::ops::Range<usize> {
-        0..self.inner.borrow().slots.len()
+    /// Cancel a snapshot of live tasks. Generations prevent callbacks that
+    /// cancel and reuse a slot from accidentally cancelling its new occupant.
+    pub fn cancel_all(&self, mut cancelled: impl FnMut() -> E) {
+        let tasks: Vec<_> = self.inner.borrow().slots.iter().enumerate()
+            .filter_map(|(id, slot)| slot.as_ref().map(|s| (id, s.flag.gen)))
+            .collect();
+        for (id, gen) in tasks {
+            let status = cancelled();
+            let live = self.inner.borrow().slots.get(id).and_then(Option::as_ref)
+                .is_some_and(|s| s.flag.gen == gen);
+            if live {
+                self.finish(id, Err(status));
+            }
+        }
     }
 
     /// Number of live tasks.
@@ -256,6 +270,7 @@ impl<E: 'static> Executor<E> {
 mod tests {
     use super::*;
     use std::future::poll_fn;
+    use std::rc::Rc;
 
     /// A future that stores its waker on first poll and completes on the second.
     fn wake_later(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
@@ -275,6 +290,7 @@ mod tests {
         let ex = Executor::new();
         let w = Rc::new(RefCell::new(None));
         let id = ex.spawn(wake_later(w.clone()), |_| {});
+        assert_eq!(ex.pop_ready(), Some(id));
         assert!(!ex.poll(id));
         let waker = w.borrow_mut().take().expect("registered waker");
         waker.wake_by_ref();
@@ -289,11 +305,13 @@ mod tests {
         let ex = Executor::<i32>::default();
         let w = Rc::new(RefCell::new(None));
         let id = ex.spawn(wake_later(w.clone()), |_| {});
+        assert_eq!(ex.pop_ready(), Some(id));
         assert!(!ex.poll(id));
         let stale = w.borrow_mut().take().expect("registered waker");
         ex.finish(id, Err(1));
         let id2 = ex.spawn(std::future::pending::<()>(), |_| {});
         assert_eq!(id, id2, "slot reused");
+        assert_eq!(ex.pop_ready(), Some(id2));
         stale.wake();
         assert_eq!(ex.pop_ready(), None, "stale generation must be skipped");
     }

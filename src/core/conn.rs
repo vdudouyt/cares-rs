@@ -12,8 +12,7 @@ use std::time::Instant;
 
 use futures_util::{select_biased, FutureExt};
 
-use crate::async_runtime::io::AsyncSocket;
-use crate::async_runtime::reactor::Timer;
+use crate::async_runtime::{AsyncSocket, Timer};
 use crate::core::tcp_pool::TcpConn;
 use crate::core::async_client::ChannelShared;
 use crate::core::lookup::ServerId;
@@ -192,11 +191,10 @@ impl Conn {
         }
     }
 
-    /// `conn.recv(timeout).await`; the timeout arm is polled first so expiry
+    /// `conn.recv(timer).await`; the timeout arm is polled first so expiry
     /// preempts a read ready in the same poll. `TimedOut` on expiry.
-    pub async fn recv(&mut self, timeout: Instant) -> io::Result<Vec<u8>> {
-        let reactor = self.sock().reactor().clone();
-        let mut t = pin!(Timer::at(&reactor, timeout).fuse());
+    pub async fn recv(&mut self, timer: Timer) -> io::Result<Vec<u8>> {
+        let mut t = pin!(timer.fuse());
         let mut r = pin!(self.recv_msg().fuse());
         select_biased! {
             _ = t => Err(io::ErrorKind::TimedOut.into()),
@@ -237,7 +235,7 @@ impl Drop for Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_runtime::reactor::Reactor;
+    use crate::async_runtime::Runtime;
     use crate::async_runtime::socket::Socket;
     use std::net::SocketAddr;
     use std::task::Context;
@@ -266,8 +264,8 @@ mod tests {
     /// Dropping a `Conn` frees exactly its own shared-conn slot (RAII).
     #[test]
     fn shared_conn_releases_slot_on_drop() {
-        let reactor = Reactor::new();
-        let tc = TcpConn::new(AsyncSocket::new(Rc::new(AlwaysReadable { fd: 5 }), &reactor));
+        let rt = Runtime::new();
+        let tc = TcpConn::new(rt.register_socket(Rc::new(AlwaysReadable { fd: 5 })));
 
         let a = Conn::shared(tc.clone(), 7);
         let b = Conn::shared(tc.clone(), 9);
@@ -290,21 +288,21 @@ mod tests {
         let mut window = Duration::from_millis(3);
         let mut trial = 0;
         while trial < 20 {
-            let reactor = Reactor::new();
+            let rt = Runtime::new();
             let sock: Rc<dyn Socket> = Rc::new(AlwaysReadable { fd: 42 });
             // Tag 0xABAB: the datagram AlwaysReadable yields routes to us.
-            let mut conn = Conn::shared_udp(UdpConn::new(AsyncSocket::new(sock, &reactor), false), 0xABAB);
+            let mut conn = Conn::shared_udp(UdpConn::new(rt.register_socket(sock), false), 0xABAB);
             let mut cx = Context::from_waker(Waker::noop());
             // Register the read arm, report the fd readable, then let the
             // deadline pass: on the next poll both arms are ready.
             let deadline = Instant::now() + window;
-            let mut fut = pin!(conn.recv(deadline));
+            let mut fut = pin!(conn.recv(rt.timer_at(deadline)));
             if fut.as_mut().poll(&mut cx).is_ready() {
                 assert!(window < Duration::from_secs(60), "first poll never beat the deadline");
                 window *= 4;
                 continue;
             }
-            reactor.set_ready_fds_with(|fd, w| fd == 42 && !w);
+            rt.process(None, |fd, w| fd == 42 && !w);
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(r) => assert!(

@@ -6,7 +6,7 @@ use super::*;
 use crate::core::async_client::{normalize_port, AsyncClient, ServerSpec};
 use crate::core::fds::{clamp_timeout, getsock_mask, nfds, TimeoutChoice};
 use crate::core::async_client::ServerStateHook;
-use crate::async_runtime::executor::Executor;
+use crate::async_runtime::Runtime;
 use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
 use crate::ffi::event_thread::{self, EventThread};
@@ -31,7 +31,7 @@ pub struct ChannelData {
     pub(crate) pending_write_arg: Cell<*mut libc::c_void>,
     pub(crate) sock_state_cb: Cell<ares_sock_state_cb>,
     pub(crate) sock_state_cb_data: Cell<*mut libc::c_void>,
-    executor: Executor<libc::c_int>,
+    rt: Runtime<libc::c_int>,
     /// `ARES_OPT_EVENT_THREAD` was requested (carried over by `ares_dup`).
     pub(crate) event_mode: Cell<bool>,
     /// The `ares_evsys_t` requested with the event thread (carried over by `ares_dup`).
@@ -50,7 +50,7 @@ pub struct ChannelData {
 unsafe impl Sync for ChannelData {}
 
 impl ChannelData {
-    pub(crate) fn new(state: AsyncClient, socket_factory: std::rc::Rc<CSocketFactory>) -> Self {
+    pub(crate) fn new(state: AsyncClient, socket_factory: std::rc::Rc<CSocketFactory>, rt: Runtime<c_int>) -> Self {
         ChannelData {
             state: RefCell::new(state),
             socket_factory: RefCell::new(socket_factory),
@@ -60,7 +60,7 @@ impl ChannelData {
             pending_write_arg: Cell::new(std::ptr::null_mut()),
             sock_state_cb: Cell::new(None),
             sock_state_cb_data: Cell::new(std::ptr::null_mut()),
-            executor: Executor::default(),
+            rt,
             event_mode: Cell::new(false),
             evsys: Cell::new(crate::ffi::ARES_EVSYS_DEFAULT),
             event: RefCell::new(None),
@@ -72,7 +72,8 @@ impl ChannelData {
     /// event channels each have their own thread; `Rc` refcounts aren't atomic).
     pub(crate) fn dup_from(&self) -> Self {
         let socket_factory = std::rc::Rc::new((**self.socket_factory.borrow()).clone());
-        let mut state = self.state.borrow().duplicate();
+        let rt = Runtime::default();
+        let mut state = self.state.borrow().duplicate(rt.handle());
         state.set_socket_factory(socket_factory.clone());
         let dup = ChannelData {
             state: RefCell::new(state),
@@ -83,7 +84,7 @@ impl ChannelData {
             pending_write_arg: Cell::new(self.pending_write_arg.get()),
             sock_state_cb: Cell::new(self.sock_state_cb.get()),
             sock_state_cb_data: Cell::new(self.sock_state_cb_data.get()),
-            executor: Executor::default(),
+            rt,
             event_mode: Cell::new(self.event_mode.get()),
             evsys: Cell::new(self.evsys.get()),
             event: RefCell::new(None),
@@ -126,8 +127,9 @@ impl ChannelData {
     /// first so ARES_FLAG_NO_DFLT_SVR and explicit servers win.
     pub(crate) fn new_unfinalized(resolvconf: Option<&str>) -> Self {
         let factory = std::rc::Rc::new(CSocketFactory::default());
-        let state = AsyncClient::from_sysconfig_path(factory.clone(), resolvconf);
-        ChannelData::new(state, factory)
+        let rt = Runtime::default();
+        let state = AsyncClient::from_sysconfig_path(factory.clone(), resolvconf, rt.handle());
+        ChannelData::new(state, factory, rt)
     }
 
     pub(crate) fn new_default() -> Self {
@@ -155,25 +157,11 @@ impl ChannelData {
         fut: impl std::future::Future<Output = T> + 'static,
         on: impl FnOnce(Result<T, c_int>) + 'static,
     ) {
-        let id = self.executor.spawn(fut, on);
-        self.advance(id);
+        let _ = self.rt.spawn(fut, on);
+        self.rt.run_ready();
         // New fds/timers may have been published: wake now rather than waiting
         // for the idle poll to expire.
         self.wake();
-    }
-
-    /// Advance one task; on `Pending` it has registered its interest with the reactor.
-    fn advance(&self, id: usize) {
-        let done = self.executor.poll(id);
-        // Detached tasks the poll spawned (e.g. failover probes) become their own
-        // executor tasks with no C callback.
-        let spawned = self.state.borrow().rt.take_spawned();
-        for task in spawned {
-            self.spawn(task, |_| {});
-        }
-        if done {
-            self.executor.finish(id, Ok(()));
-        }
     }
 
     fn drive_fd_futures(
@@ -193,32 +181,15 @@ impl ChannelData {
     /// One `ares_process*` turn: hand the caller's readiness to the reactor
     /// (waking io waiters and, unless skipped, due timers), then run every woken task.
     fn turn(&self, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
-        let reactor = self.state.borrow().rt.reactor().clone();
-        reactor.set_ready_fds_with(ready);
-        if !skip_timeouts {
-            reactor.advance_timers(Instant::now());
-        }
-        self.run_ready();
-    }
-
-    /// Poll woken tasks until the run queue is empty (siblings woken by a
-    /// shared-conn route run in this same turn). A budget bounds a self-waking
-    /// task; leftovers make `next_timeout_ms` report 0 so the caller comes back.
-    fn run_ready(&self) {
-        let mut budget = 4 * self.executor.active_count() + 16;
-        while budget > 0 {
-            let Some(id) = self.executor.pop_ready() else { break };
-            self.advance(id);
-            budget -= 1;
-        }
+        self.rt.process((!skip_timeouts).then(Instant::now), ready);
     }
 
     pub(crate) fn abort_all(&self, status: c_int) {
-        for id in self.executor.ids() {
-            self.executor.finish(id, Err(status));
+        if status == ARES_EDESTRUCTION {
+            self.rt.shutdown(|| status);
+        } else {
+            self.rt.cancel_all(|| status);
         }
-        let spawned = self.state.borrow().rt.take_spawned();
-        drop(spawned);
         // Conns are dropped after each pool borrow ends: closing one fires the
         // socket-state callback, which may re-enter (e.g. ares_cancel → here).
         let shared = self.state.borrow().shared.clone();
@@ -231,19 +202,19 @@ impl ChannelData {
     }
 
     pub(crate) fn all_poll_fds(&self) -> Vec<(i32, bool)> {
-        self.state.borrow().rt.reactor().interests()
+        self.rt.interests()
     }
 
     /// Called as the event thread starts: turn on the reactor's change log (the
     /// thread's source of interest updates) and return the requested `evsys`.
     pub(crate) fn begin_event_mode(&self) -> libc::c_int {
-        self.state.borrow().rt.reactor().enable_change_tracking();
+        self.rt.enable_change_tracking();
         self.evsys.get()
     }
 
     /// Interest changes since the last call — O(changes), unlike `all_poll_fds`.
-    pub(crate) fn take_interest_changes(&self) -> crate::async_runtime::reactor::InterestChanges {
-        self.state.borrow().rt.reactor().take_interest_changes()
+    pub(crate) fn take_interest_changes(&self) -> crate::async_runtime::InterestChanges {
+        self.rt.take_interest_changes()
     }
 
     /// DNS queries still in flight: every reserved transaction id corresponds to
@@ -257,16 +228,7 @@ impl ChannelData {
     }
 
     pub(crate) fn next_timeout_ms(&self) -> Option<u128> {
-        if self.executor.has_ready() {
-            return Some(0);
-        }
-        let now = Instant::now();
-        self.state
-            .borrow()
-            .rt
-            .reactor()
-            .next_deadline()
-            .map(|d| d.saturating_duration_since(now).as_millis())
+        self.rt.timeout(Instant::now()).map(|delay| delay.as_millis())
     }
 
     pub(crate) fn process_channel(
@@ -297,11 +259,8 @@ impl ChannelData {
     /// so each finds its waiters through the reactor's fd index (O(ready fds)).
     pub(crate) fn process_fd_events(&self, events: &[crate::ffi::ares_socket::ares_fd_events_t]) {
         use crate::ffi::ares_socket::{ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
-        let reactor = self.state.borrow().rt.reactor().clone();
         let ready = events.iter().map(|ev| (ev.fd, ev.events & ARES_FD_EVENT_READ != 0, ev.events & ARES_FD_EVENT_WRITE != 0));
-        reactor.set_ready_fds(ready);
-        reactor.advance_timers(Instant::now());
-        self.run_ready();
+        self.rt.process_events(Instant::now(), ready);
     }
 
     /// Fire the server-state callback if installed; a stale index is skipped.

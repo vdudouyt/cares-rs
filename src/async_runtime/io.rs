@@ -32,17 +32,13 @@ pub struct AsyncSocket {
 }
 
 impl AsyncSocket {
-    pub fn new(sock: Rc<dyn Socket>, reactor: &Rc<Reactor>) -> Rc<Self> {
+    pub(super) fn new(sock: Rc<dyn Socket>, reactor: &Rc<Reactor>) -> Rc<Self> {
         let source = reactor.insert_io(sock.as_raw_fd());
         Rc::new(AsyncSocket { source, reactor: reactor.clone(), read_tick: Cell::new(None), sock })
     }
 
     pub fn get_ref(&self) -> &dyn Socket {
         &*self.sock
-    }
-
-    pub fn reactor(&self) -> &Rc<Reactor> {
-        &self.reactor
     }
 
     /// Resolves on the next readable report for this fd.

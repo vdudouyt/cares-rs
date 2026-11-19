@@ -9,8 +9,8 @@ use crate::plugins::edns::EdnsPlugin;
 impl AsyncClient {
     /// A fresh channel from the system config (resolv.conf + env overrides).
     /// Defaults are applied separately so options/flags set afterwards win.
-    pub fn from_sysconfig_path(factory: Rc<dyn SocketFactory>, path: Option<&str>) -> Self {
-        let mut client = AsyncClient::build(build_sysconfig(path), factory, 53, 53);
+    pub fn from_sysconfig_path(factory: Rc<dyn SocketFactory>, path: Option<&str>, rt: Runtime<c_int>) -> Self {
+        let mut client = AsyncClient::build(build_sysconfig(path), factory, 53, 53, rt);
         // Upstream init_by_defaults: hosts file first, then DNS.
         client.lookups = "fb".to_string();
         if let Some(lookups) = client.config.lookups.clone() {
@@ -147,10 +147,11 @@ impl AsyncClient {
         factory: Rc<dyn SocketFactory>,
         default_udp_port: u16,
         default_tcp_port: u16,
+        rt: Runtime<c_int>,
     ) -> Self {
         let mut client = AsyncClient {
             config,
-            rt: Runtime::new(),
+            rt,
             factory,
             hosts: OnceCell::new(),
             default_udp_port,
@@ -213,12 +214,13 @@ impl AsyncClient {
 
     /// ares_dup: clone configuration but start with fresh reactor state (empty
     /// cache, no pooled connections, cleared failure timestamps — cloned counts).
-    pub fn duplicate(&self) -> AsyncClient {
+    pub fn duplicate(&self, rt: Runtime<c_int>) -> AsyncClient {
         let mut dup = AsyncClient::build(
             self.config.clone(),
             self.factory.clone(),
             self.default_udp_port,
             self.default_tcp_port,
+            rt,
         );
         dup.shared.health.borrow_mut().copy_failures_from(&self.shared.health.borrow());
         dup.sortlist = self.sortlist.clone();
@@ -620,14 +622,14 @@ mod tests {
 
     #[test]
     fn defaults_add_loopback_unless_no_dflt_svr() {
-        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53, Runtime::default());
         client.apply_defaults();
         assert_eq!(
             client.config.nameservers,
             vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)]
         );
 
-        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53, Runtime::default());
         client.flags = ARES_FLAG_NO_DFLT_SVR;
         client.apply_defaults();
         assert!(client.config.nameservers.is_empty());
@@ -639,7 +641,7 @@ mod tests {
     /// it as explicitly configured).
     #[test]
     fn defaults_set_server_failover_without_adding_optmask_bit() {
-        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53, Runtime::default());
         client.apply_defaults();
         assert_eq!(
             client.server_failover_retry_chance, 10,
@@ -663,7 +665,7 @@ mod tests {
     /// The server list is resolved once per change and shared by lookup copies.
     #[test]
     fn servers_resolved_per_server_change_and_shared() {
-        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53, Runtime::default());
         client.set_servers(vec![spec(1)]);
         let copy = client.derive();
         assert!(Rc::ptr_eq(&copy.servers, &client.servers), "derive shares, not recomputes");
@@ -682,7 +684,7 @@ mod tests {
     /// configured; duplicates are skipped; removed servers lose their state.
     #[test]
     fn server_state_survives_server_list_changes() {
-        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53, Runtime::default());
         client.set_servers(vec![spec(1), spec(2)]);
         let first = client.servers.to_vec();
         client.shared.health.borrow_mut().record_failure(first[1]);
@@ -699,7 +701,7 @@ mod tests {
     /// The query cache is flushed only when the server list really changes.
     #[test]
     fn cache_flushed_only_on_real_server_change() {
-        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53);
+        let mut client = AsyncClient::build(SysConfig::default(), noop_factory(), 53, 53, Runtime::default());
         client.set_servers(vec![spec(1)]);
         client.shared.cache.borrow_mut().set_max_ttl(3600);
         let key = CacheKey::new("cached.test", 1, ARES_CLASS_IN, 0, true, false);
@@ -735,7 +737,7 @@ mod reinit_tests {
         let path = temp_conf(
             "nameserver 9.9.9.9\nsearch example.test\nlookup bind files\nsortlist 10.0.0.0/8\noptions ndots:3 attempts:2 timeout:1\n",
         );
-        let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53);
+        let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53, Runtime::default());
         client.resolvconf_path = path.to_string_lossy().into_owned();
         client.shared.cache.borrow_mut().set_max_ttl(3600);
         let key = CacheKey::new("cached.test", 1, ARES_CLASS_IN, 0, true, false);
@@ -767,7 +769,7 @@ mod reinit_tests {
     #[test]
     fn reinit_preserves_explicitly_set_servers() {
         let path = temp_conf("nameserver 9.9.9.9\n");
-        let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53);
+        let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53, Runtime::default());
         client.resolvconf_path = path.to_string_lossy().into_owned();
         client.set_servers(vec![ServerSpec {
             ip: IpAddr::from([8, 8, 4, 4]),

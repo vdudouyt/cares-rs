@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use crate::async_runtime::io::{dead, AsyncSocket};
+use crate::async_runtime::{dead, AsyncSocket};
 use crate::core::lookup::ServerId;
 use crate::core::tcp_pool::dns_tag;
 
@@ -358,13 +358,13 @@ impl UdpConn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_runtime::reactor::Reactor;
+    use crate::async_runtime::Runtime;
     use crate::async_runtime::socket::Socket;
     use std::collections::VecDeque;
     use std::net::SocketAddr;
 
     fn sock(s: impl Socket + 'static) -> Rc<AsyncSocket> {
-        AsyncSocket::new(Rc::new(s), &Reactor::new())
+        Runtime::new().register_socket(Rc::new(s))
     }
 
     /// A waker that records whether it fired.

@@ -3,22 +3,19 @@
 //! blocks in `polling::Poller::wait`, the host calls [`Reactor::set_ready_fds_with`] with
 //! the readiness the caller handed to `ares_process*`, and reads interest back
 //! through [`Reactor::interests`] / [`Reactor::next_deadline`]. One reactor per
-//! channel (no global): handles are passed explicitly via [`Runtime`].
+//! channel (no global), owned by [`Runtime`](super::Runtime).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use futures_util::{select_biased, FutureExt};
-
-use crate::async_runtime::socket::{Socket, SocketFactory, SocketKind};
 
 pub(crate) const READ: usize = 0;
 pub(crate) const WRITE: usize = 1;
@@ -164,7 +161,8 @@ pub(crate) struct Source {
     state: RefCell<[Direction; 2]>,
 }
 
-/// One source's current interest, as of [`Reactor::take_interest_changes`].
+/// One source's current interest, as of
+/// [`Runtime::take_interest_changes`](super::Runtime::take_interest_changes).
 /// `read == write == false` means "watch nothing".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InterestUpdate {
@@ -190,7 +188,7 @@ impl Source {
     }
 }
 
-pub struct Reactor {
+pub(super) struct Reactor {
     /// Bumped once per `set_ready_fds_with`; a direction's `tick` records the ticker
     /// value of its last event.
     ticker: Cell<usize>,
@@ -458,7 +456,7 @@ pub struct Ready {
 }
 
 impl Ready {
-    pub(crate) fn new(reactor: Rc<Reactor>, source: Rc<Source>, dir: usize) -> Self {
+    pub(super) fn new(reactor: Rc<Reactor>, source: Rc<Source>, dir: usize) -> Self {
         Ready { reactor, source, dir, ticks: Cell::new(None), index: Cell::new(None), _pin: PhantomPinned }
     }
 }
@@ -519,7 +517,7 @@ pub struct Timer {
 }
 
 impl Timer {
-    pub fn at(reactor: &Rc<Reactor>, when: Instant) -> Self {
+    pub(super) fn at(reactor: &Rc<Reactor>, when: Instant) -> Self {
         Timer { reactor: reactor.clone(), when, id: Cell::new(None), _pin: PhantomPinned }
     }
 }
@@ -548,106 +546,6 @@ impl Drop for Timer {
         if let Some(id) = self.id.take() {
             self.reactor.remove_timer(self.when, id);
         }
-    }
-}
-
-/// A detached task waiting for the host to move it into the executor.
-pub type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
-
-/// A channel's runtime handle — smol's implicit global reactor made explicit:
-/// creates [`AsyncSocket`](crate::async_runtime::io::AsyncSocket) sockets and [`Timer`]s,
-/// and spawns detached tasks.
-#[derive(Clone)]
-pub struct Runtime {
-    reactor: Rc<Reactor>,
-    /// Tasks from [`Runtime::spawn`], not yet taken by the host.
-    spawned: Rc<RefCell<Vec<SpawnedTask>>>,
-}
-
-impl Runtime {
-    /// A runtime with the reactor and the built-in system socket factory.
-    pub fn new() -> Self {
-        Runtime { reactor: Reactor::new(), spawned: Rc::default() }
-    }
-
-    /// Spawn a detached task (≈ `tokio::spawn`): fire-and-forget, with no
-    /// output, so the spawning task never waits for it. It runs until it
-    /// completes or the channel aborts its tasks. The executor is busy polling
-    /// the caller, so the task is queued here and the host moves it into the
-    /// executor (see [`Runtime::take_spawned`]) once that poll returns.
-    pub fn spawn(&self, fut: impl Future<Output = ()> + 'static) {
-        self.spawned.borrow_mut().push(Box::pin(fut));
-    }
-
-    /// Take every task queued by [`Runtime::spawn`] since the last call.
-    pub fn take_spawned(&self) -> Vec<SpawnedTask> {
-        std::mem::take(&mut *self.spawned.borrow_mut())
-    }
-
-    pub fn reactor(&self) -> &Rc<Reactor> {
-        &self.reactor
-    }
-
-    /// Create and register a UDP socket over the built-in system I/O.
-    pub fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
-        let sock = crate::async_runtime::system::create(SocketKind::Udp, bind)?;
-        Ok(crate::async_runtime::io::AsyncSocket::new(sock, &self.reactor))
-    }
-
-    /// Create and register a TCP socket over the built-in system I/O.
-    pub fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
-        let sock = crate::async_runtime::system::create(SocketKind::Tcp, bind)?;
-        Ok(crate::async_runtime::io::AsyncSocket::new(sock, &self.reactor))
-    }
-
-    /// Convenience over `create_tcp` + `Socket::connect`: create a TCP socket
-    /// with a kernel-chosen local address, start a non-blocking connect to
-    /// `remote`, and wait until it completes or `deadline` expires.
-    ///
-    /// This is the async equivalent of `std::net::TcpStream::connect`, plus an
-    /// explicit deadline. The pending `SO_ERROR` is checked after writability,
-    /// so a refused connection is returned as the underlying I/O error.
-    pub async fn connect_tcp(
-        &self,
-        remote: SocketAddr,
-        deadline: Instant,
-    ) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
-        let local = if remote.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        };
-        let sock = self.create_tcp(local)?;
-        sock.get_ref().connect(remote)?;
-
-        self.reactor.wait_until(sock.writable(), deadline).await?;
-
-        if let Some(err) = sock.get_ref().take_error()? {
-            return Err(err);
-        }
-        Ok(sock)
-    }
-
-    /// Create and register a socket through a caller-supplied factory (e.g.
-    /// c-ares' `ares_socket_functions` table). The runtime itself stores no
-    /// factory: the application decides per socket.
-    pub fn create_custom_socket(
-        &self,
-        kind: SocketKind,
-        bind: SocketAddr,
-        factory: Rc<dyn SocketFactory>,
-    ) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
-        let sock: Rc<dyn Socket> = match kind {
-            SocketKind::Tcp => factory.create_tcp(bind)?,
-            SocketKind::Udp => factory.create_udp(bind)?,
-        };
-        Ok(crate::async_runtime::io::AsyncSocket::new(sock, &self.reactor))
-    }
-}
-
-impl Default for Runtime {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

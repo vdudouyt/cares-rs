@@ -22,7 +22,7 @@
 //! `KQUEUE`/`WIN32` don't exist on this platform and are rejected up front.
 
 use super::*;
-use crate::async_runtime::reactor::{InterestChanges, InterestUpdate};
+use crate::async_runtime::{InterestChanges, InterestUpdate};
 use crate::ffi::ares_socket::{ares_fd_events_t, ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
 use rustix::buffer::spare_capacity;
 use rustix::event::{epoll, poll, PollFd, PollFlags};

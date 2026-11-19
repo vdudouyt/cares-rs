@@ -40,7 +40,7 @@ use crate::core::cache::{CacheKey, QueryCache};
 use crate::core::conn::Conn;
 use crate::core::tcp_pool::{TcpConn, TcpPool};
 use crate::core::udp_pool::{UdpConn, UdpPool};
-use crate::async_runtime::reactor::Runtime;
+use crate::async_runtime::Runtime;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
@@ -89,9 +89,8 @@ use crate::ffi::{
 /// and the same runtime handle).
 pub(crate) struct AsyncClient {
     pub config: SysConfig,
-    /// The channel's runtime handle (reactor + detached-task queue); every
-    /// lookup copy shares it.
-    pub rt: Runtime,
+    /// A non-owning handle to the channel's unified runtime.
+    pub rt: Runtime<c_int>,
     /// The socket table used for this channel's new sockets. Kept outside the
     /// runtime so the default system I/O and custom tables are just two
     /// implementations of the same factory.
@@ -202,7 +201,7 @@ impl AsyncClient {
     fn copy(&self) -> Self {
         AsyncClient {
             config: self.config.clone(),
-            rt: self.rt.clone(),
+            rt: self.rt.handle(),
             factory: self.factory.clone(),
             hosts: OnceCell::from(self.hostsfile()),
             default_udp_port: self.default_udp_port,
