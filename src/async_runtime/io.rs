@@ -11,7 +11,7 @@ use std::io;
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::async_runtime::reactor::{wait_until, Reactor, Ready, Source, Timer, READ, WRITE};
+use crate::async_runtime::reactor::{Reactor, Ready, Source, READ, WRITE};
 use crate::async_runtime::socket::Socket;
 
 /// The uniform dead-socket error (EOF / hard recv failure).
@@ -102,7 +102,7 @@ impl Async {
     /// zero-length datagram for UDP. `deadline` is an absolute `Instant`.
     pub async fn read(&self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
         loop {
-            wait_until(self.readable(), Timer::at(&self.reactor, deadline)).await?;
+            self.reactor.wait_until(self.readable(), deadline).await?;
 
             // Mark the turn before the syscall: a same-turn readiness peek must
             // not re-read data this attempt may have consumed.
@@ -139,7 +139,7 @@ impl Async {
             match self.get_ref().send(bytes) {
                 Ok(n) => return Ok(n),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    wait_until(self.writable(), Timer::at(&self.reactor, deadline)).await?;
+                    self.reactor.wait_until(self.writable(), deadline).await?;
                 }
                 Err(e) => return Err(e),
             }
