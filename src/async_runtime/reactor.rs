@@ -1,6 +1,6 @@
 //! Per-channel reactor, shaped after async-io's `Reactor`: fd `Source`s with
 //! per-direction waker slabs and event ticks, plus a timer map. Where async-io
-//! blocks in `polling::Poller::wait`, the host calls [`Reactor::set_ready_fds`] with
+//! blocks in `polling::Poller::wait`, the host calls [`Reactor::set_ready_fds_with`] with
 //! the readiness the caller handed to `ares_process*`, and reads interest back
 //! through [`Reactor::interests`] / [`Reactor::next_deadline`]. One reactor per
 //! channel (no global): handles are passed explicitly via [`Runtime`].
@@ -191,7 +191,7 @@ impl Source {
 }
 
 pub struct Reactor {
-    /// Bumped once per `set_ready_fds`; a direction's `tick` records the ticker
+    /// Bumped once per `set_ready_fds_with`; a direction's `tick` records the ticker
     /// value of its last event.
     ticker: Cell<usize>,
     sources: RefCell<Slab<Rc<Source>>>,
@@ -323,7 +323,7 @@ impl Reactor {
     /// this turn's tick and are woken. Timers are advanced separately with
     /// [`advance_timers`](Self::advance_timers). Wakers fire after every borrow
     /// is released.
-    pub fn set_ready_fds(&self, ready: impl Fn(i32, bool) -> bool) {
+    pub fn set_ready_fds_with(&self, ready: impl Fn(i32, bool) -> bool) {
         let tick = self.ticker.get().wrapping_add(1);
         self.ticker.set(tick);
         let mut wake = Vec::new();
@@ -343,10 +343,10 @@ impl Reactor {
         }
     }
 
-    /// [`set_ready_fds`](Self::set_ready_fds) for a host that already knows *which* fds are
+    /// [`set_ready_fds_with`](Self::set_ready_fds_with) for a host that already knows *which* fds are
     /// ready (the event thread): each `(fd, readable, writable)` finds its source
     /// through the fd index, so a turn costs O(ready fds), not O(sources).
-    pub fn set_ready_events(&self, events: impl IntoIterator<Item = (i32, bool, bool)>) {
+    pub fn set_ready_fds(&self, events: impl IntoIterator<Item = (i32, bool, bool)>) {
         let tick = self.ticker.get().wrapping_add(1);
         self.ticker.set(tick);
         let mut wake = Vec::new();
@@ -682,11 +682,11 @@ mod tests {
         assert_eq!(r.interests(), vec![(7, false)]);
 
         // Write readiness does not complete a read waiter (C3).
-        r.set_ready_fds(|fd, wr| fd == 7 && wr);
+        r.set_ready_fds_with(|fd, wr| fd == 7 && wr);
         assert_eq!(count.0.load(Ordering::SeqCst), 0);
         assert!(poll(&mut rd, &w).is_pending());
 
-        r.set_ready_fds(|fd, wr| fd == 7 && !wr);
+        r.set_ready_fds_with(|fd, wr| fd == 7 && !wr);
         assert_eq!(count.0.load(Ordering::SeqCst), 1);
         assert!(poll(&mut rd, &w).is_ready());
         assert!(r.interests().is_empty());
@@ -699,7 +699,7 @@ mod tests {
         let (_c, w) = counter();
         let mut first = Box::pin(Ready::new(r.clone(), src.clone(), READ));
         assert!(poll(&mut first, &w).is_pending());
-        r.set_ready_fds(|_, wr| !wr);
+        r.set_ready_fds_with(|_, wr| !wr);
         // A waiter registered after this turn's event must not see it (C2).
         let mut late = Box::pin(Ready::new(r.clone(), src.clone(), READ));
         assert!(poll(&mut late, &w).is_pending());
@@ -733,9 +733,9 @@ mod tests {
         let mut t = Box::pin(Timer::at(&r, when));
         assert!(poll(&mut t, &w).is_pending());
         let later = when + Duration::from_millis(5);
-        r.set_ready_fds(|_, _| false);
+        r.set_ready_fds_with(|_, _| false);
         assert_eq!(count.0.load(Ordering::SeqCst), 0);
-        r.set_ready_fds(|_, _| false);
+        r.set_ready_fds_with(|_, _| false);
         r.advance_timers(later);
         assert_eq!(count.0.load(Ordering::SeqCst), 1);
         assert!(r.next_deadline().is_none());
@@ -752,7 +752,7 @@ mod tests {
         assert!(poll(&mut a, &wa).is_pending());
         assert!(poll(&mut b, &wb).is_pending());
         assert_eq!(r.interests(), vec![(4, false)]);
-        r.set_ready_fds(|_, _| true);
+        r.set_ready_fds_with(|_, _| true);
         assert_eq!(ca.0.load(Ordering::SeqCst) + cb.0.load(Ordering::SeqCst), 2);
     }
 
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn set_ready_events_wakes_only_the_named_fd_and_direction() {
+    fn set_ready_fds_wakes_only_the_named_fd_and_direction() {
         let r = Reactor::new();
         let (a, b) = (r.insert_io(5), r.insert_io(6));
         let (ca, wa) = counter();
@@ -778,11 +778,11 @@ mod tests {
         assert!(poll(&mut ra, &wa).is_pending());
         assert!(poll(&mut rb, &wb).is_pending());
 
-        r.set_ready_events([(5, false, true)]); // write only: a read waiter stays
-        r.set_ready_events([(99, true, true)]); // unknown fd
+        r.set_ready_fds([(5, false, true)]); // write only: a read waiter stays
+        r.set_ready_fds([(99, true, true)]); // unknown fd
         assert_eq!((ca.0.load(Ordering::SeqCst), cb.0.load(Ordering::SeqCst)), (0, 0));
 
-        r.set_ready_events([(6, true, false)]);
+        r.set_ready_fds([(6, true, false)]);
         assert_eq!((ca.0.load(Ordering::SeqCst), cb.0.load(Ordering::SeqCst)), (0, 1));
         assert!(poll(&mut rb, &wb).is_ready());
         assert!(poll(&mut ra, &wa).is_pending());
@@ -818,7 +818,7 @@ mod tests {
         assert!(r.take_interest_changes().updates.is_empty(), "drained");
 
         // Off and on again inside one turn: the same interest, reported once.
-        r.set_ready_events([(8, true, false)]);
+        r.set_ready_fds([(8, true, false)]);
         assert!(poll(&mut rd, &w).is_ready());
         let mut again = Box::pin(Ready::new(r.clone(), src.clone(), READ));
         assert!(poll(&mut again, &w).is_pending());
@@ -857,11 +857,11 @@ mod tests {
         assert_ne!(first.generation, second.generation);
     }
 
-    /// `cargo test --lib -- --ignored --nocapture set_ready_fds_cost`: the closure-scanning
-    /// `set_ready_fds` is O(sources × events); `set_ready_events` is O(events).
+    /// `cargo test --lib -- --ignored --nocapture set_ready_fds_with_cost`: the closure-scanning
+    /// `set_ready_fds_with` is O(sources × events); `set_ready_fds` is O(events).
     #[test]
     #[ignore]
-    fn set_ready_fds_cost_scales_with_ready_fds_not_sources() {
+    fn set_ready_fds_with_cost_scales_with_ready_fds_not_sources() {
         let sources: i32 = 20_000;
         let ready_fds: i32 = 200;
         let r = Reactor::new();
@@ -877,7 +877,7 @@ mod tests {
         let events: Vec<(i32, bool, bool)> = (0..ready_fds).map(|fd| (fd, true, false)).collect();
 
         let started = Instant::now();
-        r.set_ready_fds(|fd, wr| !wr && events.iter().any(|e| e.0 == fd));
+        r.set_ready_fds_with(|fd, wr| !wr && events.iter().any(|e| e.0 == fd));
         let scanning = started.elapsed();
         drop(held);
 
@@ -891,11 +891,11 @@ mod tests {
             .collect();
         let events: Vec<(i32, bool, bool)> = (0..ready_fds).map(|fd| (100_000 + fd, true, false)).collect();
         let started = Instant::now();
-        r.set_ready_events(events);
+        r.set_ready_fds(events);
         let indexed = started.elapsed();
         drop(held);
-        println!("{sources} sources, {ready_fds} ready: set_ready_fds {scanning:?}, set_ready_events {indexed:?}");
-        assert!(indexed * 20 < scanning, "set_ready_events should be far cheaper");
+        println!("{sources} sources, {ready_fds} ready: set_ready_fds_with {scanning:?}, set_ready_fds {indexed:?}");
+        assert!(indexed * 20 < scanning, "set_ready_fds should be far cheaper");
     }
 
     /// Randomized model check of the change log. A shadow registry, edited only by
@@ -1013,7 +1013,7 @@ mod tests {
                     6 => {
                         let events: Vec<(i32, bool, bool)> =
                             (0..1 + rng.next(3)).map(|_| (rng.next(6) as i32, rng.next(2) == 0, rng.next(2) == 0)).collect();
-                        r.set_ready_events(events);
+                        r.set_ready_fds(events);
                     }
                     7 if !live.is_empty() => {
                         let n = rng.next(live.len());

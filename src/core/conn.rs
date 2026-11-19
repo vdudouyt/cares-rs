@@ -304,7 +304,7 @@ mod tests {
                 window *= 4;
                 continue;
             }
-            reactor.set_ready_fds(|fd, w| fd == 42 && !w);
+            reactor.set_ready_fds_with(|fd, w| fd == 42 && !w);
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1));
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(r) => assert!(

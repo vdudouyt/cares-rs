@@ -18,7 +18,7 @@ application loop                         runtime
 Reactor::interests()                -->  which (fd, writable) pairs are awaited
 Reactor::next_deadline()            -->  earliest timer
 poll(2) / epoll_wait(2) / ...
-Reactor::set_ready_fds(ready)            -->  wake ready fd waiters
+Reactor::set_ready_fds_with(ready)            -->  wake ready fd waiters
 Reactor::advance_timers(now)        -->  wake due timers
 Executor::pop_ready() / poll(id)    -->  run the woken tasks
 ```
@@ -30,15 +30,15 @@ Executor::pop_ready() / poll(id)    -->  run the woken tasks
 | `ares_fds(channel, &rfds, &wfds)` | `Reactor::interests() -> Vec<(i32, bool)>` (`bool` = writable) |
 | `ares_timeout(channel, NULL, &tv)` | `Reactor::next_deadline() -> Option<Instant>` |
 | `select()` / `poll()` | the application's own wait |
-| `ares_process(channel, &rfds, &wfds)` | `Reactor::set_ready_fds(ready_fn)` + `Reactor::advance_timers(now)` |
+| `ares_process(channel, &rfds, &wfds)` | `Reactor::set_ready_fds_with(ready_fn)` + `Reactor::advance_timers(now)` |
 | — (callbacks run inside `ares_process`) | `Executor::pop_ready()` + `Executor::poll(id)` |
 
-The big difference is that `set_ready_fds` does not guess from an `fd_set`: it takes
+The big difference is that `set_ready_fds_with` does not guess from an `fd_set`: it takes
 a closure `Fn(i32, bool) -> bool` (`fd`, `writable`) that reports whether the
 application saw that direction ready. This also avoids `fd_set`'s
 `FD_SETSIZE` ceiling on high-numbered custom-socket descriptors. If your backend
 already returns an explicit list (`epoll_wait`, `kqueue`, `io_uring`), call
-`Reactor::set_ready_events([(fd, readable, writable)])`
+`Reactor::set_ready_fds([(fd, readable, writable)])`
 instead; it finds sources through the reactor's fd index and costs O(ready fds)
 rather than O(all sources). A persistent backend (like the built-in event
 thread) can call `Reactor::enable_change_tracking()` once and then apply
@@ -83,7 +83,7 @@ fn drive(runtime: &Runtime, executor: &Executor) {
         let ready = wait_for_ready(&interests, timeout_ms);
 
         // 3. ares_process() equivalent: publish readiness, run woken tasks.
-        runtime.reactor().set_ready_fds(|fd, writable| {
+        runtime.reactor().set_ready_fds_with(|fd, writable| {
             ready.contains(&(fd, writable))
         });
         runtime.reactor().advance_timers(Instant::now());
@@ -205,7 +205,7 @@ These rules keep caller-supplied sockets safe (they may block or return
 zero-length datagrams):
 
 1. **Never perform I/O before the host reported readiness.** `Ready` only
-   completes when a *newer* `set_ready_fds` reported that direction.
+   completes when a *newer* `set_ready_fds_with` reported that direction.
 2. **Readiness lasts one turn.** A report not consumed in that turn is not
    readiness later. The runtime's same-turn peek is used
    when a timeout expires alongside a report.
@@ -251,7 +251,7 @@ are polled through shared references by `select_biased!`); pin them with
    starts the non-blocking connect, and waits for completion.
 2. The task sends `"<name>\n"` and reads until `'\n'`.
 3. `drive()` builds the `poll(2)` set from `Reactor::interests()`, uses
-   `Reactor::next_deadline()` as the timeout, calls `Reactor::set_ready_fds` and
+   `Reactor::next_deadline()` as the timeout, calls `Reactor::set_ready_fds_with` and
    `Reactor::advance_timers`, then polls the executor.
 
 Run both halves:
@@ -279,4 +279,4 @@ table and the same loop works unchanged.
   reactor/executor pair belongs to one thread and one loop.
 - It does not call `poll` itself. That is the point: the application may use
   `poll`, `epoll`, `kqueue`, `select`, `io_uring`, a GUI toolkit, or a foreign
-  event loop, and simply translate readiness into `set_ready_fds`.
+  event loop, and simply translate readiness into `set_ready_fds_with`.

@@ -194,7 +194,7 @@ impl ChannelData {
     /// (waking io waiters and, unless skipped, due timers), then run every woken task.
     fn turn(&self, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
         let reactor = self.state.borrow().rt.reactor().clone();
-        reactor.set_ready_fds(ready);
+        reactor.set_ready_fds_with(ready);
         if !skip_timeouts {
             reactor.advance_timers(Instant::now());
         }
@@ -299,7 +299,7 @@ impl ChannelData {
         use crate::ffi::ares_socket::{ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
         let reactor = self.state.borrow().rt.reactor().clone();
         let ready = events.iter().map(|ev| (ev.fd, ev.events & ARES_FD_EVENT_READ != 0, ev.events & ARES_FD_EVENT_WRITE != 0));
-        reactor.set_ready_events(ready);
+        reactor.set_ready_fds(ready);
         reactor.advance_timers(Instant::now());
         self.run_ready();
     }
