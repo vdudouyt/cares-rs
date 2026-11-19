@@ -214,14 +214,14 @@ mod tests {
         let mut rd = Box::pin(a.readable());
         let mut cx = Context::from_waker(Waker::noop());
         assert!(rd.as_mut().poll(&mut cx).is_pending());
-        r.dispatch(Instant::now(), true, |fd, w| fd == 11 && !w);
+        r.set_ready_fds(|fd, w| fd == 11 && !w);
         assert!(a.readable_this_turn());
 
         let _ = a.read_datagram();
         assert_eq!(sock.reads.get(), 1);
         assert!(!a.readable_this_turn(), "a read consumes the report");
 
-        r.dispatch(Instant::now(), true, |_, _| false);
+        r.set_ready_fds(|_, _| false);
         drop(rd);
         assert!(!a.readable_this_turn(), "readiness lasts one turn (C2)");
     }

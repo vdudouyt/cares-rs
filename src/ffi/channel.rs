@@ -182,10 +182,9 @@ impl ChannelData {
         write_fds: &mut libc::fd_set,
         skip_timeouts: bool,
     ) {
-        let now = Instant::now();
         let rf: &libc::fd_set = &*read_fds;
         let wf: &libc::fd_set = &*write_fds;
-        self.turn(now, skip_timeouts, |fd, writable| {
+        self.turn(skip_timeouts, |fd, writable| {
             let set = if writable { wf } else { rf };
             unsafe { libc::FD_ISSET(fd, set as *const libc::fd_set as *mut libc::fd_set) }
         });
@@ -193,9 +192,12 @@ impl ChannelData {
 
     /// One `ares_process*` turn: hand the caller's readiness to the reactor
     /// (waking io waiters and, unless skipped, due timers), then run every woken task.
-    fn turn(&self, now: Instant, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
+    fn turn(&self, skip_timeouts: bool, ready: impl Fn(i32, bool) -> bool) {
         let reactor = self.state.borrow().rt.reactor().clone();
-        reactor.dispatch(now, skip_timeouts, ready);
+        reactor.set_ready_fds(ready);
+        if !skip_timeouts {
+            reactor.advance_timers(Instant::now());
+        }
         self.run_ready();
     }
 
@@ -285,8 +287,7 @@ impl ChannelData {
         skip_timeouts: bool,
     ) {
         use crate::ffi::ares_socket::{ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
-        let now = Instant::now();
-        self.turn(now, skip_timeouts, |fd, writable| {
+        self.turn(skip_timeouts, |fd, writable| {
             let bit = if writable { ARES_FD_EVENT_WRITE } else { ARES_FD_EVENT_READ };
             events.iter().any(|ev| ev.fd == fd && ev.events & bit != 0)
         });
@@ -298,7 +299,8 @@ impl ChannelData {
         use crate::ffi::ares_socket::{ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
         let reactor = self.state.borrow().rt.reactor().clone();
         let ready = events.iter().map(|ev| (ev.fd, ev.events & ARES_FD_EVENT_READ != 0, ev.events & ARES_FD_EVENT_WRITE != 0));
-        reactor.dispatch_events(Instant::now(), false, ready);
+        reactor.set_ready_events(ready);
+        reactor.advance_timers(Instant::now());
         self.run_ready();
     }
 
