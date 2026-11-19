@@ -1,5 +1,5 @@
 //! Protocol-agnostic async IO runtime in the shape of smol: socket traits, the
-//! per-channel reactor (`Async` sockets, `Timer`s), and the executor — driven by
+//! per-channel reactor (`AsyncSocket` values, `Timer`s), and the executor — driven by
 //! the host's event loop instead of by a blocking runtime thread.
 //!
 //! The host owns the loop, exactly as a c-ares application owns the loop around
@@ -44,6 +44,6 @@ pub mod reactor;
 mod system;
 
 pub use executor::Executor;
-pub use io::Async;
+pub use io::AsyncSocket;
 pub use reactor::{Reactor, Ready, Runtime, Timer};
 pub use socket::{Socket, SocketFactory, SocketKind};

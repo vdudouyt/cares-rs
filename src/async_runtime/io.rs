@@ -1,4 +1,4 @@
-//! Byte-level async sockets: [`Async`] (async-io's `Async<T>` over the host's
+//! Byte-level async sockets: [`AsyncSocket`] (async-io's `Async<T>` over the host's
 //! [`Socket`]) plus the non-blocking recv bodies. Knows bytes, not messages —
 //! framing and demux are the application's business.
 //!
@@ -21,7 +21,7 @@ pub fn dead() -> io::Error {
 
 /// A socket registered with the reactor; dropping it deregisters the fd before
 /// the socket itself closes.
-pub struct Async {
+pub struct AsyncSocket {
     source: Rc<Source>,
     reactor: Rc<Reactor>,
     /// Ticker value of the last read attempt, so a same-turn peek
@@ -31,10 +31,10 @@ pub struct Async {
     sock: Rc<dyn Socket>,
 }
 
-impl Async {
+impl AsyncSocket {
     pub fn new(sock: Rc<dyn Socket>, reactor: &Rc<Reactor>) -> Rc<Self> {
         let source = reactor.insert_io(sock.as_raw_fd());
-        Rc::new(Async { source, reactor: reactor.clone(), read_tick: Cell::new(None), sock })
+        Rc::new(AsyncSocket { source, reactor: reactor.clone(), read_tick: Cell::new(None), sock })
     }
 
     pub fn get_ref(&self) -> &dyn Socket {
@@ -165,7 +165,7 @@ impl Async {
     }
 }
 
-impl Drop for Async {
+impl Drop for AsyncSocket {
     fn drop(&mut self) {
         self.reactor.remove_io(&self.source);
     }
@@ -208,7 +208,7 @@ mod tests {
     fn readable_this_turn_needs_a_report_and_is_consumed_by_a_read() {
         let r = Reactor::new();
         let sock = Rc::new(Counting { reads: Cell::new(0) });
-        let a = Async::new(sock.clone(), &r);
+        let a = AsyncSocket::new(sock.clone(), &r);
         assert!(!a.readable_this_turn(), "no report yet (C1)");
 
         let mut rd = Box::pin(a.readable());
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn dropping_async_deregisters_its_fd() {
         let r = Reactor::new();
-        let a = Async::new(Rc::new(Counting { reads: Cell::new(0) }), &r);
+        let a = AsyncSocket::new(Rc::new(Counting { reads: Cell::new(0) }), &r);
         let mut rd = Box::pin(a.writable());
         let mut cx = Context::from_waker(Waker::noop());
         assert!(rd.as_mut().poll(&mut cx).is_pending());

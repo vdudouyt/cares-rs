@@ -1,5 +1,5 @@
 //! The per-query DNS connection facade (`Conn`) over `async_runtime`'s
-//! [`Async`] sockets. Pooling and QID multiplexing live in `tcp_pool`/`udp_pool`;
+//! [`AsyncSocket`] sockets. Pooling and QID multiplexing live in `tcp_pool`/`udp_pool`;
 //! this module routes a `Conn` to the right transport and drives it.
 
 use std::cell::RefCell;
@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use futures_util::{select_biased, FutureExt};
 
-use crate::async_runtime::io::Async;
+use crate::async_runtime::io::AsyncSocket;
 use crate::async_runtime::reactor::Timer;
 use crate::core::tcp_pool::TcpConn;
 use crate::core::async_client::ChannelShared;
@@ -82,7 +82,7 @@ impl Conn {
     }
 
     /// The registered socket under this conn.
-    fn sock(&self) -> Rc<Async> {
+    fn sock(&self) -> Rc<AsyncSocket> {
         match &self.wire {
             Wire::Shared(c, _) => c.borrow().sock(),
             Wire::SharedUdp(c, _) => c.borrow().sock(),
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn shared_conn_releases_slot_on_drop() {
         let reactor = Reactor::new();
-        let tc = TcpConn::new(Async::new(Rc::new(AlwaysReadable { fd: 5 }), &reactor));
+        let tc = TcpConn::new(AsyncSocket::new(Rc::new(AlwaysReadable { fd: 5 }), &reactor));
 
         let a = Conn::shared(tc.clone(), 7);
         let b = Conn::shared(tc.clone(), 9);
@@ -293,7 +293,7 @@ mod tests {
             let reactor = Reactor::new();
             let sock: Rc<dyn Socket> = Rc::new(AlwaysReadable { fd: 42 });
             // Tag 0xABAB: the datagram AlwaysReadable yields routes to us.
-            let mut conn = Conn::shared_udp(UdpConn::new(Async::new(sock, &reactor), false), 0xABAB);
+            let mut conn = Conn::shared_udp(UdpConn::new(AsyncSocket::new(sock, &reactor), false), 0xABAB);
             let mut cx = Context::from_waker(Waker::noop());
             // Register the read arm, report the fd readable, then let the
             // deadline pass: on the next poll both arms are ready.

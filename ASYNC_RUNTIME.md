@@ -49,7 +49,7 @@ thread) can call `Reactor::enable_change_tracking()` once and then apply
 |---|---|
 | `socket.rs` | `Socket` (one non-blocking fd: `connect`, `recv`, `send`, `as_raw_fd`, `drain_safe`) and `SocketFactory` (`create_udp`, `create_tcp`). |
 | `reactor.rs` | `Reactor` (fd `Source`s, per-direction wakers, timers, receive scratch), `Ready` (readable/writable future), `Timer`, `Runtime` (reactor + detached-task queue + built-in system sockets), `InterestChanges` (for persistent event backends). |
-| `io.rs` | `Async` (a `Socket` registered with a reactor), `readable()`, `writable()`, `read()`, `read_exact()`, `write()`, `write_all()`, `dead`. |
+| `io.rs` | `AsyncSocket` (a `Socket` registered with a reactor), `readable()`, `writable()`, `read()`, `read_exact()`, `write()`, `write_all()`, `dead`. |
 | `executor.rs` | `Executor<E>` (`spawn`, `pop_ready`, `poll`, `finish`, `has_ready`), one real `Waker` per task. |
 | `system.rs` | The built-in system sockets behind `Runtime::create_tcp` / `create_udp`: std `UdpSocket::bind`, and std `TcpStream` over a `rustix`-created/bound fd. |
 
@@ -165,8 +165,8 @@ Contract:
   is `Err` with `ErrorKind::WouldBlock`; the runtime only calls it after the
   host reported readability, so it normally does not happen.
 - `send` returns the byte count or a `WouldBlock` error. Use
-  `Async::write` for one attempt (returns the accepted byte count), or
-  `Async::write_all` for a stream when every byte must be sent. A datagram
+  `AsyncSocket::write` for one attempt (returns the accepted byte count), or
+  `AsyncSocket::write_all` for a stream when every byte must be sent. A datagram
   socket uses one `write`; a short datagram is an error, not a continuation.
 - `drain_safe()` should be `false` for caller-supplied sockets that may block,
   so a drain loop does not re-read them. Non-blocking descriptors return the
@@ -188,10 +188,10 @@ let sock = runtime.create_custom_socket(SocketKind::Tcp, bind, factory)?;
 (the resolver's local-IP/socket settings), not the peer. The runtime connects
 separately through `Socket::connect`.
 
-`Async` wraps a `Socket` and registers its fd with a reactor. Dropping it
+`AsyncSocket` wraps a `Socket` and registers its fd with a reactor. Dropping it
 deregisters the source before the socket closes, so a recycled fd number can
-never inherit the old interest. `Async::read` is the readiness-gated one-shot
-read returning the accepted byte count, and `Async::read_exact` is its
+never inherit the old interest. `AsyncSocket::read` is the readiness-gated one-shot
+read returning the accepted byte count, and `AsyncSocket::read_exact` is its
 stream-only all-bytes variant. The DNS pools use internal `read_stream` /
 `read_datagram` helpers that lend the reactor's 64 KB scratch buffer for one
 non-blocking receive after readiness; they are not part of the public client

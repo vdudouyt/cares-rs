@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use crate::async_runtime::io::{dead, Async};
+use crate::async_runtime::io::{dead, AsyncSocket};
 use crate::core::lookup::ServerId;
 use crate::core::tcp_pool::dns_tag;
 
@@ -41,7 +41,7 @@ impl InboxSlot {
 /// A shared datagram connection to one server, driven cooperatively by every
 /// future with an outstanding query on it (tag-demuxed inbox).
 pub(crate) struct UdpConn {
-    sock: Rc<Async>,
+    sock: Rc<AsyncSocket>,
     inbox: HashMap<u16, InboxSlot>,
     /// Every query ever reserved, not just current waiters; `ARES_OPT_UDP_MAX_QUERIES`
     /// caps this total, so an exhausted conn retires even if its waiters later drain.
@@ -57,7 +57,7 @@ pub(crate) struct UdpConn {
 impl UdpConn {
     /// A fresh shared connection over `sock`, already created and connected by
     /// the caller outside any pool borrow so socket callbacks fire with no cell held.
-    pub(crate) fn new(sock: Rc<Async>, event_driven: bool) -> Rc<RefCell<Self>> {
+    pub(crate) fn new(sock: Rc<AsyncSocket>, event_driven: bool) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(UdpConn {
             sock,
             inbox: HashMap::new(),
@@ -90,7 +90,7 @@ impl UdpConn {
         self.inbox.remove(&tag);
     }
 
-    pub(crate) fn sock(&self) -> Rc<Async> {
+    pub(crate) fn sock(&self) -> Rc<AsyncSocket> {
         self.sock.clone()
     }
 
@@ -201,7 +201,7 @@ impl UdpConn {
 
 /// Read the datagrams waiting on `sock` until `WouldBlock`; `false` if the
 /// socket died (frames read before the error are still returned).
-fn read_datagrams(sock: &Async) -> (Vec<Vec<u8>>, bool) {
+fn read_datagrams(sock: &AsyncSocket) -> (Vec<Vec<u8>>, bool) {
     let drain = sock.get_ref().drain_safe();
     let mut frames = Vec::new();
     loop {
@@ -363,8 +363,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::net::SocketAddr;
 
-    fn sock(s: impl Socket + 'static) -> Rc<Async> {
-        Async::new(Rc::new(s), &Reactor::new())
+    fn sock(s: impl Socket + 'static) -> Rc<AsyncSocket> {
+        AsyncSocket::new(Rc::new(s), &Reactor::new())
     }
 
     /// A waker that records whether it fired.

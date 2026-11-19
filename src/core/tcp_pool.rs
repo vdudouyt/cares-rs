@@ -7,7 +7,7 @@ use std::io;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
-use crate::async_runtime::io::{dead, Async};
+use crate::async_runtime::io::{dead, AsyncSocket};
 use crate::core::lookup::ServerId;
 
 /// Demux tag of a frame — its transaction id (header bytes 0..2). `None` for a
@@ -55,7 +55,7 @@ impl InboxSlot {
 /// A shared stream connection to one server: a reassembly buffer plus the
 /// tag-demuxed inbox every querying future shares.
 pub(crate) struct TcpConn {
-    sock: Rc<Async>,
+    sock: Rc<AsyncSocket>,
     rbuf: Vec<u8>,
     inbox: HashMap<u16, InboxSlot>,
 }
@@ -63,7 +63,7 @@ pub(crate) struct TcpConn {
 impl TcpConn {
     /// A fresh shared connection over `sock`, already created and connected by
     /// the caller outside any pool borrow so socket callbacks fire with no cell held.
-    pub(crate) fn new(sock: Rc<Async>) -> Rc<RefCell<Self>> {
+    pub(crate) fn new(sock: Rc<AsyncSocket>) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(TcpConn { sock, rbuf: Vec::new(), inbox: HashMap::new() }))
     }
 
@@ -87,7 +87,7 @@ impl TcpConn {
         self.inbox.remove(&tag);
     }
 
-    pub(crate) fn sock(&self) -> Rc<Async> {
+    pub(crate) fn sock(&self) -> Rc<AsyncSocket> {
         self.sock.clone()
     }
 
@@ -236,7 +236,7 @@ mod tests {
     /// `release` frees only its own query's slot.
     #[test]
     fn release_frees_only_its_slot() {
-        let mut tc = TcpConn { sock: Async::new(Rc::new(DummySock), &Reactor::new()), rbuf: Vec::new(), inbox: HashMap::new() };
+        let mut tc = TcpConn { sock: AsyncSocket::new(Rc::new(DummySock), &Reactor::new()), rbuf: Vec::new(), inbox: HashMap::new() };
         tc.register_query(7);
         tc.register_query(9);
         assert!(tc.has_waiter(7) && tc.has_waiter(9));

@@ -152,7 +152,7 @@ impl Direction {
 }
 
 /// A registered fd (async-io's `Source`). Removed from the reactor when its
-/// [`Async`](crate::async_runtime::io::Async) is dropped.
+/// [`AsyncSocket`](crate::async_runtime::io::AsyncSocket) is dropped.
 pub(crate) struct Source {
     fd: i32,
     key: usize,
@@ -551,7 +551,7 @@ impl Drop for Timer {
 pub type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
 
 /// A channel's runtime handle — smol's implicit global reactor made explicit:
-/// creates [`Async`](crate::async_runtime::io::Async) sockets and [`Timer`]s,
+/// creates [`AsyncSocket`](crate::async_runtime::io::AsyncSocket) sockets and [`Timer`]s,
 /// and spawns detached tasks.
 #[derive(Clone)]
 pub struct Runtime {
@@ -585,15 +585,15 @@ impl Runtime {
     }
 
     /// Create and register a UDP socket over the built-in system I/O.
-    pub fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+    pub fn create_udp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
         let sock = crate::async_runtime::system::create(SocketKind::Udp, bind)?;
-        Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
+        Ok(crate::async_runtime::io::AsyncSocket::new(sock, &self.reactor))
     }
 
     /// Create and register a TCP socket over the built-in system I/O.
-    pub fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+    pub fn create_tcp(&self, bind: SocketAddr) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
         let sock = crate::async_runtime::system::create(SocketKind::Tcp, bind)?;
-        Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
+        Ok(crate::async_runtime::io::AsyncSocket::new(sock, &self.reactor))
     }
 
     /// Convenience over `create_tcp` + `Socket::connect`: create a TCP socket
@@ -607,7 +607,7 @@ impl Runtime {
         &self,
         remote: SocketAddr,
         deadline: Instant,
-    ) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+    ) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
         let local = if remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
         } else {
@@ -632,12 +632,12 @@ impl Runtime {
         kind: SocketKind,
         bind: SocketAddr,
         factory: Rc<dyn SocketFactory>,
-    ) -> io::Result<Rc<crate::async_runtime::io::Async>> {
+    ) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
         let sock: Rc<dyn Socket> = match kind {
             SocketKind::Tcp => factory.create_tcp(bind)?,
             SocketKind::Udp => factory.create_udp(bind)?,
         };
-        Ok(crate::async_runtime::io::Async::new(sock, &self.reactor))
+        Ok(crate::async_runtime::io::AsyncSocket::new(sock, &self.reactor))
     }
 }
 
