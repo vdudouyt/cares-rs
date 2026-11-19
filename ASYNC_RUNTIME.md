@@ -173,10 +173,12 @@ Contract:
   default `true`.
 
 `Runtime::create_tcp(bind)` / `create_udp(bind)` use the built-in system socket
-implementation (stdlib/rustix) and need no factory. `Runtime::connect_tcp(remote)`
-is the usual one-call TCP convenience: it creates a socket with a kernel-chosen
-local address and starts a non-blocking connect. Applications that need custom
-sockets pass their own factory per socket:
+implementation (stdlib/rustix) and need no factory.
+`Runtime::connect_tcp(remote, deadline)` is the async TCP convenience: it
+creates a socket with a kernel-chosen local address, starts a non-blocking
+connect, waits for writability or the deadline, and returns the pending
+`SO_ERROR` if the connection failed. Applications that need custom sockets pass
+their own factory per socket:
 
 ```rust
 let sock = runtime.create_custom_socket(SocketKind::Tcp, bind, factory)?;
@@ -243,12 +245,9 @@ are polled through shared references by `select_biased!`); pin them with
 
 `examples/tcp_hello.rs` implements a complete client:
 
-1. `StreamFactory` creates a non-blocking `TcpStream` from a `rustix` socket
-   and implements `Socket` for it.
-2. `Runtime::connect_tcp(server)` creates, registers, and starts the
-   non-blocking connect.
-3. The task connects, waits for writability (non-blocking connect completes),
-   sends `"<name>\n"`, and reads until `'\n'`.
+1. `Runtime::connect_tcp(server, deadline)` creates the default system socket,
+   starts the non-blocking connect, and waits for completion.
+2. The task sends `"<name>\n"` and reads until `'\n'`.
 4. `drive()` builds the `poll(2)` set from `Reactor::interests()`, uses
    `Reactor::next_deadline()` as the timeout, calls `Reactor::dispatch`, then
    polls the executor.
@@ -263,9 +262,9 @@ Hello, Alice!
 ```
 
 The server half uses blocking `std::net` on purpose; only the client
-demonstrates the runtime. Replace `StreamFactory` with one backed by a custom
-network stack, a TLS library, or the c-ares socket-function table and the same
-loop works unchanged.
+demonstrates the runtime. Use `Runtime::create_custom_socket` with a factory
+backed by a custom network stack, a TLS library, or the c-ares socket-function
+table and the same loop works unchanged.
 
 ## What this runtime is not
 

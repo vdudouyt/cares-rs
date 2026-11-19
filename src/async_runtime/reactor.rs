@@ -11,10 +11,12 @@ use std::future::Future;
 use std::marker::PhantomPinned;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+
+use futures_util::{select_biased, FutureExt};
 
 use crate::async_runtime::socket::{Socket, SocketFactory, SocketKind};
 
@@ -580,16 +582,16 @@ impl Runtime {
     }
 
     /// Convenience over `create_tcp` + `Socket::connect`: create a TCP socket
-    /// with a kernel-chosen local address and start a non-blocking connect to
-    /// `remote`.
+    /// with a kernel-chosen local address, start a non-blocking connect to
+    /// `remote`, and wait until it completes or `deadline` expires.
     ///
-    /// Like `std::net::TcpStream::connect`, this takes only the peer address;
-    /// unlike it, it returns after the connect is *initiated*, not completed.
-    /// Await [`Async::writable`](crate::async_runtime::io::Async::writable)
-    /// before relying on the socket (as the examples do).
-    pub fn connect_tcp(
+    /// This is the async equivalent of `std::net::TcpStream::connect`, plus an
+    /// explicit deadline. The pending `SO_ERROR` is checked after writability,
+    /// so a refused connection is returned as the underlying I/O error.
+    pub async fn connect_tcp(
         &self,
         remote: SocketAddr,
+        deadline: Instant,
     ) -> io::Result<Rc<crate::async_runtime::io::Async>> {
         let local = if remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
@@ -598,6 +600,17 @@ impl Runtime {
         };
         let sock = self.create_tcp(local)?;
         sock.get_ref().connect(remote)?;
+
+        let mut writable = pin!(sock.writable().fuse());
+        let mut timeout = pin!(Timer::at(&self.reactor, deadline).fuse());
+        select_biased! {
+            _ = writable => {}
+            _ = timeout => return Err(io::ErrorKind::TimedOut.into()),
+        }
+
+        if let Some(err) = sock.get_ref().take_error()? {
+            return Err(err);
+        }
         Ok(sock)
     }
 

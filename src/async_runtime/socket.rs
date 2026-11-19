@@ -18,6 +18,11 @@ pub trait Socket {
     fn connect(&self, addr: SocketAddr) -> io::Result<()>;
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
     fn send(&self, data: &[u8]) -> io::Result<usize>;
+    /// The pending socket error (`SO_ERROR`), consumed by the caller. Used to
+    /// turn a completed non-blocking connect into `Ok` or the real error.
+    fn take_error(&self) -> io::Result<Option<io::Error>> {
+        Ok(None)
+    }
     /// Whether repeated `recv` calls cannot block; draining loops must not
     /// re-read a caller-supplied socket that may be blocking.
     fn drain_safe(&self) -> bool {

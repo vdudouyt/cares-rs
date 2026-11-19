@@ -54,6 +54,13 @@ impl Socket for SystemSocket {
             SystemSocket::Udp(socket) => socket.send(data),
         }
     }
+
+    fn take_error(&self) -> io::Result<Option<io::Error>> {
+        match self {
+            SystemSocket::Tcp(stream) => stream.take_error(),
+            SystemSocket::Udp(_) => Ok(None),
+        }
+    }
 }
 
 /// Create and bind one non-blocking system socket.
