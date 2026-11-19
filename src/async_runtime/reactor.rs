@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -609,9 +609,9 @@ impl Runtime {
         deadline: Instant,
     ) -> io::Result<Rc<crate::async_runtime::io::AsyncSocket>> {
         let local = if remote.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         } else {
-            SocketAddr::from(([0u16; 8], 0))
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         };
         let sock = self.create_tcp(local)?;
         sock.get_ref().connect(remote)?;
