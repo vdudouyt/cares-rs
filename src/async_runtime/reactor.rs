@@ -532,6 +532,22 @@ impl Drop for Timer {
     }
 }
 
+/// Poll `fut` until it completes or `timeout` fires. The future is polled
+/// first on ties, matching the biased readiness-before-timeout order used by
+/// `read`, `write`, and `connect_tcp`.
+pub(crate) async fn wait_until<F, T>(fut: F, timeout: T) -> io::Result<F::Output>
+where
+    F: Future,
+    T: Future<Output = ()>,
+{
+    let mut fut = pin!(fut.fuse());
+    let mut timeout = pin!(timeout.fuse());
+    select_biased! {
+        out = fut => Ok(out),
+        _ = timeout => Err(io::ErrorKind::TimedOut.into()),
+    }
+}
+
 /// A detached task waiting for the host to move it into the executor.
 pub type SpawnedTask = Pin<Box<dyn Future<Output = ()>>>;
 
@@ -601,12 +617,7 @@ impl Runtime {
         let sock = self.create_tcp(local)?;
         sock.get_ref().connect(remote)?;
 
-        let mut writable = pin!(sock.writable().fuse());
-        let mut timeout = pin!(Timer::at(&self.reactor, deadline).fuse());
-        select_biased! {
-            _ = writable => {}
-            _ = timeout => return Err(io::ErrorKind::TimedOut.into()),
-        }
+        wait_until(sock.writable(), Timer::at(&self.reactor, deadline)).await?;
 
         if let Some(err) = sock.get_ref().take_error()? {
             return Err(err);
