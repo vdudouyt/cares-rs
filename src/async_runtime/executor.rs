@@ -87,9 +87,10 @@ impl<E: 'static> Executor<E> {
     pub fn pop_ready(&self) -> Option<usize> {
         let mut inner = self.inner.borrow_mut();
         let len = inner.slots.len();
+        if len == 0 { return None; }
         for _ in 0..len {
             let id = inner.next_ready % len;
-            inner.next_ready = id + 1;
+            inner.next_ready = id.wrapping_add(1);
             if inner.slots[id].as_ref().is_some_and(|s| s.flag.take()) {
                 return Some(id);
             }
