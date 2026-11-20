@@ -12,7 +12,7 @@ Unlike for the latter ones, it has the following distinctive characteristics:
 * ``.spawn()`` starts an asynchronous task in the same runner, not a thread
 * Multithreading is safe, simultaneously accessing the same channel isn't (and not feasible from safe code)
 
-## Documentation
+## Most common methods
 
 | Method | Purpose |
 |---|---|
