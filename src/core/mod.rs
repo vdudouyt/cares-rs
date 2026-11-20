@@ -22,3 +22,4 @@ pub mod tcp_pool;
 pub mod udp_pool;
 
 pub(crate) use error::AresError;
+pub(crate) mod wire_name;

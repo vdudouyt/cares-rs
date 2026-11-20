@@ -12,17 +12,17 @@ use super::executor::Executor;
 use super::reactor::Reactor;
 use super::{AsyncSocket, InterestChanges, Socket, SocketFactory, SocketKind, Timer};
 
-/// A task was rejected because the runtime has shut down.
+/// Task admission failed before the future was polled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeClosed;
+pub enum SpawnError { Closed, NoMemory }
 
-impl fmt::Display for RuntimeClosed {
+impl fmt::Display for SpawnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("runtime is shut down")
+        f.write_str(match self { Self::Closed => "runtime is shut down", Self::NoMemory => "out of memory" })
     }
 }
 
-impl std::error::Error for RuntimeClosed {}
+impl std::error::Error for SpawnError {}
 
 /// A single-threaded runtime driven by an external event loop.
 ///
@@ -88,7 +88,7 @@ impl Runtime<()> {
 impl<E: 'static> Runtime<E> {
     /// A non-owning handle with the same runtime API, suitable for capturing in
     /// tasks. Handles never keep the task registry alive; once the owner is
-    /// dropped, spawning returns `RuntimeClosed` and driving is a no-op.
+    /// dropped, spawning returns `SpawnError::Closed` and driving is a no-op.
     pub fn handle(&self) -> Self {
         let tasks = match &self.tasks {
             Tasks::Owner(state) => Rc::downgrade(state),
@@ -108,19 +108,25 @@ impl<E: 'static> Runtime<E> {
     /// Use `|_| {}` for a detached task. Tasks spawned during a poll or callback
     /// join the same ready queue, without any host adoption or notification.
     ///
-    /// After shutdown, returns `RuntimeClosed` and drops both arguments without
+    /// On rejection, returns `SpawnError` and drops both arguments without
     /// polling the future or calling the callback.
     pub fn spawn<T: 'static>(
         &self,
         future: impl Future<Output = T> + 'static,
         on_complete: impl FnOnce(Result<T, E>) + 'static,
-    ) -> Result<(), RuntimeClosed> {
-        let state = self.task_state().ok_or(RuntimeClosed)?;
+    ) -> Result<(), SpawnError> {
+        self.try_spawn(future, on_complete).map_err(|(error, _)| error)
+    }
+
+    /// The C shim retains its callback on admission failure to deliver ENOMEM.
+    pub(crate) fn try_spawn<T: 'static, C: FnOnce(Result<T, E>) + 'static>(
+        &self, future: impl Future<Output = T> + 'static, on_complete: C,
+    ) -> Result<(), (SpawnError, C)> {
+        let Some(state) = self.task_state() else { return Err((SpawnError::Closed, on_complete)); };
         if state.closed.get() {
-            return Err(RuntimeClosed);
+            return Err((SpawnError::Closed, on_complete));
         }
-        state.executor.spawn(future, on_complete);
-        Ok(())
+        state.executor.spawn(future, on_complete).map(|_| ()).map_err(|on| (SpawnError::NoMemory, on))
     }
 
     /// Run scheduled tasks, delivering completed results exactly once. A
@@ -422,7 +428,7 @@ mod tests {
                 let rt = callback_rt.upgrade().unwrap();
                 assert_eq!(rt.spawn(async { panic!("rejected task polled") }, |_| {
                     panic!("rejected task callback called");
-                }), Err(RuntimeClosed));
+                }), Err(SpawnError::Closed));
                 rt.shutdown(|| panic!("reentrant shutdown"));
                 rt.run_ready();
             },
@@ -504,7 +510,7 @@ mod tests {
             let cancellations = Rc::new(Cell::new(0));
             let cancelled = cancellations.clone();
             rt.spawn(timer, move |result| {
-                assert_eq!(result, Err(()));
+                assert!(matches!(result, Err(())));
                 cancelled.set(cancelled.get() + 1);
             }).unwrap();
 
@@ -547,7 +553,7 @@ mod tests {
         let completed = Rc::new(Cell::new(false));
         let result = completed.clone();
         rt.spawn(rt.timer_at(now), move |value| {
-            assert_eq!(value, Ok(()));
+            assert!(matches!(value, Ok(Ok(()))));
             result.set(true);
         }).unwrap();
         rt.process(now, |_, _| false);
@@ -564,7 +570,7 @@ mod tests {
         let socket = Rc::downgrade(&sock);
         let timer = rt.timer_at(Instant::now() + Duration::from_secs(60));
         rt.spawn(async move {
-            timer.await;
+            let _ = timer.await;
             drop(sock);
             pending::<()>().await;
         }, |_| panic!("drop does not deliver cancellation callbacks")).unwrap();
@@ -593,7 +599,7 @@ mod tests {
         drop(rt);
         assert!(state.upgrade().is_none(), "captured handles must not form a task cycle");
         assert_eq!(Rc::strong_count(&dropped), 1);
-        assert_eq!(handle.spawn(async {}, |_| {}), Err(RuntimeClosed));
+        assert_eq!(handle.spawn(async {}, |_| {}), Err(SpawnError::Closed));
         handle.run_ready();
         assert_eq!(handle.active_count(), 0);
         assert_eq!(handle.timeout(Instant::now()), None);

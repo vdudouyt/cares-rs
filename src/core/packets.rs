@@ -10,6 +10,7 @@ const MAX_LABEL_PARTS: usize = 40;
 
 pub type LabelVec<'a> = ArrayVec<&'a str, MAX_LABEL_PARTS>;
 
+#[derive(Clone, Debug)]
 pub struct SliceBuf<'a> {
     data: &'a [u8],
     pub(crate) pos: usize,
@@ -172,57 +173,32 @@ impl<'a> DnsLabel<'a> {
         Some(DnsLabel { name, offset })
     }
     pub fn build_string(&self, main_buf: &[u8]) -> Option<String> {
-        if self.offset.is_none() {
-            return Some(join_escaped_labels(self.name.iter()));
-        }
         let mut result = String::new();
-        let mut idx = 0;
-        for &s in self.name.iter() {
-            if idx > 0 { result.push('.'); }
-            for &b in s.as_bytes() {
-                if b == b'.' || b == b'\\' { result.push('\\'); }
-                result.push(b as char);
-            }
-            idx += 1;
-        }
-
-        // Follow the chain, rejecting offsets that loop.
-        let mut current_offset = self.offset;
-        let mut visited = std::collections::HashSet::new();
-        while let Some(off) = current_offset {
-            if !visited.insert(off) {
-                return None;
-            }
-            let mut pos = off as usize;
-            loop {
-                let &len = main_buf.get(pos)?;
-                pos += 1;
-                if len == 0 {
-                    current_offset = None;
-                    break;
-                }
-                if len & 0xc0 == 0xc0 {
-                    let &low = main_buf.get(pos)?;
-                    pos += 1;
-                    let _ = pos; // suppress unused
-                    current_offset = Some(((len as u16 & 0x3f) << 8) | low as u16);
-                    break;
-                }
-                if len & 0xc0 != 0 || len > 63 {
-                    return None;
-                }
-                let end = pos + len as usize;
-                let label_bytes = main_buf.get(pos..end)?;
-                if idx > 0 { result.push('.'); }
-                for &b in label_bytes {
-                    if b == b'.' || b == b'\\' { result.push('\\'); }
-                    result.push(b as char);
-                }
-                idx += 1;
-                pos = end;
-            }
-        }
+        self.write_to(main_buf, &mut result).ok()?;
         Some(result)
+    }
+
+    /// Render into caller-provided storage; traversing labels never allocates.
+    pub(crate) fn write_to(&self, packet: &[u8], out: &mut impl std::fmt::Write) -> Result<(), crate::core::AresError> {
+        use crate::ffi::error::{ARES_EBADRESP, ARES_ENOMEM};
+        let suffix = self.offset.map(|off| {
+            crate::core::wire_name::Name::parse(packet, &mut usize::from(off)).ok_or(ARES_EBADRESP)
+        }).transpose()?;
+        let labels = self.name.iter().map(|s| s.as_bytes()).chain(suffix.into_iter().flat_map(|n| n.labels()));
+        for (i, label) in labels.enumerate() {
+            if i != 0 { out.write_char('.').map_err(|_| ARES_ENOMEM)?; }
+            for &b in label {
+                if b == b'.' || b == b'\\' { out.write_char('\\').map_err(|_| ARES_ENOMEM)?; }
+                out.write_char(b as char).map_err(|_| ARES_ENOMEM)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_cstring(&self, packet: &[u8]) -> Result<crate::mem::CString, i32> {
+        let mut out = crate::mem::String::new();
+        self.write_to(packet, &mut out).map_err(|e| e.code())?;
+        crate::mem::CString::from_string(out).map_err(|e| e.code())
     }
     /// `build_string` as a C string; None when the name has an embedded NUL.
     pub fn build_cstring(&self, main_buf: &[u8]) -> Option<std::ffi::CString> {
@@ -236,23 +212,6 @@ impl RRParser<'_> for std::ffi::CString {
         let name = DnsLabel::parse(&mut buf)?;
         name.build_cstring(answer.data)
     }
-}
-
-/// Join DNS labels with '.', escaping any '.' or '\\' characters within individual labels.
-fn join_escaped_labels<'a, I: Iterator<Item = &'a &'a str>>(labels: I) -> String {
-    let mut result = String::new();
-    for (i, label) in labels.enumerate() {
-        if i > 0 {
-            result.push('.');
-        }
-        for &b in label.as_bytes() {
-            if b == b'.' || b == b'\\' {
-                result.push('\\');
-            }
-            result.push(b as char);
-        }
-    }
-    result
 }
 
 #[derive(Debug, PartialEq)]

@@ -249,8 +249,9 @@ impl AsyncClient {
         } else {
             conn.send(&wire, deadline).await
         };
-        if sent.is_err() {
+        if let Err(e) = sent {
             self.discard_conn(server, q.use_tcp, &conn);
+            if e.kind() == io::ErrorKind::OutOfMemory { return Err(ARES_ENOMEM); }
             return Ok((server, Response::SendFailed));
         }
 
@@ -275,6 +276,7 @@ impl AsyncClient {
                         ReceiveVerdict::Accept => return Ok((server, Response::Answer(buf))),
                     }
                 }
+                Err(e) if e.kind() == io::ErrorKind::OutOfMemory => return Err(ARES_ENOMEM),
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => {
                     if q.use_tcp {
                         return Ok((server, Response::TimedOut));

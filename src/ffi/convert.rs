@@ -18,28 +18,29 @@ pub(crate) unsafe fn cstr_opt<'a>(p: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(p) }.to_str().ok()
 }
 
-/// Copy `bytes` into a fresh `libc::malloc` buffer with a NUL terminator.
+/// Copy `bytes` into a callback-allocated buffer with a NUL terminator.
 ///
 /// # Safety
-/// The returned pointer is either NULL or a heap C string to free with `libc::free`.
+/// The returned pointer is either NULL or a heap C string to free with `ares_free`.
 pub(crate) unsafe fn malloc_cstr(bytes: &[u8]) -> *mut c_char {
     let len = bytes.len();
-    let p = unsafe { libc::malloc(len + 1) as *mut u8 };
+    let Some(size) = len.checked_add(1) else { return std::ptr::null_mut() };
+    let p = crate::mem::malloc(size) as *mut u8;
     if p.is_null() { return std::ptr::null_mut(); }
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len) };
     unsafe { *p.add(len) = 0 }; // NUL terminator
     p as *mut c_char
 }
 
-/// Copy `bytes` into a fresh `libc::malloc` buffer with no NUL terminator;
+/// Copy `bytes` into a callback-allocated buffer with no NUL terminator;
 /// the length travels separately.
 ///
 /// # Safety
 /// The returned pointer is either NULL or a heap buffer of `bytes.len()` to free
-/// with `libc::free`.
+/// with `ares_free`.
 pub(crate) unsafe fn malloc_bytes(bytes: &[u8]) -> *mut u8 {
     let len = bytes.len();
-    let p = unsafe { libc::malloc(len) as *mut u8 };
+    let p = crate::mem::malloc(len) as *mut u8;
     if p.is_null() { return std::ptr::null_mut(); }
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len) };
     p

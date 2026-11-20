@@ -402,47 +402,18 @@ impl AsyncClient {
     /// The pure inverse of the cascade: read the channel back into option
     /// fields. Every reported value is gated on the channel's stored optmask
     /// so inherited/system defaults are not mistaken for explicit options.
-    pub fn saved_options(&self) -> SavedOptions {
+    pub fn saved_options(&self) -> SavedOptions<'_> {
         let config = &self.config;
         let opts = &config.options;
         let mask = self.optmask;
 
-        // servers (IPv4 only in ares_options)
-        let v4_servers: Vec<Ipv4Addr> = if mask & ARES_OPT_SERVERS != 0 {
-            config
-                .nameservers
-                .iter()
-                .filter_map(|(ip, _)| match ip {
-                    IpAddr::V4(v4) => Some(*v4),
-                    _ => None,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let domains: Vec<CString> = if mask & ARES_OPT_DOMAINS != 0 {
-            config
-                .search
-                .iter()
-                .map(|domain| CString::new(domain.as_str()).unwrap_or_default())
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let sortlist = if mask & ARES_OPT_SORTLIST != 0 {
-            self.sortlist.clone()
-        } else {
-            Vec::new()
-        };
         let maxtimeout = (mask & ARES_OPT_MAXTIMEOUTMS != 0).then_some(self.maxtimeout);
         let lookups = (mask & ARES_OPT_LOOKUPS != 0)
-            .then(|| CString::new(self.lookups.as_str()).unwrap_or_default());
+            .then_some(self.lookups.as_str());
         let resolvconf_path = (mask & ARES_OPT_RESOLVCONF != 0)
-            .then(|| CString::new(self.resolvconf_path.as_str()).unwrap_or_default());
+            .then_some(self.resolvconf_path.as_str());
         let hosts_path = (mask & ARES_OPT_HOSTS_FILE != 0)
-            .then(|| CString::new(self.hosts_path.as_str()).unwrap_or_default());
+            .then_some(self.hosts_path.as_str());
         let qcache_max_ttl =
             (mask & ARES_OPT_QUERY_CACHE != 0).then(|| self.shared.cache.borrow().max_ttl());
         let server_failover = (mask & ARES_OPT_SERVER_FAILOVER != 0)
@@ -457,9 +428,9 @@ impl AsyncClient {
             ndots: opts.ndots as i32,
             udp_port: self.default_udp_port,
             tcp_port: self.default_tcp_port,
-            v4_servers,
-            domains,
-            sortlist,
+            servers: &config.nameservers,
+            domains: &config.search,
+            sortlist: &self.sortlist,
             maxtimeout,
             lookups,
             resolvconf_path,
@@ -507,7 +478,7 @@ impl AsyncClient {
     }
 
     /// The configured servers with per-entry defaults and IPv6 scope ids, in order.
-    pub fn server_list(&self) -> Vec<(IpAddr, u16, u16, u32)> {
+    pub fn server_list(&self) -> impl Iterator<Item = (IpAddr, u16, u16, u32)> + '_ {
         self.config
             .nameservers
             .iter()
@@ -520,7 +491,6 @@ impl AsyncClient {
                     self.config.scopes.get(i).copied().unwrap_or(0),
                 )
             })
-            .collect()
     }
 }
 
@@ -577,7 +547,7 @@ pub(crate) struct DecodedOptions {
 /// Everything ares_save_options reports. `mask` is the channel's stored
 /// optmask; the shim only writes a field when its bit is present, and the
 /// `Option` fields are populated only for explicitly-configured options.
-pub(crate) struct SavedOptions {
+pub(crate) struct SavedOptions<'a> {
     pub mask: i32,
     pub flags: i32,
     pub ednspsz: i32,
@@ -586,13 +556,13 @@ pub(crate) struct SavedOptions {
     pub ndots: i32,
     pub udp_port: u16,
     pub tcp_port: u16,
-    pub v4_servers: Vec<Ipv4Addr>,
-    pub domains: Vec<CString>,
-    pub sortlist: Vec<SortlistEntry>,
+    pub servers: &'a [(IpAddr, Option<u16>)],
+    pub domains: &'a [String],
+    pub sortlist: &'a [SortlistEntry],
     pub maxtimeout: Option<i32>,
-    pub lookups: Option<CString>,
-    pub resolvconf_path: Option<CString>,
-    pub hosts_path: Option<CString>,
+    pub lookups: Option<&'a str>,
+    pub resolvconf_path: Option<&'a str>,
+    pub hosts_path: Option<&'a str>,
     pub udp_max_queries: i32,
     pub socket_send_buffer_size: i32,
     pub socket_receive_buffer_size: i32,

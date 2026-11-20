@@ -1,7 +1,8 @@
 // Thin c-ares C ABI shims; the documented c-ares API contract is the safety contract.
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::{ CString, c_void, c_char, c_ushort, c_int, c_uint };
+use std::ffi::{ c_void, c_char, c_ushort, c_int, c_uint };
+use crate::mem::CString;
 use crate::core::packets::{ TxtReply, TxtReplyExt, MxReply, CaaReply, NaptrReply, SoaReply, SrvReply, UriReply };
 use crate::ffi::clinkedlist::*;
 use crate::offset_of;
@@ -11,59 +12,46 @@ use crate::offset_of;
 // too, so they must have NO `Drop` (one would free the caller's stack instances).
 
 pub trait IntoAresData<T> {
-    /// Convert a parsed record into its C reply struct; `None` on an embedded NUL
-    /// (mapped to ARES_EBADRESP rather than panicking across the FFI boundary).
-    fn into_ares_data(self, main_buf: &[u8]) -> Option<T>;
+    /// Materialize a borrowed record, distinguishing malformed strings from OOM.
+    fn into_ares_data(self, main_buf: &[u8]) -> Result<T, c_int>;
 }
 
 impl IntoAresData<AresTxtReply> for TxtReply<'_> {
-    fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresTxtReply> {
-        let mut bytes = self.txt.into_owned().into_bytes();
-        let length = bytes.len();
-        bytes.push(0); // NUL terminator, not counted in `length`
-        let txt = Box::into_raw(bytes.into_boxed_slice());
-        Some(AresTxtReply { next: std::ptr::null_mut(), txt: txt as *mut u8, length })
+    fn into_ares_data(self, _main_buf: &[u8]) -> Result<AresTxtReply, c_int> {
+        txt_reply_node(self.txt.as_bytes())
     }
 }
 
 /// Build one TXT reply node; `length` excludes the added NUL terminator.
-pub(crate) fn txt_reply_node(data: &[u8]) -> AresTxtReply {
-    let mut bytes = data.to_vec();
-    let length = bytes.len();
-    bytes.push(0);
-    let txt = Box::into_raw(bytes.into_boxed_slice());
-    AresTxtReply { next: std::ptr::null_mut(), txt: txt as *mut u8, length }
+pub(crate) fn txt_reply_node(data: &[u8]) -> Result<AresTxtReply, c_int> {
+    let txt = unsafe { crate::ffi::convert::malloc_cstr(data) }.cast::<u8>();
+    if txt.is_null() { return Err(crate::ffi::error::ARES_ENOMEM); }
+    Ok(AresTxtReply { next: std::ptr::null_mut(), txt, length: data.len() })
 }
 
 /// EXT sibling of [`txt_reply_node`].
-pub(crate) fn txt_ext_node(data: &[u8], record_start: bool) -> AresTxtReplyExt {
-    let mut bytes = data.to_vec();
-    let length = bytes.len();
-    bytes.push(0);
-    let txt = Box::into_raw(bytes.into_boxed_slice());
-    AresTxtReplyExt {
+pub(crate) fn txt_ext_node(data: &[u8], record_start: bool) -> Result<AresTxtReplyExt, c_int> {
+    let txt = unsafe { crate::ffi::convert::malloc_cstr(data) }.cast::<u8>();
+    if txt.is_null() { return Err(crate::ffi::error::ARES_ENOMEM); }
+    Ok(AresTxtReplyExt {
         next: std::ptr::null_mut(),
-        txt: txt as *mut u8,
-        length,
+        txt,
+        length: data.len(),
         record_start: record_start as u8,
-    }
+    })
 }
 
 impl IntoAresData<AresTxtReplyExt> for TxtReplyExt<'_> {
-    fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresTxtReplyExt> {
-        let mut bytes = self.txt.as_bytes().to_vec();
-        let length = bytes.len();
-        bytes.push(0); // NUL terminator, not counted in `length`
-        let txt = Box::into_raw(bytes.into_boxed_slice());
-        Some(AresTxtReplyExt { next: std::ptr::null_mut(), txt: txt as *mut u8, length, record_start: self.record_start as u8 })
+    fn into_ares_data(self, _main_buf: &[u8]) -> Result<AresTxtReplyExt, c_int> {
+        txt_ext_node(self.txt.as_bytes(), self.record_start)
     }
 }
 
 impl IntoAresData<AresMxReply> for MxReply<'_> {
-    fn into_ares_data(self, main_buf: &[u8]) -> Option<AresMxReply> {
-        let name = self.label.build_cstring(main_buf)?;
+    fn into_ares_data(self, main_buf: &[u8]) -> Result<AresMxReply, c_int> {
+        let name = self.label.try_cstring(main_buf)?;
         let raw_ptr = name.into_raw();
-        Some(AresMxReply { next: std::ptr::null_mut(), host: raw_ptr, priority: self.priority })
+        Ok(AresMxReply { next: std::ptr::null_mut(), host: raw_ptr, priority: self.priority })
     }
 }
 
@@ -88,22 +76,22 @@ pub unsafe extern "C" fn ares_free_data(dataptr: *mut c_void) {
             AresDataType::AddrPortNode => free_chain::<AresAddrPortNode>(aresdata),
             AresDataType::AddrNode => free_chain::<super::ares_addr_node>(aresdata),
             // SOA is a single record (no `next` chain), so just free the one box.
-            AresDataType::SoaReply => drop(Box::from_raw(aresdata as *mut AresData<AresSoaReply>)),
+            AresDataType::SoaReply => crate::mem::drop_box(aresdata as *mut AresData<AresSoaReply>),
         }
     }
 }
 
 /// Free a node chain: the boxed tail then the inline head; each `Drop` frees only
 /// its own fields, never `next`, so no `Drop` walks into caller-owned memory.
-unsafe fn free_chain<T: CLinkedList>(aresdata: *mut AresData<*mut c_void>) {
+pub(crate) unsafe fn free_chain<T: CLinkedList>(aresdata: *mut AresData<*mut c_void>) {
     let ad = aresdata as *mut AresData<T>;
     let mut node = unsafe { *(*ad).data.next() };
     while !node.is_null() {
         let next = unsafe { *(*node).next() };
-        unsafe { drop(Box::from_raw(node)) };
+        unsafe { crate::mem::drop_box(node) };
         node = next;
     }
-    unsafe { drop(Box::from_raw(ad)) };
+    unsafe { crate::mem::drop_box(ad) };
 }
 
 #[repr(C)]
@@ -161,15 +149,15 @@ pub struct AresCaaReply {
 }
 
 impl IntoAresData<AresCaaReply> for CaaReply<'_> {
-    fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresCaaReply> {
+    fn into_ares_data(self, _main_buf: &[u8]) -> Result<AresCaaReply, c_int> {
         let plength = self.property.len();
         let length = self.value.len();
 
         // Build both CStrings before `into_raw` so a failure does not leak the first.
-        let property = CString::new(self.property).ok()?;
-        let value = CString::new(self.value).ok()?;
+        let property = CString::new(self.property).map_err(|e| e.code())?;
+        let value = CString::new(self.value).map_err(|e| e.code())?;
 
-        Some(AresCaaReply {
+        Ok(AresCaaReply {
             next: std::ptr::null_mut(),
             critical: self.critical as c_int,
             property: property.into_raw() as *mut u8,
@@ -182,8 +170,7 @@ impl IntoAresData<AresCaaReply> for CaaReply<'_> {
 
 impl Drop for AresCaaReply {
     fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.property as *mut c_char) });
-        drop(unsafe { CString::from_raw(self.value as *mut c_char) });
+        unsafe { crate::mem::free(self.property.cast()); crate::mem::free(self.value.cast()); }
     }
 }
 
@@ -199,12 +186,12 @@ pub struct AresSoaReply {
 }
 
 impl IntoAresData<AresSoaReply> for SoaReply<'_> {
-    fn into_ares_data(self, main_buf: &[u8]) -> Option<AresSoaReply> {
+    fn into_ares_data(self, main_buf: &[u8]) -> Result<AresSoaReply, c_int> {
         // Build both CStrings before `into_raw` so a failure does not leak the first.
-        let nsname = self.nsname.build_cstring(main_buf)?;
-        let hostmaster = self.hostmaster.build_cstring(main_buf)?;
+        let nsname = self.nsname.try_cstring(main_buf)?;
+        let hostmaster = self.hostmaster.try_cstring(main_buf)?;
 
-        Some(AresSoaReply {
+        Ok(AresSoaReply {
             nsname: nsname.into_raw(),
             hostmaster: hostmaster.into_raw(),
             serial: self.serial as c_uint,
@@ -234,27 +221,25 @@ pub struct AresAddrPortNode {
 
 impl Drop for AresMxReply {
     fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.host as *mut c_char) });
+        unsafe { crate::mem::free(self.host.cast()) };
     }
 }
 
 impl Drop for AresTxtReply {
     fn drop(&mut self) {
-        // txt is `length + 1` bytes (data + NUL).
-        drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length + 1, self.length + 1) });
+        unsafe { crate::mem::free(self.txt.cast()) };
     }
 }
 
 impl Drop for AresTxtReplyExt {
     fn drop(&mut self) {
-        // txt is `length + 1` bytes (data + NUL).
-        drop(unsafe { Vec::from_raw_parts(self.txt as *mut i8, self.length + 1, self.length + 1) });
+        unsafe { crate::mem::free(self.txt.cast()) };
     }
 }
 
 impl Drop for AresSrvReply {
     fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.host as *mut c_char) });
+        unsafe { crate::mem::free(self.host.cast()) };
     }
 }
 
@@ -352,35 +337,36 @@ pub struct AresNaptrReply {
 
 impl Drop for AresNaptrReply {
     fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.flags as *mut c_char) });
-        drop(unsafe { CString::from_raw(self.service as *mut c_char) });
-        drop(unsafe { CString::from_raw(self.regexp as *mut c_char) });
-        drop(unsafe { CString::from_raw(self.replacement as *mut c_char) });
+        unsafe {
+            crate::mem::free(self.flags.cast());
+            crate::mem::free(self.service.cast());
+            crate::mem::free(self.regexp.cast());
+            crate::mem::free(self.replacement.cast());
+        }
     }
 }
 
 impl Drop for AresSoaReply {
     fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.nsname as *mut c_char) });
-        drop(unsafe { CString::from_raw(self.hostmaster as *mut c_char) });
+        unsafe { crate::mem::free(self.nsname.cast()); crate::mem::free(self.hostmaster.cast()); }
     }
 }
 
 impl Drop for AresUriReply {
     fn drop(&mut self) {
-        drop(unsafe { CString::from_raw(self.uri as *mut c_char) });
+        unsafe { crate::mem::free(self.uri.cast()) };
     }
 }
 
 impl IntoAresData<AresNaptrReply> for NaptrReply<'_> {
-    fn into_ares_data(self, _buf: &[u8]) -> Option<AresNaptrReply> {
+    fn into_ares_data(self, _buf: &[u8]) -> Result<AresNaptrReply, c_int> {
         // Build all CStrings before `into_raw` so a failure does not leak the earlier ones.
-        let flags = CString::new(self.flags).ok()?;
-        let service = CString::new(self.service).ok()?;
-        let regexp = CString::new(self.regexp).ok()?;
-        let replacement = CString::new(self.replacement).ok()?;
+        let flags = CString::new(self.flags).map_err(|e| e.code())?;
+        let service = CString::new(self.service).map_err(|e| e.code())?;
+        let regexp = CString::new(self.regexp).map_err(|e| e.code())?;
+        let replacement = CString::new(self.replacement).map_err(|e| e.code())?;
 
-        Some(AresNaptrReply {
+        Ok(AresNaptrReply {
             next: std::ptr::null_mut(),
             flags: flags.into_raw() as *mut u8,
             service: service.into_raw() as *mut u8,
@@ -402,10 +388,10 @@ pub struct AresSrvReply {
 }
 
 impl IntoAresData<AresSrvReply> for SrvReply<'_> {
-    fn into_ares_data(self, main_buf: &[u8]) -> Option<AresSrvReply> {
-        Some(AresSrvReply {
+    fn into_ares_data(self, main_buf: &[u8]) -> Result<AresSrvReply, c_int> {
+        Ok(AresSrvReply {
             next: std::ptr::null_mut(),
-            host: self.host.build_cstring(main_buf)?.into_raw(),
+            host: self.host.try_cstring(main_buf)?.into_raw(),
             priority: self.priority as c_ushort,
             weight: self.weight as c_ushort,
             port: self.port as c_ushort,
@@ -423,10 +409,10 @@ pub struct AresUriReply {
 }
 
 impl IntoAresData<AresUriReply> for UriReply<'_> {
-    fn into_ares_data(self, _main_buf: &[u8]) -> Option<AresUriReply> {
-        let uri = CString::new(self.uri).ok()?;
+    fn into_ares_data(self, _main_buf: &[u8]) -> Result<AresUriReply, c_int> {
+        let uri = CString::new(self.uri).map_err(|e| e.code())?;
 
-        Some(AresUriReply {
+        Ok(AresUriReply {
             next: std::ptr::null_mut(),
             priority: self.priority as c_ushort,
             weight: self.weight as c_ushort,

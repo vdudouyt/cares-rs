@@ -544,15 +544,13 @@ impl CSocketFactory {
     /// Render a scope id as an interface name for a scoped server CSV entry.
     /// Uses the extended table's `aif_indextoname` when installed, else the
     /// platform call for the default table.
-    pub(crate) fn if_indextoname(&self, index: u32) -> Option<String> {
-        // Generous buffer: IF_NAMESIZE is 16 on Linux/BSD.
-        let mut buf = [0 as libc::c_char; 64];
+    pub(crate) fn if_indextoname<'a>(&'a self, index: u32, buf: &'a mut [libc::c_char; 64]) -> Option<&'a CStr> {
         if let Some(cb) = self.ex.and_then(|ex| ex.aif_indextoname) {
             let name = unsafe { cb(index, buf.as_mut_ptr(), buf.len(), self.user_data) };
             if name.is_null() {
                 return None;
             }
-            return Some(unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned());
+            return Some(unsafe { CStr::from_ptr(name) });
         }
         if self.custom {
             return None;
@@ -561,7 +559,7 @@ impl CSocketFactory {
         if name.is_null() {
             None
         } else {
-            Some(unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned())
+            Some(unsafe { CStr::from_ptr(name) })
         }
     }
 

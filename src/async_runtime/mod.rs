@@ -25,9 +25,10 @@ mod executor;
 mod io;
 mod reactor;
 mod runtime;
+mod timers;
 mod system;
 
 pub use io::{dead, AsyncSocket};
 pub use reactor::{InterestChanges, InterestUpdate, Ready, Timer};
-pub use runtime::{Runtime, RuntimeClosed};
+pub use runtime::{Runtime, SpawnError};
 pub use socket::{Socket, SocketFactory, SocketKind};

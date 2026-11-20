@@ -2,7 +2,7 @@
 // Thin c-ares C ABI shims; the documented c-ares API contract is the safety contract.
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_ushort, c_void, CStr};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::ffi::convert::{malloc_bytes, malloc_cstr};
@@ -225,9 +225,9 @@ pub unsafe extern "C" fn ares_dns_record_create(
         return ARES_EFORMERR;
     }
     unsafe { *dnsrec = std::ptr::null_mut(); }
-    match ares_dns_record_t::create(id, flags, opcode, rcode) {
+    match ares_dns_record_t::create(id, flags, opcode, rcode).and_then(record_into_raw) {
         Ok(rec) => {
-            unsafe { *dnsrec = Box::into_raw(Box::new(rec)); }
+            unsafe { *dnsrec = rec; }
             ARES_SUCCESS
         }
         Err(e) => e.code(),
@@ -237,8 +237,15 @@ pub unsafe extern "C" fn ares_dns_record_create(
 #[no_mangle]
 pub unsafe extern "C" fn ares_dns_record_destroy(dnsrec: *mut ares_dns_record_t) {
     if !dnsrec.is_null() {
-        let _ = unsafe { Box::from_raw(dnsrec) };
+        let _ = unsafe { Box::from_raw_in(dnsrec, crate::mem::CaresAllocator) };
     }
+}
+
+pub(crate) fn record_into_raw(rec: ares_dns_record_t) -> Result<*mut ares_dns_record_t, crate::core::AresError> {
+    // Transfer ownership to the C handle. `ares_dns_record_destroy` restores
+    // this Box with the same allocator; no Rust reference escapes this call.
+    // Stable 1.100's Box::into_raw only accepts the global allocator.
+    Ok(Box::leak(crate::mem::boxed(rec)?))
 }
 
 /// Duplicate a DNS record via serialize/parse round-trip.
@@ -250,7 +257,7 @@ pub unsafe extern "C" fn ares_dns_record_duplicate(
         return std::ptr::null_mut();
     }
     match crate::core::dns_record::duplicate_record(unsafe { &*dnsrec }) {
-        Some(rec) => Box::into_raw(Box::new(rec)),
+        Some(rec) => record_into_raw(rec).unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
     }
 }
@@ -655,7 +662,10 @@ pub unsafe extern "C" fn ares_dns_rr_set_str(
     if rr.is_null() || val.is_null() {
         return ARES_EFORMERR;
     }
-    let owned = CString::from(unsafe { CStr::from_ptr(val) });
+    let owned = match crate::mem::CString::new(unsafe { CStr::from_ptr(val) }.to_bytes()) {
+        Ok(s) => s,
+        Err(e) => return e.code(),
+    };
     match unsafe { &mut *rr }.set_str_checked(key, owned) {
         Ok(()) => ARES_SUCCESS,
         Err(e) => e.code(),
@@ -720,10 +730,11 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
     // Copied out first: `val` may point into this RR's own ABINP cache
     // (get_bin -> set_bin), which the setter frees; no borrow of it may be live
     // across that call.
-    let data: Vec<u8> = if len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(val, len) }.to_vec()
+    let data = match crate::mem::Vec::copy_from(if len == 0 { &[] } else {
+        unsafe { std::slice::from_raw_parts(val, len) }
+    }) {
+        Ok(data) => data,
+        Err(_) => return ARES_ENOMEM,
     };
     match unsafe { &mut *rr }.set_bin_checked(key, &data) {
         Ok(()) => ARES_SUCCESS,
@@ -742,10 +753,11 @@ pub unsafe extern "C" fn ares_dns_rr_set_opt(
     if rr.is_null() {
         return ARES_EFORMERR;
     }
-    let data = if val.is_null() || val_len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(val, val_len) }.to_vec()
+    let data = match crate::mem::Vec::copy_from(if val.is_null() || val_len == 0 { &[] } else {
+        unsafe { std::slice::from_raw_parts(val, val_len) }
+    }) {
+        Ok(data) => data,
+        Err(_) => return ARES_ENOMEM,
     };
     match unsafe { &mut *rr }.set_opt_checked(key, opt as u16, data) {
         Ok(()) => ARES_SUCCESS,
@@ -852,9 +864,9 @@ pub unsafe extern "C" fn ares_dns_parse(
     }
     unsafe { *dnsrec = std::ptr::null_mut(); }
     let data = unsafe { std::slice::from_raw_parts(buf, buf_len) };
-    match parse_record(data, flags) {
+    match parse_record(data, flags).and_then(record_into_raw) {
         Ok(rec) => {
-            unsafe { *dnsrec = Box::into_raw(Box::new(rec)); }
+            unsafe { *dnsrec = rec; }
             ARES_SUCCESS
         }
         Err(e) => e.code(),
@@ -1115,11 +1127,11 @@ pub unsafe extern "C" fn ares_dns_rr_add_abin(
         return ARES_EFORMERR;
     }
     // Copied out first (see ares_dns_rr_set_bin): `val` may alias this RR's cache.
-    let data: Vec<u8> = if len == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: `val` points to `len` readable bytes per the C contract.
-        unsafe { std::slice::from_raw_parts(val, len) }.to_vec()
+    let data = match crate::mem::Vec::copy_from(if len == 0 { &[] } else {
+        unsafe { std::slice::from_raw_parts(val, len) }
+    }) {
+        Ok(data) => data,
+        Err(_) => return ARES_ENOMEM,
     };
     match unsafe { &mut *rr }.add_abin_checked(key, &data) {
         Ok(()) => ARES_SUCCESS,
@@ -1145,7 +1157,6 @@ pub unsafe extern "C" fn ares_dns_rr_del_abin(
 #[no_mangle]
 pub unsafe extern "C" fn ares_free(ptr: *mut c_void) {
     if !ptr.is_null() {
-        unsafe { libc::free(ptr) };
+        unsafe { crate::mem::free(ptr) };
     }
 }
-

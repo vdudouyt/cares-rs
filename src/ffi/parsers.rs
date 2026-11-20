@@ -81,7 +81,7 @@ pub(crate) unsafe fn build_hostent(bp: Hostent) -> *mut libc::hostent {
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_mx_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresMxReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
+    unsafe { parse_to_clinkedlist::<MxReply<'_>, AresMxReply>(abuf, alen, out, RECORD_TYPE_MX) }
 }
 
 fn checked_slice<'a>(abuf: *const u8, alen: c_int) -> Option<&'a [u8]> {
@@ -102,47 +102,31 @@ fn txt_reply_from_buf(buf: &[u8], ext: bool) -> Result<*mut c_void, c_int> {
             && rr.rtype() == crate::ffi::dns_record::ARES_REC_TYPE_TXT as u32
     };
     if ext {
-        let mut nodes = Vec::new();
+        let mut nodes = clinkedlist::ReplyList::new();
         for rr in rec.answers.iter().filter(|rr| is_txt(rr)) {
             let count = rr.abin_count(crate::ffi::dns_record::ARES_RR_TXT_DATA);
             for idx in 0..count {
                 if let Some(data) =
                     rr.abin_at(crate::ffi::dns_record::ARES_RR_TXT_DATA, idx)
                 {
-                    nodes.push(txt_ext_node(data, idx == 0));
+                    nodes.push(txt_ext_node(data, idx == 0)?)?;
                 }
             }
         }
-        let Some(reply) = clinkedlist::chain_nodes(nodes) else {
-            return Ok(std::ptr::null_mut());
-        };
-        let aresdata: AresData<AresTxtReplyExt> =
-            AresData { data_type: AresTxtReplyExt::datatype(), data: reply };
-        let aresdata = Box::into_raw(Box::new(aresdata));
-        Ok((aresdata as *mut u8)
-            .wrapping_add(std::mem::offset_of!(AresData<AresTxtReplyExt>, data))
-            as *mut c_void)
+        Ok(nodes.into_raw().cast())
     } else {
-        let mut nodes = Vec::new();
+        let mut nodes = clinkedlist::ReplyList::new();
         for rr in rec.answers.iter().filter(|rr| is_txt(rr)) {
             let count = rr.abin_count(crate::ffi::dns_record::ARES_RR_TXT_DATA);
             for idx in 0..count {
                 if let Some(data) =
                     rr.abin_at(crate::ffi::dns_record::ARES_RR_TXT_DATA, idx)
                 {
-                    nodes.push(txt_reply_node(data));
+                    nodes.push(txt_reply_node(data)?)?;
                 }
             }
         }
-        let Some(reply) = clinkedlist::chain_nodes(nodes) else {
-            return Ok(std::ptr::null_mut());
-        };
-        let aresdata: AresData<AresTxtReply> =
-            AresData { data_type: AresTxtReply::datatype(), data: reply };
-        let aresdata = Box::into_raw(Box::new(aresdata));
-        Ok((aresdata as *mut u8)
-            .wrapping_add(std::mem::offset_of!(AresData<AresTxtReply>, data))
-            as *mut c_void)
+        Ok(nodes.into_raw().cast())
     }
 }
 
@@ -180,91 +164,54 @@ pub unsafe extern "C" fn ares_parse_txt_reply_ext(abuf: *const u8, alen: c_int, 
     txt_reply_entry(abuf, alen, true, out as *mut *mut c_void)
 }
 
-pub(crate) unsafe fn parse_to_vec<'a, T1, T2>(buf: &'a [u8], expected_record_type: u16) -> Result<Vec<T2>, c_int>
+unsafe fn parse_to_singleptr<'a, T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
 where T1: RRParser<'a> + IntoAresData<T2>, T2: DataType
-{
-    let res = ParsedResponse::from_buf(buf).map_err(|e| e.code())?;
-    let parsed_rrs = res.process_answers::<T1>(buf, expected_record_type).map_err(|e| e.code())?;
-    parsed_rrs.items.into_iter().map(|x| x.into_ares_data(buf)).collect::<Option<Vec<_>>>().ok_or(ARES_EBADRESP)
-}
-
-pub(crate) unsafe fn parse_to_singleptr<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
-where T2: DataType, for<'a> T2: FromParsedBuf<'a, T2>
 {
     let build = || {
         if abuf.is_null() || alen < 0 {
             return Err(ARES_EBADRESP);
         }
-        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let aresreplies = T2::parse_buf_to_vec(buf, expected_record_type)?;
-        if aresreplies.len() > 1 {
-            return Err(ARES_EBADRESP);
+        let buf: &'a [u8] = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        let res = ParsedResponse::from_buf(buf).map_err(|e| e.code())?;
+        res.validate_names(buf)?;
+        let mut reply = None;
+        for answer in res.answers {
+            if answer.class != dns_record::ARES_CLASS_IN || answer.record_type != expected_record_type { continue; }
+            if let Some(parsed) = T1::parse_rr(&answer) {
+                if reply.is_some() { return Err(ARES_EBADRESP); }
+                reply = Some(parsed.into_ares_data(buf)?);
+            }
         }
-        let reply = aresreplies.into_iter().next().ok_or(ARES_ENODATA)?;
+        let reply = reply.ok_or(ARES_ENODATA)?;
         let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
-        let aresdata = Box::into_raw(Box::new(aresdata));
+        let aresdata = crate::mem::into_raw(crate::mem::boxed(aresdata)?);
         unsafe { Ok(&mut (*aresdata).data as *mut _) }
     };
     unsafe { ares_fn_wrapper(out, build) }
 }
 
-/// Bridge lifetime-carrying parsed types to the non-lifetime output type (avoids HRTB issues).
-pub(crate) trait FromParsedBuf<'a, T2> {
-    fn parse_buf_to_vec(buf: &'a [u8], expected_record_type: u16) -> Result<Vec<T2>, c_int>;
-    fn parse_buf_to_clinkedlist_parts(buf: &'a [u8], expected_record_type: u16) -> Result<(Vec<T2>, usize), c_int>;
-}
-
-macro_rules! impl_from_parsed_buf {
-    ($t1:ty, $t2:ty) => {
-        impl<'a> FromParsedBuf<'a, $t2> for $t2 {
-            fn parse_buf_to_vec(buf: &'a [u8], expected_record_type: u16) -> Result<Vec<$t2>, c_int> {
-                unsafe { parse_to_vec::<$t1, $t2>(buf, expected_record_type) }
-            }
-            fn parse_buf_to_clinkedlist_parts(buf: &'a [u8], expected_record_type: u16) -> Result<(Vec<$t2>, usize), c_int> {
-                let res = ParsedResponse::from_buf(buf).map_err(|e| e.code())?;
-                let parsed_rrs = res.process_answers::<$t1>(buf, expected_record_type).map_err(|e| e.code())?;
-                let success = parsed_rrs.success;
-                let aresreplies = parsed_rrs.items.into_iter().map(|x| x.into_ares_data(buf)).collect::<Option<Vec<_>>>().ok_or(ARES_EBADRESP)?;
-                Ok((aresreplies, success))
-            }
-        }
-    };
-}
-
-impl_from_parsed_buf!(MxReply<'a>, AresMxReply);
-impl_from_parsed_buf!(CaaReply<'a>, AresCaaReply);
-impl_from_parsed_buf!(TxtReply<'a>, AresTxtReply);
-impl_from_parsed_buf!(NaptrReply<'a>, AresNaptrReply);
-impl_from_parsed_buf!(SoaReply<'a>, AresSoaReply);
-impl_from_parsed_buf!(SrvReply<'a>, AresSrvReply);
-impl_from_parsed_buf!(UriReply<'a>, AresUriReply);
-
-pub(crate) unsafe fn parse_to_clinkedlist<T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
-where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
+unsafe fn parse_to_clinkedlist<'a, T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
+where T1: RRParser<'a> + IntoAresData<T2>, T2: CLinkedList + DataType {
     let build = || {
         if abuf.is_null() || alen < 0 {
             return Err(ARES_EBADRESP);
         }
-        let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let (aresreplies, success) = T2::parse_buf_to_clinkedlist_parts(buf, expected_record_type)?;
-        // No records of the requested type. Upstream returns ARES_SUCCESS with
-        // a NULL out-list when the answer section has other record types (and
-        // ENODATA when there are no answers at all). Callers such as Node test
-        // `*out` on success, so it must be written.
-        let reply = match clinkedlist::chain_nodes(aresreplies) {
-            Some(reply) => reply,
-            None => {
-                let status = empty_chain_status(success);
-                if status.code() == ARES_SUCCESS {
-                    return Ok(std::ptr::null_mut());
-                }
-                return Err(status.code());
+        let buf: &'a [u8] = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
+        let res = ParsedResponse::from_buf(buf).map_err(|e| e.code())?;
+        res.validate_names(buf)?;
+        let mut list = clinkedlist::ReplyList::new();
+        let mut success = 0;
+        for answer in res.answers {
+            if answer.class != dns_record::ARES_CLASS_IN { continue; }
+            if answer.record_type != expected_record_type {
+                success += 1;
+            } else if let Some(parsed) = T1::parse_rr(&answer) {
+                list.push(parsed.into_ares_data(buf)?)?;
+                success += 1;
             }
-        };
-
-        let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
-        let aresdata = Box::into_raw(Box::new(aresdata));
-        unsafe { Ok(&mut (*aresdata).data as *mut _) }
+        }
+        if list.is_empty() && success == 0 { return Err(empty_chain_status(success).code()); }
+        Ok(list.into_raw())
     };
     unsafe { ares_fn_wrapper(out, build) }
 }
@@ -273,28 +220,28 @@ where T2: CLinkedList + DataType, for<'a> T2: FromParsedBuf<'a, T2> {
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_caa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresCaaReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
+    unsafe { parse_to_clinkedlist::<CaaReply<'_>, AresCaaReply>(abuf, alen, out, RECORD_TYPE_CAA) }
 }
 
 /// # Safety
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_naptr_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresNaptrReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
+    unsafe { parse_to_clinkedlist::<NaptrReply<'_>, AresNaptrReply>(abuf, alen, out, RECORD_TYPE_NAPTR) }
 }
 
 /// # Safety
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_srv_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSrvReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
+    unsafe { parse_to_clinkedlist::<SrvReply<'_>, AresSrvReply>(abuf, alen, out, RECORD_TYPE_SRV) }
 }
 
 /// # Safety
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresUriReply) -> c_int {
-    unsafe { parse_to_clinkedlist::<AresUriReply>(abuf, alen, out, RECORD_TYPE_URI) }
+    unsafe { parse_to_clinkedlist::<UriReply<'_>, AresUriReply>(abuf, alen, out, RECORD_TYPE_URI) }
 }
 
 /// # Safety
@@ -412,7 +359,7 @@ pub unsafe extern "C" fn ares_parse_ptr_reply(abuf: *const u8, alen: c_int, addr
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_soa_reply(abuf: *const u8, alen: c_int, out: *mut *mut AresSoaReply) -> c_int {
-    soa_status(unsafe { parse_to_singleptr::<AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA) }.into()).code()
+    soa_status(unsafe { parse_to_singleptr::<SoaReply<'_>, AresSoaReply>(abuf, alen, out, RECORD_TYPE_SOA) }.into()).code()
 }
 
 /// # Safety
@@ -426,9 +373,9 @@ pub unsafe extern "C" fn ares_free_hostent(hostent: *mut libc::hostent) {
 /// `s` must be NULL or a pointer previously returned by this library.
 #[no_mangle]
 pub unsafe extern "C" fn ares_free_string(s: *mut libc::c_void) {
-    // All caller-facing buffers are `libc::malloc`'d, so free with `libc::free`.
+    // Paired with the callback-backed buffer helpers in convert.rs.
     if !s.is_null() {
-        unsafe { libc::free(s) };
+        unsafe { crate::mem::free(s) };
     }
 }
 

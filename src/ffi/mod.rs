@@ -85,11 +85,11 @@ pub type ares_pending_write_cb = Option<unsafe extern "C" fn(data: *mut c_void)>
 
 #[no_mangle]
 pub extern "C" fn ares_library_init(_flags: c_int) -> c_int {
+    crate::mem::init(None, None, None);
     ARES_SUCCESS
 }
 
-/// `ares_library_init_mem`: allocator hooks are accepted but not used; the
-/// library keeps using the system allocator.
+/// Install library allocation callbacks; null callbacks retain their current values.
 #[no_mangle]
 pub extern "C" fn ares_library_init_mem(
     flags: c_int,
@@ -97,12 +97,14 @@ pub extern "C" fn ares_library_init_mem(
     afree: Option<unsafe extern "C" fn(ptr: *mut c_void)>,
     arealloc: Option<unsafe extern "C" fn(ptr: *mut c_void, size: libc::size_t) -> *mut c_void>,
 ) -> c_int {
-    let _ = (flags, amalloc, afree, arealloc);
+    let _ = flags;
+    crate::mem::init(amalloc, afree, arealloc);
     ARES_SUCCESS
 }
 
 #[no_mangle]
 pub extern "C" fn ares_library_cleanup() {
+    crate::mem::cleanup();
 }
 
 /// Report ARES_TRUE (1); every channel has its own event thread and lock.

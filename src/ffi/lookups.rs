@@ -174,8 +174,7 @@ fn query_dnsrec_record(
     );
     let cached = channeldata.state.borrow().shared.cache.borrow_mut().get(&cache_key, Instant::now());
     if let Some(cached_buf) = cached {
-        if let Ok(rec) = crate::core::dns_record::parse_record(&cached_buf, 0) {
-            let dnsrec = Box::into_raw(Box::new(rec));
+        if let Ok(dnsrec) = crate::core::dns_record::parse_record(&cached_buf, 0).and_then(dns_record::record_into_raw) {
             unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
             unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
             return ARES_SUCCESS;
@@ -309,9 +308,8 @@ pub(crate) fn on_dnsrec_reply(callback: AresCallbackDnsRec, arg: *mut c_void, ca
             if let Some(key) = key {
                 cache.borrow_mut().store_reply(&key, &buf, Instant::now());
             }
-            match crate::core::dns_record::parse_record(&buf, 0) {
-                Ok(rec) => {
-                    let dnsrec = Box::into_raw(Box::new(rec));
+            match crate::core::dns_record::parse_record(&buf, 0).and_then(dns_record::record_into_raw) {
+                Ok(dnsrec) => {
                     unsafe { callback(arg, ARES_SUCCESS, timeouts as usize, dnsrec) };
                     unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
                 }
@@ -504,7 +502,7 @@ fn send_raw_packet(
 /// EBADQUERY.
 fn serialize_send_record(
     rec: &dns_record::ares_dns_record_t,
-) -> Result<Vec<u8>, crate::ffi::ares_status_t> {
+) -> Result<crate::mem::Vec<u8>, crate::ffi::ares_status_t> {
     match crate::core::dns_record::write_record(rec) {
         Ok(buf) => Ok(buf),
         Err(e) => Err(if e.code() == ARES_EBADRESP {
@@ -619,9 +617,8 @@ fn send_dnsrec_record(
         Ok(Some(buf)) => {
             // Cache hit (synchronous): parse the stored reply and deliver it;
             // *qid is deliberately left untouched (upstream behavior).
-            match crate::core::dns_record::parse_record(&buf, 0) {
-                Ok(cached) => {
-                    let dnsrec = Box::into_raw(Box::new(cached));
+            match crate::core::dns_record::parse_record(&buf, 0).and_then(dns_record::record_into_raw) {
+                Ok(dnsrec) => {
                     unsafe { callback(arg, ARES_SUCCESS, 0, dnsrec) };
                     unsafe { crate::ffi::dns_record::ares_dns_record_destroy(dnsrec) };
                     ARES_SUCCESS

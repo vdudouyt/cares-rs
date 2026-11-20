@@ -197,7 +197,7 @@ impl Conn {
         let mut t = pin!(timer.fuse());
         let mut r = pin!(self.recv_msg().fuse());
         select_biased! {
-            _ = t => Err(io::ErrorKind::TimedOut.into()),
+            result = t => { result?; Err(io::ErrorKind::TimedOut.into()) },
             r = r => r,
         }
     }

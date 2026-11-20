@@ -6,14 +6,15 @@
 //! channel (no global), owned by [`Runtime`](super::Runtime).
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::io;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use super::timers::Timers;
 
 use futures_util::{select_biased, FutureExt};
 
@@ -22,59 +23,62 @@ pub(crate) const WRITE: usize = 1;
 
 /// Minimal slab (stable keys, reused holes), as async-io uses the `slab` crate.
 pub(crate) struct Slab<T> {
-    entries: Vec<Option<T>>,
-    free: Vec<usize>,
+    entries: Vec<SlabEntry<T>>,
+    free: Option<usize>,
 }
+
+enum SlabEntry<T> { Occupied(T), Vacant(Option<usize>) }
 
 impl<T> Default for Slab<T> {
     fn default() -> Self {
-        Slab { entries: Vec::new(), free: Vec::new() }
+        Slab { entries: Vec::new(), free: None }
     }
 }
 
 impl<T> Slab<T> {
     /// The key the next `insert` will use.
     pub(crate) fn vacant_key(&self) -> usize {
-        self.free.last().copied().unwrap_or(self.entries.len())
+        self.free.unwrap_or(self.entries.len())
     }
 
     pub(crate) fn insert(&mut self, value: T) -> usize {
-        match self.free.pop() {
+        match self.free {
             Some(key) => {
                 if let Some(slot) = self.entries.get_mut(key) {
-                    *slot = Some(value);
+                    if let SlabEntry::Vacant(next) = slot { self.free = *next; }
+                    *slot = SlabEntry::Occupied(value);
                 }
                 key
             }
             None => {
-                self.entries.push(Some(value));
+                self.entries.push(SlabEntry::Occupied(value));
                 self.entries.len() - 1
             }
         }
     }
 
     pub(crate) fn remove(&mut self, key: usize) -> Option<T> {
-        let value = self.entries.get_mut(key)?.take();
-        if value.is_some() {
-            self.free.push(key);
-        }
-        value
+        let slot = self.entries.get_mut(key)?;
+        if matches!(slot, SlabEntry::Vacant(_)) { return None; }
+        let old = std::mem::replace(slot, SlabEntry::Vacant(self.free));
+        self.free = Some(key);
+        match old { SlabEntry::Occupied(value) => Some(value), SlabEntry::Vacant(_) => None }
     }
 
     pub(crate) fn get(&self, key: usize) -> Option<&T> {
-        self.entries.get(key).and_then(Option::as_ref)
+        match self.entries.get(key)? { SlabEntry::Occupied(value) => Some(value), SlabEntry::Vacant(_) => None }
     }
 
     pub(crate) fn get_mut(&mut self, key: usize) -> Option<&mut T> {
-        self.entries.get_mut(key).and_then(Option::as_mut)
+        match self.entries.get_mut(key)? { SlabEntry::Occupied(value) => Some(value), SlabEntry::Vacant(_) => None }
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
-        self.entries.iter().flatten()
+        self.entries.iter().filter_map(|slot| match slot { SlabEntry::Occupied(v) => Some(v), SlabEntry::Vacant(_) => None })
     }
 
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.entries.iter_mut().flatten()
+        self.entries.iter_mut().filter_map(|slot| match slot { SlabEntry::Occupied(v) => Some(v), SlabEntry::Vacant(_) => None })
     }
 }
 
@@ -193,7 +197,7 @@ pub(super) struct Reactor {
     /// value of its last event.
     ticker: Cell<usize>,
     sources: RefCell<Slab<Rc<Source>>>,
-    timers: RefCell<BTreeMap<(Instant, usize), Waker>>,
+    timers: RefCell<Timers>,
     next_timer: Cell<usize>,
     next_generation: Cell<u64>,
     /// fd → keys of its live sources, so a ready fd finds its waiters in O(1).
@@ -216,7 +220,7 @@ impl Reactor {
             // source never looks reported in the current turn.
             ticker: Cell::new(1),
             sources: RefCell::new(Slab::default()),
-            timers: RefCell::new(BTreeMap::new()),
+            timers: RefCell::new(Timers::default()),
             next_timer: Cell::new(0),
             next_generation: Cell::new(0),
             by_fd: RefCell::new(HashMap::new()),
@@ -238,7 +242,7 @@ impl Reactor {
 
         select_biased! {
             out = fut => Ok(out),
-            _ = timer => Err(io::ErrorKind::TimedOut.into()),
+            result = timer => { result?; Err(io::ErrorKind::TimedOut.into()) },
         }
     }
 
@@ -376,12 +380,10 @@ impl Reactor {
     /// the timer map. Callers that must not advance non-fd timers (for example
     /// `ARES_PROCESS_FLAG_SKIP_NON_FD`) simply skip this call.
     pub fn advance_timers(&self, now: Instant) {
-        let mut timers = self.timers.borrow_mut();
-        let later = timers.split_off(&(now + Duration::from_nanos(1), 0));
-        let due = std::mem::replace(&mut *timers, later);
-        drop(timers);
-        for w in due.into_values() {
-            w.wake();
+        loop {
+            let due = self.timers.borrow_mut().pop_due(now);
+            let Some(waker) = due else { break };
+            waker.wake();
         }
     }
 
@@ -401,30 +403,25 @@ impl Reactor {
 
     /// The earliest registered timer deadline.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.timers.borrow().keys().next().map(|(when, _)| *when)
+        self.timers.borrow().deadline()
     }
 
-    fn insert_timer(&self, when: Instant, waker: &Waker) -> usize {
+    fn insert_timer(&self, when: Instant, waker: &Waker) -> io::Result<usize> {
         let id = self.next_timer.get().wrapping_add(1);
         self.next_timer.set(id);
-        self.timers.borrow_mut().insert((when, id), waker.clone());
-        id
+        self.update_timer(when, id, waker)?;
+        Ok(id)
     }
 
     /// Refresh (or, after `advance_timers` fired and removed it, re-insert) a timer's waker.
-    fn update_timer(&self, when: Instant, id: usize, waker: &Waker) {
-        let mut timers = self.timers.borrow_mut();
-        match timers.get_mut(&(when, id)) {
-            Some(w) if w.will_wake(waker) => {}
-            Some(w) => *w = waker.clone(),
-            None => {
-                timers.insert((when, id), waker.clone());
-            }
-        }
+    fn update_timer(&self, when: Instant, id: usize, waker: &Waker) -> io::Result<()> {
+        let replaced = self.timers.borrow_mut().insert(when, id, waker)?;
+        drop(replaced);
+        Ok(())
     }
 
-    fn remove_timer(&self, when: Instant, id: usize) {
-        let removed = self.timers.borrow_mut().remove(&(when, id));
+    fn remove_timer(&self, _when: Instant, id: usize) {
+        let removed = self.timers.borrow_mut().remove(id);
         drop(removed);
     }
 
@@ -523,19 +520,19 @@ impl Timer {
 }
 
 impl Future for Timer {
-    type Output = ();
+    type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.into_ref().get_ref();
         if Instant::now() >= this.when {
             if let Some(id) = this.id.take() {
                 this.reactor.remove_timer(this.when, id);
             }
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
         match this.id.get() {
-            Some(id) => this.reactor.update_timer(this.when, id, cx.waker()),
-            None => this.id.set(Some(this.reactor.insert_timer(this.when, cx.waker()))),
+            Some(id) => this.reactor.update_timer(this.when, id, cx.waker())?,
+            None => this.id.set(Some(this.reactor.insert_timer(this.when, cx.waker())?)),
         }
         Poll::Pending
     }
@@ -555,6 +552,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::Wake;
+    use std::time::Duration;
 
     struct Count(AtomicUsize);
     impl Wake for Count {

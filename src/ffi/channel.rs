@@ -157,7 +157,9 @@ impl ChannelData {
         fut: impl std::future::Future<Output = T> + 'static,
         on: impl FnOnce(Result<T, c_int>) + 'static,
     ) {
-        let _ = self.rt.spawn(fut, on);
+        if let Err((crate::async_runtime::SpawnError::NoMemory, on)) = self.rt.try_spawn(fut, on) {
+            on(Err(ARES_ENOMEM));
+        }
         self.rt.run_ready();
         // New fds/timers may have been published: wake now rather than waiting
         // for the idle poll to expire.
@@ -559,13 +561,11 @@ pub unsafe extern "C" fn ares_set_servers_ports(channel: Channel, head: *const A
 pub unsafe extern "C" fn ares_get_servers_ports(channel: *const ChannelData, out: *mut *mut AresAddrPortNode) -> c_int {
     if out.is_null() { return ARES_ENODATA; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
-    let Some(ptr) = get_servers_ports_ptr(channeldata) else { unsafe { *out = std::ptr::null_mut() }; return ARES_SUCCESS; };
-    unsafe { *out = ptr };
-    ARES_SUCCESS
+    unsafe { ares_fn_wrapper(out, || get_servers_ports_ptr(channeldata)) }
 }
 
-fn get_servers_ports_ptr(channeldata: &ChannelData) -> Option<*mut AresAddrPortNode> {
-    let mut data: Vec<AresAddrPortNode> = vec![];
+fn get_servers_ports_ptr(channeldata: &ChannelData) -> Result<*mut AresAddrPortNode, c_int> {
+    let mut data = clinkedlist::ReplyList::new();
     for (ip, udp_port, tcp_port, _scope) in channeldata.state.borrow().server_list() {
         let (family, addr) = match ip {
             IpAddr::V4(v4) => {
@@ -582,13 +582,9 @@ fn get_servers_ports_ptr(channeldata: &ChannelData) -> Option<*mut AresAddrPortN
             addr,
             udp_port: udp_port as c_int,
             tcp_port: tcp_port as c_int,
-        });
+        })?;
     }
-    let replies = clinkedlist::chain_nodes(data)?;
-    let aresdata: AresData<AresAddrPortNode> = AresData { data_type: AresAddrPortNode::datatype(), data: replies };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    // SAFETY: aresdata was just allocated and is owned by the caller.
-    Some(unsafe { &mut (*aresdata).data })
+    Ok(data.into_raw())
 }
 
 #[no_mangle]
@@ -735,15 +731,13 @@ pub unsafe extern "C" fn ares_set_socket_callback(channel: Channel, callback: ar
 pub unsafe extern "C" fn ares_get_servers(channel: *const ChannelData, out: *mut *mut ares_addr_node) -> c_int {
     if out.is_null() { return ARES_ENODATA; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
-    let Some(ptr) = get_servers_ptr(channeldata) else { unsafe { *out = std::ptr::null_mut() }; return ARES_SUCCESS; };
-    unsafe { *out = ptr };
-    ARES_SUCCESS
+    unsafe { ares_fn_wrapper(out, || get_servers_ptr(channeldata)) }
 }
 
 /// Build the ares_addr_node chain for ares_get_servers (wrapped in `AresData` so
 /// the caller can free it with ares_free_data, the c-ares contract).
-fn get_servers_ptr(channeldata: &ChannelData) -> Option<*mut ares_addr_node> {
-    let mut data: Vec<ares_addr_node> = vec![];
+fn get_servers_ptr(channeldata: &ChannelData) -> Result<*mut ares_addr_node, c_int> {
+    let mut data = clinkedlist::ReplyList::new();
     for (ip, _, _, _scope) in channeldata.state.borrow().server_list() {
         let (family, addr) = match ip {
             IpAddr::V4(v4) => {
@@ -752,37 +746,39 @@ fn get_servers_ptr(channeldata: &ChannelData) -> Option<*mut ares_addr_node> {
             }
             IpAddr::V6(v6) => (libc::AF_INET6, AresAddrUnion { addr6: ares_in6_addr::from_octets(v6.octets()) }),
         };
-        data.push(ares_addr_node { next: std::ptr::null_mut(), family, addr });
+        data.push(ares_addr_node { next: std::ptr::null_mut(), family, addr })?;
     }
-    let chain = clinkedlist::chain_nodes(data)?;
-    let aresdata: AresData<ares_addr_node> = AresData { data_type: ares_addr_node::datatype(), data: chain };
-    let aresdata = Box::into_raw(Box::new(aresdata));
-    // SAFETY: aresdata was just allocated and is owned by the caller.
-    Some(unsafe { &mut (*aresdata).data })
+    Ok(data.into_raw())
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *mut c_char {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return std::ptr::null_mut(); };
-    let servers = channeldata.state.borrow().server_list();
+    use std::fmt::Write;
+    let state = channeldata.state.borrow();
     // Prefer the adapter-provided interface name for a scoped IPv6 entry, and
     // fall back to the numeric index when no `aif_indextoname` is available.
     let factory = channeldata.socket_factory.borrow();
-    let csv = servers
-        .iter()
-        .map(|&(ip, udp_port, _tcp_port, scope)| match ip {
+    let mut csv = crate::mem::String::new();
+    for (i, (ip, udp_port, _tcp_port, scope)) in state.server_list().enumerate() {
+        if i != 0 && csv.push_str(",").is_err() { return std::ptr::null_mut(); }
+        let status = match ip {
             IpAddr::V6(_) if scope != 0 => {
-                let scope = factory
-                    .if_indextoname(scope)
-                    .unwrap_or_else(|| scope.to_string());
-                format!("[{}%{}]:{}", ip, scope, udp_port)
+                let mut buf = [0; 64];
+                match factory.if_indextoname(scope, &mut buf) {
+                    Some(name) => {
+                        if write!(csv, "[{ip}%").is_err() || csv.push_lossy(name.to_bytes()).is_err() { return std::ptr::null_mut(); }
+                        write!(csv, "]:{udp_port}")
+                    }
+                    None => write!(csv, "[{ip}%{scope}]:{udp_port}"),
+                }
             }
-            IpAddr::V6(_) => format!("[{}]:{}", ip, udp_port),
-            _ => format!("{}:{}", ip, udp_port),
-        })
-        .collect::<Vec<_>>()
-        .join(",");
+            IpAddr::V6(_) => write!(csv, "[{ip}]:{udp_port}"),
+            _ => write!(csv, "{ip}:{udp_port}"),
+        };
+        if status.is_err() { return std::ptr::null_mut(); }
+    }
     // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
     unsafe { malloc_cstr(csv.as_bytes()) }
 }

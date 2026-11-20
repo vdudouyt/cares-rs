@@ -47,7 +47,32 @@ pub fn expand_string_at(full_buf: &[u8], start: usize) -> Option<(&[u8], usize)>
 #[derive(Debug)]
 pub struct ParsedResponse<'a> {
     pub query: DnsQuery<'a>,
-    pub answers: Vec<DnsAnswer<'a>>,
+    pub answers: AnswerSection<'a>,
+}
+
+/// A validated answer section. Iterating reparses borrowed views, not owned
+/// records, so validation and repeated scans need no heap storage.
+#[derive(Debug)]
+pub struct AnswerSection<'a> { data: &'a [u8], count: usize }
+impl<'a> AnswerSection<'a> {
+    pub fn len(&self) -> usize { self.count }
+    pub fn iter(&self) -> Answers<'a> {
+        Answers { buf: SliceBuf::new(self.data), remaining: self.count }
+    }
+}
+pub struct Answers<'a> { buf: SliceBuf<'a>, remaining: usize }
+impl<'a> Iterator for Answers<'a> {
+    type Item = DnsAnswer<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 { return None; }
+        self.remaining -= 1;
+        DnsAnswer::parse(&mut self.buf)
+    }
+}
+impl<'a> IntoIterator for AnswerSection<'a> {
+    type Item = DnsAnswer<'a>;
+    type IntoIter = Answers<'a>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
 }
 
 /// One CNAME hop in answer order: `alias` is the owner and `name` the target.
@@ -70,6 +95,24 @@ pub struct ParsedRRs<T> {
 }
 
 impl<'a> ParsedResponse<'a> {
+    /// Legacy parsers validate the echoed name and CNAME chain even when their
+    /// output type does not use those names. Do so without materializing them.
+    pub(crate) fn validate_names(&self, packet: &[u8]) -> Result<(), i32> {
+        struct NoNul;
+        impl std::fmt::Write for NoNul {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                if s.as_bytes().contains(&0) { Err(std::fmt::Error) } else { Ok(()) }
+            }
+        }
+        if self.query.name.iter().any(|s| s.as_bytes().contains(&0)) { return Err(ARES_EBADRESP); }
+        for answer in self.answers.iter().filter(|a| a.class == 1 && a.record_type == RECORD_TYPE_CNAME) {
+            let target = DnsLabel::parse(&mut SliceBuf::new(answer.data)).ok_or(ARES_EBADRESP)?;
+            target.write_to(packet, &mut NoNul).map_err(|_| ARES_EBADRESP)?;
+            answer.name.write_to(packet, &mut NoNul).map_err(|_| ARES_EBADRESP)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn from_buf(buf: &'a [u8]) -> Result<Self, AresError> {
         let mut sbuf = SliceBuf::new(buf);
         let header = DnsHeader::parse(&mut sbuf).ok_or(ARES_EBADRESP)?;
@@ -90,10 +133,9 @@ impl<'a> ParsedResponse<'a> {
         if answer_count == 0 {
             return Err(ARES_ENODATA.into());
         }
-        // Not preallocated: ancount is attacker-controlled (up to 65535) and a
-        // tiny response could otherwise reserve tens of MB. Each parse consumes
-        // >= 11 bytes, so the loop is self-bounding.
-        let mut answers = Vec::new();
+        // Validate once; retain only the byte range and count. Each iteration
+        // consumes >= 11 bytes, bounding work even for forged counts.
+        let start = sbuf.pos;
         for _ in 0..answer_count {
             let answer = DnsAnswer::parse(&mut sbuf).ok_or(ARES_EBADRESP)?;
             // Mirror ares_dns_parse: raw/unknown types skip class validation,
@@ -108,14 +150,10 @@ impl<'a> ParsedResponse<'a> {
             {
                 return Err(ARES_EFORMERR.into());
             }
-            answers.push(answer);
-        }
-        if answers.is_empty() {
-            return Err(ARES_ENODATA.into());
         }
         Ok(Self {
             query,
-            answers,
+            answers: AnswerSection { data: &buf[start..sbuf.pos], count: answer_count },
         })
     }
 
@@ -334,4 +372,3 @@ mod tests {
         assert_eq!(rrs.items[0].ttl, 60);
     }
 }
-

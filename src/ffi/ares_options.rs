@@ -360,10 +360,10 @@ fn decode_sortlist_options(options: &ares_options) -> Result<Option<Vec<(IpAddr,
     decode_sortlist(patterns).map(Some)
 }
 
-/// Copy sortlist entries into a caller-owned libc array.
+/// Copy sortlist entries into a caller-owned callback-allocated array.
 fn save_sortlist(entries: &[crate::core::sortlist::SortlistEntry]) -> Option<(*mut apattern, c_int)> {
     let count = entries.len();
-    let arr = unsafe { libc::malloc(count * std::mem::size_of::<apattern>()) as *mut apattern };
+    let arr = crate::mem::malloc(count.checked_mul(std::mem::size_of::<apattern>())?) as *mut apattern;
     if arr.is_null() {
         return None;
     }
@@ -408,7 +408,8 @@ macro_rules! save_opt_field {
 pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options: *mut ares_options, optmask: *mut c_int) -> c_int {
     if options.is_null() || optmask.is_null() || channel.is_null() { return ARES_ENODATA; }
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return ARES_ENODATA; };
-    let saved = channeldata.state.borrow().saved_options();
+    let state = channeldata.state.borrow();
+    let saved = state.saved_options();
     let out = options;
     let mut mask = saved.mask;
 
@@ -447,14 +448,18 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
     // Servers/domains are malloc'd for the caller. An allocation failure is
     // ARES_ENOMEM (upstream behavior); fields already written remain freeable.
     if mask & ARES_OPT_SERVERS != 0 {
-        let count = saved.v4_servers.len();
+        let v4_servers = saved.servers.iter().filter_map(|(ip, _)| match ip {
+            IpAddr::V4(v4) => Some(*v4), _ => None,
+        });
+        let count = v4_servers.clone().count();
         if count > 0 {
-            let ptr = unsafe { libc::malloc(count * std::mem::size_of::<in_addr>()) as *mut in_addr };
+            let Some(size) = count.checked_mul(std::mem::size_of::<in_addr>()) else { return ARES_ENOMEM };
+            let ptr = crate::mem::malloc(size) as *mut in_addr;
             if ptr.is_null() {
                 return ARES_ENOMEM;
             }
-            for (i, v4) in saved.v4_servers.iter().enumerate() {
-                unsafe { *ptr.add(i) = in_addr { s_addr: u32::from(*v4).to_be() } };
+            for (i, v4) in v4_servers.enumerate() {
+                unsafe { *ptr.add(i) = in_addr { s_addr: u32::from(v4).to_be() } };
             }
             unsafe {
                 std::ptr::addr_of_mut!((*out).servers).write(ptr);
@@ -467,16 +472,22 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
     if mask & ARES_OPT_DOMAINS != 0 {
         let count = saved.domains.len();
         if count > 0 {
-            let arr = unsafe { libc::malloc(count * std::mem::size_of::<*mut c_char>()) as *mut *mut c_char };
+            let Some(size) = count.checked_mul(std::mem::size_of::<*mut c_char>()) else { return ARES_ENOMEM };
+            let arr = crate::mem::malloc(size) as *mut *mut c_char;
             if arr.is_null() {
                 return ARES_ENOMEM;
             }
-            for (i, cstr) in saved.domains.into_iter().enumerate() {
-                unsafe { *arr.add(i) = cstr.into_raw() };
-            }
             unsafe {
                 std::ptr::addr_of_mut!((*out).domains).write(arr);
-                std::ptr::addr_of_mut!((*out).ndomains).write(count as c_int);
+                std::ptr::addr_of_mut!((*out).ndomains).write(0);
+            }
+            for (i, domain) in saved.domains.iter().enumerate() {
+                let cstr = save_string(domain);
+                if cstr.is_null() { return ARES_ENOMEM; }
+                unsafe {
+                    arr.add(i).write(cstr);
+                    std::ptr::addr_of_mut!((*out).ndomains).write((i + 1) as c_int);
+                }
             }
         } else {
             unsafe { std::ptr::addr_of_mut!((*out).ndomains).write(0) };
@@ -490,13 +501,19 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
         unsafe { std::ptr::addr_of_mut!((*out).maxtimeout).write(maxtimeout) };
     }
     if let Some(lookups) = saved.lookups {
-        unsafe { std::ptr::addr_of_mut!((*out).lookups).write(lookups.into_raw()) };
+        let ptr = save_string(lookups);
+        if ptr.is_null() { return ARES_ENOMEM; }
+        unsafe { std::ptr::addr_of_mut!((*out).lookups).write(ptr) };
     }
     if let Some(path) = saved.resolvconf_path {
-        unsafe { std::ptr::addr_of_mut!((*out).resolvconf_path).write(path.into_raw()) };
+        let ptr = save_string(path);
+        if ptr.is_null() { return ARES_ENOMEM; }
+        unsafe { std::ptr::addr_of_mut!((*out).resolvconf_path).write(ptr) };
     }
     if let Some(path) = saved.hosts_path {
-        unsafe { std::ptr::addr_of_mut!((*out).hosts_path).write(path.into_raw()) };
+        let ptr = save_string(path);
+        if ptr.is_null() { return ARES_ENOMEM; }
+        unsafe { std::ptr::addr_of_mut!((*out).hosts_path).write(ptr) };
     }
     if let Some(ttl) = saved.qcache_max_ttl {
         unsafe { std::ptr::addr_of_mut!((*out).qcache_max_ttl).write(ttl) };
@@ -524,9 +541,15 @@ fn save_flags_and_ednspsz(out: *mut ares_options, flags: c_int, ednspsz: c_int, 
     save_opt_field!(out, mask, ARES_OPT_EDNSPSZ, ednspsz, ednspsz);
 }
 
+fn save_string(value: &str) -> *mut c_char {
+    // Preserve the previous empty-string fallback for embedded NULs.
+    let bytes = if value.as_bytes().contains(&0) { &[] } else { value.as_bytes() };
+    unsafe { crate::ffi::convert::malloc_cstr(bytes) }
+}
+
 fn free_sortlist(ptr: *mut apattern) {
     if !ptr.is_null() {
-        unsafe { libc::free(ptr as *mut c_void) };
+        unsafe { crate::mem::free(ptr as *mut c_void) };
     }
 }
 
@@ -568,7 +591,7 @@ pub unsafe extern "C" fn ares_destroy_options(options: *mut ares_options) {
     let opts = unsafe { &mut *options };
 
     if !opts.servers.is_null() {
-        unsafe { libc::free(opts.servers as *mut c_void) };
+        unsafe { crate::mem::free(opts.servers as *mut c_void) };
         opts.servers = std::ptr::null_mut();
     }
 
@@ -578,27 +601,27 @@ pub unsafe extern "C" fn ares_destroy_options(options: *mut ares_options) {
         for i in 0..opts.ndomains {
             let ptr = unsafe { *opts.domains.add(i as usize) };
             if !ptr.is_null() {
-                drop(unsafe { std::ffi::CString::from_raw(ptr) });
+                unsafe { crate::mem::free(ptr.cast()) };
             }
         }
-        unsafe { libc::free(opts.domains as *mut c_void) };
+        unsafe { crate::mem::free(opts.domains as *mut c_void) };
         opts.domains = std::ptr::null_mut();
     }
 
     take_sortlist(opts);
 
     if !opts.lookups.is_null() {
-        drop(unsafe { std::ffi::CString::from_raw(opts.lookups) });
+        unsafe { crate::mem::free(opts.lookups.cast()) };
         opts.lookups = std::ptr::null_mut();
     }
 
     if !opts.resolvconf_path.is_null() {
-        drop(unsafe { std::ffi::CString::from_raw(opts.resolvconf_path) });
+        unsafe { crate::mem::free(opts.resolvconf_path.cast()) };
         opts.resolvconf_path = std::ptr::null_mut();
     }
 
     if !opts.hosts_path.is_null() {
-        drop(unsafe { std::ffi::CString::from_raw(opts.hosts_path) });
+        unsafe { crate::mem::free(opts.hosts_path.cast()) };
         opts.hosts_path = std::ptr::null_mut();
     }
 }
