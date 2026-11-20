@@ -14,6 +14,21 @@ Unlike for the latter ones, it has the following distinctive characteristics:
 
 ## Documentation
 
+| Method | Purpose |
+|---|---|
+|Runtime::default()|Create a new runtime|
+|rt.spawn(fut, oncomplete)|Spawn a new task and runs oncomplete when future completes|
+|rt.register_socket(dyn Socket)|Registers an existing socket, then returns Rc<AsyncSocket>|
+|rt.create_udp(sock_addr)|Create a new UDP socket|
+|rt.create_tcp(sock_addr)|Create a new TCP socket|
+|rt.connect_tcp(sock_addr)|Create, connects and wait for completion|
+|rt.timer_at(instant)|Waits until specified instant|
+|rt.active_count()|Number of live tasks|
+|rt.interests()|Get all pendings fds. (Typically passed to ``select()``)|
+|rt.process(predicate)|Runs predicate against all pending fds and processes matched ones. (Typically the ones that got ``select()``ed)|
+|rt.process_events(fdlist)|Processes all fields specified in a fdlist. (Typically used with ``epoll()``)|
+|rt.advance_timers(instant)|Fires all timers due before specified moment|
+
 ## Tutorial
 
 Suppose you're writing a cares-like asynchronous greeter protocol library targeting typical C applications like that:
