@@ -24,10 +24,10 @@ jobs:
       - name: Checkout cares-rs
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.100.0
+      - name: Install Rust 1.100.0
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
 
       - name: Cache Cargo
         uses: actions/cache@v4
