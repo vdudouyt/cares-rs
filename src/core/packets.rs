@@ -327,6 +327,7 @@ impl<'a> Parser<'a> for CaaReply<'a> {
 }
 
 #[derive(Debug, PartialEq)]
+#[allow(dead_code)] // public parser type; the C TXT path consumes owned records.
 pub struct TxtReply<'a> {
     pub txt: Cow<'a, str>,
     pub length: usize,

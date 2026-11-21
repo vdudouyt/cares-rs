@@ -493,7 +493,7 @@ pub unsafe extern "C" fn ares_save_options(channel: *const ChannelData, options:
             unsafe { std::ptr::addr_of_mut!((*out).ndomains).write(0) };
         }
     }
-    if mask & ARES_OPT_SORTLIST != 0 && !save_sortlist_into(out, &saved.sortlist) {
+    if mask & ARES_OPT_SORTLIST != 0 && !save_sortlist_into(out, saved.sortlist) {
         return ARES_ENOMEM;
     }
 
