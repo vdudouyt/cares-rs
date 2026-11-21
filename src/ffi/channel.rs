@@ -753,6 +753,12 @@ fn get_servers_ptr(channeldata: &ChannelData) -> Result<*mut ares_addr_node, c_i
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *mut c_char {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return std::ptr::null_mut(); };
+    let Some(csv) = servers_csv(channeldata) else { return std::ptr::null_mut(); };
+    // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
+    unsafe { malloc_cstr(csv.as_bytes()) }
+}
+
+fn servers_csv(channeldata: &ChannelData) -> Option<crate::mem::FallibleString> {
     use std::fmt::Write;
     let state = channeldata.state.borrow();
     // Prefer the adapter-provided interface name for a scoped IPv6 entry, and
@@ -760,25 +766,24 @@ pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *m
     let factory = channeldata.socket_factory.borrow();
     let mut csv = crate::mem::FallibleString::new();
     for (i, (ip, udp_port, _tcp_port, scope)) in state.server_list().enumerate() {
-        if i != 0 && csv.push_str(",").is_err() { return std::ptr::null_mut(); }
-        let status = match ip {
+        if i != 0 { csv.push_str(",").ok()?; }
+        match ip {
             IpAddr::V6(_) if scope != 0 => {
                 let mut buf = [0; 64];
                 match factory.if_indextoname(scope, &mut buf) {
                     Some(name) => {
-                        if write!(csv, "[{ip}%").is_err() || csv.push_lossy(name.to_bytes()).is_err() { return std::ptr::null_mut(); }
-                        write!(csv, "]:{udp_port}")
+                        write!(csv, "[{ip}%").ok()?;
+                        csv.push_lossy(name.to_bytes()).ok()?;
+                        write!(csv, "]:{udp_port}").ok()?;
                     }
-                    None => write!(csv, "[{ip}%{scope}]:{udp_port}"),
+                    None => write!(csv, "[{ip}%{scope}]:{udp_port}").ok()?,
                 }
             }
-            IpAddr::V6(_) => write!(csv, "[{ip}]:{udp_port}"),
-            _ => write!(csv, "{ip}:{udp_port}"),
-        };
-        if status.is_err() { return std::ptr::null_mut(); }
+            IpAddr::V6(_) => write!(csv, "[{ip}]:{udp_port}").ok()?,
+            _ => write!(csv, "{ip}:{udp_port}").ok()?,
+        }
     }
-    // CSV of IP/port strings never contains a NUL; null return on OOM is the sentinel.
-    unsafe { malloc_cstr(csv.as_bytes()) }
+    Some(csv)
 }
 
 #[no_mangle]

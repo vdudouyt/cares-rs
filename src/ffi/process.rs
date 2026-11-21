@@ -10,6 +10,10 @@ use crate::ffi::ares_socket::{
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_process_fd(channel: Channel, read_fd: c_int, write_fd: c_int) {
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
+    process_fd(channeldata, read_fd, write_fd);
+}
+
+fn process_fd(channeldata: &ChannelData, read_fd: c_int, write_fd: c_int) {
     let mut events = [
         ares_fd_events_t { fd: ARES_SOCKET_BAD, events: 0 },
         ares_fd_events_t { fd: ARES_SOCKET_BAD, events: 0 },
@@ -54,7 +58,11 @@ pub unsafe extern "C" fn ares_process_fds(
         // SAFETY: the caller guarantees `events` points to `nevents` entries.
         unsafe { std::slice::from_raw_parts(events, nevents) }
     };
+    process_fds(channeldata, events, flags);
+    ARES_SUCCESS
+}
+
+fn process_fds(channeldata: &ChannelData, events: &[ares_fd_events_t], flags: c_uint) {
     let skip = flags & ARES_PROCESS_FLAG_SKIP_NON_FD != 0;
     channeldata.process_events(events, skip);
-    ARES_SUCCESS
 }

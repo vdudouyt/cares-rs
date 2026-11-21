@@ -172,22 +172,29 @@ where T1: RRParser<'a> + IntoAresData<T2>, T2: DataType
             return Err(ARES_EBADRESP);
         }
         let buf: &'a [u8] = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let res = ParsedResponse::from_buf(buf).map_err(|e| e.code())?;
-        res.validate_names(buf)?;
-        let mut reply = None;
-        for answer in res.answers {
-            if answer.class != dns_record::ARES_CLASS_IN || answer.record_type != expected_record_type { continue; }
-            if let Some(parsed) = T1::parse_rr(&answer) {
-                if reply.is_some() { return Err(ARES_EBADRESP); }
-                reply = Some(parsed.into_ares_data(buf)?);
-            }
-        }
-        let reply = reply.ok_or(ARES_ENODATA)?;
-        let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
-        let aresdata = crate::mem::into_raw(crate::mem::boxed(aresdata)?);
-        unsafe { Ok(&mut (*aresdata).data as *mut _) }
+        single_reply::<T1, T2>(buf, expected_record_type)
     };
     unsafe { ares_fn_wrapper(out, build) }
+}
+
+fn single_reply<'a, T1, T2>(buf: &'a [u8], expected_record_type: u16) -> Result<*mut T2, c_int>
+where T1: RRParser<'a> + IntoAresData<T2>, T2: DataType
+{
+    let res = ParsedResponse::from_buf(buf).map_err(|e| e.code())?;
+    res.validate_names(buf)?;
+    let mut reply = None;
+    for answer in res.answers {
+        if answer.class != dns_record::ARES_CLASS_IN || answer.record_type != expected_record_type { continue; }
+        if let Some(parsed) = T1::parse_rr(&answer) {
+            if reply.is_some() { return Err(ARES_EBADRESP); }
+            reply = Some(parsed.into_ares_data(buf)?);
+        }
+    }
+    let reply = reply.ok_or(ARES_ENODATA)?;
+    let aresdata: AresData<T2> = AresData { data_type: T2::datatype(), data: reply };
+    let aresdata = crate::mem::into_raw(crate::mem::boxed(aresdata)?);
+    // SAFETY: `aresdata` is the live, uniquely owned box just leaked above.
+    unsafe { Ok(&mut (*aresdata).data as *mut _) }
 }
 
 unsafe fn parse_to_clinkedlist<'a, T1, T2>(abuf: *const u8, alen: c_int, out: *mut *mut T2, expected_record_type: u16) -> c_int
@@ -197,23 +204,28 @@ where T1: RRParser<'a> + IntoAresData<T2>, T2: CLinkedList + DataType {
             return Err(ARES_EBADRESP);
         }
         let buf: &'a [u8] = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        let res = ParsedResponse::from_buf(buf).map_err(|e| e.code())?;
-        res.validate_names(buf)?;
-        let mut list = clinkedlist::ReplyList::new();
-        let mut success = 0;
-        for answer in res.answers {
-            if answer.class != dns_record::ARES_CLASS_IN { continue; }
-            if answer.record_type != expected_record_type {
-                success += 1;
-            } else if let Some(parsed) = T1::parse_rr(&answer) {
-                list.push(parsed.into_ares_data(buf)?)?;
-                success += 1;
-            }
-        }
-        if list.is_empty() && success == 0 { return Err(empty_chain_status(success).code()); }
-        Ok(list.into_raw())
+        linkedlist_reply::<T1, T2>(buf, expected_record_type)
     };
     unsafe { ares_fn_wrapper(out, build) }
+}
+
+fn linkedlist_reply<'a, T1, T2>(buf: &'a [u8], expected_record_type: u16) -> Result<*mut T2, c_int>
+where T1: RRParser<'a> + IntoAresData<T2>, T2: CLinkedList + DataType {
+    let res = ParsedResponse::from_buf(buf).map_err(|e| e.code())?;
+    res.validate_names(buf)?;
+    let mut list = clinkedlist::ReplyList::new();
+    let mut success = 0;
+    for answer in res.answers {
+        if answer.class != dns_record::ARES_CLASS_IN { continue; }
+        if answer.record_type != expected_record_type {
+            success += 1;
+        } else if let Some(parsed) = T1::parse_rr(&answer) {
+            list.push(parsed.into_ares_data(buf)?)?;
+            success += 1;
+        }
+    }
+    if list.is_empty() && success == 0 { return Err(empty_chain_status(success).code()); }
+    Ok(list.into_raw())
 }
 
 /// # Safety
@@ -248,34 +260,41 @@ pub unsafe extern "C" fn ares_parse_uri_reply(abuf: *const u8, alen: c_int, out:
 /// `abuf` must point to `alen` readable bytes and `out` must be a valid, writable pointer.
 #[no_mangle]
 pub unsafe extern "C" fn ares_parse_ns_reply(abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent) -> c_int {
-    let try_parse = || -> Result<ParsedRRs<AddrRecord>, c_int> {
-        if abuf.is_null() || alen < 0 {
-            return Err(ARES_EBADRESP);
-        }
+    let parsed = if abuf.is_null() || alen < 0 {
+        Err(ARES_EBADRESP)
+    } else {
+        // SAFETY: the caller guarantees `abuf` readable for `alen` bytes.
         let buf = unsafe { std::slice::from_raw_parts(abuf, alen as usize) };
-        addr_reply(buf, RECORD_TYPE_NS, ReplyRequire::ItemsOrAliases).map_err(|e| e.code())
+        ns_reply(buf)
     };
-    match try_parse() {
-        Ok(res) => {
+    match parsed {
+        Ok(hostent) => {
             if !out.is_null() {
-                // Upstream reports an IPv4-shaped hostent with no addresses for
-                // NS replies, even though NS answers carry no address data.
-                unsafe {
-                    *out = build_hostent(Hostent::from_parsed_explicit(
-                        res,
-                        libc::AF_INET,
-                        std::mem::size_of::<libc::in_addr>(),
-                        None,
-                    ));
-                }
+                // SAFETY: `out` is a valid writable pointer by contract.
+                unsafe { *out = build_hostent(hostent) };
             }
             ARES_SUCCESS
         }
         Err(err) => {
-            if !out.is_null() { unsafe { *out = std::ptr::null_mut(); } }
+            if !out.is_null() {
+                // SAFETY: `out` is a valid writable pointer by contract.
+                unsafe { *out = std::ptr::null_mut() };
+            }
             err
         }
     }
+}
+
+fn ns_reply(buf: &[u8]) -> Result<Hostent, c_int> {
+    let res = addr_reply(buf, RECORD_TYPE_NS, ReplyRequire::ItemsOrAliases).map_err(|e| e.code())?;
+    // Upstream reports an IPv4-shaped hostent with no addresses for NS
+    // replies, even though NS answers carry no address data.
+    Ok(Hostent::from_parsed_explicit(
+        res,
+        libc::AF_INET,
+        std::mem::size_of::<libc::in_addr>(),
+        None,
+    ))
 }
 
 pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abuf: *const u8, alen: c_int, out: *mut *mut libc::hostent, out_addrttls: *mut T, out_naddrttls: *mut c_int, family: c_int) -> c_int {
