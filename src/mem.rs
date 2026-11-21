@@ -200,37 +200,6 @@ impl<'a, T> IntoIterator for &'a mut Vec<T> {
     fn into_iter(self) -> Self::IntoIter { self.iter_mut() }
 }
 
-// hashbrown's stable allocator interface predates std's stabilization.
-unsafe impl allocator_api2::alloc::Allocator for CaresAllocator {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
-        Allocator::allocate(self, layout).map_err(|_| allocator_api2::alloc::AllocError)
-    }
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        unsafe { Allocator::deallocate(self, ptr, layout) };
-    }
-    unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
-        unsafe { Allocator::grow(self, ptr, old, new) }.map_err(|_| allocator_api2::alloc::AllocError)
-    }
-}
-
-pub(crate) struct Map<K, V>(hashbrown::HashMap<K, V, std::hash::RandomState, CaresAllocator>);
-impl<K: Eq + std::hash::Hash, V> Default for Map<K, V> { fn default() -> Self { Self::new() } }
-impl<K: Eq + std::hash::Hash, V> Map<K, V> {
-    pub(crate) fn new() -> Self {
-        Self(hashbrown::HashMap::with_hasher_in(std::hash::RandomState::new(), CaresAllocator))
-    }
-    pub(crate) fn insert(&mut self, key: K, value: V) -> Result<(), NoMemory> {
-        if let Some(slot) = self.0.get_mut(&key) { *slot = value; } else {
-            self.0.try_reserve(1).map_err(|_| NoMemory)?;
-            self.0.insert(key, value);
-        }
-        Ok(())
-    }
-    pub(crate) fn get(&self, key: &K) -> Option<&V> { self.0.get(key) }
-    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> { self.0.get_mut(key) }
-    pub(crate) fn remove(&mut self, key: &K) -> Option<V> { self.0.remove(key) }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct String(Vec<u8>);
 impl String {

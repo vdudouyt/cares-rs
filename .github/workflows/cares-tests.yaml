@@ -10,6 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -57,6 +59,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -101,6 +105,8 @@ jobs:
       # Ubuntu 24.04's apt cargo (1.75) cannot parse/build them.
       - name: Install Rust (rustup stable)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
       - name: Install Debian build toolchain
         run: |
           sudo apt-get update

@@ -1,37 +1,40 @@
 //! Indexed min-heap: fallible admission, allocation-free expiry/cancellation.
 use std::task::Waker;
 use std::time::Instant;
-use crate::mem::{Map, NoMemory, Vec};
+use crate::mem::{NoMemory, Vec};
 
 struct Entry { when: Instant, id: usize, waker: Waker }
 impl Entry { fn key(&self) -> (Instant, usize) { (self.when, self.id) } }
 
 #[derive(Default)]
-pub(super) struct Timers { heap: Vec<Entry>, positions: Map<usize, usize> }
+pub(super) struct Timers { heap: Vec<Entry>, positions: Vec<(usize, usize)> }
 
 impl Timers {
     pub(super) fn deadline(&self) -> Option<Instant> { self.heap.first().map(|e| e.when) }
 
     /// Return any replaced waker to be dropped outside the reactor's borrow.
     pub(super) fn insert(&mut self, when: Instant, id: usize, waker: &Waker) -> Result<Option<Waker>, NoMemory> {
-        if let Some(&i) = self.positions.get(&id) {
+        if let Some(i) = self.position(id) {
             let slot = &mut self.heap[i].waker;
             return Ok(if slot.will_wake(waker) { None } else { Some(std::mem::replace(slot, waker.clone())) });
         }
+        self.positions.reserve(1)?;
         self.heap.reserve(1)?;
         let index = self.heap.len();
-        self.positions.insert(id, index)?;
-        // Both containers have space; publishing this entry cannot allocate.
+        // Both containers have capacity; publishing this entry cannot allocate.
+        let _ = self.positions.push((id, index));
         let _ = self.heap.push(Entry { when, id, waker: waker.clone() });
         self.up(index);
         Ok(None)
     }
 
     pub(super) fn remove(&mut self, id: usize) -> Option<Waker> {
-        let index = self.positions.remove(&id)?;
+        let at = self.position(id)?;
+        let (_, index) = self.positions.swap_remove(at);
         let removed = self.heap.swap_remove(index);
         if index < self.heap.len() {
-            if let Some(pos) = self.positions.get_mut(&self.heap[index].id) { *pos = index; }
+            let moved = self.heap[index].id;
+            self.set_position(moved, index);
             let index = self.up(index);
             self.down(index);
         }
@@ -44,10 +47,17 @@ impl Timers {
         self.remove(entry.id)
     }
 
+    fn position(&self, id: usize) -> Option<usize> {
+        self.positions.iter().position(|&(key, _)| key == id)
+    }
+    fn set_position(&mut self, id: usize, index: usize) {
+        if let Some((_, pos)) = self.positions.iter_mut().find(|(key, _)| *key == id) { *pos = index; }
+    }
     fn swap(&mut self, a: usize, b: usize) {
         self.heap.swap(a, b);
         for i in [a, b] {
-            if let Some(pos) = self.positions.get_mut(&self.heap[i].id) { *pos = i; }
+            let id = self.heap[i].id;
+            self.set_position(id, i);
         }
     }
     fn up(&mut self, mut i: usize) -> usize {

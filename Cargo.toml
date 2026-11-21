@@ -5,11 +5,9 @@ edition = "2021"
 rust-version = "1.100"
 
 [dependencies]
-allocator-api2 = "0.2.21"
 arrayvec = "0.7"
 bytes = "1.10.1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "async-await-macro"] }
-hashbrown = { version = "0.17", default-features = false, features = ["allocator-api2"] }
 libc = "0.2.175"
 rand = "0.8.0"
 rustix = { version = "1", default-features = false, features = ["std", "event", "net", "pipe", "use-libc"] }
