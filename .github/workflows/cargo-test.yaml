@@ -13,11 +13,11 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # Install Rust (via rustup)
-      - name: Install Rust 1.100.0
+      # The repo pins nightly in rust-toolchain.toml for the allocator API.
+      - name: Install nightly Rust + clippy
         run: |
-          rustup toolchain install 1.100.0 --profile minimal --component clippy
-          rustup default 1.100.0
+          rustup toolchain install nightly --profile minimal --component clippy
+          rustup default nightly
 
       # Cache Cargo dependencies for faster builds
       - name: Cache Cargo registry
@@ -71,10 +71,10 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.100.0
+      - name: Install nightly Rust
         run: |
-          rustup toolchain install 1.100.0 --profile minimal
-          rustup default 1.100.0
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
 
       - name: Cache Cargo registry
         uses: actions/cache@v4

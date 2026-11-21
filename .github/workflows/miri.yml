@@ -26,7 +26,7 @@ jobs:
 
       - name: Install nightly Rust + Miri
         run: |
-          rustup toolchain install nightly --profile minimal --component miri
+          rustup toolchain install nightly --profile minimal --component miri --component clippy --component rust-src
           rustup default nightly
 
       - name: Cache Cargo + Miri sysroot

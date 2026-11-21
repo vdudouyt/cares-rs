@@ -25,10 +25,10 @@ jobs:
       - name: Checkout cares-rs
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.100.0
+      - name: Install nightly Rust
         run: |
-          rustup toolchain install 1.100.0 --profile minimal
-          rustup default 1.100.0
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
 
       - name: Cache Cargo
         uses: actions/cache@v4

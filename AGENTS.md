@@ -1,3 +1,4 @@
 In this repo, we're copying the tests from original c-ares to cares-rs, then tweaking our sources to make them pass.
 * When committing, don't forget to include Co-Authored-By with actual model name. Eg: Co-authored-by: DeepSeek V4.1 Flash 1017 <noreply@deepseek.com>
 * Do not let Miri reach unsupported operations. Tests that use sockets, pipes, `poll`/`ppoll`/`epoll`, threads, or other real syscalls must be marked `#[cfg_attr(miri, ignore = "reason")]`. `cargo miri test` must pass without an `unsupported operation` error or abort.
+* `rust-toolchain.toml` pins nightly, so every CI job must install nightly Rust (not stable/1.100) and every component it invokes: `clippy` before `cargo clippy`, `miri` before `cargo miri`, and `rust-src` for Miri setup and `-Zbuild-std`. A missing component or a stable toolchain override is a CI bug.

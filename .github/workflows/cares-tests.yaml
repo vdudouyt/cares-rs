@@ -9,10 +9,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust 1.100.0
+      - name: Install nightly Rust
         run: |
-          rustup toolchain install 1.100.0 --profile minimal
-          rustup default 1.100.0
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -59,10 +59,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust 1.100.0
+      - name: Install nightly Rust
         run: |
-          rustup toolchain install 1.100.0 --profile minimal
-          rustup default 1.100.0
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -105,10 +105,10 @@ jobs:
       - uses: actions/checkout@v4
       # The committed Cargo.lock is v4 and the locked crates use edition 2024;
       # Ubuntu 24.04's apt cargo (1.75) cannot parse/build them.
-      - name: Install Rust 1.100.0
+      - name: Install nightly Rust
         run: |
-          rustup toolchain install 1.100.0 --profile minimal
-          rustup default 1.100.0
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
       - name: Install Debian build toolchain
         run: |
           sudo apt-get update
