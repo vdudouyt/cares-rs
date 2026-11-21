@@ -352,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "real event backend: poll/epoll and pipe syscalls are unavailable in Miri")]
     fn closing_sender_wakes_and_stops_both_backends() {
         for evsys in [ARES_EVSYS_POLL, ARES_EVSYS_EPOLL] {
             for full in [false, true] {

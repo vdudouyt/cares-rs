@@ -38,6 +38,7 @@ cd tests/cares-tests && cmake . && make
 - Fuzz corpora: `./aresfuzz <so> fuzzinput/*` (DNS parsing) and `./aresfuzzname <so> fuzznames/*` (server CSV).
 
 CI additionally runs the gtest suite under **Valgrind** (`--leak-check=full`), and **Miri** on `cargo miri test` (`-Zmiri-tree-borrows -Zmiri-disable-isolation`) to catch UB/leaks in the unsafe FFI surface. Miri can't touch real sockets, so reactor tests are `#[cfg_attr(miri, ignore)]`.
+* **Miri must never reach an unsupported operation.** Any test that uses sockets, pipes, `poll`/`ppoll`/`epoll`, threads, or other real syscalls must carry `#[cfg_attr(miri, ignore = "reason")]`. A CI failure of the form `unsupported operation: can't call foreign function ...` is a test-annotation bug, not an acceptable limitation. Keep `cargo miri test` green.
 
 ### CI gates that fail the build (`.github/workflows/`)
 
