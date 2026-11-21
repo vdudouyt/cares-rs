@@ -51,7 +51,7 @@ impl AsyncClient {
             return;
         }
         let Some(server) = self.shared.health.borrow().pick_probe(q.opts.failover_delay, q.server) else { return };
-        let Ok(query) = self.reserve(BytesMut::from(&q.payload[..])) else { return };
+        let Ok(query) = self.reserve(ByteBuf::from_slice(&q.payload)) else { return };
         self.shared.health.borrow_mut().set_probing(server, true);
         let probe = Probe { query: Some(query), server, shared: self.shared.clone() };
         let _ = self.rt.spawn(self.copy().probe(probe), |_| {});
@@ -188,7 +188,7 @@ impl AsyncClient {
     fn create_query_state(&self, query: ReservedQuery) -> QueryState {
         let use_tcp = self.config.options.use_vc;
         let server = self.shared.health.borrow().pick_next();
-        let mut payload = query.payload.to_vec();
+        let mut payload = ByteBuf::from_slice(&query.payload);
         let cx = Ctx { client: self, server, use_tcp, rejections: 0 };
         for plugin in &self.plugins {
             plugin.on_start(&cx, &mut payload);
@@ -319,7 +319,7 @@ impl AsyncClient {
 /// How one `request()` ended.
 enum Response {
     /// This query's answer, accepted by every plugin.
-    Answer(Vec<u8>),
+    Answer(crate::mem::ByteBuf),
     /// A genuine reply a plugin rejected: re-send.
     Rejected,
     /// The send itself failed.
@@ -340,7 +340,7 @@ struct QueryState {
     /// The channel-unique transaction id, reserved for the query's whole life.
     qid: QidLease,
     /// The query as sent; plugins may rewrite it (on_start / on_reply).
-    payload: Vec<u8>,
+    payload: crate::mem::ByteBuf,
     /// Starts at ARES_FLAG_USEVC; a TC reply or a plugin upgrades.
     use_tcp: bool,
     server: ServerId,
@@ -370,7 +370,7 @@ impl Drop for Probe {
 /// Timeout-biased receive, with a last non-blocking read when the timer and
 /// socket readiness land in the same reactor turn: a pending ICMP error must
 /// not report as a timeout.
-async fn recv_reply(conn: &mut Conn, timer: crate::async_runtime::Timer) -> io::Result<Vec<u8>> {
+async fn recv_reply(conn: &mut Conn, timer: crate::async_runtime::Timer) -> io::Result<crate::mem::ByteBuf> {
     match conn.recv(timer).await {
         Err(e) if e.kind() == io::ErrorKind::TimedOut => match conn.try_recv() {
             Poll::Ready(result) => result,
@@ -530,6 +530,7 @@ fn calc_query_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::vec;
     use std::net::SocketAddr;
 
     fn qid_of(payload: &[u8]) -> u16 {
@@ -555,10 +556,10 @@ mod tests {
     struct TestFactory;
     impl SocketFactory for TestFactory {
         fn create_udp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
-            Ok(Rc::new(TestSock))
+            Ok(crate::mem::rc(TestSock))
         }
         fn create_tcp(&self, _bind: SocketAddr) -> io::Result<Rc<dyn crate::async_runtime::socket::Socket>> {
-            Ok(Rc::new(TestSock))
+            Ok(crate::mem::rc(TestSock))
         }
     }
 
@@ -570,9 +571,9 @@ mod tests {
             nameservers: vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), None)],
             ..SysConfig::default()
         };
-        let client = AsyncClient::build(config, Rc::new(TestFactory), 53, 53, Runtime::default());
+        let client = AsyncClient::build(config, crate::mem::rc(TestFactory), 53, 53, Runtime::default());
 
-        let payload = || BytesMut::from(&[0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]);
+        let payload = || ByteBuf::from([0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let first = client.reserve(payload()).expect("first reserve");
         let second = client.reserve(payload()).expect("second reserve");
         assert_ne!(first.qid(), second.qid());

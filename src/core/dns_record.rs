@@ -1,7 +1,7 @@
 //! DNS-record metadata tables and the compression-aware wire-name codec.
 
 use std::cell::{Cell, RefCell};
-use crate::mem::{CString, Vec};
+use crate::mem::{CString, FallibleVec};
 use crate::core::wire_name::Name;
 use std::ffi::CStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -70,7 +70,7 @@ pub(crate) fn is_hostname_ch(b: u8) -> bool {
 /// false. Invalid labels/lengths report ARES_EBADNAME.
 pub(crate) fn write_dns_name(
     name: &str,
-    out: &mut Vec<u8>,
+    out: &mut FallibleVec<u8>,
     validate_hostname: bool,
 ) -> Result<(), AresError> {
     let bytes = name.as_bytes();
@@ -692,18 +692,18 @@ pub(crate) enum RRValue {
     Addr(Ipv4Addr),
     Addr6(Ipv6Addr),
     Str(CString),
-    Bin(Vec<u8>), // Trailing \0 for C getters, not counted in logical length
+    Bin(FallibleVec<u8>), // Trailing \0 for C getters, not counted in logical length
     /// One entry per DNS character-string; each carries a trailing NUL
     /// (excluded from its length).
-    BinArray(Vec<Vec<u8>>),
+    BinArray(FallibleVec<FallibleVec<u8>>),
 }
 
 /// RR keys are a contiguous, statically known set (at most nine). Allocate
 /// their slots once when admitting the RR; scalar setters never allocate.
-pub(crate) struct Fields { base: u32, slots: Vec<Option<RRValue>> }
+pub(crate) struct Fields { base: u32, slots: FallibleVec<Option<RRValue>> }
 impl Fields {
     fn new(rtype: u32) -> Result<Self, AresError> {
-        let mut slots = Vec::new();
+        let mut slots = FallibleVec::new();
         let count = keys_for(rtype).map_or(0, <[u32]>::len);
         slots.reserve(count)?;
         for _ in 0..count { slots.push(None)?; }
@@ -738,11 +738,11 @@ pub struct ares_dns_rr_t {
     pub(crate) rclass: u16,
     pub(crate) ttl: u32,
     pub(crate) data: Fields,
-    pub(crate) opts: Vec<(u16, Vec<u8>)>,
+    pub(crate) opts: FallibleVec<(u16, FallibleVec<u8>)>,
     pub(crate) cached_v4: Cell<u32>,
     pub(crate) cached_v6: Cell<[u8; 16]>,
     /// Cached concatenation of ABINP strings (upstream multistring cache).
-    pub(crate) combined_cache: RefCell<Option<Vec<u8>>>,
+    pub(crate) combined_cache: RefCell<Option<FallibleVec<u8>>>,
 }
 
 /// A whole DNS message; the opaque handle type of the ares_dns_record API.
@@ -752,10 +752,10 @@ pub struct ares_dns_record_t {
     pub(crate) flags: u16,
     pub(crate) opcode: u16,
     pub(crate) rcode: u16,
-    pub(crate) queries: Vec<DnsRecordQuery>,
-    pub(crate) answers: Vec<ares_dns_rr_t>,
-    pub(crate) authority: Vec<ares_dns_rr_t>,
-    pub(crate) additional: Vec<ares_dns_rr_t>,
+    pub(crate) queries: FallibleVec<DnsRecordQuery>,
+    pub(crate) answers: FallibleVec<ares_dns_rr_t>,
+    pub(crate) authority: FallibleVec<ares_dns_rr_t>,
+    pub(crate) additional: FallibleVec<ares_dns_rr_t>,
 }
 
 /// Create a `Bin` value with a trailing NUL (not counted in logical length),
@@ -766,8 +766,8 @@ pub(crate) fn bin_nul(data: &[u8]) -> Result<RRValue, AresError> {
 
 /// One ABINP element: logical bytes plus a trailing NUL (empty elements are a
 /// 1-byte buffer, never null).
-pub(crate) fn abin_nul(data: &[u8]) -> Result<Vec<u8>, AresError> {
-    let mut v = Vec::new();
+pub(crate) fn abin_nul(data: &[u8]) -> Result<FallibleVec<u8>, AresError> {
+    let mut v = FallibleVec::new();
     v.reserve(data.len().checked_add(1).ok_or(crate::mem::NoMemory)?)?;
     v.extend_from_slice(data)?;
     v.push(0)?;
@@ -783,7 +783,7 @@ pub(crate) fn bin_logical(data: &[u8]) -> &[u8] {
     }
 }
 
-pub(crate) fn section_vec(rec: &ares_dns_record_t, sect: u32) -> Option<&Vec<ares_dns_rr_t>> {
+pub(crate) fn section_vec(rec: &ares_dns_record_t, sect: u32) -> Option<&FallibleVec<ares_dns_rr_t>> {
     match sect {
         ARES_SECTION_ANSWER => Some(&rec.answers),
         ARES_SECTION_AUTHORITY => Some(&rec.authority),
@@ -792,7 +792,7 @@ pub(crate) fn section_vec(rec: &ares_dns_record_t, sect: u32) -> Option<&Vec<are
     }
 }
 
-pub(crate) fn section_vec_mut(rec: &mut ares_dns_record_t, sect: u32) -> Option<&mut Vec<ares_dns_rr_t>> {
+pub(crate) fn section_vec_mut(rec: &mut ares_dns_record_t, sect: u32) -> Option<&mut FallibleVec<ares_dns_rr_t>> {
     match sect {
         ARES_SECTION_ANSWER => Some(&mut rec.answers),
         ARES_SECTION_AUTHORITY => Some(&mut rec.authority),
@@ -812,7 +812,7 @@ fn new_rr_owned(name_c: CString, rtype: u32, rclass: u16, ttl: u32) -> Result<ar
         rclass,
         ttl,
         data: Fields::new(rtype)?,
-        opts: Vec::new(),
+        opts: FallibleVec::new(),
         cached_v4: Cell::new(0),
         cached_v6: Cell::new([0u8; 16]),
         combined_cache: RefCell::new(None),
@@ -941,7 +941,7 @@ fn parse_dns_str(
 /// Parse an (option, length, data) sequence that must exactly fill `rdata`.
 fn parse_options(
     rdata: &[u8],
-    opts: &mut Vec<(u16, Vec<u8>)>,
+    opts: &mut FallibleVec<(u16, FallibleVec<u8>)>,
 ) -> Result<(), AresError> {
     let mut off = 0usize;
     while off < rdata.len() {
@@ -1043,7 +1043,7 @@ pub(crate) fn parse_rdata(
             if rdata.is_empty() {
                 return Err(ARES_EBADRESP.into());
             }
-            let mut strings = Vec::new();
+            let mut strings = FallibleVec::new();
             let mut pos = 0usize;
             while pos < rdata.len() {
                 let slen = rdata[pos] as usize;
@@ -1261,7 +1261,7 @@ pub(crate) fn parse_rdata(
     Ok(())
 }
 
-fn write_binstr(data: &[u8], out: &mut Vec<u8>) -> Result<(), AresError> {
+fn write_binstr(data: &[u8], out: &mut FallibleVec<u8>) -> Result<(), AresError> {
     let logical = bin_logical(data);
     let mut pos = 0usize;
     loop {
@@ -1276,14 +1276,14 @@ fn write_binstr(data: &[u8], out: &mut Vec<u8>) -> Result<(), AresError> {
     Ok(())
 }
 
-fn write_name_field(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) -> Result<(), AresError> {
+fn write_name_field(rr: &ares_dns_rr_t, key: u32, out: &mut FallibleVec<u8>) -> Result<(), AresError> {
     let Some(RRValue::Str(s)) = rr.data.get(&key) else {
         return Err(ARES_EFORMERR.into());
     };
     write_dns_name(s.to_str().map_err(|_| AresError::from(ARES_EBADSTR))?, out, false)
 }
 
-fn write_str_field(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) -> Result<(), AresError> {
+fn write_str_field(rr: &ares_dns_rr_t, key: u32, out: &mut FallibleVec<u8>) -> Result<(), AresError> {
     let Some(RRValue::Str(s)) = rr.data.get(&key) else {
         return Err(ARES_EFORMERR.into());
     };
@@ -1299,7 +1299,7 @@ fn write_str_field(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) -> Result<()
 fn write_bin_required(
     rr: &ares_dns_rr_t,
     key: u32,
-    out: &mut Vec<u8>,
+    out: &mut FallibleVec<u8>,
 ) -> Result<(), AresError> {
     let Some(RRValue::Bin(d)) = rr.data.get(&key) else {
         return Err(ARES_EFORMERR.into());
@@ -1312,21 +1312,21 @@ fn write_bin_required(
     Ok(())
 }
 
-fn push_u8(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) -> Result<(), AresError> {
+fn push_u8(rr: &ares_dns_rr_t, key: u32, out: &mut FallibleVec<u8>) -> Result<(), AresError> {
     Ok(out.push(rr.u8_val(key).unwrap_or(0))?)
 }
 
-fn push_u16(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) -> Result<(), AresError> {
+fn push_u16(rr: &ares_dns_rr_t, key: u32, out: &mut FallibleVec<u8>) -> Result<(), AresError> {
     Ok(out.extend_from_slice(&rr.u16_val(key).unwrap_or(0).to_be_bytes())?)
 }
 
-fn push_u32(rr: &ares_dns_rr_t, key: u32, out: &mut Vec<u8>) -> Result<(), AresError> {
+fn push_u32(rr: &ares_dns_rr_t, key: u32, out: &mut FallibleVec<u8>) -> Result<(), AresError> {
     Ok(out.extend_from_slice(&rr.u32_val(key).unwrap_or(0).to_be_bytes())?)
 }
 
 /// Serialize rdata to wire format, applying upstream's required-field and
 /// string-length validation.
-pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) -> Result<(), AresError> {
+pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut FallibleVec<u8>) -> Result<(), AresError> {
     match rr.rtype {
         x if x == ARES_REC_TYPE_A as u32 => {
             // Upstream's union storage always yields an address for an A RR,
@@ -1469,7 +1469,7 @@ pub(crate) fn write_rdata(rr: &ares_dns_rr_t, out: &mut Vec<u8>) -> Result<(), A
     Ok(())
 }
 
-fn write_options(opts: &[(u16, Vec<u8>)], out: &mut Vec<u8>) -> Result<(), AresError> {
+fn write_options(opts: &[(u16, FallibleVec<u8>)], out: &mut FallibleVec<u8>) -> Result<(), AresError> {
     for (code, data) in opts {
         let logical = bin_logical(data);
         out.extend_from_slice(&code.to_be_bytes())?;
@@ -1671,7 +1671,7 @@ impl ares_dns_rr_t {
             Some(RRValue::BinArray(_)) => {
                 let mut cache = self.combined_cache.borrow_mut();
                 if cache.is_none() {
-                    let mut v = Vec::new();
+                    let mut v = FallibleVec::new();
                     if let Some(RRValue::BinArray(strings)) = self.data.get(&key) {
                         for s in strings {
                             v.extend_from_slice(bin_logical(s)).ok()?;
@@ -1745,7 +1745,7 @@ impl ares_dns_rr_t {
         // may alias that cache buffer (get_bin -> set_bin).
         let replacement = if rr_key_datatype_of(key) == ARES_DATATYPE_ABINP as u32 {
             // Override semantics: replace the whole array with one string.
-            let mut strings = Vec::new();
+            let mut strings = FallibleVec::new();
             strings.push(abin_nul(data)?)?;
             RRValue::BinArray(strings)
         } else {
@@ -1762,7 +1762,7 @@ impl ares_dns_rr_t {
         // buffer get_bin() returned (see set_bin).
         let element = abin_nul(data)?;
         if !matches!(self.data.get(&key), Some(RRValue::BinArray(_))) {
-            let mut strings = Vec::new();
+            let mut strings = FallibleVec::new();
             strings.push(element)?;
             self.data.insert(key, RRValue::BinArray(strings));
         } else if let Some(RRValue::BinArray(strings)) = self.data.get_mut(&key) {
@@ -1784,7 +1784,7 @@ impl ares_dns_rr_t {
         false
     }
 
-    pub(crate) fn set_opt(&mut self, opt: u16, mut data: Vec<u8>) -> Result<(), AresError> {
+    pub(crate) fn set_opt(&mut self, opt: u16, mut data: FallibleVec<u8>) -> Result<(), AresError> {
         // Keep the NUL that backs the C getter; opt_at/opt_by_id expose logical bytes.
         data.push(0)?;
         self.opts.reserve(1)?;
@@ -1935,7 +1935,7 @@ impl ares_dns_rr_t {
         &mut self,
         key: u32,
         opt: u16,
-        data: Vec<u8>,
+        data: FallibleVec<u8>,
     ) -> Result<(), AresError> {
         if !self.key_has_datatype(key, ARES_DATATYPE_OPT as u32) {
             return Err(ARES_EFORMERR.into());
@@ -2004,10 +2004,10 @@ impl ares_dns_record_t {
             flags,
             opcode,
             rcode,
-            queries: Vec::new(),
-            answers: Vec::new(),
-            authority: Vec::new(),
-            additional: Vec::new(),
+            queries: FallibleVec::new(),
+            answers: FallibleVec::new(),
+            authority: FallibleVec::new(),
+            additional: FallibleVec::new(),
         }
     }
 }
@@ -2037,10 +2037,10 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
         flags: flags_from_wire(wire_flags),
         opcode,
         rcode,
-        queries: Vec::new(),
-        answers: Vec::new(),
-        authority: Vec::new(),
-        additional: Vec::new(),
+        queries: FallibleVec::new(),
+        answers: FallibleVec::new(),
+        authority: FallibleVec::new(),
+        additional: FallibleVec::new(),
     };
 
     // Upstream requires exactly one question (0 or >1 is malformed).
@@ -2165,8 +2165,8 @@ pub(crate) fn duplicate_record(rec: &ares_dns_record_t) -> Option<ares_dns_recor
 
 /// Encode a whole DNS message to wire format. Validation failures are
 /// reported with the same status upstream's writer produces.
-pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError> {
-    let mut out = Vec::new();
+pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<FallibleVec<u8>, AresError> {
+    let mut out = FallibleVec::new();
     out.reserve(512)?;
 
     out.push((rec.id >> 8) as u8)?;
@@ -2201,7 +2201,7 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError
         out.push(q.qclass as u8)?;
     }
 
-    let sections: [&Vec<ares_dns_rr_t>; 3] =
+    let sections: [&FallibleVec<ares_dns_rr_t>; 3] =
         [&rec.answers, &rec.authority, &rec.additional];
     for section in &sections {
         for rr in *section {
@@ -2231,7 +2231,7 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError
             };
             out.extend_from_slice(&ttl.to_be_bytes())?;
 
-            let mut rdata_buf = Vec::new();
+            let mut rdata_buf = FallibleVec::new();
             write_rdata(rr, &mut rdata_buf)?;
             let rdlength = rdata_buf.len() as u16;
             out.push((rdlength >> 8) as u8)?;

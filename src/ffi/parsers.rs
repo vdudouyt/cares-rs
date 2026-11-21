@@ -41,7 +41,7 @@ impl AddrTTL for ares_addr6ttl {
     }
 }
 
-pub use crate::core::response::{ParsedRRs, ParsedResponse};
+pub(crate) use crate::core::response::{ParsedRRs, ParsedResponse};
 use crate::core::hostent::{addrttl_fill, Hostent};
 use crate::core::async_client::build_query;
 use crate::core::response::{
@@ -51,21 +51,21 @@ use crate::ffi::convert::malloc_bytes;
 
 /// Build the C hostent graph from a core blueprint; all policy decisions were made in core.
 pub(crate) unsafe fn build_hostent(bp: Hostent) -> *mut libc::hostent {
-    let mut addrlist: Vec<*mut i8> = Vec::new();
+    let mut addrlist: crate::mem::Vec<*mut i8> = crate::mem::Vec::new();
     if bp.raw_addrs.is_empty() {
         addrlist.extend(bp.addrs.iter().map(|ip| {
-            let raw: Box<[u8]> = match ip {
-                IpAddr::V4(v4) => Box::new(v4.octets()),
-                IpAddr::V6(v6) => Box::new(v6.octets()),
+            let raw = match ip {
+                IpAddr::V4(v4) => crate::mem::ByteBuf::from(v4.octets()),
+                IpAddr::V6(v6) => crate::mem::ByteBuf::from(v6.octets()),
             };
-            Box::into_raw(raw) as *mut i8
+            crate::mem::into_raw(raw.into_boxed_slice()) as *mut i8
         }));
     } else {
         // Explicit raw addresses already have exactly `h_length` bytes;
         // `ares_free_hostent` reconstructs the same slice length.
-        addrlist.extend(bp.raw_addrs.into_iter().map(|raw| Box::into_raw(raw) as *mut i8));
+        addrlist.extend(bp.raw_addrs.into_iter().map(|raw| crate::mem::into_raw(raw) as *mut i8));
     }
-    let aliases: Vec<*mut i8> = bp.aliases.into_iter().map(|c| c.into_raw()).collect();
+    let aliases: crate::mem::Vec<*mut i8> = bp.aliases.into_iter().map(|c| c.into_raw()).collect();
     let hostent = libc::hostent {
         h_name: bp.name.into_raw(),
         h_aliases: unsafe { cnullterminated::from_vec(aliases) },
@@ -73,7 +73,7 @@ pub(crate) unsafe fn build_hostent(bp: Hostent) -> *mut libc::hostent {
         h_length: bp.length as c_int,
         h_addr_list: unsafe { cnullterminated::from_vec(addrlist) },
     };
-    Box::into_raw(Box::new(hostent))
+    crate::mem::into_raw(crate::mem::boxed_infallible(hostent))
 }
 
 
@@ -462,23 +462,27 @@ pub unsafe extern "C" fn ares_inet_ntop(af: c_int, src: *const c_void, dst: *mut
     match af {
         libc::AF_INET => {
             let addr = unsafe { *(src as *const [u8; 4]) };
-            let s = format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
+            let mut s = crate::mem::String::new();
+            use std::fmt::Write;
+            let _ = write!(s, "{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
             if s.len() + 1 > size as usize { return std::ptr::null(); }
-            // Dotted-quad strings never contain NUL; null on the impossible.
-            let Ok(cs) = CString::new(s) else { return std::ptr::null() };
-            let bytes = cs.as_bytes_with_nul();
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), dst as *mut u8, s.len());
+                *dst.add(s.len()) = 0;
+            }
             dst
         }
         libc::AF_INET6 => {
             let addr = unsafe { *(src as *const [u8; 16]) };
             let ip6 = std::net::Ipv6Addr::from(addr);
-            let s = ip6.to_string();
+            let mut s = crate::mem::String::new();
+            use std::fmt::Write;
+            let _ = write!(s, "{ip6}");
             if s.len() + 1 > size as usize { return std::ptr::null(); }
-            // IPv6 display strings never contain NUL; null on the impossible.
-            let Ok(cs) = CString::new(s) else { return std::ptr::null() };
-            let bytes = cs.as_bytes_with_nul();
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), dst as *mut u8, s.len());
+                *dst.add(s.len()) = 0;
+            }
             dst
         }
         _ => std::ptr::null(),

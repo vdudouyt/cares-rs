@@ -26,7 +26,7 @@ impl<'a> Name<'a> {
 
     /// The explicit ownership boundary used by the C DNS-record API.
     pub(crate) fn to_owned(self) -> Result<crate::mem::CString, crate::core::AresError> {
-        let mut out = crate::mem::String::new();
+        let mut out = crate::mem::FallibleString::new();
         write!(out, "{self}").map_err(|_| crate::mem::NoMemory)?;
         crate::mem::CString::from_string(out)
     }

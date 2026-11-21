@@ -20,7 +20,7 @@ pub unsafe extern "C" fn ares_gethostbyname(channel: Channel, hostname: *const c
     let Some((_guard, channeldata)) = (unsafe { channel_access(channel) }) else { return; };
     let hostname = unsafe { cstr_lossy(hostname) };
     let client = channeldata.state.borrow().derive();
-    let fut = client.gethostbyname(hostname.to_string(), family);
+    let fut = client.gethostbyname(crate::mem::String::from(hostname), family);
     channeldata.spawn(fut, move |r| on_hostent_reply(callback, arg, r));
 }
 
@@ -86,7 +86,7 @@ pub unsafe extern "C" fn ares_search(channel: Channel, name: *const c_char, dnsc
     }
     let client = channeldata.state.borrow().derive();
     let fut = client.search(
-        name_str.to_string(),
+        crate::mem::String::from(name_str),
         dnsclass as u32,
         dnstype as u32,
         false,
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn ares_getnameinfo(channel: Channel, sa: *const libc::soc
 /// ares_query / ares_send / ares_search → `ares_callback`.
 pub(crate) fn on_raw_reply(callback: AresCallback, arg: *mut c_void, r: Result<Delivery, c_int>) {
     let (res, timeouts): (Result<&[u8], c_int>, c_int) = match &r {
-        Ok(Delivery::Raw { result, timeouts }) => (result.as_deref().map_err(|&e| e), *timeouts),
+        Ok(Delivery::Raw { result, timeouts }) => (result.as_ref().map(|v| v.as_slice()).map_err(|&e| e), *timeouts),
         Err(status) => (Err(*status), 0),
     };
     match res {
@@ -439,7 +439,7 @@ pub unsafe extern "C" fn ares_getaddrinfo(
     let hostname_raw = unsafe { cstr_lossy(name) };
     let client = channeldata.state.borrow().derive();
     let fut = client.getaddrinfo(
-        hostname_raw.to_string(),
+        crate::mem::String::from(hostname_raw),
         ai_family,
         ai_flags,
         ai_socktype,
@@ -502,7 +502,7 @@ fn send_raw_packet(
 /// EBADQUERY.
 fn serialize_send_record(
     rec: &dns_record::ares_dns_record_t,
-) -> Result<crate::mem::Vec<u8>, crate::ffi::ares_status_t> {
+) -> Result<crate::mem::FallibleVec<u8>, crate::ffi::ares_status_t> {
     match crate::core::dns_record::write_record(rec) {
         Ok(buf) => Ok(buf),
         Err(e) => Err(if e.code() == ARES_EBADRESP {
@@ -535,7 +535,7 @@ fn send_record<F>(
     rec: &dns_record::ares_dns_record_t,
     qid: *mut libc::c_ushort,
     on_reply: F,
-) -> Result<Option<Vec<u8>>, crate::ffi::ares_status_t>
+) -> Result<Option<crate::mem::ByteBuf>, crate::ffi::ares_status_t>
 where
     F: FnOnce(Result<Delivery, c_int>, Option<CacheKey>) + 'static,
 {

@@ -39,6 +39,9 @@ impl TcpPool {                     // shared stream conns, keyed by an opaque in
 type FrameOf = fn(&mut Vec<u8>) -> Option<Vec<u8>>; // pop one message off the stream buffer
 type TagOf   = fn(&[u8]) -> Option<u16>;            // a frame's mux tag (demux key)
 ```
+Here `Vec` is `cares::mem::Vec` and `Rc` is `cares::mem::Rc`; both allocate
+through the channel's registered c-ares callbacks.
+
 `Conn::shared` reserves `tag`'s inbox slot on the shared conn; **dropping the
 `Conn` releases it** (RAII) — there is no manual register/clear.
 

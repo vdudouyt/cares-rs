@@ -24,15 +24,17 @@ pub(crate) use lookups::*;
 pub(crate) use packet::*;
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::ffi::{c_int, CString};
+use std::ffi::c_int;
+
+use crate::mem::{CString, String, Vec};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::pin;
 use std::task::Poll;
-use std::rc::Rc;
+use crate::mem::Rc;
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut, BytesMut};
+use crate::mem::{BufMut, ByteBuf};
 use futures_util::{select_biased, FutureExt};
 use rand::Rng;
 
@@ -169,7 +171,7 @@ pub(crate) struct ChannelShared {
 
 impl ChannelShared {
     pub(crate) fn new() -> Rc<Self> {
-        Rc::new(ChannelShared {
+        crate::mem::rc(ChannelShared {
             health: RefCell::new(ServerHealth::default()),
             cache: RefCell::new(QueryCache::default()),
             tcp_pool: RefCell::new(TcpPool::new()),
@@ -231,7 +233,7 @@ impl AsyncClient {
 
     /// The hosts table; empty only on the channel-owned instance before first use.
     fn hostsfile(&self) -> Rc<Hosts> {
-        self.hosts.get().cloned().unwrap_or_default()
+        self.hosts.get().cloned().unwrap_or_else(|| crate::mem::rc(Hosts::default()))
     }
 
     /// Hosts lookup honouring ARES_AI_ENVHOSTS (`CARES_HOSTS`); HOSTALIASES
@@ -284,7 +286,7 @@ pub(crate) type HostReply = (Result<Hostent, AresError>, c_int);
 
 /// What the raw (ares_query / ares_send) lifecycle delivers to C.
 pub(crate) enum Delivery {
-    Raw { result: Result<Vec<u8>, c_int>, timeouts: c_int },
+    Raw { result: Result<crate::mem::ByteBuf, c_int>, timeouts: c_int },
 }
 
 fn hosts_file_lookup(st: &AsyncClient, name: &str, family: i32) -> Result<HostLookup, AresError> {
@@ -302,4 +304,4 @@ fn no_servers(st: &AsyncClient) -> bool {
 }
 
 /// One `run_reserved_query()`'s result plus its timed-out attempt count.
-type QueryOutcome = (Result<Vec<u8>, c_int>, c_int);
+type QueryOutcome = (Result<crate::mem::ByteBuf, c_int>, c_int);

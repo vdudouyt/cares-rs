@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::pin;
-use std::rc::Rc;
+use crate::mem::Rc;
 use std::task::{Poll, Waker};
 use std::time::Instant;
 
@@ -112,7 +112,7 @@ impl Conn {
     /// Take a message a **sibling** already routed into this tag's slot,
     /// without this conn's fd firing again (the draining sibling consumed its
     /// readiness).
-    fn take_routed_slot(&mut self) -> Option<Vec<u8>> {
+    fn take_routed_slot(&mut self) -> Option<crate::mem::ByteBuf> {
         match &self.wire {
             Wire::Shared(c, tag) => c.borrow_mut().take(*tag),
             Wire::SharedUdp(c, tag) => c.borrow_mut().take(*tag),
@@ -137,7 +137,7 @@ impl Conn {
 
     /// One non-blocking read of this conn's next message (only after the
     /// caller reported the fd readable).
-    fn read(&mut self) -> Poll<io::Result<Vec<u8>>> {
+    fn read(&mut self) -> Poll<io::Result<crate::mem::ByteBuf>> {
         // The shared conn owns the drain, route, and per-tag demux.
         match &mut self.wire {
             Wire::Shared(c, tag) => TcpConn::poll_read(c, *tag),
@@ -148,7 +148,7 @@ impl Conn {
     /// A read bypassing wait registration, for the turn where `Conn::recv`'s
     /// timeout expired alongside socket readiness: a pending hard error (ICMP
     /// port-unreachable) must still be consumed before counting a timeout.
-    pub fn try_recv(&mut self) -> Poll<io::Result<Vec<u8>>> {
+    pub fn try_recv(&mut self) -> Poll<io::Result<crate::mem::ByteBuf>> {
         if let Some(msg) = self.take_routed_slot() {
             return Poll::Ready(Ok(msg));
         }
@@ -164,7 +164,7 @@ impl Conn {
     /// Await this conn's next message with no timeout bound: a reply a sibling
     /// routed into our slot, or one non-blocking [`read`](Self::read) each time
     /// the fd is reported readable. `Err(UnexpectedEof)` on a dead socket.
-    pub async fn recv_msg(&mut self) -> io::Result<Vec<u8>> {
+    pub async fn recv_msg(&mut self) -> io::Result<crate::mem::ByteBuf> {
         let sock = self.sock();
         loop {
             if let Some(msg) = self.take_routed_slot() {
@@ -193,7 +193,7 @@ impl Conn {
 
     /// `conn.recv(timer).await`; the timeout arm is polled first so expiry
     /// preempts a read ready in the same poll. `TimedOut` on expiry.
-    pub async fn recv(&mut self, timer: Timer) -> io::Result<Vec<u8>> {
+    pub async fn recv(&mut self, timer: Timer) -> io::Result<crate::mem::ByteBuf> {
         let mut t = pin!(timer.fuse());
         let mut r = pin!(self.recv_msg().fuse());
         select_biased! {
@@ -209,7 +209,7 @@ impl Drop for Conn {
         let retired = match (&self.wire, &self.udp_lease) {
             (Wire::Shared(c, tag), _) => {
                 c.borrow_mut().release(*tag);
-                Vec::new()
+                crate::mem::Vec::new()
             }
             (Wire::SharedUdp(c, tag), Some(lease)) => {
                 c.borrow_mut().release(*tag);
@@ -223,7 +223,7 @@ impl Drop for Conn {
             }
             (Wire::SharedUdp(c, tag), None) => {
                 c.borrow_mut().release(*tag);
-                Vec::new()
+                crate::mem::Vec::new()
             }
         };
         // Drop retired handles after the pool borrow ends so socket close
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn shared_conn_releases_slot_on_drop() {
         let rt = Runtime::new();
-        let tc = TcpConn::new(rt.register_socket(Rc::new(AlwaysReadable { fd: 5 })));
+        let tc = TcpConn::new(rt.register_socket(crate::mem::rc(AlwaysReadable { fd: 5 })));
 
         let a = Conn::shared(tc.clone(), 7);
         let b = Conn::shared(tc.clone(), 9);
@@ -289,7 +289,7 @@ mod tests {
         let mut trial = 0;
         while trial < 20 {
             let rt = Runtime::new();
-            let sock: Rc<dyn Socket> = Rc::new(AlwaysReadable { fd: 42 });
+            let sock: Rc<dyn Socket> = crate::mem::rc(AlwaysReadable { fd: 42 });
             // Tag 0xABAB: the datagram AlwaysReadable yields routes to us.
             let mut conn = Conn::shared_udp(UdpConn::new(rt.register_socket(sock), false), 0xABAB);
             let mut cx = Context::from_waker(Waker::noop());

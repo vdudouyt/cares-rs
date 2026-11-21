@@ -74,7 +74,7 @@ async fn client_task(runtime: &Runtime, server: SocketAddr, name: String) -> io:
 fn drive(runtime: &Runtime, done: &Cell<bool>) -> io::Result<()> {
     while !done.get() {
         // 1. What does the runtime want to be told about?
-        let mut interests: Vec<(i32, bool)> = runtime.interests();
+        let mut interests = runtime.interests();
         interests.sort_unstable();
 
         // 2. How long may we sleep?

@@ -1,7 +1,7 @@
 //! Parsed-reply engine for the legacy `ares_parse_*` API and lookup callbacks:
 //! classify replies by rcode, follow CNAME chains, and collect typed records.
 
-use std::ffi::CString;
+use crate::mem::{join, CString, Vec};
 
 use crate::core::packets::{DnsAnswer, DnsHeader, DnsLabel, DnsQuery, RRParser, SliceBuf};
 use crate::core::AresError;
@@ -23,7 +23,7 @@ pub fn expand_name_at(full_buf: &[u8], start: usize) -> Option<(CString, usize)>
     let label = DnsLabel::parse(&mut sbuf)?;
     let consumed = sbuf.pos;
     let name_str = label.build_string(full_buf)?;
-    CString::new(name_str).ok().map(|c| (c, consumed))
+    CString::new(name_str.as_bytes()).ok().map(|c| (c, consumed))
 }
 
 /// Expand a length-prefixed character-string; a body with an embedded NUL is
@@ -78,20 +78,19 @@ impl<'a> IntoIterator for AnswerSection<'a> {
 /// One CNAME hop in answer order: `alias` is the owner and `name` the target.
 /// Both are absent only for synthetic hosts-file canonical entries.
 #[derive(Debug, Clone)]
-pub struct CnameEntry {
+pub(crate) struct CnameEntry {
     pub ttl: u32,
     pub alias: Option<CString>,
     pub name: Option<CString>,
 }
 
 #[derive(Debug)]
-pub struct ParsedRRs<T> {
+pub(crate) struct ParsedRRs<T> {
     pub items: Vec<T>,
     pub name: CString,
     pub aliases: Vec<CString>,
     pub cnames: Vec<CnameEntry>,
     pub _limit_ttl: Option<u32>,
-    pub success: usize,
 }
 
 impl<'a> ParsedResponse<'a> {
@@ -159,11 +158,11 @@ impl<'a> ParsedResponse<'a> {
 
     pub(crate) fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, AresError> {
         // The echoed question name is untrusted and may contain a NUL.
-        let mut name = CString::new(self.query.name.join(".")).map_err(|_| AresError::from(ARES_EBADRESP))?;
+        let query_name = join(&self.query.name, ".");
+        let mut name = CString::new(query_name.as_bytes()).map_err(|_| AresError::from(ARES_EBADRESP))?;
         let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
-        let mut success = 0;
-        let mut aliases: Vec<CString> = vec![];
-        let mut cnames: Vec<CnameEntry> = vec![];
+        let mut aliases = Vec::new();
+        let mut cnames = Vec::new();
         // Upstream clamps every A/AAAA TTL to the smallest CNAME TTL anywhere in
         // the answer section, regardless of record order.
         let min_cname_ttl = self
@@ -201,7 +200,6 @@ impl<'a> ParsedResponse<'a> {
             }
 
             if answer.record_type != expected_record_type {
-                success += 1;
                 continue;
             }
 
@@ -225,7 +223,6 @@ impl<'a> ParsedResponse<'a> {
             let Some(parsed) = T::parse_rr(&answer) else {
                 continue;
             };
-            success += 1;
             items.push(parsed);
         }
         // hostent h_name is the first CNAME target, not the end of the chain.
@@ -234,7 +231,7 @@ impl<'a> ParsedResponse<'a> {
                 name = first;
             }
         }
-        Ok(ParsedRRs { items, name, aliases, cnames, _limit_ttl: min_cname_ttl, success })
+        Ok(ParsedRRs { items, name, aliases, cnames, _limit_ttl: min_cname_ttl })
     }
 }
 

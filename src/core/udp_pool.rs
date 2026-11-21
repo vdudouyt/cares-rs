@@ -2,9 +2,9 @@
 //! tag; a server gets a new conn once the per-socket query cap is spent.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::mem::{ByteBuf, HashMap, Vec};
 use std::io;
-use std::rc::Rc;
+use crate::mem::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -21,12 +21,12 @@ type Checkout = (Option<Conn>, Vec<Conn>);
 /// One tag's inbox slot: the routed reply plus the waiting task's waker, so a
 /// sibling drain can wake a future with no fd readiness of its own.
 struct InboxSlot {
-    reply: Option<Vec<u8>>,
+    reply: Option<ByteBuf>,
     waker: Option<Waker>,
 }
 
 impl InboxSlot {
-    fn deliver(&mut self, frame: Vec<u8>) {
+    fn deliver(&mut self, frame: crate::mem::ByteBuf) {
         self.reply = Some(frame);
         self.wake();
     }
@@ -58,7 +58,7 @@ impl UdpConn {
     /// A fresh shared connection over `sock`, already created and connected by
     /// the caller outside any pool borrow so socket callbacks fire with no cell held.
     pub(crate) fn new(sock: Rc<AsyncSocket>, event_driven: bool) -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(UdpConn {
+        crate::mem::rc(RefCell::new(UdpConn {
             sock,
             inbox: HashMap::new(),
             total_queries: 0,
@@ -101,7 +101,7 @@ impl UdpConn {
 
     /// Take a reply a **sibling** already routed into `tag`'s slot (it consumed
     /// the fd's readiness, so this must not read the socket).
-    pub(crate) fn take(&mut self, tag: u16) -> Option<Vec<u8>> {
+    pub(crate) fn take(&mut self, tag: u16) -> Option<ByteBuf> {
         self.inbox.get_mut(&tag).and_then(|slot| slot.reply.take())
     }
 
@@ -111,7 +111,7 @@ impl UdpConn {
     /// Takes the cell rather than `&mut self`: the socket is read with `conn`
     /// unborrowed, since a custom `arecvfrom` may re-enter the channel (and touch
     /// this conn, e.g. a new query joining it or a cancel releasing its slots).
-    pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<Vec<u8>>> {
+    pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<crate::mem::ByteBuf>> {
         let sock = {
             let this = conn.borrow();
             if this.dead {
@@ -141,7 +141,7 @@ impl UdpConn {
     }
 
     /// Route one datagram by tag into `inbox` (unknown tags dropped).
-    fn route(&mut self, frame: Vec<u8>) {
+    fn route(&mut self, frame: crate::mem::ByteBuf) {
         if let Some(tag) = dns_tag(&frame) {
             if let Some(slot) = self.inbox.get_mut(&tag) {
                 slot.deliver(frame);
@@ -201,7 +201,7 @@ impl UdpConn {
 
 /// Read the datagrams waiting on `sock` until `WouldBlock`; `false` if the
 /// socket died (frames read before the error are still returned).
-fn read_datagrams(sock: &AsyncSocket) -> (Vec<Vec<u8>>, bool) {
+fn read_datagrams(sock: &AsyncSocket) -> (Vec<ByteBuf>, bool) {
     let drain = sock.get_ref().drain_safe();
     let mut frames = Vec::new();
     loop {
@@ -322,7 +322,7 @@ impl UdpPool {
             return (None, retired);
         };
         let mut kept = Vec::with_capacity(list.len());
-        for conn in list.drain(..) {
+        for conn in std::mem::take(list) {
             let conn_state = conn.borrow();
             let retire = if conn_state.exhausted(max_queries) {
                 true
@@ -364,7 +364,7 @@ mod tests {
     use std::net::SocketAddr;
 
     fn sock(s: impl Socket + 'static) -> Rc<AsyncSocket> {
-        Runtime::new().register_socket(Rc::new(s))
+        Runtime::new().register_socket(crate::mem::rc(s))
     }
 
     /// A waker that records whether it fired.
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn sibling_routing_wakes_target() {
         let uc = UdpConn::new(
-            sock(QueueSock { queued: RefCell::new(VecDeque::from(vec![vec![0x12, 0x34, 0xAA]])) }),
+            sock(QueueSock { queued: RefCell::new(VecDeque::from(vec![crate::mem::Vec::from([0x12, 0x34, 0xAA])])) }),
             false,
         );
         let b = std::sync::Arc::new(Flag(Default::default()));

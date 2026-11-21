@@ -5,7 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::rc::{Rc, Weak};
+use crate::mem::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use super::executor::Executor;
@@ -69,7 +69,7 @@ impl<E> Default for Runtime<E> {
     fn default() -> Self {
         Self {
             reactor: Reactor::new(),
-            tasks: Tasks::Owner(Rc::new(TaskState {
+            tasks: Tasks::Owner(crate::mem::rc(TaskState {
                 executor: Executor::default(),
                 running: Cell::new(false),
                 closed: Cell::new(false),
@@ -186,7 +186,7 @@ impl<E: 'static> Runtime<E> {
     }
 
     /// Every `(fd, wants_write)` that a live socket future is waiting on.
-    pub fn interests(&self) -> Vec<(i32, bool)> {
+    pub fn interests(&self) -> crate::mem::Vec<(i32, bool)> {
         self.reactor.interests()
     }
 
@@ -299,6 +299,7 @@ impl<E: 'static> Runtime<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::{vec, Vec};
     use std::cell::RefCell;
     use std::future::{pending, poll_fn};
     use std::task::{Poll, Waker};
@@ -306,7 +307,7 @@ mod tests {
     #[test]
     fn spawn_schedules_and_completes_without_manual_polling() {
         let rt = Runtime::new();
-        let result = Rc::new(Cell::new(None));
+        let result = crate::mem::rc(Cell::new(None));
         let delivered = result.clone();
         rt.spawn(async { 42 }, move |value| delivered.set(Some(value))).unwrap();
 
@@ -322,9 +323,9 @@ mod tests {
 
     #[test]
     fn nested_tasks_and_callback_tasks_run_in_the_same_turn() {
-        let rt = Rc::new(Runtime::new());
+        let rt = crate::mem::rc(Runtime::new());
         let weak = Rc::downgrade(&rt);
-        let completed = Rc::new(Cell::new(0));
+        let completed = crate::mem::rc(Cell::new(0));
         let child_completed = completed.clone();
         let callback_rt = weak.clone();
         let callback_completed = completed.clone();
@@ -363,11 +364,11 @@ mod tests {
 
     #[test]
     fn reentrant_driving_preserves_wakes_and_allows_slot_growth() {
-        let rt = Rc::new(Runtime::new());
+        let rt = crate::mem::rc(Runtime::new());
         let weak = Rc::downgrade(&rt);
-        let polls = Rc::new(Cell::new(0));
+        let polls = crate::mem::rc(Cell::new(0));
         let polled = polls.clone();
-        let completed = Rc::new(Cell::new(0));
+        let completed = crate::mem::rc(Cell::new(0));
         let children = completed.clone();
         rt.spawn(
             poll_fn(move |cx| {
@@ -412,9 +413,9 @@ mod tests {
         #[derive(Debug, PartialEq)]
         struct Cancelled;
 
-        let rt = Rc::new(Runtime::<Cancelled>::default());
+        let rt = crate::mem::rc(Runtime::<Cancelled>::default());
         let weak = Rc::downgrade(&rt);
-        let callbacks = Rc::new(Cell::new(0));
+        let callbacks = crate::mem::rc(Cell::new(0));
         let delivered = callbacks.clone();
         let callback_rt = weak.clone();
         rt.spawn(
@@ -450,7 +451,7 @@ mod tests {
     #[test]
     fn stale_wakes_cannot_poll_a_replacement_task() {
         let rt = Runtime::new();
-        let saved = Rc::new(RefCell::new(None::<Waker>));
+        let saved = crate::mem::rc(RefCell::new(None::<Waker>));
         let waker = saved.clone();
         let mut first = true;
         rt.spawn(poll_fn(move |cx| {
@@ -468,7 +469,7 @@ mod tests {
         stale.wake_by_ref();
         rt.run_ready();
 
-        let polls = Rc::new(Cell::new(0));
+        let polls = crate::mem::rc(Cell::new(0));
         let polled = polls.clone();
         rt.spawn(poll_fn(move |_| {
             polled.set(polled.get() + 1);
@@ -507,16 +508,16 @@ mod tests {
             let now = Instant::now();
             let deadline = now + Duration::from_secs(60);
             let timer = rt.timer_at(deadline);
-            let cancellations = Rc::new(Cell::new(0));
+            let cancellations = crate::mem::rc(Cell::new(0));
             let cancelled = cancellations.clone();
             rt.spawn(timer, move |result| {
                 assert!(matches!(result, Err(())));
                 cancelled.set(cancelled.get() + 1);
             }).unwrap();
 
-            let sock = rt.register_socket(Rc::new(TestSocket));
+            let sock = rt.register_socket(crate::mem::rc(TestSocket));
             let socket = Rc::downgrade(&sock);
-            let received = Rc::new(Cell::new(None));
+            let received = crate::mem::rc(Cell::new(None));
             let result = received.clone();
             rt.spawn(async move {
                 let mut buf = [0];
@@ -550,7 +551,7 @@ mod tests {
     fn already_due_timer_completes_and_releases_its_task() {
         let rt = Runtime::new();
         let now = Instant::now();
-        let completed = Rc::new(Cell::new(false));
+        let completed = crate::mem::rc(Cell::new(false));
         let result = completed.clone();
         rt.spawn(rt.timer_at(now), move |value| {
             assert!(matches!(value, Ok(Ok(()))));
@@ -566,7 +567,7 @@ mod tests {
     fn dropping_runtime_releases_pending_tasks_and_their_io_state() {
         let rt = Runtime::new();
         let reactor = Rc::downgrade(&rt.reactor);
-        let sock = rt.register_socket(Rc::new(TestSocket));
+        let sock = rt.register_socket(crate::mem::rc(TestSocket));
         let socket = Rc::downgrade(&sock);
         let timer = rt.timer_at(Instant::now() + Duration::from_secs(60));
         rt.spawn(async move {
@@ -587,7 +588,7 @@ mod tests {
         let handle = rt.handle();
         let child_handle = handle.handle();
         let state = Rc::downgrade(&rt.task_state().unwrap());
-        let dropped = Rc::new(());
+        let dropped = crate::mem::rc(());
         let held = dropped.clone();
         handle.spawn(async move {
             let _held = held;
@@ -609,7 +610,7 @@ mod tests {
     fn cancellation_snapshot_survives_reentry_and_slot_reuse() {
         let rt = Runtime::<u8>::default();
         let handle = rt.handle();
-        let results = Rc::new(RefCell::new(Vec::new()));
+        let results = crate::mem::rc(RefCell::new(Vec::new()));
         let delivered = results.clone();
         rt.spawn(pending::<()>(), move |result| {
             delivered.borrow_mut().push((0, result));
@@ -639,7 +640,7 @@ mod tests {
     #[test]
     fn self_waking_task_is_bounded_and_requests_an_immediate_next_turn() {
         let rt = Runtime::new();
-        let polls = Rc::new(Cell::new(0));
+        let polls = crate::mem::rc(Cell::new(0));
         let polled = polls.clone();
         rt.spawn(poll_fn(move |cx| {
             polled.set(polled.get() + 1);
@@ -662,7 +663,7 @@ mod tests {
             let rt = Runtime::new();
             let when = Instant::now() + Duration::from_secs(60);
             let mut timer = Box::pin(rt.timer_at(when));
-            let polls = Rc::new(Cell::new(0));
+            let polls = crate::mem::rc(Cell::new(0));
             let polled = polls.clone();
             rt.spawn(poll_fn(move |cx| {
                 polled.set(polled.get() + 1);

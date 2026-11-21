@@ -1,7 +1,7 @@
 //! Pure, safe DNS reply/reactor truth tables reused by the async engine, with
 //! no I/O: reply classification, search plans, server health, and verdicts.
 
-use std::collections::HashMap;
+use crate::mem::{HashMap, String, Vec};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,13 @@ pub fn is_onion_domain(name: &str) -> bool {
     b.len() >= 6 && b[b.len() - 6..].eq_ignore_ascii_case(b".onion") || b.eq_ignore_ascii_case(b"onion")
 }
 
+fn append_domain(name: &str, domain: &str) -> String {
+    let mut out = String::from(name);
+    out.push_str(".");
+    out.push_str(domain);
+    out
+}
+
 /// Ordered names a lookup tries: current name, pending search domains, then a
 /// bare-name fallback.
 #[derive(Debug, Clone)]
@@ -71,27 +78,27 @@ impl SearchPlan {
         let name_clean = name_str.strip_suffix('.').unwrap_or(name_str);
         let dot_count = name_clean.chars().filter(|&c| c == '.').count() as u32;
 
-        let mut domains: Vec<String> = Vec::new();
-        let mut current = name_clean.to_string();
+        let mut domains = Vec::new();
+        let mut current = String::from(name_clean);
 
         if !has_trailing_dot && !no_search && !search.is_empty() {
             if dot_count >= ndots {
-                domains = search.to_vec();
+                domains = Vec::from_slice(search);
             } else {
-                domains = search.to_vec();
+                domains = Vec::from_slice(search);
                 let first_domain = domains.remove(0);
-                current = format!("{}.{}", name_clean, first_domain);
+                current = append_domain(name_clean, &first_domain);
             }
         }
 
-        SearchPlan { base_name: name_clean.to_string(), current, domains }
+        SearchPlan { base_name: String::from(name_clean), current, domains }
     }
 
     /// Move to the next name; the bare base name is tried exactly once.
     pub fn advance(&mut self) -> Option<String> {
         if !self.domains.is_empty() {
             let next_domain = self.domains.remove(0);
-            let new_hostname = format!("{}.{}", self.base_name, next_domain);
+            let new_hostname = append_domain(&self.base_name, &next_domain);
             self.current = new_hostname.clone();
             Some(new_hostname)
         } else if self.current != self.base_name && !self.base_name.is_empty() {
@@ -106,7 +113,7 @@ impl SearchPlan {
 
     /// The full ordered candidate list (`current`, then each `advance`).
     pub fn into_names(mut self) -> Vec<String> {
-        let mut names = vec![self.current.clone()];
+        let mut names = Vec::from([self.current.clone()]);
         while let Some(n) = self.advance() {
             names.push(n);
         }
@@ -238,7 +245,7 @@ impl ServerHealth {
         for &id in order {
             stats.insert(id, self.stats.get(&id).copied().unwrap_or_default());
         }
-        self.order = order.to_vec();
+        self.order = Vec::from_slice(order);
         self.stats = stats;
     }
 
@@ -332,6 +339,7 @@ impl ServerHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::{vec, String};
 
     #[test]
     fn summarize_short_buffers() {
@@ -361,28 +369,28 @@ mod tests {
 
     #[test]
     fn search_plan_low_dots_appends_first_domain() {
-        let search = vec!["a.com".to_string(), "b.com".to_string()];
+        let search = vec!["a.com", "b.com"].into_iter().map(String::from).collect::<Vec<_>>();
         let mut p = SearchPlan::for_search("www", 1, &search, false);
         assert_eq!(p.current, "www.a.com");
-        assert_eq!(p.advance(), Some("www.b.com".to_string()));
-        assert_eq!(p.advance(), Some("www".to_string())); // bare-name fallback
+        assert_eq!(p.advance(), Some(String::from("www.b.com")));
+        assert_eq!(p.advance(), Some(String::from("www"))); // bare-name fallback
         assert_eq!(p.advance(), None);
     }
 
     #[test]
     fn search_plan_high_dots_tries_bare_first() {
-        let search = vec!["a.com".to_string()];
+        let search = vec!["a.com"].into_iter().map(String::from).collect::<Vec<_>>();
         let mut p = SearchPlan::for_search("x.y", 1, &search, false);
         assert_eq!(p.current, "x.y");
-        assert_eq!(p.advance(), Some("x.y.a.com".to_string()));
+        assert_eq!(p.advance(), Some(String::from("x.y.a.com")));
         // current != base ("x.y.a.com" vs "x.y") -> bare fallback fires once
-        assert_eq!(p.advance(), Some("x.y".to_string()));
+        assert_eq!(p.advance(), Some(String::from("x.y")));
         assert_eq!(p.advance(), None);
     }
 
     #[test]
     fn search_plan_trailing_dot_suppresses_search() {
-        let search = vec!["a.com".to_string()];
+        let search = vec!["a.com"].into_iter().map(String::from).collect::<Vec<_>>();
         let mut p = SearchPlan::for_search("www.example.", 1, &search, false);
         assert_eq!(p.current, "www.example");
         assert_eq!(p.advance(), None);
@@ -390,7 +398,7 @@ mod tests {
 
     #[test]
     fn search_plan_no_search_uses_name_as_is() {
-        let search = vec!["a.com".to_string()];
+        let search = vec!["a.com"].into_iter().map(String::from).collect::<Vec<_>>();
         let mut p = SearchPlan::for_search("www", 1, &search, true);
         assert_eq!(p.current, "www");
         assert_eq!(p.advance(), None);

@@ -11,7 +11,8 @@ use crate::ffi::ares_options::{ares_sock_state_cb, ARES_OPT_SORTLIST};
 use crate::ffi::ares_socket::SocketConfig;
 use crate::ffi::event_thread::{self, EventThread};
 use std::cell::{Cell, RefCell};
-use std::sync::{Arc, Condvar, Mutex};
+use crate::mem::Vec;
+use std::sync::{Condvar, Mutex};
 
 /// The C-visible channel: core state plus the channel-level C callbacks.
 ///
@@ -24,7 +25,7 @@ pub struct ChannelData {
     pub(crate) state: RefCell<AsyncClient>,
     /// Concrete handle to the same factory held as `Rc<dyn SocketFactory>` in
     /// `state`; rebuilt copy-on-write. Deep-cloned by ares_dup (`Rc` isn't atomic).
-    pub(crate) socket_factory: RefCell<std::rc::Rc<CSocketFactory>>,
+    pub(crate) socket_factory: RefCell<crate::mem::Rc<CSocketFactory>>,
     pub(crate) server_state_callback: Cell<ares_server_state_callback>,
     pub(crate) server_state_callback_arg: Cell<*mut libc::c_void>,
     pub(crate) pending_write_cb: Cell<ares_pending_write_cb>,
@@ -39,7 +40,7 @@ pub struct ChannelData {
     /// The running event thread, when `event_mode` is set.
     pub(crate) event: RefCell<Option<EventThread>>,
     /// Per-channel recursive lock; user callbacks fire while it is held.
-    pub(crate) lock: Arc<ReentrantMutex>,
+    pub(crate) lock: ReentrantMutex,
 }
 
 // SAFETY: the C handle is never shared without the per-channel ReentrantMutex.
@@ -50,7 +51,7 @@ pub struct ChannelData {
 unsafe impl Sync for ChannelData {}
 
 impl ChannelData {
-    pub(crate) fn new(state: AsyncClient, socket_factory: std::rc::Rc<CSocketFactory>, rt: Runtime<c_int>) -> Self {
+    pub(crate) fn new(state: AsyncClient, socket_factory: crate::mem::Rc<CSocketFactory>, rt: Runtime<c_int>) -> Self {
         ChannelData {
             state: RefCell::new(state),
             socket_factory: RefCell::new(socket_factory),
@@ -64,14 +65,14 @@ impl ChannelData {
             event_mode: Cell::new(false),
             evsys: Cell::new(crate::ffi::ARES_EVSYS_DEFAULT),
             event: RefCell::new(None),
-            lock: Arc::new(ReentrantMutex::new()),
+            lock: ReentrantMutex::new(),
         }
     }
 
     /// ares_dup: deep-clone the factory rather than sharing its `Rc` (duplicated
     /// event channels each have their own thread; `Rc` refcounts aren't atomic).
     pub(crate) fn dup_from(&self) -> Self {
-        let socket_factory = std::rc::Rc::new((**self.socket_factory.borrow()).clone());
+        let socket_factory = crate::mem::rc((**self.socket_factory.borrow()).clone());
         let rt = Runtime::default();
         let mut state = self.state.borrow().duplicate(rt.handle());
         state.set_socket_factory(socket_factory.clone());
@@ -88,7 +89,7 @@ impl ChannelData {
             event_mode: Cell::new(self.event_mode.get()),
             evsys: Cell::new(self.evsys.get()),
             event: RefCell::new(None),
-            lock: Arc::new(ReentrantMutex::new()),
+            lock: ReentrantMutex::new(),
         };
         // The duplicate has fresh core state: rebuild its hook (not an `Rc`
         // clone — a duplicated event channel runs on its own thread).
@@ -126,7 +127,7 @@ impl ChannelData {
     /// Fresh channel before the no-nameserver fallback; options are applied
     /// first so ARES_FLAG_NO_DFLT_SVR and explicit servers win.
     pub(crate) fn new_unfinalized(resolvconf: Option<&str>) -> Self {
-        let factory = std::rc::Rc::new(CSocketFactory::default());
+        let factory = crate::mem::rc(CSocketFactory::default());
         let rt = Runtime::default();
         let state = AsyncClient::from_sysconfig_path(factory.clone(), resolvconf, rt.handle());
         ChannelData::new(state, factory, rt)
@@ -139,7 +140,7 @@ impl ChannelData {
     }
 
     /// Install a rebuilt factory, keeping the concrete handle and core `Rc` in sync.
-    pub(crate) fn apply_socket_factory(&self, factory: std::rc::Rc<CSocketFactory>) {
+    pub(crate) fn apply_socket_factory(&self, factory: crate::mem::Rc<CSocketFactory>) {
         self.state.borrow_mut().set_socket_factory(factory.clone());
         *self.socket_factory.borrow_mut() = factory;
     }
@@ -204,7 +205,7 @@ impl ChannelData {
     }
 
     pub(crate) fn all_poll_fds(&self) -> Vec<(i32, bool)> {
-        self.rt.interests()
+        self.rt.interests().into_iter().collect()
     }
 
     /// Called as the event thread starts: turn on the reactor's change log (the
@@ -279,7 +280,7 @@ impl ChannelData {
     fn install_server_state_hook(&self) {
         let arg = self.server_state_callback_arg.get();
         let hook = self.server_state_callback.get().map(|cb| -> ServerStateHook {
-            std::rc::Rc::new(move |server: std::net::SocketAddr, ok: bool, tcp: bool| {
+            crate::mem::rc(move |server: std::net::SocketAddr, ok: bool, tcp: bool| {
                 // `ip:port` / `[ip6%scope]:port` is at most 64 bytes: format it
                 // on the stack (no allocation per callback). The buffer starts
                 // zeroed and the last byte is never written, so the text is
@@ -385,25 +386,23 @@ impl Drop for ReentrantGuard<'_> {
 }
 
 /// Lock a channel and return the guard plus a shared view; `None` for NULL.
-/// The guard is `'static` because the channel can't be freed while locked
-/// (`ares_destroy` joins the event thread first); don't outlive the frame.
+/// The channel must remain alive for the returned view and lock guard.
 /// Re-entrant calls get another shared view; all mutation goes through the
 /// channel's interior mutability, so no second `&mut ChannelData` is minted.
 ///
 /// # Safety
 /// `channel` must be NULL or a live channel handle.
-pub(crate) unsafe fn channel_access<'a>(channel: *const ChannelData) -> Option<(ReentrantGuard<'static>, &'a ChannelData)> {
+pub(crate) unsafe fn channel_access<'a>(channel: *const ChannelData) -> Option<(ReentrantGuard<'a>, &'a ChannelData)> {
     if channel.is_null() { return None; }
-    // SAFETY: caller guarantees a live channel; the lock Arc outlives this
-    // borrow (destroy waits for the lock before freeing the channel).
-    let lock: &'static ReentrantMutex = unsafe { &*((*channel).lock.as_ref() as *const ReentrantMutex) };
-    Some((lock.lock(), unsafe { &*channel }))
+    // SAFETY: caller guarantees a live channel for the duration of this access.
+    let data = unsafe { &*channel };
+    Some((data.lock.lock(), data))
 }
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_init(out_channel: *mut Channel) -> c_int {
-    let channel = Box::into_raw(Box::new(ChannelData::new_default()));
+    let channel = crate::mem::into_raw(crate::mem::boxed_infallible(ChannelData::new_default()));
     unsafe { *out_channel = channel };
     ARES_SUCCESS
 }
@@ -416,14 +415,13 @@ pub unsafe extern "C" fn ares_dup(dest: *mut Channel, source: *const ChannelData
 
 fn dup_impl(dest: *mut Channel, source: *const ChannelData) -> c_int {
     if dest.is_null() || source.is_null() { return ARES_ENOTINITIALIZED; }
-    let lock = unsafe { (*source).lock.clone() };
-    let guard = lock.lock();
-    let channeldata = unsafe { &*source }.dup_from();
+    let Some((guard, source)) = (unsafe { channel_access(source) }) else { return ARES_ENOTINITIALIZED; };
+    let channeldata = source.dup_from();
     drop(guard);
-    let channel = Box::into_raw(Box::new(channeldata));
+    let channel = crate::mem::into_raw(crate::mem::boxed_infallible(channeldata));
     let event_mode = unsafe { (*channel).event_mode.get() };
     if event_mode && !event_thread::start(channel) {
-        drop(unsafe { Box::from_raw(channel) });
+        unsafe { crate::mem::drop_box(channel) };
         return ARES_ENOMEM;
     }
     unsafe { *dest = channel };
@@ -462,7 +460,7 @@ fn destroy_impl(channel: *mut ChannelData) {
     data.abort_all(ARES_EDESTRUCTION);
     // Release the recursive lock before freeing the channel (and the lock).
     drop(guard);
-    drop(unsafe { Box::from_raw(channel) });
+    unsafe { crate::mem::drop_box(channel) };
 }
 
 #[no_mangle]
@@ -626,7 +624,7 @@ fn set_servers_csv_str(channeldata: &ChannelData, s: &str) -> c_int {
     let mut specs = Vec::with_capacity(parsed.len());
     {
         let factory = channeldata.socket_factory.borrow();
-        for entry in parsed {
+        for entry in parsed.into_iter() {
             let scope_id = match entry.iface.as_deref() {
                 Some(iface) => match factory.if_nametoindex(iface) {
                     Some(index) => index,
@@ -760,7 +758,7 @@ pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *m
     // Prefer the adapter-provided interface name for a scoped IPv6 entry, and
     // fall back to the numeric index when no `aif_indextoname` is available.
     let factory = channeldata.socket_factory.borrow();
-    let mut csv = crate::mem::String::new();
+    let mut csv = crate::mem::FallibleString::new();
     for (i, (ip, udp_port, _tcp_port, scope)) in state.server_list().enumerate() {
         if i != 0 && csv.push_str(",").is_err() { return std::ptr::null_mut(); }
         let status = match ip {
@@ -895,7 +893,7 @@ mod tests {
     /// it directly and Tree Borrows can see any re-entrant `&mut ChannelData`.
     #[test]
     fn reentrant_spawn_from_poll_is_aliasing_clean() {
-        let channel = Box::into_raw(Box::new(ChannelData::new_default()));
+        let channel = crate::mem::into_raw(crate::mem::boxed_infallible(ChannelData::new_default()));
         // SAFETY: `channel` is a live Box for the whole test; the guards are
         // dropped before it is.
         let (guard, outer) = unsafe { channel_access(channel) }.expect("live channel");
@@ -917,6 +915,6 @@ mod tests {
         outer.spawn(fut, |_| {});
         drop(guard);
         // SAFETY: the last guard is gone and nothing else references the Box.
-        drop(unsafe { Box::from_raw(channel) });
+        unsafe { crate::mem::drop_box(channel) };
     }
 }

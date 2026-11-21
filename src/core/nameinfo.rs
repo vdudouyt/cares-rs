@@ -2,8 +2,10 @@
 //! (NOFQDN, the numeric fallback, LOOKUPSERVICE), address formatting and
 //! service-name/port mapping.
 
-use std::ffi::CString;
+use std::fmt::Write;
 use std::net::IpAddr;
+
+use crate::mem::{CString, String};
 
 use crate::core::response::ParsedResponse;
 use crate::core::services::Services;
@@ -51,7 +53,7 @@ pub(crate) fn assemble_nameinfo(
         Err(err) => {
             if err.code() == ARES_ENOTFOUND && (flags & ARES_NI_NAMEREQD) == 0 {
                 let ip_str = format_ip_with_scope(&ip, scope_id, flags);
-                match CString::new(ip_str) {
+                match CString::new(ip_str.as_bytes()) {
                     Ok(name) => {
                         let service = if want_service {
                             get_service_string(&services, port, flags)
@@ -75,7 +77,7 @@ pub(crate) fn nameinfo_from_hostname(name: CString, port: u16, flags: i32, timeo
     let mut name = name;
 
     if flags & ARES_NI_NOFQDN != 0 {
-        let name_str = name.to_string_lossy();
+        let name_str = String::from_utf8_lossy(name.as_bytes());
         if let Some(dot_pos) = name_str.find('.') {
             name = match CString::new(&name_str[..dot_pos]) {
                 Ok(name) => name,
@@ -94,19 +96,19 @@ pub(crate) fn nameinfo_from_hostname(name: CString, port: u16, flags: i32, timeo
 }
 
 pub(crate) fn format_ip_with_scope(ip: &IpAddr, scope_id: u32, flags: i32) -> String {
-    match ip {
-        // The scope id is appended regardless of the flag/scope_id check; the
-        // branches are intentionally identical.
-        #[allow(clippy::if_same_then_else)]
-        IpAddr::V6(_) => {
-            if flags & ARES_NI_NUMERICSCOPE != 0 || scope_id != 0 {
-                format!("{}%{}", ip, scope_id)
-            } else {
-                format!("{}%{}", ip, scope_id)
-            }
+    let mut out = String::new();
+    let _ = write!(out, "{ip}");
+    // The scope id is appended regardless of the flag/scope_id check; the
+    // branches are intentionally identical.
+    #[allow(clippy::if_same_then_else)]
+    if matches!(ip, IpAddr::V6(_)) {
+        if flags & ARES_NI_NUMERICSCOPE != 0 || scope_id != 0 {
+            let _ = write!(out, "%{scope_id}");
+        } else {
+            let _ = write!(out, "%{scope_id}");
         }
-        IpAddr::V4(_) => ip.to_string(),
     }
+    out
 }
 
 pub(crate) fn get_service_string(services: &Services, port: u16, flags: i32) -> Option<CString> {
@@ -115,7 +117,11 @@ pub(crate) fn get_service_string(services: &Services, port: u16, flags: i32) -> 
     }
 
     // A numeric port string never contains NUL, so this is always `Some`.
-    let numeric = || CString::new(port.to_string()).ok();
+    let numeric = || {
+        let mut value = String::new();
+        let _ = write!(value, "{port}");
+        CString::new(value.as_bytes()).ok()
+    };
 
     if flags & ARES_NI_NUMERICSERV != 0 {
         return numeric();
@@ -126,7 +132,7 @@ pub(crate) fn get_service_string(services: &Services, port: u16, flags: i32) -> 
     // Fall back to numeric (also when a service name has an embedded NUL).
     services
         .lookup_any(port, prefer_udp)
-        .and_then(|name| CString::new(name).ok())
+        .and_then(|name| CString::new(name.as_bytes()).ok())
         .or_else(numeric)
 }
 

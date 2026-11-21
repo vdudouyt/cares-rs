@@ -154,7 +154,7 @@ impl AsyncClient {
         retry_server_error: bool,
     ) -> Delivery {
         let name = match template.query_at(0) {
-            Some((name, _, _)) => name.to_string_lossy().into_owned(),
+            Some((name, _, _)) => String::from_utf8_lossy(name.to_bytes()),
             None => return Delivery::Raw { result: Err(ARES_EBADQUERY), timeouts: 0 },
         };
         self.search_plan(
@@ -177,7 +177,7 @@ impl AsyncClient {
         synthesize_edns: bool,
     ) -> Delivery
     where
-        F: Fn(&str) -> Result<BytesMut, AresError>,
+        F: Fn(&str) -> Result<ByteBuf, AresError>,
     {
         if self.servers.is_empty() {
             return Delivery::Raw { result: Err(ARES_ENOSERVER), timeouts: 0 };

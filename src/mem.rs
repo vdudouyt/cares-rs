@@ -1,14 +1,23 @@
 //! Library-local allocation. Never installs a process-wide Rust allocator.
 //!
-//! Rust-owned blocks remember their callbacks. Raw C buffers use the registered
+//! `CaresAllocator` routes vectors, strings, boxes, hash tables and shared
+//! pointers through the callbacks registered by `ares_library_init_mem`.
+//! Rust-owned blocks remember their callbacks, so an allocation is always freed
+//! with the matching free function. Raw C buffers use the registered
 //! malloc/free pair directly, including caller-allocated options arrays.
-use std::alloc::{AllocError, Allocator, Layout};
+//!
+//! Most resolver code uses the infallible `Vec`/`String`/`Rc` types. The C API
+//! uses `FallibleVec`/`FallibleString`/`boxed` where allocation failure must
+//! become `ARES_ENOMEM` instead of aborting.
+use std::alloc::{AllocError, Allocator, AllocatorClone, Layout};
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::sync::Mutex;
 
 mod task;
 mod waker;
+mod containers;
+pub(crate) use containers::{HashMap, HashSet};
 pub(crate) use task::Task;
 pub(crate) use waker::ReadyFlag;
 
@@ -59,11 +68,13 @@ unsafe fn install_header(base: NonNull<u8>, align: usize, hooks: Hooks) -> NonNu
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CaresAllocator;
+pub struct CaresAllocator;
 
 // SAFETY: blocks carry their owning allocator; all instances are equivalent.
 // Allocation errors leave existing storage intact. No callback is invoked while
 // the library-state mutex is held (callbacks can reenter the library).
+unsafe impl AllocatorClone for CaresAllocator {}
+
 unsafe impl Allocator for CaresAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let (total, align) = allocation_layout(layout)?;
@@ -111,6 +122,15 @@ pub(crate) unsafe fn free(ptr: *mut c_void) {
 }
 
 pub(crate) type Owned<T> = Box<T, CaresAllocator>;
+pub type Rc<T> = std::rc::Rc<T, CaresAllocator>;
+pub type Weak<T> = std::rc::Weak<T, CaresAllocator>;
+
+pub fn rc<T>(value: T) -> Rc<T> { Rc::new_in(value, CaresAllocator) }
+
+/// Box value like std's `Box::new`; allocation failure aborts.
+pub(crate) fn boxed_infallible<T>(value: T) -> Owned<T> {
+    Box::new_in(value, CaresAllocator)
+}
 
 pub(crate) fn boxed<T>(value: T) -> Result<Owned<T>, NoMemory> {
     let ptr = if size_of::<T>() == 0 { NonNull::dangling() } else {
@@ -130,10 +150,16 @@ pub(crate) fn initialize<T>(storage: Owned<std::mem::MaybeUninit<T>>, value: T) 
 }
 
 /// Transfer a Box to an owning C handle. Pair with `drop_box`, never libc::free.
-pub(crate) fn into_raw<T>(value: Owned<T>) -> *mut T { Box::leak(value) }
+pub(crate) fn into_raw<T: ?Sized>(value: Owned<T>) -> *mut T { Box::leak(value) }
 
 /// `ptr` is null or an owning pointer previously returned by `into_raw`.
-pub(crate) unsafe fn drop_box<T>(ptr: *mut T) {
+pub(crate) unsafe fn from_raw<T: ?Sized>(ptr: *mut T) -> Owned<T> {
+    // SAFETY: the caller passes a pointer from into_raw.
+    unsafe { Box::from_raw_in(ptr, CaresAllocator) }
+}
+
+/// `ptr` is null or an owning pointer previously returned by `into_raw`.
+pub(crate) unsafe fn drop_box<T: ?Sized>(ptr: *mut T) {
     if !ptr.is_null() { drop(unsafe { Box::from_raw_in(ptr, CaresAllocator) }); }
 }
 
@@ -150,11 +176,12 @@ impl From<NoMemory> for std::io::Error {
     fn from(_: NoMemory) -> Self { std::io::ErrorKind::OutOfMemory.into() }
 }
 
-/// Only fallible growth is exposed. Slice access cannot grow the allocation.
+/// A vector for operations that must report allocation failure to C callers.
+/// Only fallible growth is exposed.
 #[derive(Debug)]
-pub(crate) struct Vec<T>(std::vec::Vec<T, CaresAllocator>);
-impl<T> Default for Vec<T> { fn default() -> Self { Self::new() } }
-impl<T> Vec<T> {
+pub(crate) struct FallibleVec<T>(std::vec::Vec<T, CaresAllocator>);
+impl<T> Default for FallibleVec<T> { fn default() -> Self { Self::new() } }
+impl<T> FallibleVec<T> {
     pub(crate) fn new() -> Self { Self(std::vec::Vec::new_in(CaresAllocator)) }
     pub(crate) fn reserve(&mut self, n: usize) -> Result<(), NoMemory> {
         self.0.try_reserve(n).map_err(|_| NoMemory)
@@ -179,14 +206,65 @@ impl<T> Vec<T> {
     pub(crate) fn retain(&mut self, f: impl FnMut(&T) -> bool) { self.0.retain(f); }
     pub(crate) fn as_slice(&self) -> &[T] { &self.0 }
 }
-impl<T> std::ops::Deref for Vec<T> {
+impl<T> std::ops::Deref for FallibleVec<T> {
     type Target = [T];
     fn deref(&self) -> &[T] { &self.0 }
 }
-impl<T> std::ops::DerefMut for Vec<T> { fn deref_mut(&mut self) -> &mut [T] { &mut self.0 } }
-impl<T> IntoIterator for Vec<T> {
+impl<T> std::ops::DerefMut for FallibleVec<T> { fn deref_mut(&mut self) -> &mut [T] { &mut self.0 } }
+impl<T> IntoIterator for FallibleVec<T> {
     type Item = T;
     type IntoIter = <std::vec::Vec<T, CaresAllocator> as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }
+}
+impl<'a, T> IntoIterator for &'a FallibleVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
+}
+impl<'a, T> IntoIterator for &'a mut FallibleVec<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter { self.iter_mut() }
+}
+
+/// Ordinary collections use the c-ares callbacks without fallible plumbing.
+/// Like std's containers, an allocation failure aborts the process.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Vec<T>(std::vec::Vec<T, CaresAllocator>);
+impl<T> Default for Vec<T> { fn default() -> Self { Self::new() } }
+impl<T> Vec<T> {
+    pub(crate) fn new() -> Self { Self(std::vec::Vec::new_in(CaresAllocator)) }
+    pub(crate) fn with_capacity(n: usize) -> Self { Self(std::vec::Vec::with_capacity_in(n, CaresAllocator)) }
+    pub(crate) fn from_slice(data: &[T]) -> Self where T: Clone {
+        let mut out = Self::with_capacity(data.len());
+        out.0.extend_from_slice(data);
+        out
+    }
+    pub(crate) fn into_boxed_slice(self) -> Owned<[T]> { self.0.into_boxed_slice() }
+    /// Reclaim storage produced by `into_boxed_slice`/`into_raw` plus
+    /// `std::mem::forget`, e.g. a C null-terminated array.
+    pub(crate) unsafe fn from_raw_parts(ptr: *mut T, len: usize, capacity: usize) -> Self {
+        Self(unsafe { std::vec::Vec::from_raw_parts_in(ptr, len, capacity, CaresAllocator) })
+    }
+}
+impl<T> std::ops::Deref for Vec<T> {
+    type Target = std::vec::Vec<T, CaresAllocator>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl<T> std::ops::DerefMut for Vec<T> { fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 } }
+impl<T> AsRef<[T]> for Vec<T> { fn as_ref(&self) -> &[T] { self } }
+impl<T> std::borrow::Borrow<[T]> for Vec<T> { fn borrow(&self) -> &[T] { self } }
+impl<T> FromIterator<T> for Vec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut out = Self::new();
+        out.extend(iter);
+        out
+    }
+}
+impl<T> Extend<T> for Vec<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { self.0.extend(iter); } }
+impl<T> IntoIterator for Vec<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T, CaresAllocator>;
     fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }
 }
 impl<'a, T> IntoIterator for &'a Vec<T> {
@@ -199,11 +277,42 @@ impl<'a, T> IntoIterator for &'a mut Vec<T> {
     type IntoIter = std::slice::IterMut<'a, T>;
     fn into_iter(self) -> Self::IntoIter { self.iter_mut() }
 }
+impl<T: Clone> From<&[T]> for Vec<T> { fn from(data: &[T]) -> Self { Self::from_slice(data) } }
+impl<T, const N: usize> From<[T; N]> for Vec<T> { fn from(data: [T; N]) -> Self { data.into_iter().collect() } }
+impl<T: PartialEq, const N: usize> PartialEq<[T; N]> for Vec<T> {
+    fn eq(&self, other: &[T; N]) -> bool { self.as_slice() == other }
+}
+impl<T: PartialEq, const N: usize> PartialEq<&[T; N]> for Vec<T> {
+    fn eq(&self, other: &&[T; N]) -> bool { self.as_slice() == **other }
+}
+impl<T: PartialEq> PartialEq<&[T]> for Vec<T> {
+    fn eq(&self, other: &&[T]) -> bool { self.as_slice() == *other }
+}
+impl<T: PartialEq> PartialEq<std::vec::Vec<T>> for Vec<T> {
+    fn eq(&self, other: &std::vec::Vec<T>) -> bool { self.as_slice() == other }
+}
+
+/// DNS wire buffers use the same callback-backed storage as every other
+/// container.
+pub(crate) type ByteBuf = Vec<u8>;
+
+/// Byte-buffer writes for DNS serialization.
+#[allow(dead_code)] // The full trait is used by the packet tests.
+pub(crate) trait BufMut {
+    fn put_u8(&mut self, value: u8);
+    fn put_u16(&mut self, value: u16);
+    fn put_slice(&mut self, bytes: &[u8]);
+}
+impl BufMut for Vec<u8> {
+    fn put_u8(&mut self, value: u8) { self.push(value); }
+    fn put_u16(&mut self, value: u16) { self.extend_from_slice(&value.to_be_bytes()); }
+    fn put_slice(&mut self, bytes: &[u8]) { self.extend_from_slice(bytes); }
+}
 
 #[derive(Debug, Default)]
-pub(crate) struct String(Vec<u8>);
-impl String {
-    pub(crate) fn new() -> Self { Self(Vec::new()) }
+pub(crate) struct FallibleString(FallibleVec<u8>);
+impl FallibleString {
+    pub(crate) fn new() -> Self { Self(FallibleVec::new()) }
     pub(crate) fn push_str(&mut self, s: &str) -> Result<(), NoMemory> { self.0.extend_from_slice(s.as_bytes()) }
     pub(crate) fn push_lossy(&mut self, bytes: &[u8]) -> Result<(), NoMemory> {
         for chunk in bytes.utf8_chunks() {
@@ -213,6 +322,33 @@ impl String {
         Ok(())
     }
 }
+impl std::ops::Deref for FallibleString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        // All construction and mutation accepts valid UTF-8 only.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+impl std::fmt::Write for FallibleString {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result { self.push_str(s).map_err(|_| std::fmt::Error) }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct String(Vec<u8>);
+impl String {
+    pub(crate) fn new() -> Self { Self(Vec::new()) }
+    pub(crate) fn as_str(&self) -> &str { self }
+    pub(crate) fn push_str(&mut self, s: &str) { self.0.extend_from_slice(s.as_bytes()); }
+    pub(crate) fn push(&mut self, ch: char) { self.push_str(ch.encode_utf8(&mut [0; 4])); }
+    pub(crate) fn from_utf8_lossy(bytes: &[u8]) -> Self {
+        let mut out = Self::new();
+        for chunk in bytes.utf8_chunks() {
+            out.push_str(chunk.valid());
+            if !chunk.invalid().is_empty() { out.push_str("\u{fffd}"); }
+        }
+        out
+    }
+}
 impl std::ops::Deref for String {
     type Target = str;
     fn deref(&self) -> &str {
@@ -220,14 +356,55 @@ impl std::ops::Deref for String {
         unsafe { std::str::from_utf8_unchecked(&self.0) }
     }
 }
+impl std::fmt::Debug for String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Debug::fmt(&**self, f) }
+}
+impl std::fmt::Display for String { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self) } }
 impl std::fmt::Write for String {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result { self.push_str(s).map_err(|_| std::fmt::Error) }
+    fn write_str(&mut self, s: &str) -> std::fmt::Result { self.push_str(s); Ok(()) }
+}
+impl AsRef<str> for String { fn as_ref(&self) -> &str { self } }
+impl AsRef<[u8]> for String { fn as_ref(&self) -> &[u8] { self.as_bytes() } }
+impl AsRef<std::path::Path> for String { fn as_ref(&self) -> &std::path::Path { std::path::Path::new(self.as_str()) } }
+impl FromIterator<char> for String {
+    fn from_iter<I: IntoIterator<Item = char>>(iter: I) -> Self {
+        let mut out = Self::new();
+        for ch in iter { out.push(ch); }
+        out
+    }
+}
+impl std::borrow::Borrow<str> for String { fn borrow(&self) -> &str { self } }
+impl From<&str> for String { fn from(s: &str) -> Self { let mut out = Self::new(); out.push_str(s); out } }
+impl PartialEq<str> for String { fn eq(&self, other: &str) -> bool { &**self == other } }
+impl PartialEq<&str> for String { fn eq(&self, other: &&str) -> bool { &**self == *other } }
+
+/// `vec!` for allocator-backed vectors (mainly convenient in tests).
+#[cfg(test)]
+macro_rules! vec {
+    () => { $crate::mem::Vec::new() };
+    ($value:expr; $count:expr) => {{
+        let mut out = $crate::mem::Vec::new();
+        out.resize($count, $value);
+        out
+    }};
+    ($($value:expr),+ $(,)?) => { $crate::mem::Vec::from([$($value),+]) };
+}
+#[cfg(test)]
+pub(crate) use vec;
+
+pub(crate) fn join<S: AsRef<str>>(parts: &[S], separator: &str) -> String {
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i != 0 { out.push_str(separator); }
+        out.push_str(part.as_ref());
+    }
+    out
 }
 
 #[derive(Debug)]
 pub(crate) struct CString { ptr: NonNull<u8>, len: usize, free: Free }
 impl CString {
-    pub(crate) fn from_string(s: String) -> Result<Self, crate::core::AresError> {
+    pub(crate) fn from_string(s: FallibleString) -> Result<Self, crate::core::AresError> {
         Self::new(s.as_bytes())
     }
     pub(crate) fn new(bytes: impl AsRef<[u8]>) -> Result<Self, crate::core::AresError> {
@@ -249,12 +426,38 @@ impl CString {
         // Raw C ownership obeys the library-init lifetime, like upstream.
         std::mem::ManuallyDrop::new(self).ptr.as_ptr().cast()
     }
+    /// Reclaim a pointer produced by [`CString::into_raw`]. As upstream, the
+    /// caller must free it before `ares_library_cleanup` restores the defaults.
+    pub(crate) unsafe fn from_raw(ptr: *mut std::ffi::c_char) -> Self {
+        // SAFETY: the caller passes a live CString produced by into_raw.
+        let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes();
+        let free = hooks().free;
+        // SAFETY: checked by the caller and asserted above.
+        Self { ptr: unsafe { NonNull::new_unchecked(ptr) }.cast(), len: bytes.len(), free }
+    }
 }
 impl std::ops::Deref for CString {
     type Target = std::ffi::CStr;
     fn deref(&self) -> &Self::Target {
         // Construction guarantees exactly one trailing NUL.
         unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(std::slice::from_raw_parts(self.ptr.as_ptr(), self.len + 1)) }
+    }
+}
+impl Default for CString {
+    fn default() -> Self {
+        match Self::new([]) {
+            Ok(empty) => empty,
+            Err(_) => std::process::abort(),
+        }
+    }
+}
+impl Clone for CString {
+    fn clone(&self) -> Self {
+        // A live CString is NUL-free, so only allocation can fail.
+        match Self::new(self.as_bytes()) {
+            Ok(copy) => copy,
+            Err(_) => std::process::abort(),
+        }
     }
 }
 impl Drop for CString {

@@ -1,3 +1,4 @@
+#![feature(allocator_ext, arbitrary_self_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
 // Panic-safety wall: a panic in a C-ABI library aborts the host process, so
 // production code must stay panic-free. Tests are exempt.
@@ -19,6 +20,7 @@ pub mod async_runtime;
 mod core;
 mod ffi;
 mod plugins;
-mod mem;
+#[doc(hidden)]
+pub mod mem;
 
 pub use crate::ffi::*;

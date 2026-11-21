@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use crate::mem::{ByteBuf, HashMap, String};
+use std::io::Read;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
@@ -25,12 +24,18 @@ impl Default for Services {
 
 impl Services {
     pub fn from_path(path: &str) -> Result<Self, std::io::Error> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
+        let mut file = std::fs::File::open(path)?;
+        let mut bytes = ByteBuf::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = file.read(&mut chunk)?;
+            if n == 0 { break; }
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        let content = std::str::from_utf8(&bytes).map_err(|_| std::io::ErrorKind::InvalidData)?;
         let mut entries = HashMap::new();
 
-        for line in reader.lines() {
-            let line = line?;
+        for line in content.lines() {
             let line = line.trim();
 
             if line.is_empty() || line.starts_with('#') {
@@ -64,15 +69,19 @@ impl Services {
                 continue;
             };
 
-            let protocol = match proto_str.to_lowercase().as_str() {
-                "tcp" => Protocol::Tcp,
-                "udp" => Protocol::Udp,
-                "sctp" => Protocol::Sctp,
-                "dccp" => Protocol::Dccp,
-                _ => continue,
+            let protocol = if proto_str.eq_ignore_ascii_case("tcp") {
+                Protocol::Tcp
+            } else if proto_str.eq_ignore_ascii_case("udp") {
+                Protocol::Udp
+            } else if proto_str.eq_ignore_ascii_case("sctp") {
+                Protocol::Sctp
+            } else if proto_str.eq_ignore_ascii_case("dccp") {
+                Protocol::Dccp
+            } else {
+                continue;
             };
 
-            entries.insert((port, protocol), service_name.to_string());
+            entries.insert((port, protocol), String::from(service_name));
         }
 
         Ok(Services { entries })

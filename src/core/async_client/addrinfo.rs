@@ -38,7 +38,7 @@ impl AsyncClient {
                 AddressFamily::Any => true,
             };
             if matches {
-                return Ok(self.finalize_hostent(Hostent::new(hostname, vec![ip])));
+                return Ok(self.finalize_hostent(Hostent::new(&hostname, crate::mem::Vec::from([ip]))));
             }
         }
 
@@ -46,7 +46,7 @@ impl AsyncClient {
         // file, 'b' = DNS; unknown chars ignored (upstream next_lookup).
         let order: Vec<char> = self.lookups.chars().collect();
         let mut last_error: AresError = ARES_ECONNREFUSED.into();
-        for ch in order {
+        for ch in order.into_iter() {
             match ch {
                 'f' => {
                     if let Some(lookup) = self.hostsfile().lookup(&hostname, filter) {
@@ -59,11 +59,11 @@ impl AsyncClient {
                     // upstream file lookup).
                     if is_localhost(&hostname) {
                         let addrs = match filter {
-                            AddressFamily::Ipv4 => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-                            AddressFamily::Ipv6 => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
-                            AddressFamily::Any => vec![IpAddr::V6(Ipv6Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                            AddressFamily::Ipv4 => crate::mem::Vec::from([IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+                            AddressFamily::Ipv6 => crate::mem::Vec::from([IpAddr::V6(Ipv6Addr::LOCALHOST)]),
+                            AddressFamily::Any => crate::mem::Vec::from([IpAddr::V6(Ipv6Addr::LOCALHOST), IpAddr::V4(Ipv4Addr::LOCALHOST)]),
                         };
-                        return Ok(self.finalize_hostent(Hostent::new(hostname, addrs)));
+                        return Ok(self.finalize_hostent(Hostent::new(&hostname, addrs)));
                     }
                 }
                 'b' => {
@@ -108,19 +108,25 @@ impl AsyncClient {
                     // (unlike ares_search) so query/cache/store keys match.
                     let dots = resolved.chars().filter(|&c| c == '.').count() as u32;
                     let no_search = alias_found || self.flags & ARES_FLAG_NOSEARCH != 0;
-                    let names: Vec<String> = if !no_search && dots < self.config.options.ndots && !self.config.search.is_empty() {
-                        let mut v: Vec<String> = self.config.search.iter().map(|d| format!("{resolved}.{d}")).collect();
-                        v.push(resolved.clone());
-                        v
+                    let names = if !no_search && dots < self.config.options.ndots && !self.config.search.is_empty() {
+                        let mut names = Vec::new();
+                        for domain in &self.config.search {
+                            let mut name = resolved.clone();
+                            name.push_str(".");
+                            name.push_str(domain);
+                            names.push(name);
+                        }
+                        names.push(resolved.clone());
+                        names
                     } else {
-                        vec![resolved.clone()]
+                        Vec::from([resolved.clone()])
                     };
                     // AF_UNSPEC queries A+AAAA in parallel via the shared core;
                     // the Hostent holds one family, preferring IPv6.
-                    let rtypes: Vec<u16> = match family {
-                        AF_INET => vec![RTYPE_A],
-                        AF_INET6 => vec![RTYPE_AAAA],
-                        _ => vec![RTYPE_A, RTYPE_AAAA],
+                    let rtypes = match family {
+                        AF_INET => Vec::from([RTYPE_A]),
+                        AF_INET6 => Vec::from([RTYPE_AAAA]),
+                        _ => Vec::from([RTYPE_A, RTYPE_AAAA]),
                     };
                     let lookup = self.resolve_addrinfo(&names, &rtypes).await;
                     timeouts.set(lookup.timeouts);
@@ -136,7 +142,7 @@ impl AsyncClient {
                     let hfamily = if reply.rtype == RTYPE_AAAA { AF_INET6 } else { AF_INET };
 
                     if self.shared.cache.borrow().enabled() {
-                        let mut store = vec![lookup.name.clone()];
+                        let mut store = Vec::from([lookup.name.clone()]);
                         if resolved != lookup.name {
                             store.push(resolved.clone());
                         }
@@ -307,17 +313,17 @@ impl AsyncClient {
             };
             if matches {
                 let cnames = if can_name {
-                    vec![CnameEntry {
+                    Vec::from([CnameEntry {
                         ttl: 0,
                         alias: None,
-                        name: CString::new(hostname).ok(),
-                    }]
+                        name: CString::new(hostname.as_bytes()).ok(),
+                    }])
                 } else {
                     Vec::new()
                 };
                 return AddrInfoOut::success(
-                    hostname.to_string(),
-                    vec![AddrRecord { ip, ttl: 0 }],
+                    String::from(hostname),
+                    Vec::from([AddrRecord { ip, ttl: 0 }]),
                     cnames,
                     socktype,
                     protocol,
@@ -332,7 +338,7 @@ impl AsyncClient {
         let mut last_error: AresError = ARES_ECONNREFUSED.into();
         let mut timeouts: c_int = 0;
 
-        for ch in order {
+        for ch in order.into_iter() {
             match ch {
                 'f' => {
                     // Hosts file, honouring ARES_AI_ENVHOSTS when requested.
@@ -357,7 +363,7 @@ impl AsyncClient {
                                 Vec::new()
                             };
                             return AddrInfoOut::success(
-                                hostname.to_string(),
+                                String::from(hostname),
                                 records,
                                 cnames,
                                 socktype,
@@ -376,7 +382,7 @@ impl AsyncClient {
                             sort_addrinfo(&mut records);
                         }
                         return AddrInfoOut::success(
-                            hostname.to_string(),
+                            String::from(hostname),
                             records,
                             Vec::new(),
                             socktype,
@@ -394,10 +400,10 @@ impl AsyncClient {
                         continue;
                     }
 
-                    let rtypes: Vec<u16> = match ai_family {
-                        libc::AF_INET => vec![RTYPE_A],
-                        libc::AF_INET6 => vec![RTYPE_AAAA],
-                        _ => vec![RTYPE_A, RTYPE_AAAA],
+                    let rtypes = match ai_family {
+                        libc::AF_INET => Vec::from([RTYPE_A]),
+                        libc::AF_INET6 => Vec::from([RTYPE_AAAA]),
+                        _ => Vec::from([RTYPE_A, RTYPE_AAAA]),
                     };
                     let no_aliases = self.flags & ARES_FLAG_NOALIASES != 0;
                     let (search_name, alias_found) = match hostaliases_lookup(&hostname_raw, no_aliases) {
@@ -421,7 +427,7 @@ impl AsyncClient {
                     }
                     let mut cnames: Vec<CnameEntry> = Vec::new();
                     let mut records: Vec<AddrRecord> = Vec::new();
-                    for reply in lookup.replies {
+                    for reply in lookup.replies.into_iter() {
                         records.extend(reply.rrs.items);
                         cnames.extend(reply.rrs.cnames);
                     }
@@ -429,7 +435,7 @@ impl AsyncClient {
                         .iter()
                         .rev()
                         .find_map(|c| c.name.clone())
-                        .map(|c| c.to_string_lossy().into_owned())
+                        .map(|c| String::from_utf8_lossy(c.as_bytes()))
                         .unwrap_or(lookup.name);
                     if !no_sort {
                         sort_addrinfo(&mut records);
@@ -447,7 +453,7 @@ impl AsyncClient {
 /// the gethostbyname query cache), and parsed address records.
 struct FamilyReply {
     rtype: u16,
-    buf: Vec<u8>,
+    buf: crate::mem::ByteBuf,
     rrs: ParsedRRs<AddrRecord>,
 }
 
@@ -521,16 +527,16 @@ fn merge_loopback(records: &mut Vec<AddrRecord>, filter: AddressFamily) {
 /// Hosts-file CNAME chain: each alias points at the entry's primary host; with
 /// no aliases, a single alias-less entry names the primary.
 fn hosts_cnames(lookup: &HostLookup) -> Vec<CnameEntry> {
-    let primary = CString::new(lookup.canonical.as_str()).ok();
+    let primary = CString::new(lookup.canonical.as_bytes()).ok();
     if lookup.aliases.is_empty() {
-        return vec![CnameEntry { ttl: 0, alias: None, name: primary }];
+        return Vec::from([CnameEntry { ttl: 0, alias: None, name: primary }]);
     }
     lookup
         .aliases
         .iter()
         .map(|alias| CnameEntry {
             ttl: 0,
-            alias: CString::new(alias.as_str()).ok(),
+            alias: CString::new(alias.as_bytes()).ok(),
             name: primary.clone(),
         })
         .collect()
@@ -551,7 +557,7 @@ pub(super) fn hostaliases_lookup(hostname: &str, no_aliases: bool) -> Result<Opt
             for line in content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 && parts[0].eq_ignore_ascii_case(hostname) {
-                    return Ok(Some(parts[1].to_string()));
+                    return Ok(Some(String::from(parts[1])));
                 }
             }
             Ok(None)

@@ -3,7 +3,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::rc::Rc;
+use crate::mem::Rc;
 
 /// Which kind of socket a custom factory should create.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

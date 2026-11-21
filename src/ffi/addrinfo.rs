@@ -50,17 +50,17 @@ pub(crate) fn nodes_from_addr_records(
     for record in records {
         let (ai_family, ai_addrlen, ai_addr): (c_int, libc::socklen_t, *mut libc::sockaddr) = match record.ip {
             IpAddr::V4(v4) => {
-                let sa = Box::new(libc::sockaddr_in {
+                let sa = crate::mem::boxed_infallible(libc::sockaddr_in {
                     sin_family: libc::AF_INET as libc::sa_family_t,
                     sin_port: port.to_be(),
                     sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(v4.octets()) },
                     sin_zero: [0; 8],
                 });
                 (libc::AF_INET, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                 Box::into_raw(sa) as *mut libc::sockaddr)
+                 crate::mem::into_raw(sa) as *mut libc::sockaddr)
             }
             IpAddr::V6(v6) => {
-                let sa = Box::new(libc::sockaddr_in6 {
+                let sa = crate::mem::boxed_infallible(libc::sockaddr_in6 {
                     sin6_family: libc::AF_INET6 as libc::sa_family_t,
                     sin6_port: port.to_be(),
                     sin6_flowinfo: 0,
@@ -68,10 +68,10 @@ pub(crate) fn nodes_from_addr_records(
                     sin6_scope_id: 0,
                 });
                 (libc::AF_INET6, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                 Box::into_raw(sa) as *mut libc::sockaddr)
+                 crate::mem::into_raw(sa) as *mut libc::sockaddr)
             }
         };
-        let node = Box::into_raw(Box::new(ares_addrinfo_node {
+        let node = crate::mem::into_raw(crate::mem::boxed_infallible(ares_addrinfo_node {
             ai_ttl: record.ttl as c_int,
             ai_flags: 0,
             ai_family,
@@ -107,7 +107,7 @@ pub(crate) fn cnames_from_entries(entries: &[crate::core::response::CnameEntry])
             .as_ref()
             .map(|s| s.clone().into_raw())
             .unwrap_or(std::ptr::null_mut());
-        let node = Box::into_raw(Box::new(ares_addrinfo_cname {
+        let node = crate::mem::into_raw(crate::mem::boxed_infallible(ares_addrinfo_cname {
             ttl: entry.ttl as c_int,
             alias,
             name,
@@ -128,10 +128,10 @@ pub(crate) fn build_ares_addrinfo(
     nodes: *mut ares_addrinfo_node,
     cnames: *mut ares_addrinfo_cname,
 ) -> *mut ares_addrinfo {
-    Box::into_raw(Box::new(ares_addrinfo {
+    crate::mem::into_raw(crate::mem::boxed_infallible(ares_addrinfo {
         cnames,
         nodes,
-        name: CString::new(name).unwrap_or_default().into_raw(),
+        name: CString::new(name.as_bytes()).unwrap_or_default().into_raw(),
     }))
 }
 
@@ -140,12 +140,12 @@ pub(crate) unsafe fn free_addrinfo_nodes(mut node: *mut ares_addrinfo_node) {
         let next = (unsafe { &*node }).ai_next;
         if !(unsafe { &*node }).ai_addr.is_null() {
             match (unsafe { &*node }).ai_family {
-                libc::AF_INET => { drop(unsafe { Box::from_raw((*node).ai_addr as *mut libc::sockaddr_in) }); }
-                libc::AF_INET6 => { drop(unsafe { Box::from_raw((*node).ai_addr as *mut libc::sockaddr_in6) }); }
+                libc::AF_INET => { drop(unsafe { crate::mem::from_raw((*node).ai_addr as *mut libc::sockaddr_in) }); }
+                libc::AF_INET6 => { drop(unsafe { crate::mem::from_raw((*node).ai_addr as *mut libc::sockaddr_in6) }); }
                 _ => {}
             }
         }
-        unsafe { drop(Box::from_raw(node)) };
+        unsafe { crate::mem::drop_box(node) };
         node = next;
     }
 }
@@ -154,7 +154,7 @@ pub(crate) unsafe fn free_addrinfo_nodes(mut node: *mut ares_addrinfo_node) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn ares_freeaddrinfo(ai: *mut ares_addrinfo) {
     if ai.is_null() { return; }
-    let ai = unsafe { Box::from_raw(ai) };
+    let ai = unsafe { crate::mem::from_raw(ai) };
 
     unsafe { free_addrinfo_nodes(ai.nodes) };
 
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn ares_freeaddrinfo(ai: *mut ares_addrinfo) {
         if !unsafe { (*cname).name }.is_null() {
             drop(unsafe { CString::from_raw((*cname).name) });
         }
-        drop(unsafe { Box::from_raw(cname) });
+        unsafe { crate::mem::drop_box(cname) };
         cname = next;
     }
 

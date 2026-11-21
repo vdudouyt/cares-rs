@@ -5,13 +5,13 @@
 //! through [`Reactor::interests`] / [`Reactor::next_deadline`]. One reactor per
 //! channel (no global), owned by [`Runtime`](super::Runtime).
 
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cell::{Cell, Ref, RefCell};
+use crate::mem::{ByteBuf, HashMap, Vec};
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::io;
 use std::pin::{pin, Pin};
-use std::rc::Rc;
+use crate::mem::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 use super::timers::Timers;
@@ -99,8 +99,9 @@ impl Direction {
 
     /// Set (or refresh) the waker at `index`, inserting a slot if there is none.
     /// Returns the slot and whether the direction just gained its first waiter.
-    fn register(&mut self, index: Option<usize>, waker: &Waker) -> (usize, bool) {
+    fn register(&mut self, index: Option<usize>, waker: &Waker) -> (usize, bool, Option<Waker>) {
         let was_waiting = self.has_waiters();
+        let mut replaced = None;
         let existing = index.filter(|&i| self.wakers.get_mut(i).is_some());
         let slot = match existing {
             Some(i) => {
@@ -108,7 +109,7 @@ impl Direction {
                     match slot {
                         Some(w) => {
                             if !w.will_wake(waker) {
-                                *w = waker.clone();
+                                replaced = Some(std::mem::replace(w, waker.clone()));
                             }
                         }
                         // The slot was emptied by a readiness wake; waiting again.
@@ -125,7 +126,7 @@ impl Direction {
                 self.wakers.insert(Some(waker.clone()))
             }
         };
-        (slot, !was_waiting && self.has_waiters())
+        (slot, !was_waiting && self.has_waiters(), replaced)
     }
 
     /// Drop the slot at `index`. Returns its waker (to drop outside any borrow)
@@ -152,14 +153,20 @@ impl Direction {
     }
 }
 
-/// A registered fd (async-io's `Source`). Removed from the reactor when its
-/// [`AsyncSocket`](crate::async_runtime::io::AsyncSocket) is dropped.
+/// A non-owning registration ID. The generation prevents an old socket or
+/// readiness future from accessing a reused slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Source {
     fd: i32,
     key: usize,
     /// Reactor-unique, never reused: tells a fresh registration of a recycled
     /// fd number from the old one (see [`InterestUpdate::generation`]).
     generation: u64,
+}
+
+/// Registration storage belongs to the reactor, not its socket or waiters.
+struct SourceState {
+    id: Source,
     /// Interest changed since the last [`Reactor::take_interest_changes`].
     dirty: Cell<bool>,
     state: RefCell<[Direction; 2]>,
@@ -182,21 +189,15 @@ pub struct InterestUpdate {
 #[derive(Default, Debug)]
 pub struct InterestChanges {
     /// `(fd, generation)` of every dropped source.
-    pub removed: Vec<(i32, u64)>,
-    pub updates: Vec<InterestUpdate>,
-}
-
-impl Source {
-    pub(crate) fn tick(&self, dir: usize) -> usize {
-        self.state.borrow().get(dir).map_or(0, |d| d.tick)
-    }
+    pub removed: crate::mem::Vec<(i32, u64)>,
+    pub updates: crate::mem::Vec<InterestUpdate>,
 }
 
 pub(super) struct Reactor {
     /// Bumped once per `set_ready_fds_with`; a direction's `tick` records the ticker
     /// value of its last event.
     ticker: Cell<usize>,
-    sources: RefCell<Slab<Rc<Source>>>,
+    sources: RefCell<Slab<SourceState>>,
     timers: RefCell<Timers>,
     next_timer: Cell<usize>,
     next_generation: Cell<u64>,
@@ -206,16 +207,16 @@ pub(super) struct Reactor {
     /// thread). Off unless [`Reactor::enable_change_tracking`] ran, so channels
     /// driven by `ares_process*` never accumulate entries nobody drains.
     tracking: Cell<bool>,
-    dirty: RefCell<Vec<usize>>,
-    removed: RefCell<Vec<(i32, u64)>>,
+    dirty: RefCell<crate::mem::Vec<usize>>,
+    removed: RefCell<crate::mem::Vec<(i32, u64)>>,
     /// Receive scratch (grown to 64 KB on first use), lent out for one
     /// synchronous recv at a time — avoids zeroing 64 KB per call.
-    scratch: Cell<Vec<u8>>,
+    scratch: Cell<ByteBuf>,
 }
 
 impl Reactor {
     pub fn new() -> Rc<Self> {
-        Rc::new(Reactor {
+        crate::mem::rc(Reactor {
             // Starts above every direction's initial tick (0), so a fresh
             // source never looks reported in the current turn.
             ticker: Cell::new(1),
@@ -225,9 +226,9 @@ impl Reactor {
             next_generation: Cell::new(0),
             by_fd: RefCell::new(HashMap::new()),
             tracking: Cell::new(false),
-            dirty: RefCell::new(Vec::new()),
-            removed: RefCell::new(Vec::new()),
-            scratch: Cell::new(Vec::new()),
+            dirty: RefCell::new(crate::mem::Vec::new()),
+            removed: RefCell::new(crate::mem::Vec::new()),
+            scratch: Cell::new(ByteBuf::new()),
         })
     }
 
@@ -250,19 +251,37 @@ impl Reactor {
         self.ticker.get()
     }
 
-    pub(crate) fn insert_io(&self, fd: i32) -> Rc<Source> {
+    pub(crate) fn insert_io(&self, fd: i32) -> Source {
         let mut sources = self.sources.borrow_mut();
         let generation = self.next_generation.get().wrapping_add(1);
         self.next_generation.set(generation);
         let key = sources.vacant_key();
-        let source = Rc::new(Source { fd, key, generation, dirty: Cell::new(false), state: RefCell::default() });
-        sources.insert(source.clone());
+        let source = Source { fd, key, generation };
+        sources.insert(SourceState { id: source, dirty: Cell::new(false), state: RefCell::default() });
         self.by_fd.borrow_mut().entry(fd).or_default().push(key);
         source
     }
 
+    fn source(&self, id: Source) -> Option<Ref<'_, SourceState>> {
+        Ref::filter_map(self.sources.borrow(), |sources| {
+            sources.get(id.key).filter(|source| source.id == id)
+        }).ok()
+    }
+
+    pub(crate) fn source_tick(&self, id: Source, dir: usize) -> Option<usize> {
+        let source = self.source(id)?;
+        let state = source.state.borrow();
+        state.get(dir).map(|d| d.tick)
+    }
+
     pub(crate) fn remove_io(&self, source: &Source) {
-        let removed = self.sources.borrow_mut().remove(source.key);
+        let removed = {
+            let mut sources = self.sources.borrow_mut();
+            if !sources.get(source.key).is_some_and(|s| s.id == *source) {
+                return;
+            }
+            sources.remove(source.key)
+        };
         {
             let mut by_fd = self.by_fd.borrow_mut();
             if let Some(keys) = by_fd.get_mut(&source.fd) {
@@ -281,9 +300,9 @@ impl Reactor {
 
     /// Record that `source`'s interest may have changed (a direction gained its
     /// first waiter or lost its last one).
-    fn interest_changed(&self, source: &Source) {
+    fn interest_changed(&self, source: &SourceState) {
         if self.tracking.get() && !source.dirty.replace(true) {
-            self.dirty.borrow_mut().push(source.key);
+            self.dirty.borrow_mut().push(source.id.key);
         }
     }
 
@@ -303,16 +322,16 @@ impl Reactor {
         let removed = std::mem::take(&mut *self.removed.borrow_mut());
         let keys = std::mem::take(&mut *self.dirty.borrow_mut());
         let sources = self.sources.borrow();
-        let mut updates = Vec::with_capacity(keys.len());
-        for key in keys {
+        let mut updates = crate::mem::Vec::with_capacity(keys.len());
+        for key in keys.into_iter() {
             let Some(source) = sources.get(key) else { continue };
             if !source.dirty.replace(false) {
                 continue; // already reported (a stale or duplicate key)
             }
             let state = source.state.borrow();
             updates.push(InterestUpdate {
-                fd: source.fd,
-                generation: source.generation,
+                fd: source.id.fd,
+                generation: source.id.generation,
                 read: state[READ].has_waiters(),
                 write: state[WRITE].has_waiters(),
             });
@@ -332,7 +351,7 @@ impl Reactor {
         for source in self.sources.borrow().iter() {
             let mut state = source.state.borrow_mut();
             for (dir, d) in state.iter_mut().enumerate() {
-                if d.has_waiters() && ready(source.fd, dir == WRITE) {
+                if d.has_waiters() && ready(source.id.fd, dir == WRITE) {
                     d.tick = tick;
                     if d.take_wakers(&mut wake) {
                         self.interest_changed(source);
@@ -388,13 +407,13 @@ impl Reactor {
     }
 
     /// Every `(fd, wants_write)` some live [`Ready`] is waiting on.
-    pub fn interests(&self) -> Vec<(i32, bool)> {
-        let mut out = Vec::new();
+    pub fn interests(&self) -> crate::mem::Vec<(i32, bool)> {
+        let mut out = crate::mem::Vec::new();
         for source in self.sources.borrow().iter() {
             let state = source.state.borrow();
             for (dir, d) in state.iter().enumerate() {
                 if d.has_waiters() {
-                    out.push((source.fd, dir == WRITE));
+                    out.push((source.id.fd, dir == WRITE));
                 }
             }
         }
@@ -427,7 +446,7 @@ impl Reactor {
 
     /// Run `f` with the shared receive scratch, taken out for the call so a
     /// re-entrant socket callback never finds it borrowed.
-    pub(crate) fn with_scratch<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    pub(crate) fn with_scratch<R>(&self, f: impl FnOnce(&mut ByteBuf) -> R) -> R {
         let mut scratch = self.scratch.take();
         let r = f(&mut scratch);
         self.scratch.set(scratch);
@@ -445,7 +464,7 @@ impl Reactor {
 /// treated as unique there (Tree Borrows), making the next self-write UB.
 pub struct Ready {
     reactor: Rc<Reactor>,
-    source: Rc<Source>,
+    source: Source,
     dir: usize,
     ticks: Cell<Option<(usize, usize)>>,
     index: Cell<Option<usize>>,
@@ -453,7 +472,7 @@ pub struct Ready {
 }
 
 impl Ready {
-    pub(super) fn new(reactor: Rc<Reactor>, source: Rc<Source>, dir: usize) -> Self {
+    pub(super) fn new(reactor: Rc<Reactor>, source: Source, dir: usize) -> Self {
         Ready { reactor, source, dir, ticks: Cell::new(None), index: Cell::new(None), _pin: PhantomPinned }
     }
 }
@@ -463,26 +482,33 @@ impl Future for Ready {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.into_ref().get_ref();
-        let mut state = this.source.state.borrow_mut();
+        let Some(source) = this.reactor.source(this.source) else { return Poll::Ready(()) };
+        let mut state = source.state.borrow_mut();
         let Some(d) = state.get_mut(this.dir) else { return Poll::Ready(()) };
         match this.ticks.get() {
             Some((a, b)) if d.tick != a && d.tick != b => {
                 if let Some(i) = this.index.take() {
-                    let (_waker, idle) = d.deregister(i);
+                    let (waker, idle) = d.deregister(i);
                     if idle {
-                        this.reactor.interest_changed(&this.source);
+                        this.reactor.interest_changed(&source);
                     }
+                    drop(state);
+                    drop(source);
+                    drop(waker);
                 }
                 return Poll::Ready(());
             }
             Some(_) => {}
             None => this.ticks.set(Some((this.reactor.ticker(), d.tick))),
         }
-        let (slot, gained) = d.register(this.index.get(), cx.waker());
+        let (slot, gained, replaced) = d.register(this.index.get(), cx.waker());
         this.index.set(Some(slot));
         if gained {
-            this.reactor.interest_changed(&this.source);
+            this.reactor.interest_changed(&source);
         }
+        drop(state);
+        drop(source);
+        drop(replaced);
         Poll::Pending
     }
 }
@@ -490,13 +516,15 @@ impl Future for Ready {
 impl Drop for Ready {
     fn drop(&mut self) {
         if let Some(i) = self.index.take() {
-            let (removed, idle) = match self.source.state.borrow_mut().get_mut(self.dir) {
+            let Some(source) = self.reactor.source(self.source) else { return };
+            let (removed, idle) = match source.state.borrow_mut().get_mut(self.dir) {
                 Some(d) => d.deregister(i),
                 None => (None, false),
             };
             if idle {
-                self.reactor.interest_changed(&self.source);
+                self.reactor.interest_changed(&source);
             }
+            drop(source);
             drop(removed);
         }
     }
@@ -549,6 +577,7 @@ impl Drop for Timer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::{vec, Vec};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::Wake;
@@ -573,7 +602,7 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(7);
         let (count, w) = counter();
-        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut rd = Box::pin(Ready::new(r.clone(), src, READ));
         assert!(poll(&mut rd, &w).is_pending());
         assert_eq!(r.interests(), vec![(7, false)]);
 
@@ -593,11 +622,11 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(7);
         let (_c, w) = counter();
-        let mut first = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut first = Box::pin(Ready::new(r.clone(), src, READ));
         assert!(poll(&mut first, &w).is_pending());
         r.set_ready_fds_with(|_, wr| !wr);
         // A waiter registered after this turn's event must not see it (C2).
-        let mut late = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut late = Box::pin(Ready::new(r.clone(), src, READ));
         assert!(poll(&mut late, &w).is_pending());
         assert!(poll(&mut first, &w).is_ready());
     }
@@ -607,7 +636,7 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(9);
         let (_c, w) = counter();
-        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), WRITE));
+        let mut rd = Box::pin(Ready::new(r.clone(), src, WRITE));
         let mut t = Box::pin(Timer::at(&r, Instant::now() + Duration::from_secs(60)));
         assert!(poll(&mut rd, &w).is_pending());
         assert!(poll(&mut t, &w).is_pending());
@@ -643,8 +672,8 @@ mod tests {
         let src = r.insert_io(4);
         let (ca, wa) = counter();
         let (cb, wb) = counter();
-        let mut a = Box::pin(Ready::new(r.clone(), src.clone(), READ));
-        let mut b = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut a = Box::pin(Ready::new(r.clone(), src, READ));
+        let mut b = Box::pin(Ready::new(r.clone(), src, READ));
         assert!(poll(&mut a, &wa).is_pending());
         assert!(poll(&mut b, &wb).is_pending());
         assert_eq!(r.interests(), vec![(4, false)]);
@@ -657,7 +686,7 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(3);
         let (_c, w) = counter();
-        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut rd = Box::pin(Ready::new(r.clone(), src, READ));
         assert!(poll(&mut rd, &w).is_pending());
         r.remove_io(&src);
         assert!(r.interests().is_empty());
@@ -669,8 +698,8 @@ mod tests {
         let (a, b) = (r.insert_io(5), r.insert_io(6));
         let (ca, wa) = counter();
         let (cb, wb) = counter();
-        let mut ra = Box::pin(Ready::new(r.clone(), a.clone(), READ));
-        let mut rb = Box::pin(Ready::new(r.clone(), b.clone(), READ));
+        let mut ra = Box::pin(Ready::new(r.clone(), a, READ));
+        let mut rb = Box::pin(Ready::new(r.clone(), b, READ));
         assert!(poll(&mut ra, &wa).is_pending());
         assert!(poll(&mut rb, &wb).is_pending());
 
@@ -690,7 +719,7 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(3);
         let (_c, w) = counter();
-        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut rd = Box::pin(Ready::new(r.clone(), src, READ));
         assert!(poll(&mut rd, &w).is_pending());
         drop(rd);
         r.remove_io(&src);
@@ -704,8 +733,8 @@ mod tests {
         r.enable_change_tracking();
         let src = r.insert_io(8);
         let (_c, w) = counter();
-        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
-        let mut wr = Box::pin(Ready::new(r.clone(), src.clone(), WRITE));
+        let mut rd = Box::pin(Ready::new(r.clone(), src, READ));
+        let mut wr = Box::pin(Ready::new(r.clone(), src, WRITE));
         assert!(poll(&mut rd, &w).is_pending());
         assert!(poll(&mut wr, &w).is_pending());
         let c = r.take_interest_changes();
@@ -716,7 +745,7 @@ mod tests {
         // Off and on again inside one turn: the same interest, reported once.
         r.set_ready_fds([(8, true, false)]);
         assert!(poll(&mut rd, &w).is_ready());
-        let mut again = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut again = Box::pin(Ready::new(r.clone(), src, READ));
         assert!(poll(&mut again, &w).is_pending());
         let c = r.take_interest_changes();
         assert_eq!(c.updates, vec![InterestUpdate { fd: 8, generation: src.generation, read: true, write: true }]);
@@ -737,7 +766,7 @@ mod tests {
         let r = Reactor::new();
         let src = r.insert_io(2);
         let (_c, w) = counter();
-        let mut rd = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+        let mut rd = Box::pin(Ready::new(r.clone(), src, READ));
         assert!(poll(&mut rd, &w).is_pending());
         r.enable_change_tracking();
         let c = r.take_interest_changes();
@@ -753,6 +782,34 @@ mod tests {
         assert_ne!(first.generation, second.generation);
     }
 
+    #[test]
+    fn stale_source_and_waiter_cannot_modify_reused_slot() {
+        let r = Reactor::new();
+        r.enable_change_tracking();
+        let first = r.insert_io(4);
+        let mut old_waiter = Box::pin(Ready::new(r.clone(), first, READ));
+        let (_, waker) = counter();
+        assert!(poll(&mut old_waiter, &waker).is_pending());
+        r.remove_io(&first);
+
+        let second = r.insert_io(4);
+        assert_eq!(first.key, second.key, "exercise slot reuse as well as fd reuse");
+        let mut waiter = Box::pin(Ready::new(r.clone(), second, READ));
+        assert!(poll(&mut waiter, &waker).is_pending());
+        r.take_interest_changes();
+
+        r.remove_io(&first);
+        drop(old_waiter);
+        assert!(r.source_tick(first, READ).is_none());
+        assert_eq!(r.interests(), vec![(4, false)]);
+        let changes = r.take_interest_changes();
+        assert!(changes.removed.is_empty());
+        assert!(changes.updates.is_empty());
+
+        r.set_ready_fds([(4, true, false)]);
+        assert!(poll(&mut waiter, &waker).is_ready());
+    }
+
     /// `cargo test --lib -- --ignored --nocapture set_ready_fds_with_cost`: the closure-scanning
     /// `set_ready_fds_with` is O(sources × events); `set_ready_fds` is O(events).
     #[test]
@@ -765,7 +822,7 @@ mod tests {
         let held: Vec<_> = (0..sources)
             .map(|fd| {
                 let src = r.insert_io(fd);
-                let mut f = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+                let mut f = Box::pin(Ready::new(r.clone(), src, READ));
                 assert!(poll(&mut f, &w).is_pending());
                 (src, f)
             })
@@ -780,7 +837,7 @@ mod tests {
         let held: Vec<_> = (0..sources)
             .map(|fd| {
                 let src = r.insert_io(100_000 + fd);
-                let mut f = Box::pin(Ready::new(r.clone(), src.clone(), READ));
+                let mut f = Box::pin(Ready::new(r.clone(), src, READ));
                 assert!(poll(&mut f, &w).is_pending());
                 (src, f)
             })
@@ -802,7 +859,7 @@ mod tests {
     #[test]
     fn change_log_never_loses_an_update() {
         struct Live {
-            src: Rc<Source>,
+            src: Source,
             readers: Vec<Pin<Box<Ready>>>,
             writers: Vec<Pin<Box<Ready>>>,
         }
@@ -820,12 +877,12 @@ mod tests {
         // (read, write, generation) per fd, built only from drained changes.
         type Shadow = HashMap<i32, (bool, bool, u64)>;
         fn apply(shadow: &mut Shadow, c: InterestChanges) {
-            for (fd, generation) in c.removed {
+            for (fd, generation) in c.removed.into_iter() {
                 if shadow.get(&fd).is_some_and(|e| e.2 == generation) {
                     shadow.remove(&fd);
                 }
             }
-            for u in c.updates {
+            for u in c.updates.into_iter() {
                 match (u.read || u.write, shadow.get(&u.fd).copied()) {
                     (true, Some((_, _, g))) if g > u.generation => {} // a newer source owns the fd
                     (true, _) => {
@@ -840,7 +897,7 @@ mod tests {
         }
         fn truth(r: &Reactor, live: &[Live]) -> Shadow {
             let mut out = Shadow::new();
-            for (fd, write) in r.interests() {
+            for (fd, write) in r.interests().into_iter() {
                 let generation = live.iter().find(|l| l.src.fd == fd).map_or(0, |l| l.src.generation);
                 let e = out.entry(fd).or_insert((false, false, generation));
                 if write {
@@ -878,7 +935,7 @@ mod tests {
                         let n = rng.next(live.len());
                         let l = &mut live[n];
                         let dir = rng.next(2);
-                        let mut f = Box::pin(Ready::new(r.clone(), l.src.clone(), if dir == 0 { READ } else { WRITE }));
+                        let mut f = Box::pin(Ready::new(r.clone(), l.src, if dir == 0 { READ } else { WRITE }));
                         if f.as_mut().poll(&mut Context::from_waker(&w)).is_pending() {
                             if dir == 0 { l.readers.push(f) } else { l.writers.push(f) }
                         }

@@ -12,7 +12,7 @@ impl AsyncClient {
     pub fn from_sysconfig_path(factory: Rc<dyn SocketFactory>, path: Option<&str>, rt: Runtime<c_int>) -> Self {
         let mut client = AsyncClient::build(build_sysconfig(path), factory, 53, 53, rt);
         // Upstream init_by_defaults: hosts file first, then DNS.
-        client.lookups = "fb".to_string();
+        client.lookups = String::from("fb");
         if let Some(lookups) = client.config.lookups.clone() {
             client.lookups = lookups;
         }
@@ -138,7 +138,7 @@ impl AsyncClient {
             pending.extend(tcp.into_iter().map(DroppedConn::Tcp));
             pending.extend(udp.into_iter().map(DroppedConn::Udp));
         }
-        self.servers = Rc::new(servers);
+        self.servers = crate::mem::rc(servers);
     }
 
 
@@ -163,7 +163,7 @@ impl AsyncClient {
             local_dev: String::new(),
             shared: ChannelShared::new(),
             plugins: Vec::new(),
-            sortlist: vec![],
+            sortlist: Vec::new(),
             flags: 0,
             ednspsz: EDNS_PACKETSZ as i32,
             maxtimeout: 0,
@@ -172,7 +172,7 @@ impl AsyncClient {
             resolvconf_path: String::new(),
             hosts_path: String::new(),
             udp_max_queries: 0,
-            servers: Rc::new(Vec::new()),
+            servers: crate::mem::rc(Vec::new()),
             // Documented defaults (ares_init_options(3)): a 1-in-10 retry
             // chance with a 5 s minimum delay. They are applied here rather
             // than in `apply_defaults` so they never show up in the optmask.
@@ -196,19 +196,19 @@ impl AsyncClient {
 
     /// Register a query plugin; plugins run in registration order.
     pub(crate) fn add_plugin(&mut self, plugin: impl Plugin + 'static) {
-        self.plugins.push(Rc::new(plugin));
+        self.plugins.push(crate::mem::rc(plugin));
     }
 
     /// The hosts table as a shared `Rc`, lazily loaded once. An empty
     /// `ARES_OPT_HOSTS_FILE` path means the system `/etc/hosts`.
     pub fn hosts(&self) -> Rc<Hosts> {
         let path = if self.hosts_path.is_empty() {
-            "/etc/hosts".to_string()
+            String::from("/etc/hosts")
         } else {
             self.hosts_path.clone()
         };
         self.hosts
-            .get_or_init(|| Rc::new(Hosts::from_path(path).unwrap_or_default()))
+            .get_or_init(|| crate::mem::rc(Hosts::from_path(path).unwrap_or_default()))
             .clone()
     }
 
@@ -448,7 +448,7 @@ impl AsyncClient {
         self.config.nameservers.clear();
         self.config.tcp_ports.clear();
         self.config.scopes.clear();
-        for server in servers {
+        for server in servers.into_iter() {
             self.config.nameservers.push((server.ip, server.udp_port));
             self.config.tcp_ports.push(server.tcp_port);
             self.config.scopes.push(server.scope_id);
@@ -574,6 +574,7 @@ pub(crate) struct SavedOptions<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::vec;
     use std::net::SocketAddr;
 
     struct NoopFactory;
@@ -587,7 +588,7 @@ mod tests {
     }
 
     pub(super) fn noop_factory() -> Rc<dyn SocketFactory> {
-        Rc::new(NoopFactory)
+        crate::mem::rc(NoopFactory)
     }
 
     #[test]
@@ -691,6 +692,7 @@ mod tests {
 #[cfg(test)]
 mod reinit_tests {
     use super::*;
+    use crate::mem::vec;
 
     fn temp_conf(contents: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -708,7 +710,7 @@ mod reinit_tests {
             "nameserver 9.9.9.9\nsearch example.test\nlookup bind files\nsortlist 10.0.0.0/8\noptions ndots:3 attempts:2 timeout:1\n",
         );
         let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53, Runtime::default());
-        client.resolvconf_path = path.to_string_lossy().into_owned();
+        client.resolvconf_path = crate::mem::String::from_utf8_lossy(path.to_string_lossy().as_bytes());
         client.shared.cache.borrow_mut().set_max_ttl(3600);
         let key = CacheKey::new("cached.test", 1, ARES_CLASS_IN, 0, true, false);
         client.shared.cache.borrow_mut().store_names(
@@ -726,7 +728,7 @@ mod reinit_tests {
             client.config.nameservers,
             vec![(IpAddr::from([9, 9, 9, 9]), None)]
         );
-        assert_eq!(client.config.search, vec!["example.test".to_string()]);
+        assert_eq!(client.config.search.as_slice(), &["example.test"]);
         assert_eq!(client.config.options.ndots, 3);
         assert_eq!(client.config.options.attempts, 2);
         assert_eq!(client.config.options.timeout_ms, 1000);
@@ -740,7 +742,7 @@ mod reinit_tests {
     fn reinit_preserves_explicitly_set_servers() {
         let path = temp_conf("nameserver 9.9.9.9\n");
         let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53, Runtime::default());
-        client.resolvconf_path = path.to_string_lossy().into_owned();
+        client.resolvconf_path = crate::mem::String::from_utf8_lossy(path.to_string_lossy().as_bytes());
         client.set_servers(vec![ServerSpec {
             ip: IpAddr::from([8, 8, 4, 4]),
             scope_id: 0,

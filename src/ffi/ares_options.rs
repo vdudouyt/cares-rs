@@ -10,6 +10,7 @@ use crate::core::async_client::DecodedOptions;
 use crate::ffi::channel::ChannelData;
 use crate::ffi::channel::channel_access;
 use crate::ares_socket_t;
+use crate::mem::{String, Vec};
 
 /// Upstream's private sortlist pattern (address + prefix length), mirrored
 /// exactly because `ares_save_options` exposes its layout.
@@ -173,10 +174,10 @@ pub unsafe extern "C" fn ares_init_options(out_channel: *mut Channel, options: *
     };
     match init_options_from(optmask, options, options_supplied) {
         Ok(channeldata) => {
-            let channel = Box::into_raw(Box::new(channeldata));
+            let channel = crate::mem::into_raw(crate::mem::boxed_infallible(channeldata));
             let event_mode = unsafe { (*channel).event_mode.get() };
             if event_mode && !crate::ffi::event_thread::start(channel) {
-                drop(unsafe { Box::from_raw(channel) });
+                unsafe { crate::mem::drop_box(channel) };
                 return crate::ffi::error::ARES_ESERVFAIL;
             }
             unsafe { *out_channel = channel };
@@ -246,7 +247,7 @@ fn init_options_from(
                 Some(
                     domains
                         .iter()
-                        .map(|&p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+                        .map(|&p| String::from_utf8_lossy(unsafe { CStr::from_ptr(p) }.to_bytes()))
                         .collect(),
                 )
             } else {
@@ -258,18 +259,18 @@ fn init_options_from(
             None
         },
         lookups: if optmask & ARES_OPT_LOOKUPS != 0 && !options.lookups.is_null() {
-            Some(unsafe { CStr::from_ptr(options.lookups) }.to_string_lossy().into_owned())
+            Some(String::from_utf8_lossy(unsafe { CStr::from_ptr(options.lookups) }.to_bytes()))
         } else {
             None
         },
         sortlist: decoded_sortlist,
         resolvconf_path: if optmask & ARES_OPT_RESOLVCONF != 0 && !options.resolvconf_path.is_null() {
-            Some(unsafe { CStr::from_ptr(options.resolvconf_path) }.to_string_lossy().into_owned())
+            Some(String::from_utf8_lossy(unsafe { CStr::from_ptr(options.resolvconf_path) }.to_bytes()))
         } else {
             None
         },
         hosts_path: if optmask & ARES_OPT_HOSTS_FILE != 0 && !options.hosts_path.is_null() {
-            Some(unsafe { CStr::from_ptr(options.hosts_path) }.to_string_lossy().into_owned())
+            Some(String::from_utf8_lossy(unsafe { CStr::from_ptr(options.hosts_path) }.to_bytes()))
         } else {
             None
         },

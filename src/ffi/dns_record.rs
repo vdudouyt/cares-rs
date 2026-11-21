@@ -244,7 +244,7 @@ pub unsafe extern "C" fn ares_dns_record_destroy(dnsrec: *mut ares_dns_record_t)
 pub(crate) fn record_into_raw(rec: ares_dns_record_t) -> Result<*mut ares_dns_record_t, crate::core::AresError> {
     // Transfer ownership to the C handle. `ares_dns_record_destroy` restores
     // this Box with the same allocator; no Rust reference escapes this call.
-    // Stable 1.100's Box::into_raw only accepts the global allocator.
+    // Box::into_raw only accepts the global allocator; use our own leak.
     Ok(Box::leak(crate::mem::boxed(rec)?))
 }
 
@@ -730,7 +730,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_bin(
     // Copied out first: `val` may point into this RR's own ABINP cache
     // (get_bin -> set_bin), which the setter frees; no borrow of it may be live
     // across that call.
-    let data = match crate::mem::Vec::copy_from(if len == 0 { &[] } else {
+    let data = match crate::mem::FallibleVec::copy_from(if len == 0 { &[] } else {
         unsafe { std::slice::from_raw_parts(val, len) }
     }) {
         Ok(data) => data,
@@ -753,7 +753,7 @@ pub unsafe extern "C" fn ares_dns_rr_set_opt(
     if rr.is_null() {
         return ARES_EFORMERR;
     }
-    let data = match crate::mem::Vec::copy_from(if val.is_null() || val_len == 0 { &[] } else {
+    let data = match crate::mem::FallibleVec::copy_from(if val.is_null() || val_len == 0 { &[] } else {
         unsafe { std::slice::from_raw_parts(val, val_len) }
     }) {
         Ok(data) => data,
@@ -1127,7 +1127,7 @@ pub unsafe extern "C" fn ares_dns_rr_add_abin(
         return ARES_EFORMERR;
     }
     // Copied out first (see ares_dns_rr_set_bin): `val` may alias this RR's cache.
-    let data = match crate::mem::Vec::copy_from(if len == 0 { &[] } else {
+    let data = match crate::mem::FallibleVec::copy_from(if len == 0 { &[] } else {
         unsafe { std::slice::from_raw_parts(val, len) }
     }) {
         Ok(data) => data,

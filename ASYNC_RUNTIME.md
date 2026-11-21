@@ -206,7 +206,7 @@ still observes its expiry, because it reads the clock on every poll.
 
 ## Composing futures
 
-Wakers are real (`Arc<impl Wake>` per task), so any `std` future combinator
+Wakers are real (a small `RawWaker` reference count per task), so any `std` future combinator
 works. The DNS engine still uses `futures_util::select_biased!` where arm order
 is a correctness concern (timeout-first receive, probe-before-primary race).
 For a straightforward client, `select_biased!` with a `Timer` is a convenient

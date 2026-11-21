@@ -12,10 +12,10 @@
 pub(crate) mod wire;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::mem::HashMap;
 use std::ffi::c_int;
 
-use bytes::BytesMut;
+use crate::mem::ByteBuf;
 
 use self::wire::{CookieVerdict, ServerCookie, EDNS_PACKETSZ};
 use super::{Ctx, Plugin, Reply, Resend, ReceiveVerdict};
@@ -45,17 +45,17 @@ impl AsyncClient {
     }
 
     /// Append the channel's EDNS OPT (ARES_FLAG_EDNS) unless the query has one.
-    pub(crate) fn with_edns(&self, payload: BytesMut) -> Result<BytesMut, AresError> {
+    pub(crate) fn with_edns(&self, payload: ByteBuf) -> Result<ByteBuf, AresError> {
         if wire::has_opt(&payload) {
             return Ok(payload);
         }
         // EDNSPSZ wider than the 16-bit OPT CLASS: rejected before any send.
         let Some(size) = self.edns_udp_size()? else { return Ok(payload) };
-        let mut buf = payload.to_vec();
+        let mut buf = ByteBuf::from_slice(&payload);
         if !wire::append_opt(&mut buf, size) {
             return Err(ARES_EFORMERR.into());
         }
-        Ok(BytesMut::from(buf.as_slice()))
+        Ok(buf)
     }
 }
 
@@ -88,7 +88,7 @@ impl Plugin for EdnsPlugin {
     /// BADCOOKIE retry must pick up the learned server cookie, a TCP upgrade
     /// must strip it. No OPT on the packet → untouched. `ARES_EFORMERR` means
     /// the rewrite would exceed the 16-bit DNS limit.
-    fn on_send(&self, cx: &Ctx, packet: &mut Vec<u8>) -> Result<(), c_int> {
+    fn on_send(&self, cx: &Ctx, packet: &mut crate::mem::ByteBuf) -> Result<(), c_int> {
         if !wire::has_opt(packet) {
             return Ok(());
         }
@@ -117,7 +117,7 @@ impl Plugin for EdnsPlugin {
         }
     }
 
-    fn on_reply(&self, cx: &Ctx, reply: Reply, payload: &mut Vec<u8>) -> Option<Resend> {
+    fn on_reply(&self, cx: &Ctx, reply: Reply, payload: &mut crate::mem::ByteBuf) -> Option<Resend> {
         match reply {
             // BADCOOKIE: re-send with the learned server cookie; persistent
             // BADCOOKIE upgrades to TCP.
@@ -140,7 +140,7 @@ impl Plugin for EdnsPlugin {
 
 /// Set (or remove) the packet's COOKIE option; `ARES_EFORMERR` when the
 /// rewrite would exceed the 16-bit DNS limit.
-fn set_cookie(packet: &mut Vec<u8>, cookie: Option<&[u8]>) -> Result<(), c_int> {
+fn set_cookie(packet: &mut crate::mem::ByteBuf, cookie: Option<&[u8]>) -> Result<(), c_int> {
     if wire::set_cookie_option(packet, cookie) {
         Ok(())
     } else {

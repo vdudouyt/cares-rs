@@ -8,10 +8,11 @@
 
 use std::cell::Cell;
 use std::io;
-use std::rc::Rc;
+use crate::mem::Rc;
 use std::time::Instant;
 
 use crate::async_runtime::reactor::{Reactor, Ready, Source, READ, WRITE};
+use crate::mem::ByteBuf;
 use crate::async_runtime::socket::Socket;
 
 /// The uniform dead-socket error (EOF / hard recv failure).
@@ -22,7 +23,7 @@ pub fn dead() -> io::Error {
 /// A socket registered with the reactor; dropping it deregisters the fd before
 /// the socket itself closes.
 pub struct AsyncSocket {
-    source: Rc<Source>,
+    source: Source,
     reactor: Rc<Reactor>,
     /// Ticker value of the last read attempt, so a same-turn peek
     /// ([`readable_this_turn`](Self::readable_this_turn)) never re-reads a
@@ -34,7 +35,7 @@ pub struct AsyncSocket {
 impl AsyncSocket {
     pub(super) fn new(sock: Rc<dyn Socket>, reactor: &Rc<Reactor>) -> Rc<Self> {
         let source = reactor.insert_io(sock.as_raw_fd());
-        Rc::new(AsyncSocket { source, reactor: reactor.clone(), read_tick: Cell::new(None), sock })
+        crate::mem::rc(AsyncSocket { source, reactor: reactor.clone(), read_tick: Cell::new(None), sock })
     }
 
     pub fn get_ref(&self) -> &dyn Socket {
@@ -43,19 +44,19 @@ impl AsyncSocket {
 
     /// Resolves on the next readable report for this fd.
     pub fn readable(&self) -> Ready {
-        Ready::new(self.reactor.clone(), self.source.clone(), READ)
+        Ready::new(self.reactor.clone(), self.source, READ)
     }
 
     /// Resolves on the next writable report for this fd.
     pub fn writable(&self) -> Ready {
-        Ready::new(self.reactor.clone(), self.source.clone(), WRITE)
+        Ready::new(self.reactor.clone(), self.source, WRITE)
     }
 
     /// The caller reported this fd readable in the current turn and nothing has
     /// read since — the peek for a timeout that expired alongside readiness.
     pub(crate) fn readable_this_turn(&self) -> bool {
         let now = self.reactor.ticker();
-        self.source.tick(READ) == now && self.read_tick.get() != Some(now)
+        self.reactor.source_tick(self.source, READ) == Some(now) && self.read_tick.get() != Some(now)
     }
 
     /// One non-blocking stream read, using the reactor scratch and marking this
@@ -63,7 +64,7 @@ impl AsyncSocket {
     /// `Ok(Some(0))` means EOF; `Ok(Some(n))` appended `n` bytes to `out`.
     /// This is internal DNS-pool plumbing: generic callers use
     /// [`read`](Self::read).
-    pub(crate) fn read_stream(&self, out: &mut Vec<u8>) -> io::Result<Option<usize>> {
+    pub(crate) fn read_stream(&self, out: &mut ByteBuf) -> io::Result<Option<usize>> {
         self.read_tick.set(Some(self.reactor.ticker()));
         self.reactor.with_scratch(|scratch| {
             ensure_scratch(scratch);
@@ -81,12 +82,12 @@ impl AsyncSocket {
     /// One non-blocking datagram read, using the reactor scratch.
     /// `Ok(None)` means `WouldBlock`; `Ok(Some(frame))` is one datagram,
     /// including a valid zero-length one. Internal to the DNS pools.
-    pub(crate) fn read_datagram(&self) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) fn read_datagram(&self) -> io::Result<Option<ByteBuf>> {
         self.read_tick.set(Some(self.reactor.ticker()));
         self.reactor.with_scratch(|scratch| {
             ensure_scratch(scratch);
             match self.sock.recv(scratch) {
-                Ok(n) => Ok(Some(scratch[..n].to_vec())),
+                Ok(n) => Ok(Some(ByteBuf::from_slice(&scratch[..n]))),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
                 Err(e) => Err(e),
             }
@@ -168,7 +169,7 @@ impl Drop for AsyncSocket {
 }
 
 /// Grow the receive scratch to 64 KB on first use.
-fn ensure_scratch(scratch: &mut Vec<u8>) {
+fn ensure_scratch(scratch: &mut ByteBuf) {
     if scratch.is_empty() {
         scratch.resize(65_535, 0);
     }
@@ -203,7 +204,7 @@ mod tests {
     #[test]
     fn readable_this_turn_needs_a_report_and_is_consumed_by_a_read() {
         let r = Reactor::new();
-        let sock = Rc::new(Counting { reads: Cell::new(0) });
+        let sock = crate::mem::rc(Counting { reads: Cell::new(0) });
         let a = AsyncSocket::new(sock.clone(), &r);
         assert!(!a.readable_this_turn(), "no report yet (C1)");
 
@@ -225,7 +226,7 @@ mod tests {
     #[test]
     fn dropping_async_deregisters_its_fd() {
         let r = Reactor::new();
-        let a = AsyncSocket::new(Rc::new(Counting { reads: Cell::new(0) }), &r);
+        let a = AsyncSocket::new(crate::mem::rc(Counting { reads: Cell::new(0) }), &r);
         let mut rd = Box::pin(a.writable());
         let mut cx = Context::from_waker(Waker::noop());
         assert!(rd.as_mut().poll(&mut cx).is_pending());

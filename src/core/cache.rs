@@ -1,7 +1,7 @@
 //! TTL-bounded cache of raw DNS replies keyed by the upstream qcache tuple
 //! (opcode, RD/CD, qname, qtype, qclass), shared by the async engine and reactor.
 
-use std::collections::HashMap;
+use crate::mem::{ByteBuf, HashMap, String, Vec};
 use std::time::{Duration, Instant};
 
 use crate::core::response::ParsedResponse;
@@ -23,7 +23,7 @@ impl CacheKey {
     /// share an entry.
     pub fn new(name: &str, qtype: u16, qclass: u16, opcode: u16, rd: bool, cd: bool) -> Self {
         CacheKey {
-            name: name.strip_suffix('.').unwrap_or(name).to_string(),
+            name: String::from(name.strip_suffix('.').unwrap_or(name)),
             qtype,
             qclass,
             opcode,
@@ -40,7 +40,7 @@ impl CacheKey {
 /// TTL-bounded reply cache. `max_ttl == 0` disables it.
 #[derive(Default)]
 pub struct QueryCache {
-    map: HashMap<CacheKey, (Vec<u8>, Instant)>,
+    map: HashMap<CacheKey, (ByteBuf, Instant)>,
     max_ttl: u32,
 }
 
@@ -59,7 +59,7 @@ impl QueryCache {
         self.map.clear();
     }
 
-    pub fn get(&mut self, key: &CacheKey, now: Instant) -> Option<Vec<u8>> {
+    pub fn get(&mut self, key: &CacheKey, now: Instant) -> Option<ByteBuf> {
         if self.max_ttl == 0 {
             return None;
         }
@@ -86,8 +86,8 @@ impl QueryCache {
         let ttl = std::cmp::min(min_item_ttl, self.max_ttl);
         if ttl > 0 {
             let expires = now + Duration::from_secs(ttl as u64);
-            for name in names {
-                self.map.insert(template.with_name(&name), (buf.to_vec(), expires));
+            for name in names.into_iter() {
+                self.map.insert(template.with_name(&name), (ByteBuf::from_slice(buf), expires));
             }
         }
     }
@@ -97,7 +97,7 @@ impl QueryCache {
     pub fn store_reply(&mut self, request_key: &CacheKey, buf: &[u8], now: Instant) {
         if let Ok(parsed) = ParsedResponse::from_buf(buf) {
             let min_ttl = parsed.answers.iter().map(|a| a.ttl).min().unwrap_or(0);
-            self.store_names(vec![request_key.name.clone()], request_key, min_ttl, buf, now);
+            self.store_names(Vec::from([request_key.name.clone()]), request_key, min_ttl, buf, now);
         }
     }
 }
@@ -105,6 +105,7 @@ impl QueryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::vec;
     use crate::ffi::dns_record::ARES_CLASS_IN;
 
     #[test]
@@ -114,7 +115,7 @@ mod tests {
         let now = Instant::now();
         let key = CacheKey::new("example.com", 1, ARES_CLASS_IN, 0, true, false);
         cache.store_names(vec!["example.com".into()], &key, 60, b"reply", now);
-        assert_eq!(cache.get(&key, now).as_deref(), Some(&b"reply"[..]));
+        assert_eq!(cache.get(&key, now).as_ref().map(|v| v.as_slice()), Some(&b"reply"[..]));
 
         // CHAOS must not hit the IN entry.
         assert!(cache

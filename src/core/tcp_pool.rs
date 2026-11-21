@@ -2,9 +2,9 @@
 //! one `server->tcp_conn`, all queries pipelined).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::mem::{ByteBuf, HashMap, Vec};
 use std::io;
-use std::rc::Rc;
+use crate::mem::Rc;
 use std::task::{Poll, Waker};
 
 use crate::async_runtime::{dead, AsyncSocket};
@@ -19,7 +19,7 @@ pub(crate) fn dns_tag(frame: &[u8]) -> Option<u16> {
 
 /// DNS-over-TCP framing (RFC 1035 §4.2.2): a u16-BE length prefixes each
 /// message. Pops one complete message off a reassembly buffer.
-pub(crate) fn dns_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
+pub(crate) fn dns_frame(rbuf: &mut crate::mem::ByteBuf) -> Option<ByteBuf> {
     if rbuf.len() < 2 {
         return None;
     }
@@ -27,20 +27,22 @@ pub(crate) fn dns_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
     if rbuf.len() < 2 + payload_len {
         return None;
     }
-    let msg = rbuf[2..2 + payload_len].to_vec();
-    rbuf.drain(..2 + payload_len);
+    let msg = ByteBuf::from_slice(&rbuf[2..2 + payload_len]);
+    let remaining = rbuf.len() - (2 + payload_len);
+    rbuf.copy_within(2 + payload_len.., 0);
+    rbuf.truncate(remaining);
     Some(msg)
 }
 
 /// One tag's inbox slot: the routed reply plus the waiting task's waker, so a
 /// sibling drain can wake a future with no fd readiness of its own.
 struct InboxSlot {
-    reply: Option<Vec<u8>>,
+    reply: Option<ByteBuf>,
     waker: Option<Waker>,
 }
 
 impl InboxSlot {
-    fn deliver(&mut self, frame: Vec<u8>) {
+    fn deliver(&mut self, frame: crate::mem::ByteBuf) {
         self.reply = Some(frame);
         self.wake();
     }
@@ -56,7 +58,7 @@ impl InboxSlot {
 /// tag-demuxed inbox every querying future shares.
 pub(crate) struct TcpConn {
     sock: Rc<AsyncSocket>,
-    rbuf: Vec<u8>,
+    rbuf: crate::mem::ByteBuf,
     inbox: HashMap<u16, InboxSlot>,
 }
 
@@ -64,7 +66,7 @@ impl TcpConn {
     /// A fresh shared connection over `sock`, already created and connected by
     /// the caller outside any pool borrow so socket callbacks fire with no cell held.
     pub(crate) fn new(sock: Rc<AsyncSocket>) -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(TcpConn { sock, rbuf: Vec::new(), inbox: HashMap::new() }))
+        crate::mem::rc(RefCell::new(TcpConn { sock, rbuf: ByteBuf::new(), inbox: HashMap::new() }))
     }
 
     /// Open an inbox slot for a query's id. Ids are unique channel-wide
@@ -98,7 +100,7 @@ impl TcpConn {
 
     /// Take a reply a **sibling** already routed into `tag`'s slot (it consumed
     /// the fd's readiness, so this must not read the socket).
-    pub(crate) fn take(&mut self, tag: u16) -> Option<Vec<u8>> {
+    pub(crate) fn take(&mut self, tag: u16) -> Option<ByteBuf> {
         self.inbox.get_mut(&tag).and_then(|slot| slot.reply.take())
     }
 
@@ -108,9 +110,9 @@ impl TcpConn {
     /// Takes the cell rather than `&mut self`: the socket is read with `conn`
     /// unborrowed, since a custom `arecvfrom` may re-enter the channel (and touch
     /// this conn, e.g. a cancel releasing its slots).
-    pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<Vec<u8>>> {
+    pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<crate::mem::ByteBuf>> {
         let sock = conn.borrow().sock.clone();
-        let mut bytes = Vec::new();
+        let mut bytes = ByteBuf::new();
         let alive = match sock.read_stream(&mut bytes) {
             Ok(Some(0)) | Err(_) => false,
             Ok(_) => true,
@@ -222,21 +224,21 @@ mod tests {
 
     #[test]
     fn dns_frame_extraction() {
-        let mut rbuf = vec![0x00, 0x03, 1, 2, 3, 0x00];
-        assert_eq!(dns_frame(&mut rbuf), Some(vec![1, 2, 3]));
-        assert_eq!(rbuf, vec![0x00]); // partial next frame stays buffered
+        let mut rbuf = ByteBuf::from([0x00, 0x03, 1, 2, 3, 0x00]);
+        assert_eq!(dns_frame(&mut rbuf), Some(ByteBuf::from([1, 2, 3])));
+        assert_eq!(rbuf.as_slice(), &[0x00]); // partial next frame stays buffered
         assert_eq!(dns_frame(&mut rbuf), None);
         rbuf.push(0x02);
         assert_eq!(dns_frame(&mut rbuf), None); // length known, payload missing
         rbuf.extend_from_slice(&[9, 8]);
-        assert_eq!(dns_frame(&mut rbuf), Some(vec![9, 8]));
+        assert_eq!(dns_frame(&mut rbuf), Some(ByteBuf::from([9, 8])));
         assert!(rbuf.is_empty());
     }
 
     /// `release` frees only its own query's slot.
     #[test]
     fn release_frees_only_its_slot() {
-        let mut tc = TcpConn { sock: Runtime::new().register_socket(Rc::new(DummySock)), rbuf: Vec::new(), inbox: HashMap::new() };
+        let mut tc = TcpConn { sock: Runtime::new().register_socket(crate::mem::rc(DummySock)), rbuf: ByteBuf::new(), inbox: HashMap::new() };
         tc.register_query(7);
         tc.register_query(9);
         assert!(tc.has_waiter(7) && tc.has_waiter(9));

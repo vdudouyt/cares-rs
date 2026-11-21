@@ -9,7 +9,8 @@ pub mod error;
 mod offset_of;
 
 use std::ffi::{ c_int, c_uint, c_void, c_char };
-use std::ffi::{ CString, CStr };
+use std::ffi::CStr;
+use crate::mem::CString;
 use std::net::IpAddr;
 use std::cmp::min;
 use std::time::Instant;

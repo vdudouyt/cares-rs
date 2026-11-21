@@ -9,10 +9,8 @@
 //! thread, under the recursive lock (destroy inside one is unsupported).
 
 use super::*;
-use crate::ffi::event_backend::{Backend, WakePipe};
+use crate::ffi::event_backend::{Backend, WakePipe, WakeSender};
 use crate::ffi::channel::{channel_access, ReentrantMutex};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -21,8 +19,7 @@ const EVENT_MAX_WAIT_MS: u128 = 1000;
 
 /// A running event thread, owned by its channel (`ChannelData::event`).
 pub(crate) struct EventThread {
-    stop: Arc<AtomicBool>,
-    wake: Arc<WakePipe>,
+    wake: WakeSender,
     join: JoinHandle<()>,
 }
 
@@ -37,38 +34,35 @@ impl EventThread {
 /// the thread only holds the raw address as `usize`, so `ChannelData` need not
 /// be `Send`. False if the OS refuses a pipe or a thread.
 pub(crate) fn start(channel: *mut ChannelData) -> bool {
-    let Some(wake) = WakePipe::new().map(Arc::new) else { return false };
-    let stop = Arc::new(AtomicBool::new(false));
-    // SAFETY: the caller passes a freshly boxed, live channel; its lock Arc
+    let Some((reader, wake)) = WakePipe::new() else { return false };
+    // SAFETY: the caller passes a freshly boxed, live channel; its lock
     // outlives the thread (`stop` joins before the channel is freed).
-    let lock: &'static ReentrantMutex = unsafe { &*((*channel).lock.as_ref() as *const ReentrantMutex) };
+    let lock: &'static ReentrantMutex = unsafe { &(*channel).lock };
     let raw = channel as usize;
     // SAFETY: as above; done before the thread exists, so nothing races it.
     let evsys = unsafe { (*channel).begin_event_mode() };
-    let (thread_stop, thread_wake) = (stop.clone(), wake.clone());
     let spawned = std::thread::Builder::new()
-        .name("cares-event".to_string())
-        .spawn(move || event_thread_main(raw, evsys, thread_stop, lock, thread_wake));
+        .spawn(move || event_thread_main(raw, evsys, lock, reader));
     let Ok(join) = spawned else { return false };
     // Stored under the channel lock: the thread may already be running a turn.
     let _guard = lock.lock();
     // SAFETY: as above; the lock excludes the thread's access to the channel.
-    unsafe { *(*channel).event.borrow_mut() = Some(EventThread { stop, wake, join }) };
+    unsafe { *(*channel).event.borrow_mut() = Some(EventThread { wake, join }) };
     true
 }
 
 /// Stop and join `thread`. The caller must not hold the channel lock, which
 /// the thread needs to finish its current turn.
 pub(crate) fn stop(thread: EventThread) {
-    thread.stop.store(true, Ordering::Release);
-    thread.wake.wake();
-    let _ = thread.join.join();
+    let EventThread { wake, join } = thread;
+    drop(wake);
+    let _ = join.join();
 }
 
-fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: &'static ReentrantMutex, wake: Arc<WakePipe>) {
+fn event_thread_main(channel: usize, evsys: c_int, lock: &'static ReentrantMutex, wake: WakePipe) {
     let mut backend = Backend::new(evsys);
     loop {
-        if stop.load(Ordering::Acquire) {
+        if wake.closed() {
             break;
         }
 
@@ -78,7 +72,7 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
         // joins this thread.
         let next_timeout = {
             let _guard = lock.lock();
-            if stop.load(Ordering::Acquire) {
+            if wake.closed() {
                 break;
             }
             // SAFETY: the channel is alive for the lifetime of this thread and
@@ -95,14 +89,14 @@ fn event_thread_main(channel: usize, evsys: c_int, stop: Arc<AtomicBool>, lock: 
         // A timeout/error just means no fd is ready; timeouts are still
         // processed below, so no extra sleep is needed.
         let ready = backend.wait(&wake, timeout_ms);
-        if ready.woke {
-            wake.drain();
+        if ready.woke && wake.closed() {
+            break;
         }
         let events = ready.events;
 
         {
             let _guard = lock.lock();
-            if stop.load(Ordering::Acquire) {
+            if wake.closed() {
                 break;
             }
             // SAFETY: as above; the lock excludes all other channel access.

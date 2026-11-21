@@ -4,6 +4,7 @@ use crate::core::AresError;
 use std::net::IpAddr;
 
 use crate::core::packets::AddrRecord;
+use crate::mem::Vec;
 use crate::ffi::error::ARES_EBADSTR;
 
 #[derive(Clone, Debug)]
@@ -149,6 +150,7 @@ pub(crate) fn parse_sortlist(s: &str) -> Result<Vec<SortlistEntry>, AresError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::{vec, String};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn rec(ip: IpAddr) -> AddrRecord {
@@ -176,8 +178,8 @@ mod tests {
             rec(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
         ];
         apply_sortlist(&list, &mut items);
-        let got: Vec<_> = items.iter().map(|r| r.ip.to_string()).collect();
-        assert_eq!(got, ["2.2.2.2", "3.3.3.3", "9.9.9.9", "8.8.8.8"]);
+        let got: Vec<_> = items.iter().map(|r| String::from_utf8_lossy(r.ip.to_string().as_bytes())).collect();
+        assert_eq!(got.as_slice(), &["2.2.2.2", "3.3.3.3", "9.9.9.9", "8.8.8.8"]);
     }
 
     #[test]
@@ -208,7 +210,7 @@ mod tests {
             rec(IpAddr::V6("2001:0:0:1::1".parse().unwrap())),
         ];
         sort_addrinfo(&mut items);
-        let got: Vec<_> = items.iter().map(|r| r.ip.to_string()).collect();
+        let got: Vec<_> = items.iter().map(|r| String::from_utf8_lossy(r.ip.to_string().as_bytes())).collect();
         assert_eq!(got[0], "::1");
         assert_eq!(got[1], "9.9.9.9");
         assert_eq!(got[2], "2002::1");

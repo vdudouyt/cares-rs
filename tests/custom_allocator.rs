@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 
 use cares::dns_record::*;
 use cares::error::ARES_ENOMEM;
-use cares::{ares_library_cleanup, ares_library_init_mem, ARES_SUCCESS};
+use cares::{
+    ares_destroy, ares_init, ares_library_cleanup, ares_library_init_mem, ares_set_servers_csv,
+    ARES_SUCCESS,
+};
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -109,6 +112,15 @@ fn dns_record_ownership_and_exhaustive_allocation_failures() {
 
     arm(usize::MAX, false);
     assert_eq!(unsafe { ares_dns_parse(wire.as_ptr(), wire.len(), 0, &mut rec) }, ARES_SUCCESS);
+    // Every channel-owned container (config strings, server list, runtime
+    // tables and shared pointers) must use the registered callbacks too.
+    let before_channel = LIVE.load(SeqCst);
+    let mut channel = ptr::null_mut();
+    assert_eq!(unsafe { ares_init(&mut channel) }, ARES_SUCCESS);
+    assert!(LIVE.load(SeqCst) > before_channel, "channel storage must use the callbacks");
+    assert_eq!(unsafe { ares_set_servers_csv(channel, c"8.8.8.8,1.1.1.1".as_ptr()) }, ARES_SUCCESS);
+    unsafe { ares_destroy(channel) };
+    assert_eq!(LIVE.load(SeqCst), before_channel, "channel storage leaked");
     // Allocation identity survives cleanup restoring the default callbacks.
     ares_library_cleanup();
     unsafe { ares_dns_record_destroy(rec) };

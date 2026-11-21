@@ -1,6 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
+use crate::mem::{join, String, Vec};
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SysConfig {
     pub nameservers: Vec<(IpAddr, Option<u16>)>,
@@ -53,11 +55,11 @@ impl FromStr for SysConfig {
             let mut parts = line.split_whitespace();
             let Some(keyword) = parts.next() else { continue };
             let rest = parts.collect::<Vec<_>>();
-            let [arg1, ..] = rest[..] else { return Err(ParseError::MissingValue { keyword: keyword.into() })  };
+            let [arg1, ..] = rest[..] else { return Err(ParseError::MissingValue { keyword: String::from(keyword) })  };
 
             match keyword {
                 "nameserver" => {
-                    for tok in rest {
+                    for tok in &rest {
                         // Skip invalid tokens rather than failing on a malformed
                         // resolv.conf (matches upstream).
                         if let Some(ns) = parse_ns_addr(tok) {
@@ -67,16 +69,16 @@ impl FromStr for SysConfig {
                         }
                     }
                 }
-                "domain" => conf.domain = Some(arg1.to_string()),
-                "search" => conf.search.extend(rest.iter().map(|s| s.to_string())),
+                "domain" => conf.domain = Some(String::from(arg1)),
+                "search" => conf.search.extend(rest.iter().map(|s| String::from(*s))),
                 "lookup" | "hostresorder" => {
                     let lookups = parse_lookups(&rest);
                     if !lookups.is_empty() {
                         conf.lookups = Some(lookups);
                     }
                 }
-                "sortlist" => conf.sortlist = Some(rest.join(" ")),
-                "options" => parse_options_into(&mut conf.options, &rest.join(" "))?,
+                "sortlist" => conf.sortlist = Some(join(&rest, " ")),
+                "options" => parse_options_into(&mut conf.options, &join(&rest, " "))?,
                 _ => continue,
             }
         }
@@ -90,10 +92,12 @@ impl FromStr for SysConfig {
 fn parse_lookups(tokens: &[&str]) -> String {
     let mut out = String::new();
     for token in tokens {
-        let ch = match token.to_ascii_lowercase().as_str() {
-            "dns" | "bind" | "resolv" | "resolve" => Some('b'),
-            "files" | "file" | "local" => Some('f'),
-            _ => None,
+        let ch = if ["dns", "bind", "resolv", "resolve"].iter().any(|v| token.eq_ignore_ascii_case(v)) {
+            Some('b')
+        } else if ["files", "file", "local"].iter().any(|v| token.eq_ignore_ascii_case(v)) {
+            Some('f')
+        } else {
+            None
         };
         if let Some(ch) = ch {
             if !out.contains(ch) {
@@ -129,8 +133,8 @@ fn parse_options_into(opts: &mut SysConfigOptions, src: &str) -> Result<(), Pars
 
 fn take_num_arg<T: FromStr>(keyword: &str, val: &str) -> Result<T, ParseError> {
     match val {
-        "" => Err(ParseError::MissingValue { keyword: keyword.into() }),
-        _ => val.parse().map_err(|_| ParseError::InvalidNumber { keyword: keyword.into(), value: val.into() }),
+        "" => Err(ParseError::MissingValue { keyword: String::from(keyword) }),
+        _ => val.parse().map_err(|_| ParseError::InvalidNumber { keyword: String::from(keyword), value: String::from(val) }),
     }
     
 }
@@ -139,7 +143,7 @@ pub fn apply_env_overrides(config: &mut SysConfig) {
     if let Ok(val) = std::env::var("LOCALDOMAIN") {
         let val = val.trim();
         if !val.is_empty() {
-            config.search = val.split_whitespace().map(|s| s.to_string()).collect();
+            config.search = val.split_whitespace().map(String::from).collect();
             config.domain = config.search.first().cloned();
         }
     }
@@ -219,7 +223,7 @@ mod tests {
         "#;
         let conf: SysConfig = input.parse().unwrap();
         assert_eq!(conf.nameservers.len(), 3);
-        assert_eq!(conf.search, vec!["corp.local", "example.org"]);
+        assert_eq!(conf.search.as_slice(), &["corp.local", "example.org"]);
         assert_eq!(conf.options.ndots, 2);
         assert_eq!(conf.options.attempts, 4);
         assert_eq!(conf.options.timeout_ms, 3000);

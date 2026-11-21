@@ -1,8 +1,10 @@
-use std::borrow::Cow;
 use arrayvec::ArrayVec;
 use std::net::IpAddr;
+use std::ops::Deref;
+
+use crate::mem::{CString, String};
 #[cfg(test)]
-use bytes::BufMut;
+use crate::mem::BufMut;
 
 /// DNS label segments per name ("www.example.com" = 3). IPv6 reverse DNS
 /// (ip6.arpa) needs up to 34.
@@ -172,7 +174,7 @@ impl<'a> DnsLabel<'a> {
 
         Some(DnsLabel { name, offset })
     }
-    pub fn build_string(&self, main_buf: &[u8]) -> Option<String> {
+    pub(crate) fn build_string(&self, main_buf: &[u8]) -> Option<String> {
         let mut result = String::new();
         self.write_to(main_buf, &mut result).ok()?;
         Some(result)
@@ -196,18 +198,18 @@ impl<'a> DnsLabel<'a> {
     }
 
     pub(crate) fn try_cstring(&self, packet: &[u8]) -> Result<crate::mem::CString, i32> {
-        let mut out = crate::mem::String::new();
+        let mut out = crate::mem::FallibleString::new();
         self.write_to(packet, &mut out).map_err(|e| e.code())?;
         crate::mem::CString::from_string(out).map_err(|e| e.code())
     }
     /// `build_string` as a C string; None when the name has an embedded NUL.
-    pub fn build_cstring(&self, main_buf: &[u8]) -> Option<std::ffi::CString> {
-        std::ffi::CString::new(self.build_string(main_buf)?).ok()
+    pub(crate) fn build_cstring(&self, main_buf: &[u8]) -> Option<CString> {
+        CString::new(self.build_string(main_buf)?.as_bytes()).ok()
     }
 }
 
-impl RRParser<'_> for std::ffi::CString {
-    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<std::ffi::CString> {
+impl RRParser<'_> for CString {
+    fn parse_rr(answer: &DnsAnswer<'_>) -> Option<CString> {
         let mut buf = SliceBuf::new(answer.data);
         let name = DnsLabel::parse(&mut buf)?;
         name.build_cstring(answer.data)
@@ -326,10 +328,26 @@ impl<'a> Parser<'a> for CaaReply<'a> {
     }
 }
 
+/// A TXT value: the common single segment borrows the packet, while joined
+/// segments own callback-backed storage.
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)] // Constructed by the legacy TXT parser.
+pub enum TxtData<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+}
+
+impl Deref for TxtData<'_> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self { Self::Borrowed(text) => text, Self::Owned(text) => text }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 #[allow(dead_code)] // public parser type; the C TXT path consumes owned records.
 pub struct TxtReply<'a> {
-    pub txt: Cow<'a, str>,
+    pub txt: TxtData<'a>,
     pub length: usize,
 }
 
@@ -339,37 +357,25 @@ impl<'a> Parser<'a> for TxtReply<'a> {
         let first = parse_prefixed_str(buf)?;
         if buf.remaining() == 0 {
             let length = first.len();
-            return Some(TxtReply { txt: Cow::Borrowed(first), length });
+            return Some(TxtReply { txt: TxtData::Borrowed(first), length });
         }
         let mut joined = String::from(first);
         while buf.remaining() > 0 {
             joined.push_str(parse_prefixed_str(buf)?);
         }
         let length = joined.len();
-        Some(TxtReply { txt: Cow::Owned(joined), length })
+        Some(TxtReply { txt: TxtData::Owned(joined), length })
     }
 }
 
 #[derive(Debug, PartialEq)]
+#[allow(dead_code)] // Used by the C TXT reply builder.
 pub struct TxtReplyExt<'a> {
     pub txt: &'a str,
     pub length: usize,
     pub record_start: bool,
 }
 
-impl<'a> Parser<'a> for Vec<TxtReplyExt<'a>> {
-    fn parse(buf: &mut SliceBuf<'a>) -> Option<Vec<TxtReplyExt<'a>>> {
-        let mut record_start = true;
-        let mut ret: Vec<TxtReplyExt<'a>> = vec![];
-        while buf.remaining() > 0 {
-            let txt = parse_prefixed_str(buf)?;
-            let length = txt.len();
-            ret.push(TxtReplyExt { txt, length, record_start });
-            record_start = false;
-        }
-        Some(ret)
-    }
-}
 
 impl<'a, T: Parser<'a>> RRParser<'a> for T {
     fn parse_rr(answer: &DnsAnswer<'a>) -> Option<T> {
@@ -556,7 +562,7 @@ mod tests {
             nscount: 0,
             arcount: 0
         };
-        let mut vec: Vec<u8> = vec![];
+        let mut vec = crate::mem::ByteBuf::new();
         header.write(&mut vec);
         let expected = b"\x8a\x70\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00";
         assert_eq!(vec, expected);
@@ -635,7 +641,7 @@ mod tests {
     #[test]
     fn test_write_dns_query() {
         let question = DnsQuery::new("google.com", 1, 1);
-        let mut vec: Vec<u8> = vec![];
+        let mut vec = crate::mem::ByteBuf::new();
         question.write(&mut vec);
         assert_eq!(vec, b"\x06\x67\x6f\x6f\x67\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01");
     }
@@ -682,7 +688,7 @@ mod tests {
             queries: vec![query],
             answers: vec![],
         };
-        let mut vec: Vec<u8> = vec![];
+        let mut vec = crate::mem::ByteBuf::new();
         frame.write(&mut vec);
         assert_eq!(&vec[..], b"\x8a\x70\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06\x67\x6f\x6f\x67\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01");
     }
@@ -697,7 +703,7 @@ mod tests {
     fn test_parse_txt_response() {
         let buf: Vec<u8> = b"\x04abcd".to_vec();
         let mut cur = SliceBuf::new(&buf);
-        let expected = TxtReply { length: 4, txt: Cow::Borrowed("abcd") };
+        let expected = TxtReply { length: 4, txt: TxtData::Borrowed("abcd") };
         assert_eq!(TxtReply::parse(&mut cur), Some(expected));
     }
 }

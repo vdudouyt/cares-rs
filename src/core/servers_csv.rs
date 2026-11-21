@@ -1,6 +1,8 @@
 use std::io::Read;
 use std::net::IpAddr;
+
 use crate::core::sysconfig::parse_ns_addr;
+use crate::mem::{ByteBuf, String, Vec};
 
 /// One parsed CSV server entry. `iface` is the optional `%<interface>` scope
 /// specifier for a link-local IPv6 address (c-ares resolves it to a scope id
@@ -12,15 +14,24 @@ pub struct ParsedServer {
     pub iface: Option<String>,
 }
 
+fn read_text(r: &mut impl Read) -> Option<String> {
+    let mut bytes = ByteBuf::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = r.read(&mut chunk).ok()?;
+        if n == 0 { break; }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    std::str::from_utf8(&bytes).ok().map(String::from)
+}
+
 /// Parse a comma/newline/space-separated server list; `[IPv6]:port` and bare
 /// addresses are accepted, and a missing port defaults to 53.
 // Kept for callers that do not need scopes; the ffi CSV path uses the
 // scope-aware variant below.
 #[allow(dead_code)]
 pub fn parse_from_reader<R: Read>(mut r: R) -> Option<Vec<(IpAddr, Option<u16>)>> {
-    let mut buf = Vec::new();
-    r.read_to_end(&mut buf).ok()?;
-    let s = String::from_utf8(buf).ok()?;
+    let s = read_text(&mut r)?;
     parse_servers_str(&s)
 }
 
@@ -43,9 +54,7 @@ pub fn parse_servers_str(s: &str) -> Option<Vec<(IpAddr, Option<u16>)>> {
 /// Scope-aware variant of [`parse_from_reader`]: preserves `%<interface>`
 /// suffixes instead of skipping those entries.
 pub fn parse_from_reader_scoped<R: Read>(mut r: R) -> Option<Vec<ParsedServer>> {
-    let mut buf = Vec::new();
-    r.read_to_end(&mut buf).ok()?;
-    let s = String::from_utf8(buf).ok()?;
+    let s = read_text(&mut r)?;
     parse_servers_scoped_str(&s)
 }
 
@@ -66,19 +75,22 @@ pub fn parse_servers_scoped_str(s: &str) -> Option<Vec<ParsedServer>> {
 /// brackets while `[fe80::1]:5353%lo` and `fe80::1%lo` carry it at the end.
 fn parse_scoped_server(item: &str) -> Option<ParsedServer> {
     let (addr_text, iface) = match item.find('%') {
-        None => (item.to_string(), None),
+        None => (String::from(item), None),
         Some(pct) => {
             if let Some(close) = item.find(']') {
                 if item.starts_with('[') && pct < close {
                     let iface = &item[pct + 1..close];
                     // Rebuild "[ip]" plus anything after the closing bracket.
-                    let addr_text = format!("[{}]{}", &item[1..pct], &item[close + 1..]);
-                    (addr_text, Some(iface.to_string()))
+                    let mut addr_text = String::from("[");
+                    addr_text.push_str(&item[1..pct]);
+                    addr_text.push_str("]");
+                    addr_text.push_str(&item[close + 1..]);
+                    (addr_text, Some(String::from(iface)))
                 } else {
-                    (item[..pct].to_string(), Some(item[pct + 1..].to_string()))
+                    (String::from(&item[..pct]), Some(String::from(&item[pct + 1..])))
                 }
             } else {
-                (item[..pct].to_string(), Some(item[pct + 1..].to_string()))
+                (String::from(&item[..pct]), Some(String::from(&item[pct + 1..])))
             }
         }
     };

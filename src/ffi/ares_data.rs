@@ -435,7 +435,7 @@ mod tests {
     impl Default for AresTxtReply {
         fn default() -> Self {
             // Production path keeps txt at `length + 1` bytes to match the Drop size.
-            TxtReply { txt: std::borrow::Cow::Borrowed("default"), length: 7 }
+            TxtReply { txt: crate::core::packets::TxtData::Borrowed("default"), length: 7 }
                 .into_ares_data(&[])
                 .unwrap()
         }
@@ -482,7 +482,7 @@ mod tests {
     // read past the allocation.
     #[test]
     fn txt_reply_is_nul_terminated() {
-        let data = TxtReply { txt: std::borrow::Cow::Borrowed("abc"), length: 3 }
+        let data = TxtReply { txt: crate::core::packets::TxtData::Borrowed("abc"), length: 3 }
             .into_ares_data(&[]).unwrap();
         assert_eq!(data.length, 3, "length excludes the NUL terminator");
         unsafe {
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn empty_txt_is_nul_terminated() {
         // length 0 -> a 1-byte allocation holding just the terminator.
-        let data = TxtReply { txt: std::borrow::Cow::Borrowed(""), length: 0 }
+        let data = TxtReply { txt: crate::core::packets::TxtData::Borrowed(""), length: 0 }
             .into_ares_data(&[]).unwrap();
         assert_eq!(data.length, 0);
         unsafe { assert_eq!(*data.txt.add(0), 0); }

@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::task::Context;
-use crate::mem::{ReadyFlag, Task, Vec};
+use crate::mem::{FallibleVec, ReadyFlag, Task};
 
 struct Slot<E> {
     /// `None` while the task is being polled: [`Executor::poll`] moves it onto
@@ -34,7 +34,7 @@ pub(super) struct Executor<E = ()> {
 }
 
 struct ExecutorInner<E> {
-    slots: Vec<Option<Slot<E>>>,
+    slots: FallibleVec<Option<Slot<E>>>,
     next_ready: usize,
     next_gen: u32,
 }
@@ -47,7 +47,7 @@ impl<E> Default for Executor<E> {
 
 impl<E> Default for ExecutorInner<E> {
     fn default() -> Self {
-        ExecutorInner { slots: Vec::new(), next_ready: 0, next_gen: 0 }
+        ExecutorInner { slots: FallibleVec::new(), next_ready: 0, next_gen: 0 }
     }
 }
 

@@ -4,6 +4,8 @@
 use std::time::Instant;
 
 use rand::Rng;
+use crate::mem::ByteBuf;
+use arrayvec::ArrayVec;
 
 /// Default advertised UDP payload size.
 pub(crate) const EDNS_PACKETSZ: u16 = 1280;
@@ -128,7 +130,7 @@ pub(crate) fn has_opt(buf: &[u8]) -> bool {
 
 /// Append an empty OPT pseudo-RR (root name, CLASS = `udp_size`, TTL 0) as the
 /// last additional record; false if malformed, already has an OPT, or ARCOUNT is full.
-pub(crate) fn append_opt(buf: &mut Vec<u8>, udp_size: u16) -> bool {
+pub(crate) fn append_opt(buf: &mut ByteBuf, udp_size: u16) -> bool {
     // Header + root name + TYPE/CLASS/TTL/RDLENGTH = 11 bytes; reject a
     // near-limit packet up front so it cannot be truncated by the 16-bit length.
     const OPT_WIRE_LEN: usize = 11;
@@ -151,7 +153,7 @@ pub(crate) fn append_opt(buf: &mut Vec<u8>, udp_size: u16) -> bool {
 
 /// Remove the OPT pseudo-RR (FORMERR-with-EDNS fallback), keeping other
 /// additional records and fixing ARCOUNT.
-pub(crate) fn strip_opt(buf: &mut Vec<u8>) -> bool {
+pub(crate) fn strip_opt(buf: &mut ByteBuf) -> bool {
     let Some(opt) = find_opt(buf) else { return false };
     let Some(arcount) = header_u16(buf, 10) else { return false };
     if arcount == 0 {
@@ -160,7 +162,7 @@ pub(crate) fn strip_opt(buf: &mut Vec<u8>) -> bool {
     if opt.rr_start > opt.rr_end || opt.rr_end > buf.len() {
         return false;
     }
-    buf.drain(opt.rr_start..opt.rr_end);
+    replace_range(buf, opt.rr_start..opt.rr_end, &[]);
     buf[10..12].copy_from_slice(&(arcount - 1).to_be_bytes());
     true
 }
@@ -196,11 +198,11 @@ pub(crate) fn cookie_option(buf: &[u8]) -> Option<&[u8]> {
 /// Replace (or remove, when `cookie` is `None`) the COOKIE option in an
 /// existing OPT, preserving all other options. A missing OPT is a no-op;
 /// malformed lists or a message over the 16-bit length limit return false.
-pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) -> bool {
+pub(crate) fn set_cookie_option(buf: &mut ByteBuf, cookie: Option<&[u8]>) -> bool {
     let Some(opt) = find_opt(buf) else { return true };
     let Some(old_rdata) = opt.rdata(buf) else { return false };
 
-    let mut new_rdata: Vec<u8> = Vec::with_capacity(old_rdata.len() + cookie.map_or(0, |c| 4 + c.len()));
+    let mut new_rdata = ByteBuf::with_capacity(old_rdata.len() + cookie.map_or(0, |c| 4 + c.len()));
     let mut rest = old_rdata;
     while !rest.is_empty() {
         if rest.len() < 4 {
@@ -243,8 +245,24 @@ pub(crate) fn set_cookie_option(buf: &mut Vec<u8>, cookie: Option<&[u8]>) -> boo
     let rdlen_offset = opt.rdata_offset.wrapping_sub(2);
     let Some(slot) = buf.get_mut(rdlen_offset..rdlen_offset + 2) else { return false };
     slot.copy_from_slice(&(new_rdata.len() as u16).to_be_bytes());
-    buf.splice(opt.rdata_offset..opt.rdata_offset + opt.rdata_len, new_rdata);
+    replace_range(buf, opt.rdata_offset..opt.rdata_offset + opt.rdata_len, &new_rdata);
     true
+}
+
+/// Replace `range` with `data`, preserving order. The allocator-backed Vec
+/// cannot use `splice`/`drain` on stable Rust.
+fn replace_range(buf: &mut ByteBuf, range: std::ops::Range<usize>, data: &[u8]) {
+    let old_len = buf.len();
+    let removed = range.len();
+    let new_len = old_len - removed + data.len();
+    if data.len() > removed {
+        buf.resize(new_len, 0);
+    }
+    if data.len() != removed {
+        buf.copy_within(range.end..old_len, range.start + data.len());
+    }
+    buf[range.start..range.start + data.len()].copy_from_slice(data);
+    buf.truncate(new_len);
 }
 
 /// Cookie support state for one server (upstream `ares_cookie_t`, minus timers).
@@ -262,7 +280,7 @@ pub(crate) enum CookieState {
 pub(crate) struct ServerCookie {
     pub state: CookieState,
     client: [u8; 8],
-    server: Vec<u8>,
+    server: ArrayVec<u8, 32>,
     client_ts: Option<Instant>,
 }
 
@@ -281,30 +299,28 @@ impl ServerCookie {
     /// COOKIE value for this query, advancing INITIAL → GENERATED and regenerating
     /// the client cookie only from a cleared state. `None` means do not send a
     /// cookie (UNSUPPORTED).
-    pub(crate) fn cookie_for_query(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn cookie_for_query(&mut self) -> Option<ArrayVec<u8, 40>> {
         match self.state {
-            CookieState::Unsupported => None,
+            CookieState::Unsupported => return None,
             CookieState::Initial => {
                 self.client = rand::thread_rng().gen::<[u8; 8]>();
                 self.client_ts = Some(Instant::now());
                 self.server.clear();
                 self.state = CookieState::Generated;
-                Some(self.client.to_vec())
             }
-            CookieState::Generated | CookieState::Supported => {
-                let mut cookie = self.client.to_vec();
-                cookie.extend_from_slice(&self.server);
-                Some(cookie)
-            }
+            CookieState::Generated | CookieState::Supported => {}
         }
+        let mut cookie = ArrayVec::new();
+        cookie.try_extend_from_slice(&self.client).ok()?;
+        cookie.try_extend_from_slice(&self.server).ok()?;
+        Some(cookie)
     }
 
     fn store_server(&mut self, cookie: &[u8]) {
+        let Some(server) = cookie.get(8..) else { return };
+        let Ok(server) = ArrayVec::try_from(server) else { return };
         self.state = CookieState::Supported;
-        self.server.clear();
-        if cookie.len() > 8 {
-            self.server.extend_from_slice(&cookie[8..]);
-        }
+        self.server = server;
     }
 
     fn clear(&mut self) {
@@ -381,11 +397,11 @@ impl ServerCookie {
 mod tests {
     use super::*;
 
-    fn query() -> Vec<u8> {
-        let mut q = vec![
+    fn query() -> ByteBuf {
+        let mut q = ByteBuf::from([
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
-        ];
+        ]);
         assert!(append_opt(&mut q, 1280));
         q
     }
@@ -405,7 +421,7 @@ mod tests {
     fn cookie_append_checks_total_message_length() {
         // Header with one empty OPT at offset 12 plus padding, near the 16-bit limit.
         let make = |len: usize| {
-            let mut buf = vec![0u8; len];
+            let mut buf = ByteBuf::from_slice(&vec![0u8; len]);
             buf[10..12].copy_from_slice(&1u16.to_be_bytes());
             buf[12] = 0;
             buf[13..15].copy_from_slice(&41u16.to_be_bytes());
@@ -428,13 +444,13 @@ mod tests {
     fn append_opt_rejects_messages_without_room_for_the_whole_rr() {
         // 65531 bytes + the 11-byte OPT overflows the 16-bit message length, so it
         // must be rejected without mutating the buffer.
-        let mut buf = vec![0u8; 65531];
+        let mut buf = ByteBuf::from_slice(&vec![0u8; 65531]);
         assert!(!append_opt(&mut buf, 1280));
         assert_eq!(buf.len(), 65531);
         assert_eq!(header_u16(&buf, 10), Some(0));
 
         // Exactly 65535 bytes is still representable.
-        let mut fits = vec![0u8; 65524];
+        let mut fits = ByteBuf::from_slice(&vec![0u8; 65524]);
         assert!(append_opt(&mut fits, 1280));
         assert_eq!(fits.len(), 65535);
         assert_eq!(header_u16(&fits, 10), Some(1));
@@ -443,11 +459,11 @@ mod tests {
     #[test]
     fn strip_preserves_other_additions() {
         // One non-OPT additional (root-named TXT RR) before OPT.
-        let mut q = vec![
+        let mut q = ByteBuf::from([
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
             7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
             0, 0, 16, 0, 1, 0, 0, 0, 0, 0, 1, 0xAA,
-        ];
+        ]);
         assert!(append_opt(&mut q, 1232));
         assert!(strip_opt(&mut q));
         assert_eq!(header_u16(&q, 10), Some(1));
@@ -459,9 +475,9 @@ mod tests {
         let mut q = query();
         let opt = find_opt(&q).expect("opt");
         let custom = [0x00, 0x03, 0x00, 0x02, 0xAA, 0xBB];
-        let mut rdata = custom.to_vec();
+        let mut rdata = ByteBuf::from_slice(&custom);
         rdata.extend_from_slice(&[0x00, 0x0A, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8]);
-        q.splice(opt.rdata_offset..opt.rdata_offset + opt.rdata_len, rdata);
+        replace_range(&mut q, opt.rdata_offset..opt.rdata_offset + opt.rdata_len, &rdata);
         let rdlen_off = opt.rdata_offset - 2;
         q[rdlen_off..rdlen_off + 2].copy_from_slice(&18u16.to_be_bytes());
 
@@ -477,7 +493,7 @@ mod tests {
     #[test]
     fn malformed_messages_do_not_panic() {
         for len in 0..40 {
-            let mut buf = vec![0xff; len];
+            let mut buf = ByteBuf::from_slice(&vec![0xff; len]);
             let _ = find_opt(&buf);
             let _ = has_opt(&buf);
             let _ = cookie_option(&buf);
@@ -512,8 +528,8 @@ mod tests {
         assert_eq!(c.state, CookieState::Unsupported);
     }
 
-    fn response_with_cookie(cookie: &[u8]) -> Vec<u8> {
-        let mut resp = vec![0, 1, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+    fn response_with_cookie(cookie: &[u8]) -> ByteBuf {
+        let mut resp = ByteBuf::from([0, 1, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert!(append_opt(&mut resp, 1280));
         set_cookie_option(&mut resp, Some(cookie));
         resp
@@ -536,7 +552,7 @@ mod tests {
         let mut c = ServerCookie::default();
         let mut client = c.cookie_for_query().unwrap();
         let sent: [u8; 8] = client[..8].try_into().unwrap();
-        client.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        client.try_extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         assert_eq!(
             c.validate_response(&response_with_cookie(&client), Some(&sent), 0),
             CookieVerdict::Accept

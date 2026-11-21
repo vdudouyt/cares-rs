@@ -4,10 +4,10 @@
 //! ends. Because a shared socket only ever carries this channel's queries, a
 //! per-socket inbox keyed by qid can never see a clash.
 
-use std::collections::HashSet;
-use std::rc::Rc;
+use crate::mem::HashSet;
+use crate::mem::Rc;
 
-use bytes::BytesMut;
+use crate::mem::ByteBuf;
 
 use crate::core::async_client::ChannelShared;
 use rand::Rng;
@@ -70,7 +70,7 @@ impl Drop for QidLease {
 /// A query packet stamped with its reserved id; the id stays reserved for as
 /// long as this (or the request that consumes it) lives.
 pub(crate) struct ReservedQuery {
-    pub payload: BytesMut,
+    pub payload: ByteBuf,
     pub lease: QidLease,
 }
 

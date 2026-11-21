@@ -2,6 +2,8 @@
 
 ## Synopsis
 
+Requires nightly Rust for the allocator API; `rust-toolchain.toml` selects it.
+
 Build and run example.c:
 ```nohighlight
 $ gcc example.c -lcares -o example

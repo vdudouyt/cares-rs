@@ -32,13 +32,13 @@ impl AsyncClient {
         if no_servers(self) {
             return Err(ARES_ENOSERVER.into());
         }
-        self.reserve(BytesMut::from(query_buf))
+        self.reserve(ByteBuf::from(query_buf))
     }
 
     /// Reserve a channel-unique transaction id (upstream `generate_unique_qid`)
     /// and stamp it on `payload`; it stays reserved until the query ends.
     /// `ARES_ENOMEM` when all 65536 ids are in flight.
-    pub(crate) fn reserve(&self, mut payload: BytesMut) -> Result<ReservedQuery, AresError> {
+    pub(crate) fn reserve(&self, mut payload: ByteBuf) -> Result<ReservedQuery, AresError> {
         if payload.len() < 2 {
             return Err(ARES_EBADQUERY.into());
         }
@@ -49,8 +49,8 @@ impl AsyncClient {
 }
 
 /// Wrap a DNS payload in the 2-byte big-endian length prefix (RFC 1035 §4.2.2).
-pub(super) fn frame_tcp(payload: &[u8]) -> BytesMut {
-    let mut framed = BytesMut::with_capacity(2 + payload.len());
+pub(super) fn frame_tcp(payload: &[u8]) -> ByteBuf {
+    let mut framed = ByteBuf::with_capacity(2 + payload.len());
     framed.put_u16(payload.len() as u16);
     framed.extend_from_slice(payload);
     framed
@@ -76,21 +76,21 @@ pub(crate) fn dns_query_payload(
     qtype: u32,
     qclass: u32,
     rd: bool,
-) -> Result<BytesMut, AresError> {
+) -> Result<ByteBuf, AresError> {
     let transaction_id = rand::thread_rng().r#gen::<u16>();
     let packet = build_query(name, qclass, qtype, transaction_id, rd, 0)?;
-    Ok(BytesMut::from(packet.as_slice()))
+    Ok(ByteBuf::from(packet.as_slice()))
 }
 
 /// Duplicate a caller-supplied record via serialize/parse, replace query[0]'s
 /// name, and stamp a fresh id.
-pub(super) fn payload_from_template(template: &ares_dns_record_t, name: &str) -> Result<BytesMut, AresError> {
+pub(super) fn payload_from_template(template: &ares_dns_record_t, name: &str) -> Result<ByteBuf, AresError> {
     let wire = write_record(template)?;
     let mut rec = parse_record(&wire, 0)?;
     rec.query_set_name(0, name)?;
     rec.set_id(rand::thread_rng().r#gen::<u16>());
     let out = write_record(&rec)?;
-    Ok(BytesMut::from(out.as_slice()))
+    Ok(ByteBuf::from(out.as_slice()))
 }
 
 /// The pure body of ares_create_query/ares_mkquery: escaped-name analysis, RFC
@@ -103,7 +103,7 @@ pub(crate) fn build_query(
     id: u16,
     rd: bool,
     max_udp_size: i32,
-) -> Result<Vec<u8>, AresError> {
+) -> Result<ByteBuf, AresError> {
     let max_udp_size: u16 = if max_udp_size > 0 {
         if max_udp_size > u16::MAX as i32 {
             return Err(ARES_EFORMERR.into());
@@ -124,13 +124,14 @@ pub(crate) fn build_query(
         false
     };
 
-    let lower = name_str.to_lowercase();
     let check = if has_unescaped_trailing_dot {
-        lower.strip_suffix('.').unwrap_or(&lower)
+        name_str.strip_suffix('.').unwrap_or(name_str)
     } else {
-        &lower
+        name_str
     };
-    if check.ends_with(".onion") || check == "onion" {
+    let is_onion = check.eq_ignore_ascii_case("onion")
+        || check.get(check.len().saturating_sub(6)..).is_some_and(|suffix| suffix.eq_ignore_ascii_case(".onion"));
+    if is_onion {
         return Err(ARES_ENOTFOUND.into());
     }
 
@@ -142,10 +143,10 @@ pub(crate) fn build_query(
     } else {
         name_str
     };
-    let labels: Vec<&str> = if clean_name.is_empty() {
-        vec![]
+    let labels: crate::mem::Vec<&str> = if clean_name.is_empty() {
+        crate::mem::Vec::new()
     } else {
-        let mut result = Vec::new();
+        let mut result = crate::mem::Vec::new();
         let mut current_start = 0;
         let bytes = clean_name.as_bytes();
         let mut i = 0;
@@ -192,7 +193,7 @@ pub(crate) fn build_query(
     }
 
     let flags: u16 = if rd { 0x0100 } else { 0x0000 };
-    let mut packet = Vec::with_capacity(512);
+    let mut packet = ByteBuf::with_capacity(512);
     packet.extend_from_slice(&id.to_be_bytes());
     packet.extend_from_slice(&flags.to_be_bytes());
     packet.extend_from_slice(&1u16.to_be_bytes());
@@ -225,8 +226,8 @@ pub(crate) fn build_query(
 }
 
 /// Decode a presentation-form label: `\.` escapes and `\DDD` numeric escapes.
-fn unescape_label(label: &str) -> Vec<u8> {
-    let mut result = Vec::with_capacity(label.len());
+fn unescape_label(label: &str) -> ByteBuf {
+    let mut result = ByteBuf::with_capacity(label.len());
     let bytes = label.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -247,14 +248,25 @@ fn unescape_label(label: &str) -> Vec<u8> {
     result
 }
 
-pub(crate) fn rdns_name(ip: IpAddr) -> String {
+pub(crate) fn rdns_name(ip: IpAddr) -> crate::mem::String {
+    use std::fmt::Write;
+    let mut out = crate::mem::String::new();
     match ip {
-        IpAddr::V4(v4) => v4.octets().into_iter().rev().map(|b| b.to_string())
-            .collect::<Vec<_>>().join(".") + ".in-addr.arpa",
+        IpAddr::V4(v4) => {
+            for byte in v4.octets().iter().rev() {
+                let _ = write!(out, "{byte}.");
+            }
+            out.push_str("in-addr.arpa");
+        }
         // IPv6 nibbles are emitted low nibble first.
-        IpAddr::V6(v6) => v6.octets().into_iter().flat_map(|b| [b >> 4, b & 0x0f]).map(|n| format!("{:x}", n))
-            .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(".") + ".ip6.arpa",
+        IpAddr::V6(v6) => {
+            for byte in v6.octets().iter().rev() {
+                let _ = write!(out, "{:x}.{:x}.", byte & 0x0f, byte >> 4);
+            }
+            out.push_str("ip6.arpa");
+        }
     }
+    out
 }
 
 #[cfg(test)]

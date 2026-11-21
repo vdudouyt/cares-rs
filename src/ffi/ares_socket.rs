@@ -1,8 +1,9 @@
 use libc::{bind, close, connect, fcntl, iovec, recvfrom, setsockopt, sockaddr, socket, socklen_t, writev, F_GETFL, F_SETFL, O_NONBLOCK, sockaddr_in, sockaddr_in6, AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use std::cell::Cell;
-use std::ffi::{c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{c_int, c_uint, c_void, CStr};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::rc::Rc;
+use crate::mem::Rc;
+use crate::mem::String;
 use std::io;
 use std::io::{Error, ErrorKind};
 use crate::ffi::ares_options::ares_sock_state_cb;
@@ -448,7 +449,7 @@ impl Drop for CSocket {
 impl CSocketFactory {
     /// New function table; socket-state callbacks are an independent setting, so carry them over.
     pub(crate) fn with_funcs(funcs: AresSocketFunctions, user_data: *mut c_void, prev: &CSocketFactory) -> Rc<Self> {
-        Rc::new(Self {
+        crate::mem::rc(Self {
             funcs,
             user_data,
             create_cb: prev.create_cb,
@@ -468,7 +469,7 @@ impl CSocketFactory {
         user_data: *mut c_void,
         prev: &CSocketFactory,
     ) -> Rc<Self> {
-        Rc::new(Self {
+        crate::mem::rc(Self {
             funcs,
             user_data,
             create_cb: prev.create_cb,
@@ -483,7 +484,7 @@ impl CSocketFactory {
 
     /// Copy socket-option / local-bind / state-callback settings into a rebuilt factory.
     pub(crate) fn with_config(&self, socket: SocketConfig) -> Rc<Self> {
-        Rc::new(Self {
+        crate::mem::rc(Self {
             funcs: self.funcs.clone(),
             user_data: self.user_data,
             create_cb: self.create_cb,
@@ -497,7 +498,7 @@ impl CSocketFactory {
     }
 
     pub fn with_create_cb(&self, cb: ares_sock_create_callback, arg: *mut c_void) -> Rc<Self> {
-        Rc::new(Self {
+        crate::mem::rc(Self {
             funcs: self.funcs.clone(),
             user_data: self.user_data,
             create_cb: cb,
@@ -511,7 +512,7 @@ impl CSocketFactory {
     }
 
     pub fn with_config_cb(&self, cb: ares_sock_config_callback, arg: *mut c_void) -> Rc<Self> {
-        Rc::new(Self {
+        crate::mem::rc(Self {
             funcs: self.funcs.clone(),
             user_data: self.user_data,
             create_cb: self.create_cb,
@@ -529,7 +530,7 @@ impl CSocketFactory {
     /// platform call for the default table. A custom legacy table has no
     /// adapter, so scoped names cannot be resolved (returns `None`).
     pub(crate) fn if_nametoindex(&self, name: &str) -> Option<u32> {
-        let cname = CString::new(name).ok()?;
+        let cname = crate::mem::CString::new(name.as_bytes()).ok()?;
         if let Some(cb) = self.ex.and_then(|ex| ex.aif_nametoindex) {
             let index = unsafe { cb(cname.as_ptr(), self.user_data) };
             return (index != 0).then_some(index);
@@ -570,7 +571,7 @@ impl CSocketFactory {
         if fd == ARES_SOCKET_BAD {
             return Err(Error::last_os_error());
         }
-        let sock = Rc::new(CSocket {
+        let sock = crate::mem::rc(CSocket {
             fd,
             funcs: self.funcs.clone(),
             ex: self.ex,
@@ -631,7 +632,7 @@ impl CSocketFactory {
         }
         if !self.socket.local_dev.is_empty() {
             // The option value is a C string: include the trailing NUL in val_size.
-            let mut device = self.socket.local_dev.as_bytes().to_vec();
+            let mut device = crate::mem::ByteBuf::from_slice(self.socket.local_dev.as_bytes());
             device.push(0);
             // Device-bind failure is ignored, matching prior c-ares behavior.
             let _ = self.setsockopt(fd, ARES_SOCKET_OPT_BIND_DEVICE, &device);

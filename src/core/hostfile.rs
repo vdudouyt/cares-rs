@@ -1,6 +1,9 @@
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
+
+use crate::mem::{String, Vec};
 
 /// Address family filter for lookups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +37,7 @@ pub struct HostEntry {
 
 impl HostEntry {
     fn canonical(&self) -> &str {
-        self.names.first().map(String::as_str).unwrap_or("")
+        self.names.first().map(|name| name.as_str()).unwrap_or("")
     }
 
     pub fn has_name(&self, name: &str) -> bool {
@@ -73,8 +76,17 @@ impl Hosts {
     }
 
     pub fn from_path<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        Ok(Self::parse(&content))
+        let mut file = std::fs::File::open(path)?;
+        let mut bytes = crate::mem::ByteBuf::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = file.read(&mut chunk)?;
+            if n == 0 { break; }
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|_| std::io::ErrorKind::InvalidData)?;
+        Ok(Self::parse(content))
     }
 
     fn parse_line(line: &str) -> Option<HostEntry> {
@@ -91,14 +103,14 @@ impl Hosts {
         let mut names = Vec::new();
         for name in parts {
             if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(name)) {
-                names.push(name.to_string());
+                names.push(String::from(name));
             }
         }
         if names.is_empty() {
             return None;
         }
 
-        Some(HostEntry { ips: vec![ip], names })
+        Some(HostEntry { ips: Vec::from([ip]), names })
     }
 
     fn add_entry(&mut self, entry: HostEntry) {
@@ -109,7 +121,7 @@ impl Hosts {
         };
 
         let mut new_names = Vec::new();
-        for name in entry.names {
+        for name in entry.names.into_iter() {
             if self.entries[match_idx].has_name(&name) {
                 continue;
             }
@@ -164,7 +176,7 @@ impl Hosts {
         }
 
         Some(HostLookup {
-            canonical: entry.canonical().to_string(),
+            canonical: String::from(entry.canonical()),
             aliases: entry_alias_list(entry),
             addrs,
         })
@@ -180,7 +192,7 @@ impl Hosts {
             .collect();
 
         Some(HostLookup {
-            canonical: entry.canonical().to_string(),
+            canonical: String::from(entry.canonical()),
             aliases: entry_alias_list(entry),
             addrs,
         })
@@ -232,7 +244,7 @@ fd00::10        myserver
         assert!(entry.is_some());
         let entry = entry.unwrap();
         assert_eq!(entry.ips, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
-        assert_eq!(entry.names, vec!["localhost"]);
+        assert_eq!(entry.names.as_slice(), &["localhost"]);
         assert_eq!(entry.canonical(), "localhost");
     }
 
@@ -278,8 +290,8 @@ fd00::10        myserver
         let result = result.unwrap();
         assert_eq!(result.addrs.len(), 2); // 127.0.0.1 and ::1
         assert_eq!(
-            result.aliases,
-            vec!["localhost.localdomain", "loopback", "ip6-localhost"]
+            result.aliases.as_slice(),
+            &["localhost.localdomain", "loopback", "ip6-localhost"]
         );
     }
 
@@ -314,7 +326,7 @@ fd00::10        myserver
         let result = result.unwrap();
         assert_eq!(result.addrs.len(), 3); // two IPv4, one IPv6
         assert_eq!(result.canonical, "myserver");
-        assert_eq!(result.aliases, vec!["myserver.local"]);
+        assert_eq!(result.aliases.as_slice(), &["myserver.local"]);
     }
 
     #[test]
@@ -327,7 +339,7 @@ fd00::10        myserver
 
         let result = hosts.lookup("alias1", AddressFamily::Any).unwrap();
         assert_eq!(result.canonical, "primary.example");
-        assert_eq!(result.aliases, vec!["alias1", "alias2", "alias3"]);
+        assert_eq!(result.aliases.as_slice(), &["alias1", "alias2", "alias3"]);
         assert_eq!(
             result.addrs,
             vec![
@@ -341,7 +353,7 @@ fd00::10        myserver
             .reverse_lookup(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)))
             .unwrap();
         assert_eq!(rev.canonical, "primary.example");
-        assert_eq!(rev.aliases, vec!["alias1", "alias2", "alias3"]);
+        assert_eq!(rev.aliases.as_slice(), &["alias1", "alias2", "alias3"]);
         assert_eq!(rev.addrs.len(), 2);
     }
 
@@ -393,6 +405,6 @@ fd00::10        myserver
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.canonical, "gateway");
-        assert!(result.aliases.contains(&"router".to_string()));
+        assert!(result.aliases.iter().any(|alias| alias == "router"));
     }
 }

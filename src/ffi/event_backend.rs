@@ -24,12 +24,11 @@
 use super::*;
 use crate::async_runtime::{InterestChanges, InterestUpdate};
 use crate::ffi::ares_socket::{ares_fd_events_t, ARES_FD_EVENT_READ, ARES_FD_EVENT_WRITE};
-use rustix::buffer::spare_capacity;
 use rustix::event::{epoll, poll, PollFd, PollFlags};
 use rustix::fd::{BorrowedFd, OwnedFd, RawFd};
 use rustix::io::Errno;
 use rustix::pipe::{pipe_with, PipeFlags};
-use std::collections::HashMap;
+use crate::mem::{HashMap, Vec};
 
 /// Whether `evsys` names a backend available here (upstream: otherwise `ARES_ENOTIMP`).
 pub(crate) fn supported(evsys: c_int) -> bool {
@@ -49,16 +48,20 @@ fn timespec(timeout_ms: i32) -> rustix::event::Timespec {
     rustix::event::Timespec { tv_sec: ms / 1000, tv_nsec: ((ms % 1000) * 1_000_000) as _ }
 }
 
-/// Event-thread self-pipe; `wake` is nonblocking (a full pipe means the thread is already runnable).
+/// The event thread owns the read end; the channel owns the write end.
+/// Closing the write end requests shutdown, even if the pipe is full.
 pub(crate) struct WakePipe {
     read: OwnedFd,
+}
+
+pub(crate) struct WakeSender {
     write: OwnedFd,
 }
 
 impl WakePipe {
-    pub(crate) fn new() -> Option<Self> {
+    pub(crate) fn new() -> Option<(Self, WakeSender)> {
         let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).ok()?;
-        Some(WakePipe { read, write })
+        Some((WakePipe { read }, WakeSender { write }))
     }
 
     pub(crate) fn read_fd(&self) -> RawFd {
@@ -66,14 +69,25 @@ impl WakePipe {
         self.read.as_raw_fd()
     }
 
-    pub(crate) fn wake(&self) {
-        // EAGAIN (pipe full) and EINTR are benign: the thread is already awake.
-        let _ = rustix::io::write(&self.write, &[1u8]);
-    }
-
-    pub(crate) fn drain(&self) {
+    /// Consume pending notifications. EOF means the channel requested shutdown.
+    pub(crate) fn closed(&self) -> bool {
         let mut buf = [0u8; 64];
-        while matches!(rustix::io::read(&self.read, &mut buf[..]), Ok(n) if n > 0) {}
+        loop {
+            match rustix::io::read(&self.read, &mut buf[..]) {
+                Ok(0) => return true,
+                Ok(_) | Err(Errno::INTR) => continue,
+                Err(Errno::AGAIN) => return false,
+                Err(_) => return true,
+            }
+        }
+    }
+}
+
+impl WakeSender {
+    pub(crate) fn wake(&self) {
+        // A full pipe already makes the thread runnable. An interrupted write
+        // may not have written anything, so retry it.
+        while rustix::io::write(&self.write, &[1u8]) == Err(Errno::INTR) {}
     }
 }
 
@@ -127,7 +141,7 @@ pub(crate) enum Backend {
 
 /// What one wait produced: ready fds, and whether the wake pipe fired.
 pub(crate) struct Ready {
-    pub(crate) events: Vec<ares_fd_events_t>,
+    pub(crate) events: crate::mem::Vec<ares_fd_events_t>,
     pub(crate) woke: bool,
 }
 
@@ -212,7 +226,7 @@ fn wait_poll(registry: &HashMap<RawFd, Registered>, wake: &WakePipe, timeout_ms:
     let ts = timespec(timeout_ms);
     let _ = poll(&mut pollfds, Some(&ts));
 
-    let mut ready = Ready { events: Vec::new(), woke: false };
+    let mut ready = Ready { events: crate::mem::Vec::new(), woke: false };
     for ((fd, _, _), p) in borrowed.iter().zip(&pollfds) {
         let revents = p.revents();
         if revents.is_empty() {
@@ -234,7 +248,6 @@ pub(crate) struct EpollSet {
     epfd: OwnedFd,
     registered: HashMap<RawFd, Registered>,
     wake_registered: Option<RawFd>,
-    buf: Vec<epoll::Event>,
 }
 
 fn epoll_flags(read: bool, write: bool) -> epoll::EventFlags {
@@ -251,7 +264,7 @@ fn epoll_flags(read: bool, write: bool) -> epoll::EventFlags {
 impl EpollSet {
     fn new() -> Option<Self> {
         let epfd = epoll::create(epoll::CreateFlags::CLOEXEC).ok()?;
-        Some(EpollSet { epfd, registered: HashMap::new(), wake_registered: None, buf: Vec::with_capacity(64) })
+        Some(EpollSet { epfd, registered: HashMap::new(), wake_registered: None })
     }
 
     /// One `epoll_ctl` per change. An fd the kernel refuses stays unwatched.
@@ -303,11 +316,11 @@ impl EpollSet {
             }
         }
         let ts = timespec(timeout_ms);
-        let mut ready = Ready { events: Vec::new(), woke: false };
+        let mut ready = Ready { events: crate::mem::Vec::new(), woke: false };
 
-        self.buf.clear();
-        let _ = epoll::wait(&self.epfd, spare_capacity(&mut self.buf), Some(&ts));
-        for ev in &self.buf {
+        let mut buf: [std::mem::MaybeUninit<epoll::Event>; 64] = std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+        let Ok((events, _)) = epoll::wait(&self.epfd, &mut buf, Some(&ts)) else { return ready };
+        for ev in events {
             // `Event` is packed on x86-64: copy the fields out, never borrow them.
             let (flags, data) = (ev.flags, ev.data);
             let fd = data.u64() as RawFd;
@@ -325,6 +338,7 @@ impl EpollSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::vec;
     use std::net::UdpSocket;
     use std::os::fd::AsRawFd;
     use std::time::Instant;
@@ -335,6 +349,30 @@ mod tests {
 
     fn changes(updates: Vec<InterestUpdate>, removed: Vec<(i32, u64)>) -> InterestChanges {
         InterestChanges { removed, updates }
+    }
+
+    #[test]
+    fn closing_sender_wakes_and_stops_both_backends() {
+        for evsys in [ARES_EVSYS_POLL, ARES_EVSYS_EPOLL] {
+            for full in [false, true] {
+                let (reader, sender) = WakePipe::new().unwrap();
+                let mut backend = Backend::new(evsys);
+                assert!(!backend.wait(&reader, 0).woke);
+                if full {
+                    let bytes = [1u8; 4096];
+                    loop {
+                        match rustix::io::write(&sender.write, &bytes) {
+                            Ok(_) | Err(Errno::INTR) => continue,
+                            Err(Errno::AGAIN) => break,
+                            result => panic!("filling the wake pipe: {result:?}"),
+                        }
+                    }
+                }
+                drop(sender);
+                assert!(backend.wait(&reader, 100).woke);
+                assert!(reader.closed(), "shutdown must survive queued notifications");
+            }
+        }
     }
 
     /// A UDP socket with one datagram already queued, so it is readable.
@@ -356,7 +394,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn recycled_fd_number_is_reregistered() {
-        let wake = WakePipe::new().unwrap();
+        let (wake, _sender) = WakePipe::new().unwrap();
         let mut backend = Backend::new(ARES_EVSYS_EPOLL);
         assert!(matches!(backend, Backend::Epoll(_)));
         let mut reused = 0;
@@ -386,7 +424,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn late_removal_of_old_generation_keeps_new_registration() {
         for evsys in [ARES_EVSYS_EPOLL, ARES_EVSYS_POLL] {
-            let wake = WakePipe::new().unwrap();
+            let (wake, _sender) = WakePipe::new().unwrap();
             let mut backend = Backend::new(evsys);
             let sock = readable_socket();
             let fd = sock.as_raw_fd();
@@ -400,7 +438,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn modify_and_remove_take_effect() {
         for evsys in [ARES_EVSYS_EPOLL, ARES_EVSYS_POLL] {
-            let wake = WakePipe::new().unwrap();
+            let (wake, _sender) = WakePipe::new().unwrap();
             let mut backend = Backend::new(evsys);
             let idle = UdpSocket::bind("127.0.0.1:0").unwrap(); // nothing to read, always writable
             let fd = idle.as_raw_fd();
@@ -422,7 +460,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn interest_churn_matches_poll() {
-        let wake = WakePipe::new().unwrap();
+        let (wake, _sender) = WakePipe::new().unwrap();
         let mut epoll = Backend::new(ARES_EVSYS_EPOLL);
         let mut poll = Backend::new(ARES_EVSYS_POLL);
         for round in 0..300usize {
@@ -446,13 +484,13 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn wake_pipe_interrupts_wait() {
         for evsys in [ARES_EVSYS_EPOLL, ARES_EVSYS_POLL] {
-            let wake = WakePipe::new().unwrap();
+            let (wake, sender) = WakePipe::new().unwrap();
             let mut backend = Backend::new(evsys);
-            wake.wake();
+            sender.wake();
             let started = Instant::now();
             let r = backend.wait(&wake, 5000);
             assert!(r.woke && started.elapsed().as_millis() < 1000);
-            wake.drain();
+            assert!(!wake.closed());
             assert!(!backend.wait(&wake, 10).woke);
         }
     }
@@ -462,12 +500,12 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn more_ready_fds_than_one_wait_returns() {
-        let wake = WakePipe::new().unwrap();
+        let (wake, _sender) = WakePipe::new().unwrap();
         let mut backend = Backend::new(ARES_EVSYS_EPOLL);
         let socks: Vec<UdpSocket> = (0..200).map(|_| readable_socket()).collect();
         let updates = socks.iter().enumerate().map(|(i, s)| upd(s.as_raw_fd(), i as u64 + 1, true, false)).collect();
         backend.apply(changes(updates, vec![]));
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::mem::HashSet::new();
         for _ in 0..50 {
             seen.extend(backend.wait(&wake, 100).events.iter().map(|e| e.fd));
             if seen.len() == socks.len() {
@@ -482,7 +520,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn unwatchable_fd_is_left_unwatched_not_spun_on() {
-        let wake = WakePipe::new().unwrap();
+        let (wake, _sender) = WakePipe::new().unwrap();
         let file = std::fs::File::open("/proc/self/exe").unwrap();
         let fd = file.as_raw_fd();
 

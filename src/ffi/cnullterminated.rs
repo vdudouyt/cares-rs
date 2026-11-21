@@ -1,4 +1,5 @@
 use std::ptr;
+use crate::mem::{into_raw, Vec};
 
 pub trait Nullable {
     const NULL: Self;
@@ -13,8 +14,7 @@ where
     T: Copy + PartialEq + Nullable,
 {
     v.push(T::NULL);
-    let boxed: Box<[T]> = v.into_boxed_slice();
-    Box::into_raw(boxed) as *mut T
+    into_raw(v.into_boxed_slice()) as *mut T
 }
 
 pub unsafe fn into_vec<T>(ptr: *mut T) -> Vec<T>

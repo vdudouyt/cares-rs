@@ -1,8 +1,9 @@
 //! The pure shape of a hostent result: which names, aliases and addresses a
 //! reply yields. The ffi layer only builds the C graph mechanically.
 
-use std::ffi::CString;
 use std::net::IpAddr;
+
+use crate::mem::{CString, Owned, String, Vec};
 
 use crate::core::hostfile::HostLookup;
 use crate::core::packets::AddrRecord;
@@ -18,14 +19,14 @@ pub(crate) struct Hostent {
     pub addrs: Vec<IpAddr>,
     /// Address bytes supplied verbatim (PTR replies); each box has exactly
     /// `length` bytes, which need not be 4 or 16.
-    pub raw_addrs: Vec<Box<[u8]>>,
+    pub raw_addrs: Vec<Owned<[u8]>>,
 }
 
 impl Hostent {
     /// A synthetic result with no aliases (IP literal / localhost); `addrs`
     /// must be non-empty.
-    pub fn new(canonical: String, addrs: Vec<IpAddr>) -> Self {
-        Self::from_lookup(HostLookup { canonical, aliases: vec![], addrs })
+    pub fn new(canonical: &str, addrs: Vec<IpAddr>) -> Self {
+        Self::from_lookup(HostLookup { canonical: String::from(canonical), aliases: Vec::new(), addrs })
     }
 
     /// A hosts-file/IP-literal result: family from the first address; aliases
@@ -39,10 +40,10 @@ impl Hostent {
         let aliases = lookup
             .aliases
             .into_iter()
-            .filter_map(|s| CString::new(s).ok()) // drop NUL-containing aliases
+            .filter_map(|s| CString::new(s.as_bytes()).ok()) // drop NUL-containing aliases
             .collect();
         Hostent {
-            name: CString::new(lookup.canonical).unwrap_or_default(),
+            name: CString::new(lookup.canonical.as_bytes()).unwrap_or_default(),
             aliases,
             addrtype,
             length,
@@ -73,7 +74,7 @@ impl Hostent {
         raw_addr: Option<&[u8]>,
     ) -> Self {
         let raw_addrs = match raw_addr {
-            Some(bytes) if !bytes.is_empty() => vec![bytes.to_vec().into_boxed_slice()],
+            Some(bytes) if !bytes.is_empty() => Vec::from([crate::mem::ByteBuf::from_slice(bytes).into_boxed_slice()]),
             _ => Vec::new(),
         };
         Hostent {
@@ -119,12 +120,12 @@ mod tests {
     #[test]
     fn channel_sortlist_applies_to_hosts_derived_hostent() {
         let lookup = HostLookup {
-            canonical: "example.test".into(),
-            aliases: vec![],
-            addrs: vec![
+            canonical: String::from("example.test"),
+            aliases: Vec::new(),
+            addrs: Vec::from([
                 IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
                 IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
-            ],
+            ]),
         };
         let mut host = Hostent::from_lookup(lookup);
         let sortlist = vec![

@@ -9,7 +9,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
-use std::rc::Rc;
+use crate::mem::Rc;
 
 use rustix::net::{AddressFamily, SocketType};
 
@@ -90,5 +90,5 @@ pub(crate) fn create(kind: SocketKind, bind: SocketAddr) -> io::Result<Rc<dyn So
             SystemSocket::Tcp(stream)
         }
     };
-    Ok(Rc::new(socket))
+    Ok(crate::mem::rc(socket))
 }

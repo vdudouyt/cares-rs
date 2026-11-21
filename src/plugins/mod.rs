@@ -65,11 +65,11 @@ pub(crate) enum Resend {
 /// A protocol extension hooked into every query. Every hook defaults to a no-op.
 pub(crate) trait Plugin {
     /// Once per query, before the first attempt: may rewrite the query packet.
-    fn on_start(&self, _cx: &Ctx, _payload: &mut Vec<u8>) {}
+    fn on_start(&self, _cx: &Ctx, _payload: &mut crate::mem::ByteBuf) {}
 
     /// Before each send, on that send's copy of the packet. An error ends the
     /// query with that status.
-    fn on_send(&self, _cx: &Ctx, _wire: &mut Vec<u8>) -> Result<(), c_int> {
+    fn on_send(&self, _cx: &Ctx, _wire: &mut crate::mem::ByteBuf) -> Result<(), c_int> {
         Ok(())
     }
 
@@ -80,7 +80,7 @@ pub(crate) trait Plugin {
 
     /// The decision step: may rewrite the query packet and claim the reply as
     /// an uncounted re-send.
-    fn on_reply(&self, _cx: &Ctx, _reply: Reply, _payload: &mut Vec<u8>) -> Option<Resend> {
+    fn on_reply(&self, _cx: &Ctx, _reply: Reply, _payload: &mut crate::mem::ByteBuf) -> Option<Resend> {
         None
     }
 

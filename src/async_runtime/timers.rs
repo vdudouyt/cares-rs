@@ -1,13 +1,13 @@
 //! Indexed min-heap: fallible admission, allocation-free expiry/cancellation.
 use std::task::Waker;
 use std::time::Instant;
-use crate::mem::{NoMemory, Vec};
+use crate::mem::{FallibleVec, NoMemory};
 
 struct Entry { when: Instant, id: usize, waker: Waker }
 impl Entry { fn key(&self) -> (Instant, usize) { (self.when, self.id) } }
 
 #[derive(Default)]
-pub(super) struct Timers { heap: Vec<Entry>, positions: Vec<(usize, usize)> }
+pub(super) struct Timers { heap: FallibleVec<Entry>, positions: FallibleVec<(usize, usize)> }
 
 impl Timers {
     pub(super) fn deadline(&self) -> Option<Instant> { self.heap.first().map(|e| e.when) }
