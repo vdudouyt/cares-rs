@@ -26,6 +26,36 @@ fn parse_a_reply_negative_alen_returns_error() {
 }
 
 #[test]
+fn parse_a_reply_negative_naddrttls_is_no_capacity() {
+    // A negative capacity must not become usize::MAX: the parser must write no
+    // address/TTL entries and report zero written.
+    let buf = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+        b.extend_from_slice(&[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        b.extend_from_slice(&[0, 1, 0, 1]);
+        b.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        b
+    };
+    let mut host: *mut libc::hostent = ptr::null_mut();
+    let mut addrs = [cares::ares_addrttl { ipaddr: libc::in_addr { s_addr: 0 }, ttl: 0 }; 1];
+    let mut naddrttls: c_int = -1;
+    unsafe {
+        let rc = ares_parse_a_reply(
+            buf.as_ptr(),
+            buf.len() as c_int,
+            &mut host,
+            addrs.as_mut_ptr(),
+            &mut naddrttls,
+        );
+        assert_eq!(rc, ARES_SUCCESS);
+        assert_eq!(naddrttls, 0, "negative capacity means no entries");
+        assert_eq!(addrs[0].ipaddr.s_addr, 0, "caller array untouched");
+        ares_free_hostent(host);
+    }
+}
+
+#[test]
 fn parse_txt_reply_ext_negative_alen_returns_error() {
     let mut out: *mut c_void = ptr::null_mut();
     let rc = unsafe {
@@ -61,10 +91,48 @@ struct CbResult {
     status: c_int,
 }
 
+#[repr(C)]
+struct ShortSockaddr {
+    one_byte: u8,
+}
+
+unsafe extern "C" fn nameinfo_cb(
+    arg: *mut c_void,
+    status: c_int,
+    _timeouts: c_int,
+    _node: *mut std::ffi::c_char,
+    _service: *mut std::ffi::c_char,
+) {
+    let r = unsafe { &mut *(arg as *mut CbResult) };
+    r.fired = true;
+    r.status = status;
+}
+
 unsafe extern "C" fn host_cb(arg: *mut c_void, status: c_int, _timeouts: c_int, _hostent: *mut libc::hostent) {
     let r = &mut *(arg as *mut CbResult);
     r.fired = true;
     r.status = status;
+}
+
+#[test]
+fn getnameinfo_short_salen_is_rejected_without_reading_sa() {
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+        let short = ShortSockaddr { one_byte: 0 };
+        let mut result = CbResult { fired: false, status: -1 };
+        ares_getnameinfo(
+            ch,
+            &short as *const ShortSockaddr as *const libc::sockaddr,
+            0,
+            0,
+            Some(nameinfo_cb),
+            &mut result as *mut _ as *mut c_void,
+        );
+        assert!(result.fired);
+        assert_eq!(result.status, ARES_ENOTIMP);
+        ares_destroy(ch);
+    }
 }
 
 #[test]

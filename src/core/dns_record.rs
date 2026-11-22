@@ -805,15 +805,23 @@ pub struct ares_dns_rr_t {
 
 /// A whole DNS message; the opaque handle type of the ares_dns_record API.
 #[allow(non_camel_case_types)]
+// The C API hands out `ares_dns_rr_t *` values that must remain valid while the
+// record is alive, so each RR needs its own stable allocation. Clippy's
+// vec-box heuristic cannot see that FFI contract.
+#[allow(clippy::vec_box)]
 pub struct ares_dns_record_t {
     pub(crate) id: u16,
     pub(crate) flags: u16,
     pub(crate) opcode: u16,
     pub(crate) rcode: u16,
     pub(crate) queries: Vec<DnsRecordQuery>,
-    pub(crate) answers: Vec<ares_dns_rr_t>,
-    pub(crate) authority: Vec<ares_dns_rr_t>,
-    pub(crate) additional: Vec<ares_dns_rr_t>,
+    // Boxed so `ares_dns_record_rr_add`/`rr_del` never move an existing RR:
+    // the C API hands out pointers owned by the record, and they must stay
+    // valid across later mutations of the section. Vec<Box<_>> also keeps the
+    // per-RR address getter caches (`cached_v4`/`cached_v6`) at stable addresses.
+    pub(crate) answers: Vec<Box<ares_dns_rr_t>>,
+    pub(crate) authority: Vec<Box<ares_dns_rr_t>>,
+    pub(crate) additional: Vec<Box<ares_dns_rr_t>>,
 }
 
 /// Create a `Bin` value with a trailing NUL (not counted in logical length),
@@ -843,7 +851,8 @@ pub(crate) fn bin_logical(data: &[u8]) -> &[u8] {
     }
 }
 
-pub(crate) fn section_vec(rec: &ares_dns_record_t, sect: u32) -> Option<&Vec<ares_dns_rr_t>> {
+#[allow(clippy::vec_box)]
+pub(crate) fn section_vec(rec: &ares_dns_record_t, sect: u32) -> Option<&Vec<Box<ares_dns_rr_t>>> {
     match sect {
         ARES_SECTION_ANSWER => Some(&rec.answers),
         ARES_SECTION_AUTHORITY => Some(&rec.authority),
@@ -852,7 +861,8 @@ pub(crate) fn section_vec(rec: &ares_dns_record_t, sect: u32) -> Option<&Vec<are
     }
 }
 
-pub(crate) fn section_vec_mut(rec: &mut ares_dns_record_t, sect: u32) -> Option<&mut Vec<ares_dns_rr_t>> {
+#[allow(clippy::vec_box)]
+pub(crate) fn section_vec_mut(rec: &mut ares_dns_record_t, sect: u32) -> Option<&mut Vec<Box<ares_dns_rr_t>>> {
     match sect {
         ARES_SECTION_ANSWER => Some(&mut rec.answers),
         ARES_SECTION_AUTHORITY => Some(&mut rec.authority),
@@ -1622,8 +1632,8 @@ impl ares_dns_record_t {
             return Err(ARES_EFORMERR.into());
         }
         let vec = section_vec_mut(self, sect).ok_or(AresError::from(ARES_EFORMERR))?;
-        vec.push(new_rr(name, rtype, rclass as u16, ttl));
-        vec.last_mut().ok_or(AresError::from(ARES_EFORMERR))
+        vec.push(Box::new(new_rr(name, rtype, rclass as u16, ttl)));
+        vec.last_mut().map(|rr| rr.as_mut()).ok_or(AresError::from(ARES_EFORMERR))
     }
 
     pub(crate) fn rr_cnt(&self, sect: u32) -> usize {
@@ -1634,11 +1644,11 @@ impl ares_dns_record_t {
     }
 
     pub(crate) fn rr_at_mut(&mut self, sect: u32, idx: usize) -> Option<&mut ares_dns_rr_t> {
-        section_vec_mut(self, sect)?.get_mut(idx)
+        section_vec_mut(self, sect)?.get_mut(idx).map(|rr| rr.as_mut())
     }
 
     pub(crate) fn rr_at(&self, sect: u32, idx: usize) -> Option<&ares_dns_rr_t> {
-        section_vec(self, sect)?.get(idx)
+        section_vec(self, sect)?.get(idx).map(|rr| rr.as_ref())
     }
 
     pub(crate) fn rr_del(&mut self, sect: u32, idx: usize) -> Result<(), AresError> {
@@ -2198,7 +2208,7 @@ pub(crate) fn parse_record(data: &[u8], flags: u32) -> Result<ares_dns_record_t,
             }
 
             let vec = section_vec_mut(&mut rec, *section).ok_or(AresError::from(ARES_EBADRESP))?;
-            vec.push(rr);
+            vec.push(Box::new(rr));
         }
     }
 
@@ -2252,7 +2262,7 @@ pub(crate) fn write_record(rec: &ares_dns_record_t) -> Result<Vec<u8>, AresError
         out.push(q.qclass as u8);
     }
 
-    let sections: [&Vec<ares_dns_rr_t>; 3] =
+    let sections: [&[Box<ares_dns_rr_t>]; 3] =
         [&rec.answers, &rec.authority, &rec.additional];
     for section in &sections {
         for rr in *section {

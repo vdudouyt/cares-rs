@@ -629,7 +629,9 @@ fn set_servers_csv_str(channeldata: &ChannelData, s: &str) -> c_int {
     // list, matching c-ares.
     let mut specs = Vec::with_capacity(parsed.len());
     {
-        let factory = channeldata.socket_factory.borrow();
+        // Clone the Rc so the user's aif_nametoindex callback (which may
+        // re-enter the channel) runs without a live RefCell borrow.
+        let factory = channeldata.socket_factory.borrow().clone();
         for entry in parsed {
             let scope_id = match entry.iface.as_deref() {
                 Some(iface) => match factory.if_nametoindex(iface) {
@@ -768,7 +770,9 @@ pub unsafe extern "C" fn ares_get_servers_csv(channel: *const ChannelData) -> *m
     let servers = channeldata.state.borrow().server_list();
     // Prefer the adapter-provided interface name for a scoped IPv6 entry, and
     // fall back to the numeric index when no `aif_indextoname` is available.
-    let factory = channeldata.socket_factory.borrow();
+    // Clone the Rc so the user's aif_indextoname callback (which may re-enter
+    // the channel) runs without a live RefCell borrow.
+    let factory = channeldata.socket_factory.borrow().clone();
     let csv = servers
         .iter()
         .map(|&(ip, udp_port, _tcp_port, scope)| match ip {

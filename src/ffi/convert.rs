@@ -79,6 +79,11 @@ pub(crate) fn extract_addr_port(sa: *const libc::sockaddr, salen: libc::socklen_
     if sa.is_null() {
         return Err(ARES_ENOTIMP);
     }
+    // Do not read sa_family when the caller's length does not even cover the
+    // family field. `salen` is validated before the first field access.
+    if (salen as usize) < std::mem::size_of::<libc::sa_family_t>() {
+        return Err(ARES_ENOTIMP);
+    }
 
     let family = unsafe { (*sa).sa_family as c_int };
 

@@ -6,7 +6,7 @@ use std::ptr;
 
 use cares::ares_data::{ares_free_data, AresAddrPortNode};
 use cares::ares_options::{ares_destroy_options, ares_options, ares_save_options};
-use cares::ares_socket::ares_set_socket_functions_ex;
+use cares::ares_socket::{ares_set_socket_functions_ex, AresSocketFunctionsEx};
 use cares::dns_record::*;
 use cares::error::{ares_strerror, ARES_EBADRESP};
 use cares::*;
@@ -205,6 +205,59 @@ fn parse_error_clears_out_pointer() {
     };
     assert_eq!(rc, ARES_EBADRESP);
     assert!(out.is_null());
+}
+
+// The optional extended-table interface callbacks are user code. They must be
+// callable while the CSV helpers are running, including if they re-enter a
+// factory-mutating channel API. Previously both CSV paths held a live
+// `RefCell` borrow of the socket factory across the callback (panic/abort).
+unsafe extern "C" fn reenter_asocket(_domain: c_int, _ty: c_int, _proto: c_int, _user: *mut c_void) -> c_int {
+    -1
+}
+unsafe extern "C" fn reenter_aclose(_fd: c_int, _user: *mut c_void) -> c_int { 0 }
+unsafe extern "C" fn reenter_asetsockopt(_fd: c_int, _opt: c_uint, _val: *const c_void, _len: libc::socklen_t, _user: *mut c_void) -> c_int { -1 }
+unsafe extern "C" fn reenter_aconnect(_fd: c_int, _addr: *const libc::sockaddr, _len: libc::socklen_t, _flags: c_uint, _user: *mut c_void) -> c_int { -1 }
+unsafe extern "C" fn reenter_arecvfrom(_fd: c_int, _buf: *mut c_void, _len: libc::size_t, _flags: c_int, _addr: *mut libc::sockaddr, _alen: *mut libc::socklen_t, _user: *mut c_void) -> libc::ssize_t { -1 }
+unsafe extern "C" fn reenter_asendto(_fd: c_int, _buf: *const c_void, _len: libc::size_t, _flags: c_int, _addr: *const libc::sockaddr, _alen: libc::socklen_t, _user: *mut c_void) -> libc::ssize_t { -1 }
+
+unsafe extern "C" fn reenter_aif_nametoindex(_name: *const c_char, user: *mut c_void) -> c_uint {
+    // Re-enter the channel while the CSV parser is calling the adapter.
+    unsafe { ares_set_socket_callback(user as Channel, None, ptr::null_mut()) };
+    7
+}
+
+unsafe extern "C" fn reenter_aif_indextoname(_index: c_uint, _buf: *mut c_char, _len: libc::size_t, user: *mut c_void) -> *const c_char {
+    unsafe { ares_set_socket_callback(user as Channel, None, ptr::null_mut()) };
+    c"reenter".as_ptr()
+}
+
+#[test]
+fn aif_interface_callbacks_may_reenter_the_channel() {
+    unsafe {
+        let mut ch: Channel = ptr::null_mut();
+        assert_eq!(ares_init(&mut ch), ARES_SUCCESS);
+        let funcs = AresSocketFunctionsEx {
+            version: 1,
+            flags: 0,
+            asocket: Some(reenter_asocket),
+            aclose: Some(reenter_aclose),
+            asetsockopt: Some(reenter_asetsockopt),
+            aconnect: Some(reenter_aconnect),
+            arecvfrom: Some(reenter_arecvfrom),
+            asendto: Some(reenter_asendto),
+            agetsockname: None,
+            abind: None,
+            aif_nametoindex: Some(reenter_aif_nametoindex),
+            aif_indextoname: Some(reenter_aif_indextoname),
+        };
+        assert_eq!(ares_set_socket_functions_ex(ch, &funcs, ch as *mut c_void), ARES_SUCCESS);
+        let csv = CString::new("[fe80::1%reenter]:53").unwrap();
+        assert_eq!(ares_set_servers_ports_csv(ch, csv.as_ptr()), ARES_SUCCESS);
+        let out = ares_get_servers_csv(ch);
+        assert!(!out.is_null());
+        ares_free_string(out as *mut c_void);
+        ares_destroy(ch);
+    }
 }
 
 #[test]
@@ -465,7 +518,8 @@ fn dns_record_accessors_roundtrip() {
         let optval = b"optdata";
         assert_eq!(ares_dns_rr_set_opt(rr_opt, ARES_RR_OPT_OPTIONS, 5, optval.as_ptr(), optval.len()), ARES_SUCCESS);
 
-        // rr_add can reallocate the RR array and invalidate earlier pointers; re-fetch by index.
+        // RRs are individually allocated, so the pointers returned by rr_add
+        // stay valid across later additions; rr_get returns the same addresses.
         let rr_a = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 0);
         let rr_aaaa = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 1);
         let rr_mx = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 2);
@@ -813,6 +867,60 @@ fn parse_multi_record_reply_freed_via_free_chain() {
     }
 }
 
+/// An RR pointer returned by `ares_dns_record_rr_add`/`rr_get` must stay valid
+/// when a later `rr_add` grows the section. The section stores boxed RRs, so
+/// reallocating the section's pointer array never moves an RR (and therefore
+/// never invalidates an RR's cached address storage either).
+#[test]
+fn dns_record_rr_pointer_survives_section_growth() {
+    unsafe {
+        let mut rec = ptr::null_mut();
+        assert_eq!(ares_dns_record_create(&mut rec, 1, 0, 0, 0), ARES_SUCCESS);
+        let apex = CString::new("example.com").unwrap();
+
+        let mut first = ptr::null_mut();
+        assert_eq!(ares_dns_record_rr_add(&mut first, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_A as u32, 1, 60), ARES_SUCCESS);
+        assert!(!first.is_null());
+        // Grow well past any small initial capacity.
+        for _ in 0..16 {
+            let mut rr = ptr::null_mut();
+            assert_eq!(ares_dns_record_rr_add(&mut rr, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_A as u32, 1, 60), ARES_SUCCESS);
+        }
+        assert_eq!(
+            ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 0),
+            first,
+            "rr_get must return the same address as the original rr_add"
+        );
+        let a4 = libc::in_addr { s_addr: u32::from_ne_bytes([192, 0, 2, 9]) };
+        assert_eq!(ares_dns_rr_set_addr(first, ARES_RR_A_ADDR, &a4), ARES_SUCCESS);
+        let p = ares_dns_rr_get_addr(first, ARES_RR_A_ADDR);
+        assert!(!p.is_null());
+        assert_eq!((*p).s_addr, a4.s_addr);
+        ares_dns_record_destroy(rec);
+    }
+}
+
+/// Deleting an earlier RR must not move the surviving RRs: their C pointers
+/// remain valid (and rr_get returns the same addresses).
+#[test]
+fn dns_record_rr_pointers_survive_deletion() {
+    unsafe {
+        let mut rec = ptr::null_mut();
+        assert_eq!(ares_dns_record_create(&mut rec, 1, 0, 0, 0), ARES_SUCCESS);
+        let apex = CString::new("example.com").unwrap();
+        let mut ptrs = [ptr::null_mut(); 3];
+        for rr in &mut ptrs {
+            assert_eq!(ares_dns_record_rr_add(rr, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_A as u32, 1, 60), ARES_SUCCESS);
+        }
+        assert_eq!(ares_dns_record_rr_del(rec, ARES_SECTION_ANSWER, 0), ARES_SUCCESS);
+        assert_eq!(ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 0), ptrs[1]);
+        assert_eq!(ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 1), ptrs[2]);
+        let a4 = libc::in_addr { s_addr: u32::from_ne_bytes([198, 51, 100, 7]) };
+        assert_eq!(ares_dns_rr_set_addr(ptrs[2], ARES_RR_A_ADDR, &a4), ARES_SUCCESS);
+        ares_dns_record_destroy(rec);
+    }
+}
+
 /// Cached in_addr/in6_addr getters must return a stable pointer valid while the
 /// RR is alive (guards the Cell-backed refresh in dns_record/safe.rs).
 #[test]
@@ -825,12 +933,14 @@ fn dns_record_cached_addr_pointer_stability() {
 
         let mut rr = ptr::null_mut();
         assert_eq!(ares_dns_record_rr_add(&mut rr, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_A as u32, 1, 300), ARES_SUCCESS);
+        let first_rr = rr;
         let mut rr6 = ptr::null_mut();
         assert_eq!(ares_dns_record_rr_add(&mut rr6, rec, ARES_SECTION_ANSWER, apex.as_ptr(), T_AAAA as u32, 1, 300), ARES_SUCCESS);
 
-        // The second rr_add may have reallocated the section; re-fetch by index.
+        // The second rr_add must not move (or invalidate) the first RR.
         let rr = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 0);
         let rr6 = ares_dns_record_rr_get(rec, ARES_SECTION_ANSWER, 1);
+        assert_eq!(rr, first_rr, "rr_add must not invalidate earlier RR pointers");
 
         let a4 = libc::in_addr { s_addr: u32::from_ne_bytes([192, 0, 2, 1]) };
         assert_eq!(ares_dns_rr_set_addr(rr, ARES_RR_A_ADDR, &a4), ARES_SUCCESS);
