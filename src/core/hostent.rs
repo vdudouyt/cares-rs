@@ -101,7 +101,9 @@ fn ip_len(ip: &IpAddr) -> usize {
     }
 }
 
-pub(crate) fn addrttl_fill(items: &[AddrRecord], want_v4: bool, max: usize) -> Vec<(IpAddr, u32)> {
+pub(crate) fn addrttl_fill(items: &[AddrRecord], want_v4: bool, max: i32) -> Vec<(IpAddr, u32)> {
+    // A negative capacity is "no entries", never a huge usize.
+    let max = usize::try_from(max).unwrap_or(0);
     items
         .iter()
         .filter(|r| matches!(r.ip, IpAddr::V4(_)) == want_v4)

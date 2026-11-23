@@ -341,15 +341,7 @@ pub(crate) unsafe fn parse_to_hostent<T: AddrTTL>(expected_record_type: u16, abu
     };
     let on_success = |res: ParsedRRs<AddrRecord>| -> c_int {
         if !out_addrttls.is_null() && !out_naddrttls.is_null() {
-            // The initial *out_naddrttls is the caller's array capacity. A
-            // negative value is not a huge capacity: treat it as zero and never
-            // write past the caller's array.
-            let capacity = unsafe { *out_naddrttls };
-            let pairs = if capacity > 0 {
-                addrttl_fill(&res.items, T::WANT_V4, capacity as usize)
-            } else {
-                Vec::new()
-            };
+            let pairs = addrttl_fill(&res.items, T::WANT_V4, unsafe { *out_naddrttls });
             for (i, (ip, ttl)) in pairs.iter().enumerate() {
                 unsafe { (*out_addrttls.add(i)).write(ip, *ttl) };
             }
