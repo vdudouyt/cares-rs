@@ -41,6 +41,52 @@ pub fn qid_matches(resp: &[u8], writebuf: &[u8], is_tcp: bool) -> bool {
     resp_qid == query_qid
 }
 
+/// Whether a reply's question section matches the query that was sent (upstream
+/// `same_questions`): equal question counts and, per question, the same type,
+/// class and name. Names compare case-insensitively unless `case_sensitive`
+/// (DNS 0x20 over UDP), matching the spoofing defence of that extension.
+pub fn same_questions(resp: &[u8], query: &[u8], case_sensitive: bool) -> bool {
+    let (Some(reply_questions), Some(query_questions)) = (questions(resp), questions(query)) else {
+        return false;
+    };
+    if reply_questions.len() != query_questions.len() {
+        return false;
+    }
+    reply_questions.iter().zip(&query_questions).all(|(reply, query)| {
+        reply.1 == query.1
+            && reply.2 == query.2
+            && if case_sensitive {
+                reply.0 == query.0
+            } else {
+                reply.0.eq_ignore_ascii_case(&query.0)
+            }
+    })
+}
+
+/// Parse a message's question section (names follow compression, as RFC 1035
+/// allows). `None` when the header or any question is malformed.
+fn questions(buf: &[u8]) -> Option<Vec<(String, u16, u16)>> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let count = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    // Each question needs a root label plus type/class (5 bytes), so a huge
+    // attacker-supplied count cannot reserve unbounded memory.
+    let mut out = Vec::with_capacity(count.min(buf.len() / 5));
+    let mut pos = 12usize;
+    for _ in 0..count {
+        let name = crate::core::dns_record::parse_dns_name(buf, &mut pos)?;
+        if pos + 4 > buf.len() {
+            return None;
+        }
+        let qtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let qclass = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+        pos += 4;
+        out.push((name, qtype, qclass));
+    }
+    Some(out)
+}
+
 /// RFC 6761: "localhost" or any name under ".localhost".
 pub fn is_localhost(name: &str) -> bool {
     name.eq_ignore_ascii_case("localhost")
@@ -357,6 +403,45 @@ mod tests {
         // Too-short response or query: accepted (historical behavior)
         assert!(qid_matches(&[0xab], &query, false));
         assert!(qid_matches(&[0xab, 0xcd], &[0x00], false));
+    }
+
+    fn message(questions: &[(&str, u16, u16)]) -> Vec<u8> {
+        let mut buf = vec![0x12, 0x34, 0x01, 0x00];
+        buf.extend_from_slice(&(questions.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&[0; 6]);
+        for &(name, qtype, qclass) in questions {
+            for label in name.split('.').filter(|label| !label.is_empty()) {
+                buf.push(label.len() as u8);
+                buf.extend_from_slice(label.as_bytes());
+            }
+            buf.push(0);
+            buf.extend_from_slice(&qtype.to_be_bytes());
+            buf.extend_from_slice(&qclass.to_be_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn same_question_rules() {
+        let query = message(&[("example.com", 1, 1)]);
+        assert!(same_questions(&query, &query, true));
+        // Case is ignored without DNS 0x20, but significant with it.
+        let upper = message(&[("EXAMPLE.COM", 1, 1)]);
+        assert!(same_questions(&upper, &query, false));
+        assert!(!same_questions(&upper, &query, true));
+        // Type, class and question count must match.
+        assert!(!same_questions(&message(&[("example.com", 28, 1)]), &query, false));
+        assert!(!same_questions(&message(&[("example.com", 1, 3)]), &query, false));
+        assert!(!same_questions(&message(&[]), &query, false));
+        assert!(!same_questions(&message(&[("other.test", 1, 1)]), &query, false));
+        assert!(!same_questions(
+            &message(&[("example.com", 1, 1), ("example.com", 1, 1)]),
+            &query,
+            false,
+        ));
+        assert!(!same_questions(&[], &query, false));
+        // A malformed question section is never accepted.
+        assert!(!same_questions(&[0xff; 12], &query, false));
     }
 
     #[test]

@@ -23,6 +23,7 @@ const ARES_EFORMERR: c_int = 2;
 const ARES_ENOSERVER: c_int = 26;
 const ARES_EBADQUERY: c_int = 7;
 const ARES_EBADNAME: c_int = 8;
+const ARES_ETIMEOUT: c_int = 12;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -38,6 +39,7 @@ enum ReplyKind {
     Truncated,
     Rcode(u8),
     NxThenA,
+    WrongQuestion,
 }
 
 struct TcpConn {
@@ -192,6 +194,7 @@ fn make_reply(request: &[u8], kind: ReplyKind) -> Vec<u8> {
                 (3u8, false, false)
             }
         }
+        ReplyKind::WrongQuestion => (0u8, false, true),
     };
 
     let mut reply = Vec::new();
@@ -205,7 +208,15 @@ fn make_reply(request: &[u8], kind: ReplyKind) -> Vec<u8> {
     reply.extend_from_slice(&[0, 1]);
     reply.extend_from_slice(&(u16::from(answer)).to_be_bytes());
     reply.extend_from_slice(&[0, 0, 0, 0]);
-    reply.extend_from_slice(&request[12..]);
+    if matches!(kind, ReplyKind::WrongQuestion) {
+        // Same id, type and class, but a question the client never asked.
+        let (_, qtype, qclass) = question_parts(request);
+        push_name(&mut reply, "not-the-question.example");
+        reply.extend_from_slice(&qtype.to_be_bytes());
+        reply.extend_from_slice(&qclass.to_be_bytes());
+    } else {
+        reply.extend_from_slice(&request[12..]);
+    }
     if answer {
         reply.extend_from_slice(&[0xC0, 0x0C]);
         reply.extend_from_slice(&[0, 1, 0, 1]);
@@ -690,6 +701,25 @@ fn query_apis_carry_class_and_norecurse() {
         let reply = run_search(channel, &search_name, ARES_CLASS_CHAOS, &mut mini);
         assert_eq!(reply.status, ARES_SUCCESS);
         assert!(!rd_bit(mini.last_udp()));
+        ares_destroy(channel);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "real sockets: Miri cannot run socket syscalls")]
+fn reply_with_a_different_question_is_dropped() {
+    let _serial = serial();
+    let (mut mini, port) = Mini::udp(ReplyKind::WrongQuestion);
+    unsafe {
+        let channel = init_flags(0);
+        use_server(channel, port);
+        let name = CString::new("question-check.example").unwrap();
+        let reply = run_query(channel, &name, ARES_CLASS_IN, &mut mini);
+        assert!(!mini.udp_queries.is_empty(), "the query was never sent");
+        assert_eq!(
+            reply.status, ARES_ETIMEOUT,
+            "a reply answering a different question must be ignored, not delivered"
+        );
         ares_destroy(channel);
     }
 }

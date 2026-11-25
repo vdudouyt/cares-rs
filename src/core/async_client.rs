@@ -44,8 +44,9 @@ use crate::async_runtime::Runtime;
 use crate::core::hostent::Hostent;
 use crate::core::hostfile::{AddressFamily, HostLookup, Hosts};
 use crate::core::lookup::{
-    is_localhost, is_onion_domain, qid_matches, summarize, SearchPlan, ServerHealth, ServerId,
-    AF_INET, AF_INET6, RCODE_NOTIMP, RCODE_REFUSED, RCODE_SERVFAIL, RTYPE_A, RTYPE_AAAA,
+    is_localhost, is_onion_domain, qid_matches, same_questions, summarize, SearchPlan,
+    ServerHealth, ServerId, AF_INET, AF_INET6, RCODE_NOTIMP, RCODE_REFUSED, RCODE_SERVFAIL,
+    RTYPE_A, RTYPE_AAAA,
 };
 use crate::core::dns_record::{ares_dns_record_t, class_isvalid, parse_record, rec_type_isvalid, write_record};
 use crate::plugins::edns::wire::EDNS_PACKETSZ;
@@ -63,7 +64,7 @@ use crate::core::sysconfig::SysConfig;
 use crate::core::AresError;
 use crate::ffi::dns_record::ARES_CLASS_IN;
 use crate::ffi::ares_options::{
-    ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
+    ARES_FLAG_DNS0x20, ARES_FLAG_EDNS, ARES_FLAG_IGNTC, ARES_FLAG_NO_DFLT_SVR, ARES_FLAG_NOALIASES,
     ARES_FLAG_NOCHECKRESP, ARES_FLAG_NORECURSE, ARES_FLAG_NOSEARCH, ARES_FLAG_PRIMARY,
     ARES_FLAG_STAYOPEN, ARES_FLAG_USEVC, ARES_OPT_DOMAINS, ARES_OPT_EDNSPSZ,
     ARES_OPT_EVENT_THREAD, ARES_OPT_FLAGS,

@@ -258,9 +258,14 @@ impl AsyncClient {
             let timer = self.rt.timer_at(deadline);
             match recv_reply(&mut conn, timer).await {
                 Ok(buf) => {
-                    // Not this query's response (wrong id), or a plugin drops
-                    // it as stray or spoofed: keep listening.
-                    if !qid_matches(&buf, &q.payload, false) {
+                    // Not this query's response (wrong id or question), or a
+                    // plugin drops it as stray or spoofed: keep listening.
+                    // DNS 0x20 makes the question-name comparison case-sensitive
+                    // on UDP, as its spoofing defence.
+                    let dns0x20 = self.flags & ARES_FLAG_DNS0x20 != 0 && !q.use_tcp;
+                    if !qid_matches(&buf, &q.payload, false)
+                        || !same_questions(&buf, &wire, dns0x20)
+                    {
                         continue;
                     }
                     let verdict = self
