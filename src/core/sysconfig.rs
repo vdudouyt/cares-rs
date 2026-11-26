@@ -22,6 +22,12 @@ pub struct SysConfigOptions {
     pub ndots: u32,
     pub attempts: u32,
     pub timeout_ms: u32,
+    /// Whether a usable `attempts`/`retry` token was present. Upstream keeps
+    /// its sysconfig value unset when the token is absent or rejected, so
+    /// `reinit` must preserve the channel's previous value in that case.
+    pub attempts_set: bool,
+    /// Whether a usable `timeout`/`retrans` token was present (same rule).
+    pub timeout_ms_set: bool,
     pub use_vc: bool,
     pub rotate: bool,
     pub inet6: bool,
@@ -30,7 +36,17 @@ pub struct SysConfigOptions {
 
 impl Default for SysConfigOptions {
     fn default() -> Self {
-        SysConfigOptions { ndots: 1, attempts: 3, timeout_ms: 2000, use_vc: false, rotate: false, inet6: false, edns0: false }
+        SysConfigOptions {
+            ndots: 1,
+            attempts: 3,
+            timeout_ms: 2000,
+            attempts_set: false,
+            timeout_ms_set: false,
+            use_vc: false,
+            rotate: false,
+            inet6: false,
+            edns0: false,
+        }
     }
 }
 
@@ -115,8 +131,26 @@ fn parse_options_into(opts: &mut SysConfigOptions, src: &str) -> Result<(), Pars
 
         match key {
             "ndots" => opts.ndots = take_num_arg(key, val)?,
-            "attempts" => opts.attempts = take_num_arg(key, val)?,
-            "timeout" | "retrans" => opts.timeout_ms = take_num_arg::<u32>(key, val)? * 1000,
+            // Upstream rejects zero values for these options, leaving the
+            // previous/default setting in place.
+            "attempts" | "retry" => {
+                let attempts = take_num_arg::<u32>(key, val)?;
+                if attempts != 0 {
+                    opts.attempts = attempts;
+                    opts.attempts_set = true;
+                }
+            }
+            // `secs * 1000` must not overflow: an out-of-range value is
+            // ignored rather than wrapping to a tiny timeout.
+            "timeout" | "retrans" => {
+                let secs = take_num_arg::<u64>(key, val)?;
+                if let Some(ms) = u32::try_from(secs).ok().and_then(|s| s.checked_mul(1000)) {
+                    if ms != 0 {
+                        opts.timeout_ms = ms;
+                        opts.timeout_ms_set = true;
+                    }
+                }
+            }
             "use-vc" | "usevc" => opts.use_vc = true,
             "rotate" => opts.rotate = true,
             "inet6" => opts.inet6 = true,
@@ -233,6 +267,30 @@ mod tests {
         let conf: SysConfig = input.parse().unwrap();
         assert_eq!(conf.options.timeout_ms, 7000);
         assert!(conf.options.edns0);
+    }
+
+    /// Upstream rejects zero timer values and an overflowing `* 1000`
+    /// conversion; each ignored token leaves the prior/default value.
+    #[test]
+    fn ignores_zero_and_overflowing_timer_options() {
+        let conf: SysConfig = "options timeout:0 attempts:0\n".parse().unwrap();
+        assert_eq!(conf.options.timeout_ms, 2000);
+        assert_eq!(conf.options.attempts, 3);
+        assert!(!conf.options.timeout_ms_set);
+        assert!(!conf.options.attempts_set);
+
+        let conf: SysConfig = "options timeout:4294968 attempts:1\n".parse().unwrap();
+        assert_eq!(conf.options.timeout_ms, 2000, "overflowing timeout is ignored");
+        assert!(!conf.options.timeout_ms_set);
+        assert_eq!(conf.options.attempts, 1);
+        assert!(conf.options.attempts_set);
+
+        // A later valid token still applies after an ignored one.
+        let conf: SysConfig = "options timeout:0 retrans:2 attempts:0 retry:5\n".parse().unwrap();
+        assert_eq!(conf.options.timeout_ms, 2000);
+        assert_eq!(conf.options.attempts, 5);
+        assert!(conf.options.timeout_ms_set);
+        assert!(conf.options.attempts_set);
     }
 
     #[test]

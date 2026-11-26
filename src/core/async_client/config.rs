@@ -45,11 +45,13 @@ impl AsyncClient {
         if self.optmask & ARES_OPT_NDOTS == 0 {
             self.config.options.ndots = sys.options.ndots;
         }
-        if self.optmask & ARES_OPT_TRIES == 0 && sys.options.attempts != 0 {
+        // Only a usable sysconfig value overrides the channel's previous
+        // setting; an absent or ignored (zero/overflowing) token leaves it.
+        if self.optmask & ARES_OPT_TRIES == 0 && sys.options.attempts_set {
             self.config.options.attempts = sys.options.attempts;
         }
         if self.optmask & (ARES_OPT_TIMEOUTMS | ARES_OPT_TIMEOUT) == 0
-            && sys.options.timeout_ms != 0
+            && sys.options.timeout_ms_set
         {
             self.config.options.timeout_ms = sys.options.timeout_ms;
         }
@@ -763,6 +765,25 @@ mod reinit_tests {
         assert_eq!(client.lookups, "bf");
         assert!(!client.sortlist.is_empty());
         assert!(client.shared.cache.borrow_mut().get(&key, Instant::now()).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Zero/overflowing timer tokens must not reset a value previously loaded
+    /// from sysconfig; reinit keeps the channel's current setting.
+    #[test]
+    fn reinit_ignores_zero_timer_options() {
+        let path = temp_conf("options timeout:1 attempts:4\n");
+        let mut client = AsyncClient::build(SysConfig::default(), super::tests::noop_factory(), 53, 53, Runtime::default());
+        client.resolvconf_path = path.to_string_lossy().into_owned();
+        client.reinit().expect("reinit");
+        assert_eq!(client.config.options.timeout_ms, 1000);
+        assert_eq!(client.config.options.attempts, 4);
+
+        std::fs::write(&path, "options timeout:0 attempts:0\n").expect("rewrite temp resolv.conf");
+        client.reinit().expect("reinit");
+        assert_eq!(client.config.options.timeout_ms, 1000, "zero timeout keeps the previous value");
+        assert_eq!(client.config.options.attempts, 4, "zero attempts keeps the previous value");
+
         let _ = std::fs::remove_file(path);
     }
 
