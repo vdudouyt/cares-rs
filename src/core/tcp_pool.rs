@@ -1,0 +1,247 @@
+//! DNS-over-TCP pooling: one shared, multiplexed connection per server (upstream:
+//! one `server->tcp_conn`, all queries pipelined).
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io;
+use std::rc::Rc;
+use std::task::{Poll, Waker};
+
+use crate::async_runtime::{dead, AsyncSocket};
+use crate::core::lookup::ServerId;
+
+/// Demux tag of a frame — its transaction id (header bytes 0..2). `None` for a
+/// frame too short to carry one: it is handed to an awaiting waiter, which then
+/// rejects it as EBADRESP.
+pub(crate) fn dns_tag(frame: &[u8]) -> Option<u16> {
+    frame.get(0..2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+
+/// DNS-over-TCP framing (RFC 1035 §4.2.2): a u16-BE length prefixes each
+/// message. Pops one complete message off a reassembly buffer.
+pub(crate) fn dns_frame(rbuf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if rbuf.len() < 2 {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([rbuf[0], rbuf[1]]) as usize;
+    if rbuf.len() < 2 + payload_len {
+        return None;
+    }
+    let msg = rbuf[2..2 + payload_len].to_vec();
+    rbuf.drain(..2 + payload_len);
+    Some(msg)
+}
+
+/// One tag's inbox slot: the routed reply plus the waiting task's waker, so a
+/// sibling drain can wake a future with no fd readiness of its own.
+struct InboxSlot {
+    reply: Option<Vec<u8>>,
+    waker: Option<Waker>,
+}
+
+impl InboxSlot {
+    fn deliver(&mut self, frame: Vec<u8>) {
+        self.reply = Some(frame);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if let Some(w) = &self.waker {
+            w.wake_by_ref();
+        }
+    }
+}
+
+/// A shared stream connection to one server: a reassembly buffer plus the
+/// tag-demuxed inbox every querying future shares.
+pub(crate) struct TcpConn {
+    sock: Rc<AsyncSocket>,
+    rbuf: Vec<u8>,
+    inbox: HashMap<u16, InboxSlot>,
+}
+
+impl TcpConn {
+    /// A fresh shared connection over `sock`, already created and connected by
+    /// the caller outside any pool borrow so socket callbacks fire with no cell held.
+    pub(crate) fn new(sock: Rc<AsyncSocket>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(TcpConn { sock, rbuf: Vec::new(), inbox: HashMap::new() }))
+    }
+
+    /// Open an inbox slot for a query's id. Ids are unique channel-wide
+    /// (`core::qid`), so the slot is never already taken.
+    pub(crate) fn register_query(&mut self, qid: u16) {
+        self.inbox.insert(qid, InboxSlot { reply: None, waker: None });
+    }
+
+    /// Remember the task waiting on `tag`, to be woken when a sibling routes its reply.
+    pub(crate) fn register(&mut self, tag: u16, waker: &Waker) {
+        if let Some(slot) = self.inbox.get_mut(&tag) {
+            if !slot.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+                slot.waker = Some(waker.clone());
+            }
+        }
+    }
+
+    /// Release `tag`'s slot (RAII from `Conn`'s Drop; unknown tags are a no-op).
+    pub(crate) fn release(&mut self, tag: u16) {
+        self.inbox.remove(&tag);
+    }
+
+    pub(crate) fn sock(&self) -> Rc<AsyncSocket> {
+        self.sock.clone()
+    }
+
+    /// Whether a sibling has routed a reply into `tag`'s slot.
+    pub(crate) fn has_reply(&self, tag: u16) -> bool {
+        self.inbox.get(&tag).is_some_and(|slot| slot.reply.is_some())
+    }
+
+    /// Take a reply a **sibling** already routed into `tag`'s slot (it consumed
+    /// the fd's readiness, so this must not read the socket).
+    pub(crate) fn take(&mut self, tag: u16) -> Option<Vec<u8>> {
+        self.inbox.get_mut(&tag).and_then(|slot| slot.reply.take())
+    }
+
+    /// Drain + route this cycle, then resolve `tag`: `Ready(Ok)` if a frame is now
+    /// in its slot, `Ready(Err(UnexpectedEof))` if the connection died, else `Pending`.
+    ///
+    /// Takes the cell rather than `&mut self`: the socket is read with `conn`
+    /// unborrowed, since a custom `arecvfrom` may re-enter the channel (and touch
+    /// this conn, e.g. a cancel releasing its slots).
+    pub(crate) fn poll_read(conn: &RefCell<Self>, tag: u16) -> Poll<io::Result<Vec<u8>>> {
+        let sock = conn.borrow().sock.clone();
+        let mut bytes = Vec::new();
+        let alive = match sock.read_stream(&mut bytes) {
+            Ok(Some(0)) | Err(_) => false,
+            Ok(_) => true,
+        };
+        let mut this = conn.borrow_mut();
+        this.rbuf.extend_from_slice(&bytes);
+        this.route();
+        match this.take(tag) {
+            Some(msg) => Poll::Ready(Ok(msg)),
+            None if !alive => Poll::Ready(Err(dead())),
+            None => Poll::Pending,
+        }
+    }
+
+    /// Reassemble frames from `rbuf` and route each by tag into `inbox`
+    /// (unknown tags dropped).
+    fn route(&mut self) {
+        while let Some(frame) = dns_frame(&mut self.rbuf) {
+            if let Some(tag) = dns_tag(&frame) {
+                if let Some(slot) = self.inbox.get_mut(&tag) {
+                    slot.deliver(frame);
+                }
+            } else if let Some(slot) = self.inbox.values_mut().find(|s| s.reply.is_none()) {
+                // Untaggable frame: hand it to an awaiting waiter so the
+                // application sees (and rejects) it.
+                slot.deliver(frame);
+            }
+        }
+    }
+}
+
+/// Shared stream connections per server (upstream: one `server->tcp_conn`, all
+/// queries pipelined on it).
+///
+/// Methods that drop connections hand them back instead (`#[must_use]`): the
+/// last reference closing fires the C socket-state callback, which may re-enter
+/// the channel and borrow this pool, so callers drop them after releasing the
+/// pool borrow (as `UdpPool::clear` does).
+pub(crate) struct TcpPool {
+    conns: HashMap<ServerId, Rc<RefCell<TcpConn>>>,
+}
+
+impl TcpPool {
+    pub fn new() -> Self {
+        TcpPool { conns: HashMap::new() }
+    }
+
+    #[must_use = "drop the evicted conns after releasing the pool borrow"]
+    pub fn clear(&mut self) -> Vec<Rc<RefCell<TcpConn>>> {
+        self.conns.drain().map(|(_, conn)| conn).collect()
+    }
+
+    /// Evict the conns of servers no longer in `keep` (a server-list change).
+    #[must_use = "drop the evicted conns after releasing the pool borrow"]
+    pub fn retain_servers(&mut self, keep: &[ServerId]) -> Vec<Rc<RefCell<TcpConn>>> {
+        let gone: Vec<ServerId> = self.conns.keys().filter(|id| !keep.contains(id)).copied().collect();
+        gone.into_iter().filter_map(|id| self.conns.remove(&id)).collect()
+    }
+
+    #[must_use = "drop the evicted conn after releasing the pool borrow"]
+    pub fn remove(&mut self, key: ServerId) -> Option<Rc<RefCell<TcpConn>>> {
+        self.conns.remove(&key)
+    }
+
+    /// The live connection to `key`. Callers clone the `Rc` so no pool borrow
+    /// outlives this call: socket creation on a miss needs the pool unborrowed.
+    pub fn get(&self, key: ServerId) -> Option<Rc<RefCell<TcpConn>>> {
+        self.conns.get(&key).cloned()
+    }
+
+    /// Returns the conn previously pooled for `key`, if any.
+    #[must_use = "drop the replaced conn after releasing the pool borrow"]
+    pub fn insert(&mut self, key: ServerId, conn: Rc<RefCell<TcpConn>>) -> Option<Rc<RefCell<TcpConn>>> {
+        self.conns.insert(key, conn)
+    }
+}
+
+#[cfg(test)]
+impl TcpConn {
+    /// Whether `tag` has a reserved slot (fields are private to this module).
+    pub(crate) fn has_waiter(&self, tag: u16) -> bool {
+        self.inbox.contains_key(&tag)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_runtime::Runtime;
+    use crate::async_runtime::socket::Socket;
+    use std::net::SocketAddr;
+
+    /// A socket with no bytes waiting, for tests that never read it.
+    struct DummySock;
+    impl Socket for DummySock {
+        fn as_raw_fd(&self) -> i32 {
+            5
+        }
+        fn connect(&self, _addr: SocketAddr) -> io::Result<()> {
+            Ok(())
+        }
+        fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+        fn send(&self, data: &[u8]) -> io::Result<usize> {
+            Ok(data.len())
+        }
+    }
+
+    #[test]
+    fn dns_frame_extraction() {
+        let mut rbuf = vec![0x00, 0x03, 1, 2, 3, 0x00];
+        assert_eq!(dns_frame(&mut rbuf), Some(vec![1, 2, 3]));
+        assert_eq!(rbuf, vec![0x00]); // partial next frame stays buffered
+        assert_eq!(dns_frame(&mut rbuf), None);
+        rbuf.push(0x02);
+        assert_eq!(dns_frame(&mut rbuf), None); // length known, payload missing
+        rbuf.extend_from_slice(&[9, 8]);
+        assert_eq!(dns_frame(&mut rbuf), Some(vec![9, 8]));
+        assert!(rbuf.is_empty());
+    }
+
+    /// `release` frees only its own query's slot.
+    #[test]
+    fn release_frees_only_its_slot() {
+        let mut tc = TcpConn { sock: Runtime::new().register_socket(Rc::new(DummySock)), rbuf: Vec::new(), inbox: HashMap::new() };
+        tc.register_query(7);
+        tc.register_query(9);
+        assert!(tc.has_waiter(7) && tc.has_waiter(9));
+
+        tc.release(7);
+        assert!(!tc.has_waiter(7) && tc.has_waiter(9));
+    }
+}

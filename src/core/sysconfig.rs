@@ -4,8 +4,16 @@ use std::str::FromStr;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SysConfig {
     pub nameservers: Vec<(IpAddr, Option<u16>)>,
+    // Parallel to `nameservers`.
+    pub tcp_ports: Vec<Option<u16>>,
+    /// IPv6 scope ids, parallel to `nameservers` (0 = unscoped). resolv.conf
+    /// entries never carry a scope, so parsing pushes 0 for each nameserver.
+    pub scopes: Vec<u32>,
     pub domain: Option<String>,
     pub search: Vec<String>,
+    /// Raw `lookup`/`hostresorder` tokens mapped to c-ares's `b`/`f` order.
+    pub lookups: Option<String>,
+    pub sortlist: Option<String>,
     pub options: SysConfigOptions,
 }
 
@@ -13,7 +21,13 @@ pub struct SysConfig {
 pub struct SysConfigOptions {
     pub ndots: u32,
     pub attempts: u32,
-    pub timeout_secs: u32,
+    pub timeout_ms: u32,
+    /// Whether a usable `attempts`/`retry` token was present. Upstream keeps
+    /// its sysconfig value unset when the token is absent or rejected, so
+    /// `reinit` must preserve the channel's previous value in that case.
+    pub attempts_set: bool,
+    /// Whether a usable `timeout`/`retrans` token was present (same rule).
+    pub timeout_ms_set: bool,
     pub use_vc: bool,
     pub rotate: bool,
     pub inet6: bool,
@@ -22,7 +36,17 @@ pub struct SysConfigOptions {
 
 impl Default for SysConfigOptions {
     fn default() -> Self {
-        SysConfigOptions { ndots: 0, attempts: 4, timeout_secs: 5, use_vc: false, rotate: false, inet6: false, edns0: false }
+        SysConfigOptions {
+            ndots: 1,
+            attempts: 3,
+            timeout_ms: 2000,
+            attempts_set: false,
+            timeout_ms_set: false,
+            use_vc: false,
+            rotate: false,
+            inet6: false,
+            edns0: false,
+        }
     }
 }
 
@@ -43,18 +67,31 @@ impl FromStr for SysConfig {
             if line.is_empty() { continue; }
 
             let mut parts = line.split_whitespace();
-            let keyword = parts.next().unwrap();
+            let Some(keyword) = parts.next() else { continue };
             let rest = parts.collect::<Vec<_>>();
             let [arg1, ..] = rest[..] else { return Err(ParseError::MissingValue { keyword: keyword.into() })  };
 
             match keyword {
                 "nameserver" => {
                     for tok in rest {
-                        conf.nameservers.push(parse_ns_addr(tok).unwrap());
+                        // Skip invalid tokens rather than failing on a malformed
+                        // resolv.conf (matches upstream).
+                        if let Some(ns) = parse_ns_addr(tok) {
+                            conf.nameservers.push(ns);
+                            conf.tcp_ports.push(None);
+                            conf.scopes.push(0);
+                        }
                     }
                 }
                 "domain" => conf.domain = Some(arg1.to_string()),
                 "search" => conf.search.extend(rest.iter().map(|s| s.to_string())),
+                "lookup" | "hostresorder" => {
+                    let lookups = parse_lookups(&rest);
+                    if !lookups.is_empty() {
+                        conf.lookups = Some(lookups);
+                    }
+                }
+                "sortlist" => conf.sortlist = Some(rest.join(" ")),
                 "options" => parse_options_into(&mut conf.options, &rest.join(" "))?,
                 _ => continue,
             }
@@ -62,6 +99,25 @@ impl FromStr for SysConfig {
 
         Ok(conf)
     }
+}
+
+/// Map resolv.conf `lookup`/`hostresorder` tokens to upstream's compact
+/// order string (`b` = DNS, `f` = hosts file), de-duplicated in input order.
+fn parse_lookups(tokens: &[&str]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        let ch = match token.to_ascii_lowercase().as_str() {
+            "dns" | "bind" | "resolv" | "resolve" => Some('b'),
+            "files" | "file" | "local" => Some('f'),
+            _ => None,
+        };
+        if let Some(ch) = ch {
+            if !out.contains(ch) {
+                out.push(ch);
+            }
+        }
+    }
+    out
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -75,8 +131,26 @@ fn parse_options_into(opts: &mut SysConfigOptions, src: &str) -> Result<(), Pars
 
         match key {
             "ndots" => opts.ndots = take_num_arg(key, val)?,
-            "attempts" => opts.attempts = take_num_arg(key, val)?,
-            "timeout" | "retrans" => opts.timeout_secs = take_num_arg(key, val)?,
+            // Upstream rejects zero values for these options, leaving the
+            // previous/default setting in place.
+            "attempts" | "retry" => {
+                let attempts = take_num_arg::<u32>(key, val)?;
+                if attempts != 0 {
+                    opts.attempts = attempts;
+                    opts.attempts_set = true;
+                }
+            }
+            // `secs * 1000` must not overflow: an out-of-range value is
+            // ignored rather than wrapping to a tiny timeout.
+            "timeout" | "retrans" => {
+                let secs = take_num_arg::<u64>(key, val)?;
+                if let Some(ms) = u32::try_from(secs).ok().and_then(|s| s.checked_mul(1000)) {
+                    if ms != 0 {
+                        opts.timeout_ms = ms;
+                        opts.timeout_ms_set = true;
+                    }
+                }
+            }
             "use-vc" | "usevc" => opts.use_vc = true,
             "rotate" => opts.rotate = true,
             "inet6" => opts.inet6 = true,
@@ -95,6 +169,24 @@ fn take_num_arg<T: FromStr>(keyword: &str, val: &str) -> Result<T, ParseError> {
     
 }
 
+pub fn apply_env_overrides(config: &mut SysConfig) {
+    if let Ok(val) = std::env::var("LOCALDOMAIN") {
+        let val = val.trim();
+        if !val.is_empty() {
+            config.search = val.split_whitespace().map(|s| s.to_string()).collect();
+            config.domain = config.search.first().cloned();
+        }
+    }
+
+    if let Ok(val) = std::env::var("RES_OPTIONS") {
+        let val = val.trim();
+        if !val.is_empty() {
+            let opts_str = val.strip_prefix("options").map(|s| s.trim_start()).unwrap_or(val);
+            let _ = parse_options_into(&mut config.options, opts_str);
+        }
+    }
+}
+
 pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
     if let Ok(sa) = SocketAddr::from_str(s) {
         return Some((sa.ip(), Some(sa.port())));
@@ -104,12 +196,39 @@ pub fn parse_ns_addr(s: &str) -> Option<(IpAddr, Option<u16>)> {
         return Some((ip, None))
     }
 
+    // Bracketed IPv6 without a port, e.g. "[::1]".
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len()-1];
+        if let Ok(ip) = IpAddr::from_str(inner) {
+            return Some((ip, None));
+        }
+    }
+
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Documented c-ares defaults: `DEFAULT_TIMEOUT` is 2000 ms,
+    /// `DEFAULT_TRIES` is 3, and ndots is 1.
+    #[test]
+    fn defaults_match_documented_timeout_and_tries() {
+        let opts = SysConfigOptions::default();
+        assert_eq!(opts.ndots, 1, "documented default ndots");
+        assert_eq!(opts.attempts, 3, "documented default tries");
+        assert_eq!(opts.timeout_ms, 2000, "documented default timeout in ms");
+    }
+
+    #[test]
+    fn skips_malformed_nameserver() {
+        // A malformed nameserver token must be skipped, not panic on init/reinit.
+        let input = "nameserver 8.8.8.8\nnameserver not-an-ip\nnameserver 1.1.1.1\n";
+        let conf: SysConfig = input.parse().unwrap();
+        assert_eq!(conf.nameservers.len(), 2, "the invalid token is skipped");
+        assert_eq!(conf.nameservers.len(), conf.tcp_ports.len(), "parallel vecs stay in sync");
+    }
 
     #[test]
     fn parse_minimal() {
@@ -118,8 +237,8 @@ mod tests {
         assert_eq!(conf.nameservers.len(), 1);
         assert_eq!(conf.domain, None);
         assert!(conf.search.is_empty());
-        assert_eq!(conf.options.timeout_secs, 5);
-        assert_eq!(conf.options.attempts, 4);
+        assert_eq!(conf.options.timeout_ms, 2000);
+        assert_eq!(conf.options.attempts, 3);
     }
 
     #[test]
@@ -137,7 +256,7 @@ mod tests {
         assert_eq!(conf.search, vec!["corp.local", "example.org"]);
         assert_eq!(conf.options.ndots, 2);
         assert_eq!(conf.options.attempts, 4);
-        assert_eq!(conf.options.timeout_secs, 3);
+        assert_eq!(conf.options.timeout_ms, 3000);
         assert!(conf.options.rotate);
         assert!(conf.options.use_vc);
     }
@@ -146,8 +265,32 @@ mod tests {
     fn parse_options_variants() {
         let input = "options retrans=7 edns0 foo=bar baz:9 qux";
         let conf: SysConfig = input.parse().unwrap();
-        assert_eq!(conf.options.timeout_secs, 7);
+        assert_eq!(conf.options.timeout_ms, 7000);
         assert!(conf.options.edns0);
+    }
+
+    /// Upstream rejects zero timer values and an overflowing `* 1000`
+    /// conversion; each ignored token leaves the prior/default value.
+    #[test]
+    fn ignores_zero_and_overflowing_timer_options() {
+        let conf: SysConfig = "options timeout:0 attempts:0\n".parse().unwrap();
+        assert_eq!(conf.options.timeout_ms, 2000);
+        assert_eq!(conf.options.attempts, 3);
+        assert!(!conf.options.timeout_ms_set);
+        assert!(!conf.options.attempts_set);
+
+        let conf: SysConfig = "options timeout:4294968 attempts:1\n".parse().unwrap();
+        assert_eq!(conf.options.timeout_ms, 2000, "overflowing timeout is ignored");
+        assert!(!conf.options.timeout_ms_set);
+        assert_eq!(conf.options.attempts, 1);
+        assert!(conf.options.attempts_set);
+
+        // A later valid token still applies after an ignored one.
+        let conf: SysConfig = "options timeout:0 retrans:2 attempts:0 retry:5\n".parse().unwrap();
+        assert_eq!(conf.options.timeout_ms, 2000);
+        assert_eq!(conf.options.attempts, 5);
+        assert!(conf.options.timeout_ms_set);
+        assert!(conf.options.attempts_set);
     }
 
     #[test]
@@ -158,5 +301,18 @@ mod tests {
             ParseError::MissingValue { .. } => {},
             _ => panic!("unexpected error: {:?}", err),
         }
+    }
+
+    #[test]
+    fn parses_lookup_and_hostresorder_order() {
+        let conf: SysConfig = "lookup bind files\n".parse().unwrap();
+        assert_eq!(conf.lookups.as_deref(), Some("bf"));
+
+        let conf: SysConfig = "hostresorder files bind\n".parse().unwrap();
+        assert_eq!(conf.lookups.as_deref(), Some("fb"));
+
+        // Unknown tokens are skipped; duplicates keep first position.
+        let conf: SysConfig = "lookup garbage bind local bind\n".parse().unwrap();
+        assert_eq!(conf.lookups.as_deref(), Some("bf"));
     }
 }

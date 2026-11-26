@@ -1,0 +1,153 @@
+name: Node.js downstream (manual)
+
+# Manual-only: start from the GitHub Actions UI ("Run workflow").
+# Builds Ubuntu's Node.js source with --shared-cares against this checkout's
+# cares-rs, then runs Node's DNS test subsystem by default.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_pattern:
+        description: "test.py selector (e.g. dns, parallel/test-dns.js)"
+        required: false
+        default: dns
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  nodejs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout cares-rs
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nodejs-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-nodejs-
+
+      - name: Install Node.js build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          if ! grep -q '^Types:.*deb-src' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo 'deb-src http://archive.ubuntu.com/ubuntu noble main universe' \
+              | sudo tee /etc/apt/sources.list.d/cares-deb-src.list
+          fi
+          sudo apt-get update
+          sudo apt-get install -y build-essential dpkg-dev devscripts netbase
+          # Install Node's native build dependencies explicitly.  Do not use
+          # `apt-get build-dep nodejs`: the node-* packages pull in nodejs,
+          # which depends on libnode109 -> libcares2, installing the distro's
+          # c-ares.  --shared-cares must resolve only to our prefix.
+          sudo apt-get install -y \
+            bash-completion ca-certificates curl gyp jq \
+            libbrotli-dev libhttp-parser-dev libicu-dev libnghttp2-dev \
+            libssl-dev libuv1-dev openssl pkgconf procps python3 zlib1g-dev
+          for p in libc-ares-dev libcares2 libc-ares2; do
+            if dpkg -s "$p" >/dev/null 2>&1; then
+              echo "ERROR: stock c-ares package $p was installed" >&2
+              exit 1
+            fi
+          done
+
+      - name: Fetch Node shared builtins without installing nodejs
+        run: |
+          # The DFSG source tree omits acorn, cjs-module-lexer and undici.
+          # Extract just their JS files from the debs instead of installing the
+          # node-* packages (which would drag in nodejs and libcares2).
+          mkdir -p /tmp/node-builtins
+          cd /tmp/node-builtins
+          apt-get download node-acorn node-cjs-module-lexer node-undici
+          for deb in ./*.deb; do
+            dpkg-deb -x "$deb" /tmp/node-builtins
+          done
+          test -f /tmp/node-builtins/usr/share/nodejs/acorn/dist/acorn.js
+          test -f /tmp/node-builtins/usr/share/nodejs/acorn-walk/dist/walk.js
+          test -f /tmp/node-builtins/usr/share/nodejs/cjs-module-lexer/lexer.js
+          test -f /tmp/node-builtins/usr/share/nodejs/cjs-module-lexer/dist/lexer.js
+          test -f /tmp/node-builtins/usr/share/nodejs/undici/undici-fetch.js
+
+      - name: Build cares-rs
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-soname,libcares.so.2"
+        run: cargo build --release --locked
+
+      - name: Stage cares-rs for Node
+        run: |
+          PREFIX=/tmp/cares-prefix
+          mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
+          install -m755 target/release/libcares.so "$PREFIX/lib/libcares.so.2.0.0"
+          ln -sf libcares.so.2.0.0 "$PREFIX/lib/libcares.so.2"
+          ln -sf libcares.so.2 "$PREFIX/lib/libcares.so"
+          install -m644 include/ares*.h "$PREFIX/include/"
+          sed -e "s|^prefix=.*|prefix=$PREFIX|" \
+              -e 's|@MULTIARCH@||' \
+              debian/libcares.pc.in > "$PREFIX/lib/pkgconfig/libcares.pc"
+
+      - name: Fetch Node.js source
+        working-directory: /tmp
+        run: |
+          apt-get source nodejs
+          src=$(find /tmp -maxdepth 1 -type d -name 'nodejs-*' | sort | tail -1)
+          test -n "$src"
+          echo "NODE_SRC=$src" >> "$GITHUB_ENV"
+
+      - name: Configure Node.js with cares-rs
+        working-directory: ${{ env.NODE_SRC }}
+        env:
+          PKG_CONFIG_PATH: "/tmp/cares-prefix/lib/pkgconfig"
+        run: |
+          ./configure --verbose \
+            --without-npm --without-corepack \
+            --shared-cares \
+            --shared-cares-includes=/tmp/cares-prefix/include \
+            --shared-cares-libpath=/tmp/cares-prefix/lib \
+            --shared-zlib --shared-libuv --shared-nghttp2 --shared-brotli --shared-openssl \
+            --with-intl=system-icu \
+            --prefix=/tmp/node-cares \
+            --shared-builtin-undici/undici-path=/tmp/node-builtins/usr/share/nodejs/undici/undici-fetch.js \
+            --shared-builtin-acorn-path=/tmp/node-builtins/usr/share/nodejs/acorn/dist/acorn.js \
+            --shared-builtin-acorn_walk-path=/tmp/node-builtins/usr/share/nodejs/acorn-walk/dist/walk.js \
+            --shared-builtin-cjs_module_lexer/lexer-path=/tmp/node-builtins/usr/share/nodejs/cjs-module-lexer/lexer.js \
+            --shared-builtin-cjs_module_lexer/dist/lexer-path=/tmp/node-builtins/usr/share/nodejs/cjs-module-lexer/dist/lexer.js
+
+      - name: Build Node.js
+        working-directory: ${{ env.NODE_SRC }}
+        env:
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+        run: make -j"$(nproc)"
+
+      - name: Verify cares-rs linkage
+        working-directory: ${{ env.NODE_SRC }}
+        env:
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+        run: |
+          ldd out/Release/node | tee /tmp/node-ldd.txt
+          grep -q "/tmp/cares-prefix/lib/libcares.so.2" /tmp/node-ldd.txt
+          test "$(./out/Release/node -p process.versions.ares)" = "1.34.6"
+
+      - name: Run Node.js tests
+        working-directory: ${{ env.NODE_SRC }}
+        env:
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+          TEST_PATTERN: ${{ inputs.test_pattern }}
+        run: |
+          python3 tools/test.py \
+            --shell=out/Release/node \
+            -j1 --timeout=60 --progress=verbose \
+            "$TEST_PATTERN"

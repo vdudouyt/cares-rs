@@ -1,0 +1,57 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# Prefer a rustup toolchain (CI and developer machines) when present, then the
+# OS toolchain. The committed Cargo.lock is v4 and the locked crates use
+# edition 2024, so a cargo older than 1.85 (e.g. Ubuntu 24.04's 1.75) cannot
+# build this package.
+export PATH := $(HOME)/.cargo/bin:/usr/bin:$(PATH)
+export RUSTC ?= rustc
+export CARGO ?= cargo
+
+# Use a clean Cargo home inside the build tree so the build cannot pick up
+# crates from a pre-populated cache (the system registry or the user's
+# ~/.cargo). Cargo fetches the crates.io versions pinned in Cargo.lock.
+export CARGO_HOME := $(CURDIR)/debian/cargo_home
+
+# Embed the stock c-ares SONAME on the cdylib (cargo cannot set it directly).
+export RUSTFLAGS := -C link-arg=-Wl,-soname,libcares.so.2
+
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+LIBDIR := usr/lib/$(DEB_HOST_MULTIARCH)
+RT := debian/libcares-rs2
+DEV := debian/libcares-rs-dev
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	# Download the crates.io versions pinned in the committed Cargo.lock.
+	# --locked makes a stale or unexpectedly updated lockfile a hard error.
+	$(CARGO) fetch --locked
+
+override_dh_auto_build:
+	$(CARGO) build --release --locked
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(CARGO) test --release --locked --tests
+endif
+
+override_dh_auto_install:
+	# runtime: real SONAME object + SONAME symlink (stock c-ares names)
+	install -d $(RT)/$(LIBDIR)
+	install -m644 target/release/libcares.so $(RT)/$(LIBDIR)/libcares.so.2.0.0
+	ln -sf libcares.so.2.0.0 $(RT)/$(LIBDIR)/libcares.so.2
+	# dev: public headers (<ares.h> + upstream-compatible split-header stubs),
+	# dev symlink, pkg-config, cmake
+	install -d $(DEV)/usr/include $(DEV)/$(LIBDIR)/pkgconfig $(DEV)/$(LIBDIR)/cmake/c-ares
+	install -m644 include/ares*.h $(DEV)/usr/include/
+	ln -sf libcares.so.2 $(DEV)/$(LIBDIR)/libcares.so
+	sed 's|@MULTIARCH@|$(DEB_HOST_MULTIARCH)|g' debian/libcares.pc.in > $(DEV)/$(LIBDIR)/pkgconfig/libcares.pc
+	install -m644 debian/cmake/c-ares-config.cmake debian/cmake/c-ares-config-version.cmake $(DEV)/$(LIBDIR)/cmake/c-ares/
+
+override_dh_auto_clean:
+	$(CARGO) clean || true
+	rm -rf $(CARGO_HOME)

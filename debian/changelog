@@ -1,0 +1,19 @@
+cares-rs (0.1.0-1) UNRELEASED; urgency=medium
+
+  * Initial Debian packaging of the c-ares-compatible Rust resolver
+    (libcares-rs2 / libcares-rs-dev). Installs the stock c-ares file names
+    (<ares.h>, libcares.so.2, libcares.pc, c-ares-config.cmake), so existing
+    consumers build against it unchanged; replaces the stock c-ares packages.
+  * Build against the crates.io versions pinned in the committed Cargo.lock
+    instead of the distro's librust-*-dev packages; Cargo downloads the exact
+    locked versions itself. The version-relaxing patch is no longer needed.
+  * Fix a release-mode heap corruption when a server-state callback starts
+    queries: a re-entrant spawn could reallocate the executor's slot table while
+    a poll still used a pointer into it. The executor state now lives behind
+    interior mutability, so re-entrant access always re-reads the current table.
+  * Remove the FFI re-entrancy aliasing: channel_access now hands out a shared
+    &ChannelData, mutable channel state lives in Cell/RefCell, and pooled conns
+    evicted by a server-list change are dropped after the state borrow ends so
+    socket callbacks may re-enter. No second &mut ChannelData is minted.
+
+ -- Valentin Dudouyt <valentin.dudouyt@gmail.com>  Tue, 30 Jun 2026 21:16:41 +0300

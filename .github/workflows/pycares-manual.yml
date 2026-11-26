@@ -1,0 +1,203 @@
+name: pycares downstream (manual)
+
+# Manual-only: start from the GitHub Actions UI ("Run workflow").
+# Builds Ubuntu's pycares source against the cares-rs in this checkout and
+# runs pycares' own unittest suite.
+
+on:
+  workflow_dispatch:
+    inputs:
+      valgrind:
+        description: "Run the full pycares suite under Valgrind"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  pycares:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout cares-rs
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pycares-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pycares-
+
+      - name: Install pycares build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          if ! grep -q '^Types:.*deb-src' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo 'deb-src http://archive.ubuntu.com/ubuntu noble main universe' \
+              | sudo tee /etc/apt/sources.list.d/cares-deb-src.list
+          fi
+          sudo apt-get update
+          sudo apt-get install -y build-essential dpkg-dev devscripts netbase
+          # pycares' distro Build-Depends includes libc-ares-dev.  Install the
+          # rest explicitly so the distro c-ares never enters the image; the
+          # extension is built against /tmp/cares-prefix below.
+          sudo apt-get install -y \
+            debhelper dh-python pybuild-plugin-pyproject \
+            python3-all python3-all-dev python3-cffi python3-docutils \
+            python3-idna python3-setuptools python3-sphinx \
+            python3-sphinx-rtd-theme
+          for p in libc-ares-dev libcares2 libc-ares2; do
+            if dpkg -s "$p" >/dev/null 2>&1; then
+              echo "ERROR: stock c-ares package $p was installed" >&2
+              exit 1
+            fi
+          done
+
+      - name: Build cares-rs
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-soname,libcares.so.2"
+        run: cargo build --release --locked
+
+      - name: Stage cares-rs for pycares
+        run: |
+          PREFIX=/tmp/cares-prefix
+          mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
+          install -m755 target/release/libcares.so "$PREFIX/lib/libcares.so.2.0.0"
+          ln -sf libcares.so.2.0.0 "$PREFIX/lib/libcares.so.2"
+          ln -sf libcares.so.2 "$PREFIX/lib/libcares.so"
+          install -m644 include/ares*.h "$PREFIX/include/"
+          sed -e "s|^prefix=.*|prefix=$PREFIX|" \
+              -e 's|@MULTIARCH@||' \
+              debian/libcares.pc.in > "$PREFIX/lib/pkgconfig/libcares.pc"
+
+      - name: Fetch pycares source
+        working-directory: /tmp
+        run: |
+          apt-get source pycares
+          src=$(find /tmp -maxdepth 1 -type d -name 'pycares-*' | sort | tail -1)
+          test -n "$src"
+          echo "PYCARES_SRC=$src" >> "$GITHUB_ENV"
+
+      - name: Prepare pycares-compatible headers
+        run: |
+          # pycares' own ares_build.h/ares_nameser.h normally come from its
+          # deps/build-config include directory, ahead of the system header.
+          # Put them in our prefix next to cares-rs ares.h so the extension
+          # compiles against cares-rs without losing the T_* nameser macros.
+          cp "$PYCARES_SRC/deps/build-config/include/ares_build.h" /tmp/cares-prefix/include/
+          cp "$PYCARES_SRC/deps/build-config/include/ares_nameser.h" /tmp/cares-prefix/include/
+
+      - name: Retain pycares CFFI ownership and free server lists
+        working-directory: ${{ env.PYCARES_SRC }}
+        run: |
+          # These are pycares bugs, not cares-rs bugs: the temporary CFFI
+          # char[] objects for lookups/resolvconf_path can be freed before
+          # ares_init_options reads them, and the servers getter leaks the
+          # ares_get_servers() chain.  Fix them locally so the Valgrind run
+          # measures cares-rs rather than known pycares leaks/UAF.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/pycares/__init__.py")
+          text = path.read_text()
+
+          def replace(old, new):
+              global text
+              if old not in text:
+                  raise SystemExit("pycares patch anchor not found: %r" % old[:70])
+              text = text.replace(old, new, 1)
+
+          # Keep the CFFI buffers alive for the ares_init_options() call.
+          replace(
+              "options.lookups = _ffi.new('char[]', ascii_bytes(lookups))",
+              "self._lookups_cdata = _ffi.new('char[]', ascii_bytes(lookups))\n"
+              "            options.lookups = self._lookups_cdata",
+          )
+          replace(
+              "options.domains = c",
+              "self._domains_cdata = c\n"
+              "            self._domains_strs = strs\n"
+              "            options.domains = c",
+          )
+          replace(
+              "options.resolvconf_path = _ffi.new('char[]', ascii_bytes(resolvconf_path))",
+              "self._resolvconf_path_cdata = _ffi.new('char[]', ascii_bytes(resolvconf_path))\n"
+              "            options.resolvconf_path = self._resolvconf_path_cdata",
+          )
+
+          # The getter owns the chain returned by ares_get_servers().
+          replace(
+              "            server = s.next\n\n        return server_list",
+              "            server = s.next\n\n"
+              "        if servers[0] != _ffi.NULL:\n"
+              "            _lib.ares_free_data(servers[0])\n\n"
+              "        return server_list",
+          )
+
+          path.write_text(text)
+          PY
+
+      - name: Install Valgrind
+        if: ${{ inputs.valgrind }}
+        run: sudo apt-get install -y valgrind
+
+      - name: Build pycares extension against cares-rs
+        working-directory: ${{ env.PYCARES_SRC }}
+        env:
+          PYCARES_USE_SYSTEM_LIB: "1"
+          CFLAGS: "-I/tmp/cares-prefix/include"
+          LDFLAGS: "-L/tmp/cares-prefix/lib -Wl,-rpath,/tmp/cares-prefix/lib"
+        run: |
+          python3 setup.py build_ext --inplace --force
+          LD_LIBRARY_PATH=/tmp/cares-prefix/lib \
+            ldd src/pycares/_cares*.so | tee /tmp/pycares-ldd.txt
+          grep -q "/tmp/cares-prefix/lib/libcares.so.2" /tmp/pycares-ldd.txt
+
+      - name: Run pycares tests
+        if: ${{ !inputs.valgrind }}
+        working-directory: ${{ env.PYCARES_SRC }}
+        env:
+          DEBCI: "1"
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+          PYTHONPATH: "src:."
+        run: python3 -m unittest -v tests.test_all
+
+      - name: Run pycares tests under Valgrind
+        if: ${{ inputs.valgrind }}
+        working-directory: ${{ env.PYCARES_SRC }}
+        env:
+          DEBCI: "1"
+          LD_LIBRARY_PATH: "/tmp/cares-prefix/lib"
+          PYTHONPATH: "src:."
+        run: |
+          set +e
+          valgrind --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=definite \
+            --errors-for-leak-kinds=definite \
+            --error-exitcode=99 \
+            --num-callers=25 \
+            --log-file=/tmp/pycares-valgrind.log \
+            python3 -m unittest -v tests.test_all \
+            > /tmp/pycares-valgrind-tests.log 2>&1
+          rc=$?
+          set -e
+
+          tail -80 /tmp/pycares-valgrind-tests.log
+          grep -E 'ERROR SUMMARY|definitely lost:' /tmp/pycares-valgrind.log \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+          if [ "$rc" -ne 0 ]; then
+            tail -300 /tmp/pycares-valgrind.log
+            exit "$rc"
+          fi

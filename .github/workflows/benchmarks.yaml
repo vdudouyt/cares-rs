@@ -3,13 +3,13 @@ name: Benchmarks
 on:
   push:
     branches: [ "*" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "*" ]
 
-
 jobs:
   run_benchmarks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v4

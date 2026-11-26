@@ -1,0 +1,13 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${prefix}/lib/@MULTIARCH@
+includedir=${prefix}/include
+
+Name: c-ares
+URL: https://c-ares.org/
+Description: asynchronous DNS resolver library (Rust, c-ares-compatible)
+# Expose the c-ares ABI version, not the cares-rs package version: consumers use
+# this in PKG_CHECK_MODULES([libcares >= 1.x]) checks.
+Version: 1.34.6
+Libs: -L${libdir} -lcares
+Cflags: -I${includedir}
