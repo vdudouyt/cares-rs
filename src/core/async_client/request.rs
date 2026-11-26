@@ -261,10 +261,12 @@ impl AsyncClient {
                     // Not this query's response (wrong id or question), or a
                     // plugin drops it as stray or spoofed: keep listening.
                     // DNS 0x20 makes the question-name comparison case-sensitive
-                    // on UDP, as its spoofing defence.
+                    // on UDP, as its spoofing defence. A malformed question
+                    // section is not a mismatch: deliver it so response parsing
+                    // reports EBADRESP instead of the query silently timing out.
                     let dns0x20 = self.flags & ARES_FLAG_DNS0x20 != 0 && !q.use_tcp;
                     if !qid_matches(&buf, &q.payload, false)
-                        || !same_questions(&buf, &wire, dns0x20)
+                        || same_questions(&buf, &wire, dns0x20) == Some(false)
                     {
                         continue;
                     }

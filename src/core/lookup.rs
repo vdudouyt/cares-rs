@@ -41,18 +41,22 @@ pub fn qid_matches(resp: &[u8], writebuf: &[u8], is_tcp: bool) -> bool {
     resp_qid == query_qid
 }
 
-/// Whether a reply's question section matches the query that was sent (upstream
+/// Compare a reply's question section with the query that was sent (upstream
 /// `same_questions`): equal question counts and, per question, the same type,
 /// class and name. Names compare case-insensitively unless `case_sensitive`
 /// (DNS 0x20 over UDP), matching the spoofing defence of that extension.
-pub fn same_questions(resp: &[u8], query: &[u8], case_sensitive: bool) -> bool {
-    let (Some(reply_questions), Some(query_questions)) = (questions(resp), questions(query)) else {
-        return false;
-    };
+///
+/// `None` means the reply's header or question section is malformed, so the two
+/// cannot be compared. Callers must treat that as "not a mismatch" and let the
+/// reply reach response parsing, which reports it as `ARES_EBADRESP`: only a
+/// well-formed reply that answers a different question may be ignored.
+pub fn same_questions(resp: &[u8], query: &[u8], case_sensitive: bool) -> Option<bool> {
+    let reply_questions = questions(resp)?;
+    let query_questions = questions(query)?;
     if reply_questions.len() != query_questions.len() {
-        return false;
+        return Some(false);
     }
-    reply_questions.iter().zip(&query_questions).all(|(reply, query)| {
+    Some(reply_questions.iter().zip(&query_questions).all(|(reply, query)| {
         reply.1 == query.1
             && reply.2 == query.2
             && if case_sensitive {
@@ -60,7 +64,7 @@ pub fn same_questions(resp: &[u8], query: &[u8], case_sensitive: bool) -> bool {
             } else {
                 reply.0.eq_ignore_ascii_case(&query.0)
             }
-    })
+    }))
 }
 
 /// Parse a message's question section (names follow compression, as RFC 1035
@@ -424,24 +428,28 @@ mod tests {
     #[test]
     fn same_question_rules() {
         let query = message(&[("example.com", 1, 1)]);
-        assert!(same_questions(&query, &query, true));
+        assert_eq!(same_questions(&query, &query, true), Some(true));
         // Case is ignored without DNS 0x20, but significant with it.
         let upper = message(&[("EXAMPLE.COM", 1, 1)]);
-        assert!(same_questions(&upper, &query, false));
-        assert!(!same_questions(&upper, &query, true));
+        assert_eq!(same_questions(&upper, &query, false), Some(true));
+        assert_eq!(same_questions(&upper, &query, true), Some(false));
         // Type, class and question count must match.
-        assert!(!same_questions(&message(&[("example.com", 28, 1)]), &query, false));
-        assert!(!same_questions(&message(&[("example.com", 1, 3)]), &query, false));
-        assert!(!same_questions(&message(&[]), &query, false));
-        assert!(!same_questions(&message(&[("other.test", 1, 1)]), &query, false));
-        assert!(!same_questions(
-            &message(&[("example.com", 1, 1), ("example.com", 1, 1)]),
-            &query,
-            false,
-        ));
-        assert!(!same_questions(&[], &query, false));
-        // A malformed question section is never accepted.
-        assert!(!same_questions(&[0xff; 12], &query, false));
+        assert_eq!(same_questions(&message(&[("example.com", 28, 1)]), &query, false), Some(false));
+        assert_eq!(same_questions(&message(&[("example.com", 1, 3)]), &query, false), Some(false));
+        assert_eq!(same_questions(&message(&[]), &query, false), Some(false));
+        assert_eq!(same_questions(&message(&[("other.test", 1, 1)]), &query, false), Some(false));
+        assert_eq!(
+            same_questions(
+                &message(&[("example.com", 1, 1), ("example.com", 1, 1)]),
+                &query,
+                false,
+            ),
+            Some(false)
+        );
+        // A malformed reply cannot be compared: it must not be treated as a
+        // mismatch, or response parsing never gets to report EBADRESP.
+        assert_eq!(same_questions(&[], &query, false), None);
+        assert_eq!(same_questions(&[0xff; 12], &query, false), None);
     }
 
     #[test]
