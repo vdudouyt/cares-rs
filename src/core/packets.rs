@@ -4,11 +4,14 @@ use std::net::IpAddr;
 #[cfg(test)]
 use bytes::BufMut;
 
+use crate::core::dns_record::push_escaped_label;
+
 /// DNS label segments per name ("www.example.com" = 3). IPv6 reverse DNS
 /// (ip6.arpa) needs up to 34.
 const MAX_LABEL_PARTS: usize = 40;
 
-pub type LabelVec<'a> = ArrayVec<&'a str, MAX_LABEL_PARTS>;
+/// Wire labels are arbitrary bytes, not necessarily UTF-8.
+pub type LabelVec<'a> = ArrayVec<&'a [u8], MAX_LABEL_PARTS>;
 
 pub struct SliceBuf<'a> {
     data: &'a [u8],
@@ -102,7 +105,7 @@ impl<'a> DnsQuery<'a> {
     #[cfg(test)]
     pub fn new(domain: &'a str, qtype: u16, qclass: u16) -> DnsQuery<'a> {
         DnsQuery {
-            name: domain.split('.').collect(),
+            name: domain.split('.').map(str::as_bytes).collect(),
             qtype,
             qclass
         }
@@ -117,7 +120,7 @@ impl<'a> DnsQuery<'a> {
     pub fn write<B: BufMut>(&self, b: &mut B) {
         for label in &self.name {
             b.put_u8(label.len() as u8);
-            b.put_slice(label.as_bytes());
+            b.put_slice(label);
         }
         b.put_u8(0);
         b.put_u16(self.qtype);
@@ -135,7 +138,7 @@ impl<'a> DnsLabel<'a> {
     #[cfg(test)]
     pub fn new(name: &[&'a str], offset: Option<u16>) -> DnsLabel<'a> {
         let mut v = LabelVec::new();
-        for &s in name { v.push(s); }
+        for &s in name { v.push(s.as_bytes()); }
         DnsLabel { name: v, offset }
     }
     pub fn parse(buf: &mut SliceBuf<'a>) -> Option<DnsLabel<'a>> {
@@ -165,7 +168,7 @@ impl<'a> DnsLabel<'a> {
                 return None;
             }
 
-            let Some(s) = buf.get_str(len as usize) else { buf.pos = saved_pos; return None; };
+            let Some(s) = buf.get_slice(len as usize) else { buf.pos = saved_pos; return None; };
             if name.try_push(s).is_err() { buf.pos = saved_pos; return None; }
         }
 
@@ -179,10 +182,7 @@ impl<'a> DnsLabel<'a> {
         let mut idx = 0;
         for &s in self.name.iter() {
             if idx > 0 { result.push('.'); }
-            for &b in s.as_bytes() {
-                if b == b'.' || b == b'\\' { result.push('\\'); }
-                result.push(b as char);
-            }
+            push_escaped_label(s, &mut result);
             idx += 1;
         }
 
@@ -214,10 +214,7 @@ impl<'a> DnsLabel<'a> {
                 let end = pos + len as usize;
                 let label_bytes = main_buf.get(pos..end)?;
                 if idx > 0 { result.push('.'); }
-                for &b in label_bytes {
-                    if b == b'.' || b == b'\\' { result.push('\\'); }
-                    result.push(b as char);
-                }
+                push_escaped_label(label_bytes, &mut result);
                 idx += 1;
                 pos = end;
             }
@@ -238,19 +235,14 @@ impl RRParser<'_> for std::ffi::CString {
     }
 }
 
-/// Join DNS labels with '.', escaping any '.' or '\\' characters within individual labels.
-fn join_escaped_labels<'a, I: Iterator<Item = &'a &'a str>>(labels: I) -> String {
+/// Join DNS labels with '.', escaping bytes as c-ares renders wire names.
+pub(crate) fn join_escaped_labels<'a, I: Iterator<Item = &'a &'a [u8]>>(labels: I) -> String {
     let mut result = String::new();
     for (i, label) in labels.enumerate() {
         if i > 0 {
             result.push('.');
         }
-        for &b in label.as_bytes() {
-            if b == b'.' || b == b'\\' {
-                result.push('\\');
-            }
-            result.push(b as char);
-        }
+        push_escaped_label(label, &mut result);
     }
     result
 }

@@ -56,7 +56,7 @@ use crate::ffi::dns_record::{
 };
 
 /// Append one wire label to `out` using c-ares's `\DDD`/`\c` escapes.
-fn push_escaped_label(label: &[u8], out: &mut String) {
+pub(crate) fn push_escaped_label(label: &[u8], out: &mut String) {
     for &c in label {
         if !(0x20..=0x7e).contains(&c) {
             out.push('\\');

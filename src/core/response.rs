@@ -3,7 +3,9 @@
 
 use std::ffi::CString;
 
-use crate::core::packets::{DnsAnswer, DnsHeader, DnsLabel, DnsQuery, RRParser, SliceBuf};
+use crate::core::packets::{
+    join_escaped_labels, DnsAnswer, DnsHeader, DnsLabel, DnsQuery, RRParser, SliceBuf,
+};
 use crate::core::AresError;
 use crate::core::dns_record::{class_isvalid, rec_type_isvalid};
 use crate::ffi::dns_record::ARES_REC_TYPE_OPT;
@@ -120,8 +122,10 @@ impl<'a> ParsedResponse<'a> {
     }
 
     pub(crate) fn process_answers<T: RRParser<'a>>(self, buf: &[u8], expected_record_type: u16) -> Result<ParsedRRs<T>, AresError> {
-        // The echoed question name is untrusted and may contain a NUL.
-        let mut name = CString::new(self.query.name.join(".")).map_err(|_| AresError::from(ARES_EBADRESP))?;
+        // The echoed question name is untrusted and may contain any wire byte;
+        // c-ares escapes it before it reaches a NUL-terminated C string.
+        let mut name = CString::new(join_escaped_labels(self.query.name.iter()))
+            .map_err(|_| AresError::from(ARES_EBADRESP))?;
         let mut items: Vec<T> = Vec::with_capacity(self.answers.len());
         let mut success = 0;
         let mut aliases: Vec<CString> = vec![];

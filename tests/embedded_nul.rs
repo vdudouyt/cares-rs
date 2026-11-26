@@ -1,13 +1,13 @@
-//! Embedded NUL bytes in attacker-controlled DNS data must yield a clean error,
-//! not a panic/abort across the FFI boundary.
+//! Embedded NUL bytes in attacker-controlled DNS data must be handled without a
+//! panic/abort across the FFI boundary: character-strings reject them, wire
+//! names escape them as `\000` like c-ares.
 
-use std::ffi::{c_int, c_long, c_void, CString};
+use std::ffi::{c_int, c_long, c_void, CStr, CString};
 use std::ptr;
 
 use cares::*;
 
 const ARES_SUCCESS: c_int = 0;
-const ARES_EBADRESP: c_int = 10;
 const ARES_EBADSTR: c_int = 17;
 
 /// Interior NUL previously panicked in `CString::from_vec_with_nul().unwrap()`.
@@ -23,10 +23,11 @@ fn expand_string_with_embedded_nul_returns_ebadstr() {
     assert!(s.is_null(), "no string should be allocated on error");
 }
 
-/// An echoed question name containing an embedded NUL previously aborted via
-/// `.unwrap()` in the shared `process_answers` path used by every `ares_parse_*_reply`.
+/// An echoed question name containing an embedded NUL is part of the wire name,
+/// so the legacy presentation path escapes it as `\000` instead of rejecting or
+/// truncating it (a panic/abort here was the original bug).
 #[test]
-fn parse_reply_with_nul_in_question_name_returns_ebadresp() {
+fn parse_reply_with_nul_in_question_name_is_escaped() {
     #[rustfmt::skip]
     let resp: [u8; 35] = [
         0x12, 0x34,
@@ -47,14 +48,21 @@ fn parse_reply_with_nul_in_question_name_returns_ebadresp() {
         0x7F, 0x00, 0x00, 0x01,
     ];
 
-    let mut out: *mut c_void = ptr::null_mut();
-    // ares_parse_caa_reply has the simplest signature; any parse fn hits the
-    // same question-name path before record-type interpretation.
+    let mut host: *mut libc::hostent = ptr::null_mut();
     let rc = unsafe {
-        ares_parse_caa_reply(resp.as_ptr(), resp.len() as c_int, &mut out as *mut _ as *mut *mut _)
+        ares_parse_a_reply(
+            resp.as_ptr(),
+            resp.len() as c_int,
+            &mut host,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
     };
-    assert_eq!(rc, ARES_EBADRESP, "NUL in question name must be rejected, not panic");
-    assert!(out.is_null(), "no data should be allocated on error");
+    assert_eq!(rc, ARES_SUCCESS, "a NUL in the wire name must be escaped");
+    assert!(!host.is_null(), "the A answer must produce a hostent");
+    let name = unsafe { CStr::from_ptr((*host).h_name) };
+    assert_eq!(name.to_bytes(), b"\\000", "NUL must be rendered as \\000");
+    unsafe { ares_free_hostent(host) };
 }
 
 /// `ares_create_query` returns a libc::malloc'd packet freed via
