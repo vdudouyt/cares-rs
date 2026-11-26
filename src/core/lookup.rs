@@ -92,9 +92,13 @@ fn questions(buf: &[u8]) -> Option<Vec<(String, u16, u16)>> {
 }
 
 /// RFC 6761: "localhost" or any name under ".localhost".
+///
+/// Compares on bytes (like [`is_onion_domain`]) so a non-ASCII name can never
+/// make us slice a `&str` at a non-UTF-8 boundary and panic.
 pub fn is_localhost(name: &str) -> bool {
-    name.eq_ignore_ascii_case("localhost")
-        || (name.len() >= 10 && name[name.len()-10..].eq_ignore_ascii_case(".localhost"))
+    let b = name.as_bytes();
+    b.eq_ignore_ascii_case(b"localhost")
+        || (b.len() >= 10 && b[b.len() - 10..].eq_ignore_ascii_case(b".localhost"))
 }
 
 /// RFC 7686: case-insensitive byte suffix match (no alloc/UTF-8 validation,
@@ -558,6 +562,9 @@ mod tests {
         assert!(!is_onion_domain("日本語.example"));
         // A non-ASCII name that still ends in .onion is matched without panic.
         assert!(is_onion_domain("café.onion"));
+        // The same hazard existed in `is_localhost`; it must not panic either.
+        assert!(!is_localhost("😀😀😀"));
+        assert!(!is_localhost("café.café"));
     }
 
     #[test]
